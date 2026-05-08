@@ -326,6 +326,96 @@ def _resolve_spmm_alg1_launch_config(
     }
 
 
+def _normalize_spmm_base_device_props(device):
+    props = torch.cuda.get_device_properties(device)
+    warp_size = int(getattr(props, "warp_size", 32) or 32)
+    max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
+    max_threads_per_mp = int(
+        getattr(props, "max_threads_per_multi_processor", 2048) or 2048
+    )
+    return {
+        "warp_size": max(1, warp_size),
+        "max_threads_per_block": max(32, max_threads_per_block),
+        "max_threads_per_mp": max(32, max_threads_per_mp),
+    }
+
+
+def _clip_spmm_base_num_warps(desired, device_props):
+    warp_size = int(device_props["warp_size"])
+    max_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
+    max_supported = min(16, max_by_block, max_by_mp)
+    supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
+    if not supported:
+        return 1
+    desired = max(1, int(desired))
+    for value in reversed(supported):
+        if value <= desired:
+            return value
+    return supported[0]
+
+
+def _resolve_spmm_base_triton_launch(
+    dtype,
+    n_dense_cols,
+    max_row_nnz,
+    block_n=None,
+    block_nnz=None,
+    max_segments=None,
+    device_props=None,
+):
+    launch = _resolve_spmm_alg1_launch_config(
+        n_dense_cols,
+        max_row_nnz,
+        block_n=block_n,
+        block_nnz=block_nnz,
+        max_segments=max_segments,
+    )
+    if device_props is None:
+        return {
+            **launch,
+            "num_warps": 1,
+            "num_stages": 2,
+        }
+
+    n_dense_cols = int(n_dense_cols)
+    max_row_nnz = int(max_row_nnz)
+    block_n = int(launch["block_n"])
+
+    if n_dense_cols <= 16:
+        desired_warps = 1
+    elif n_dense_cols <= 32:
+        desired_warps = 2
+    elif n_dense_cols <= 64:
+        desired_warps = 4
+    else:
+        desired_warps = 8 if max_row_nnz >= 512 else 4
+
+    if block_n >= 128:
+        desired_warps = max(desired_warps, 4)
+    if max_row_nnz >= 1024 and n_dense_cols > 32:
+        desired_warps = max(desired_warps, 8)
+
+    if dtype in (torch.float64, torch.complex128):
+        desired_warps = min(desired_warps, 8)
+    elif dtype in (torch.float16, torch.bfloat16, torch.float32, torch.complex64):
+        desired_warps = min(desired_warps, 16)
+
+    num_warps = _clip_spmm_base_num_warps(desired_warps, device_props)
+    if n_dense_cols > 64 or block_n >= 128:
+        num_stages = 1
+    elif dtype in (torch.float64, torch.complex128) and max_row_nnz >= 512:
+        num_stages = 1
+    else:
+        num_stages = 2
+
+    return {
+        **launch,
+        "num_warps": int(num_warps),
+        "num_stages": int(num_stages),
+    }
+
+
 class PreparedCsrSpmmOpt:
     """Cached CSR metadata for repeated native SpMM-opt calls on the same sparse matrix."""
 
@@ -683,6 +773,8 @@ def _triton_spmm_csr_impl(
     n_dense_cols,
     block_n,
     block_nnz,
+    num_warps,
+    num_stages,
 ):
     device = data.device
     dtype = data.dtype
@@ -720,6 +812,8 @@ def _triton_spmm_csr_impl(
             BLOCK_N=block_n,
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
         if compute_dtype != dtype:
             C_compute = C_compute.to(dtype)
@@ -747,6 +841,8 @@ def _triton_spmm_csr_impl(
         BLOCK_N=block_n,
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return torch.view_as_complex(C_ri.contiguous())
 
@@ -2303,12 +2399,15 @@ def flagsparse_spmm_csr(
         if n_rows > 0
         else 0
     )
-    launch = _resolve_spmm_alg1_launch_config(
+    device_props = _normalize_spmm_base_device_props(data.device)
+    launch = _resolve_spmm_base_triton_launch(
+        data.dtype,
         n_dense_cols,
         max_row_nnz,
         block_n=block_n,
         block_nnz=block_nnz,
         max_segments=max_segments,
+        device_props=device_props,
     )
 
     if out is not None:
@@ -2330,6 +2429,8 @@ def flagsparse_spmm_csr(
         n_dense_cols,
         block_n=launch["block_n"],
         block_nnz=launch["block_nnz"],
+        num_warps=launch["num_warps"],
+        num_stages=launch["num_stages"],
     )
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -2577,12 +2678,14 @@ def benchmark_spmm_case(
     B = _build_random_dense((n_cols, n_dense_cols), value_dtype, device)
     shape = (n_rows, n_cols)
     max_row_nnz = int(torch.max(indptr[1:] - indptr[:-1]).item()) if n_rows > 0 else 0
-    launch = _resolve_spmm_alg1_launch_config(
+    launch = _resolve_spmm_base_triton_launch(
+        value_dtype,
         n_dense_cols,
         max_row_nnz,
         block_n=block_n,
         block_nnz=block_nnz,
         max_segments=max_segments,
+        device_props=_normalize_spmm_base_device_props(device),
     )
 
     triton_kwargs = {
@@ -2721,6 +2824,8 @@ def benchmark_spmm_case(
             "required_segments": launch["required_segments"],
             "alg1_warp_size": launch["warp_size"],
             "alg1_factor": launch["factor"],
+            "base_num_warps": launch["num_warps"],
+            "base_num_stages": launch["num_stages"],
             "auto_max_segments": launch["auto_max_segments"],
             "run_cusparse": run_cusparse,
         },

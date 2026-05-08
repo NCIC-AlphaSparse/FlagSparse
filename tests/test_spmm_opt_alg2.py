@@ -12,7 +12,6 @@ import glob
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -149,8 +148,7 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
     first, meta = fs.flagsparse_spmm_csr_opt_alg2(B=B, prepared=prepared, return_meta=True)
     torch.cuda.synchronize()
     for _ in range(max(0, int(warmup))):
-        warm_prepared = fs.prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
-        _ = fs.flagsparse_spmm_csr_opt_alg2(B=B, prepared=warm_prepared)
+        _ = fs.flagsparse_spmm_csr_opt_alg2(B=B, prepared=prepared)
     torch.cuda.synchronize()
 
     total_ms = 0.0
@@ -161,21 +159,15 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
     measured_value = first
     count = max(1, int(iters))
     for _ in range(count):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        measured_prepared = fs.prepare_spmm_csr_opt_alg2(data, indices, indptr, shape)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        measured_value, measured_meta = fs.flagsparse_spmm_csr_opt_alg2(
+        measured_value, elapsed_ms, measured_meta = fs.flagsparse_spmm_csr_opt_alg2(
             B=B,
             prepared=measured_prepared,
+            return_time=True,
             return_meta=True,
         )
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        symbolic_ms += (t1 - t0) * 1000.0
-        compute_ms += (t2 - t1) * 1000.0
-        total_ms += (t2 - t0) * 1000.0
+        symbolic_ms += float(measured_meta["symbolic_ms"])
+        compute_ms += float(measured_meta["compute_ms"])
+        total_ms += float(elapsed_ms)
     return (
         measured_value,
         total_ms / count,

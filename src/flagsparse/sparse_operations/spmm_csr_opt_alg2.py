@@ -639,7 +639,6 @@ def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
         row_lengths,
         max_row_nnz,
     ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
-    opt_buckets = _build_spmm_opt_alg2_buckets(row_lengths, data.dtype)
     return PreparedCsrSpmmOptAlg2(
         data=data,
         kernel_indices=kernel_indices,
@@ -649,7 +648,7 @@ def prepare_spmm_csr_opt_alg2(data, indices, indptr, shape):
         n_cols=n_cols,
         row_lengths=row_lengths,
         max_row_nnz=max_row_nnz,
-        opt_buckets=opt_buckets,
+        opt_buckets=[],
     )
 
 
@@ -768,12 +767,14 @@ def _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props):
     return launch
 
 
-def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, return_meta=False):
+def _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, opt_buckets=None, return_meta=False):
     device_props = _normalize_spmm_opt_alg2_device_props(prepared.data.device)
     C_out = torch.zeros((prepared.n_rows, int(B.shape[1])), dtype=B.dtype, device=B.device)
     launch_configs = []
     bucket_hits = []
-    for bucket in prepared.opt_buckets:
+    if opt_buckets is None:
+        opt_buckets = prepared.opt_buckets
+    for bucket in opt_buckets:
         launch = _run_spmm_opt_alg2_bucket(prepared, bucket, B, C_out, device_props)
         launch_configs.append(launch)
         bucket_hits.append(
@@ -829,22 +830,49 @@ def flagsparse_spmm_csr_opt_alg2(
     _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out)
     B = B.contiguous()
 
-    t0 = None
-    if return_time:
+    do_timing = bool(return_time or return_meta)
+    symbolic_ms = None
+    compute_ms = None
+    op_total_ms = None
+
+    if do_timing:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-    C, meta = _triton_spmm_csr_impl_opt_alg2_prepared(prepared, B, return_meta=return_meta)
-    elapsed_ms = None
-    if return_time:
+    opt_buckets = _build_spmm_opt_alg2_buckets(prepared.row_lengths, prepared.data.dtype)
+    prepared.opt_buckets = opt_buckets
+    if do_timing:
         torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        t1 = time.perf_counter()
+        symbolic_ms = (t1 - t0) * 1000.0
+
+    C, meta = _triton_spmm_csr_impl_opt_alg2_prepared(
+        prepared,
+        B,
+        opt_buckets=opt_buckets,
+        return_meta=return_meta,
+    )
+    if do_timing:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        compute_ms = (t2 - t1) * 1000.0
+        op_total_ms = symbolic_ms + compute_ms
     if out is not None:
         out.copy_(C)
         C = out
+    if return_meta:
+        if meta is None:
+            meta = {}
+        meta.update(
+            {
+                "symbolic_ms": symbolic_ms,
+                "compute_ms": compute_ms,
+                "op_total_ms": op_total_ms,
+            }
+        )
     if return_time and return_meta:
-        return C, elapsed_ms, meta
+        return C, op_total_ms, meta
     if return_time:
-        return C, elapsed_ms
+        return C, op_total_ms
     if return_meta:
         return C, meta
     return C
