@@ -32,7 +32,9 @@ from .spmm_csr_opt_alg2 import (
     PreparedCsrSpmmOptAlg2,
     benchmark_spmm_opt_alg2_case,
     flagsparse_spmm_csr_opt_alg2,
+    flagsparse_spmm_csr_opt_alg2_symbolic,
     prepare_spmm_csr_opt_alg2,
+    prepare_spmm_csr_opt_alg2_symbolic,
 )
 from .spmv_coo import PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo
 from .spmv_csr import (
@@ -89,6 +91,7 @@ __all__ = [
     "flagsparse_spmm_csr",
     "flagsparse_spmm_csr_opt",
     "flagsparse_spmm_csr_opt_alg2",
+    "flagsparse_spmm_csr_opt_alg2_symbolic",
     "flagsparse_spmv_coo",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csr",
@@ -101,6 +104,7 @@ __all__ = [
     "prepare_spgemm_csr",
     "prepare_spmm_csr_opt",
     "prepare_spmm_csr_opt_alg2",
+    "prepare_spmm_csr_opt_alg2_symbolic",
     "prepare_spmv_coo",
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csr",

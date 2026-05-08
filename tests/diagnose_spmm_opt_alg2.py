@@ -2,8 +2,8 @@
 Diagnostics for CSR SpMM opt_alg2 protected four-way comparisons.
 
 Usage:
-    python tests/diagnose_spmm_opt_alg2.py path/to/matrix.mtx --dense-cols 32 --out-dir diag_out --with-cusparse
-    python tests/diagnose_spmm_opt_alg2.py path/to/mtx_dir --dense-cols 32 --out-dir diag_out --with-cusparse
+    python tests/diagnose_spmm_opt_alg2.py path/to/matrix.mtx --dense-cols 32 --out-dir diag_out
+    python tests/diagnose_spmm_opt_alg2.py path/to/mtx_dir --dense-cols 32 --out-dir diag_out --no-cusparse
 """
 
 import argparse
@@ -67,6 +67,8 @@ WORST_ROW_FIELDS = [
     "opt_vs_cusparse_row_err",
     "opt_alg2_vs_torch_row_err",
     "opt_alg2_vs_cusparse_row_err",
+    "opt_alg2_sym_vs_torch_row_err",
+    "opt_alg2_sym_vs_cusparse_row_err",
 ]
 
 
@@ -151,6 +153,8 @@ def _build_worst_rows(matrix_name, prepared, profiles, top_rows):
     opt_vs_torch = profiles["opt_vs_torch"]["row_max_ratio"]
     opt_vs_cusparse = profiles["opt_vs_cusparse"]["row_max_ratio"]
     alg2_vs_cusparse = profiles["opt_alg2_vs_cusparse"]["row_max_ratio"]
+    alg2_sym_vs_torch = profiles["opt_alg2_sym_vs_torch"]["row_max_ratio"]
+    alg2_sym_vs_cusparse = profiles["opt_alg2_sym_vs_cusparse"]["row_max_ratio"]
     row_lengths = prepared.row_lengths.to(torch.int64)
     rows = []
     for row_id in order.to(torch.int64).cpu().tolist():
@@ -166,34 +170,33 @@ def _build_worst_rows(matrix_name, prepared, profiles, top_rows):
                 "opt_alg2_vs_cusparse_row_err": (
                     float(alg2_vs_cusparse[row_id].item()) if alg2_vs_cusparse is not None else None
                 ),
+                "opt_alg2_sym_vs_torch_row_err": (
+                    float(alg2_sym_vs_torch[row_id].item()) if alg2_sym_vs_torch is not None else None
+                ),
+                "opt_alg2_sym_vs_cusparse_row_err": (
+                    float(alg2_sym_vs_cusparse[row_id].item()) if alg2_sym_vs_cusparse is not None else None
+                ),
             }
         )
     return rows
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Diagnose CSR SpMM opt_alg2 with protected four-way comparisons.")
-    parser.add_argument("input_path", help=".mtx file or directory")
-    parser.add_argument("--out-dir", required=True, help="Directory for summary/bucket/launch/worst_rows CSV files")
-    parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
-    parser.add_argument("--dense-cols", type=int, default=32)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--with-cusparse", action="store_true")
-    parser.add_argument("--top-rows", type=int, default=512, help="Top rows by opt_alg2_vs_torch error")
-    args = parser.parse_args()
+def _dtype_suffix(dtype_name):
+    return "f32" if dtype_name == "float32" else "f64"
 
-    dtype = {"float32": torch.float32, "float64": torch.float64}[args.dtype]
+
+def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
+    dtype = {"float32": torch.float32, "float64": torch.float64}[dtype_name]
+    suffix = _dtype_suffix(dtype_name)
+    out_dir = f"{args.out_dir}_{suffix}"
     index_dtype = torch.int32
     device = torch.device("cuda")
-    paths = _resolve_input_paths([args.input_path])
-    if not paths:
-        raise ValueError(f"No .mtx files found from input: {args.input_path}")
 
     summary_rows = []
     bucket_rows = []
     launch_rows = []
+    bucket_rows_alg2s = []
+    launch_rows_alg2s = []
     worst_rows = []
     for path in paths:
         data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
@@ -210,30 +213,66 @@ def main():
             args.warmup,
             args.iters,
             args.seed,
-            args.with_cusparse,
+            with_cusparse,
             return_details=True,
         )
         matrix_name = result["summary"]["matrix"]
         summary_rows.append(result["summary"])
         bucket_rows.extend(_build_bucket_rows(matrix_name, result["prepared_alg2"], result["alg2_meta"]))
-        launch_rows.extend(_build_launch_rows(matrix_name, args.dtype, args.dense_cols, result["alg2_meta"]))
+        launch_rows.extend(_build_launch_rows(matrix_name, dtype_name, args.dense_cols, result["alg2_meta"]))
+        bucket_rows_alg2s.extend(_build_bucket_rows(matrix_name, result["prepared_alg2_sym"], result["alg2_sym_meta"]))
+        launch_rows_alg2s.extend(_build_launch_rows(matrix_name, dtype_name, args.dense_cols, result["alg2_sym_meta"]))
         worst_rows.extend(_build_worst_rows(matrix_name, result["prepared_alg2"], result["profiles"], args.top_rows))
         print(
+            f"[{suffix}] "
             f"{matrix_name}: matrix_status={result['summary']['matrix_status']}  "
             f"opt_alg2_total_ms={result['summary']['opt_alg2_op_total_ms']:.4f}  "
             f"symbolic_ms={result['summary']['opt_alg2_symbolic_ms']:.4f}  "
             f"compute_ms={result['summary']['opt_alg2_compute_ms']:.4f}  "
+            f"alg2s_total_ms={result['summary']['opt_alg2_sym_total_ms']:.4f}  "
+            f"alg2s_symbolic_ms={result['summary']['opt_alg2_sym_symbolic_ms']:.4f}  "
+            f"alg2s_compute_ms={result['summary']['opt_alg2_sym_compute_ms']:.4f}  "
             f"Base/Alg2={result['summary']['base_vs_opt_alg2_speedup']:.2f}x  "
             f"Torch/Alg2={result['summary']['torch_vs_opt_alg2_speedup']:.2f}x  "
             f"CU/Alg2={_fmt_speed(result['summary']['cusparse_vs_opt_alg2_speedup'])}  "
+            f"Base/Alg2S={result['summary']['base_vs_opt_alg2_sym_speedup']:.2f}x  "
+            f"Torch/Alg2S={result['summary']['torch_vs_opt_alg2_sym_speedup']:.2f}x  "
+            f"CU/Alg2S={_fmt_speed(result['summary']['cusparse_vs_opt_alg2_sym_speedup'])}  "
             f"opt_alg2_vs_torch_err={result['summary']['opt_alg2_vs_torch_err']}"
+            f"  opt_alg2_sym_vs_torch_err={result['summary']['opt_alg2_sym_vs_torch_err']}"
         )
 
-    _write_csv(os.path.join(args.out_dir, "summary.csv"), summary_rows, SUMMARY_FIELDS)
-    _write_csv(os.path.join(args.out_dir, "bucket_stats.csv"), bucket_rows, BUCKET_FIELDS)
-    _write_csv(os.path.join(args.out_dir, "launch_stats.csv"), launch_rows, LAUNCH_FIELDS)
-    _write_csv(os.path.join(args.out_dir, "worst_rows.csv"), worst_rows, WORST_ROW_FIELDS)
-    print(f"Wrote diagnostics to {os.path.abspath(args.out_dir)}")
+    _write_csv(os.path.join(out_dir, f"summary_{suffix}.csv"), summary_rows, SUMMARY_FIELDS)
+    _write_csv(os.path.join(out_dir, f"bucket_stats_{suffix}.csv"), bucket_rows, BUCKET_FIELDS)
+    _write_csv(os.path.join(out_dir, f"launch_stats_{suffix}.csv"), launch_rows, LAUNCH_FIELDS)
+    _write_csv(os.path.join(out_dir, f"worst_rows_{suffix}.csv"), worst_rows, WORST_ROW_FIELDS)
+    _write_csv(os.path.join(out_dir, f"bucket_stats_alg2s_{suffix}.csv"), bucket_rows_alg2s, BUCKET_FIELDS)
+    _write_csv(os.path.join(out_dir, f"launch_stats_alg2s_{suffix}.csv"), launch_rows_alg2s, LAUNCH_FIELDS)
+    print(f"Wrote {dtype_name} diagnostics to {os.path.abspath(out_dir)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Diagnose CSR SpMM opt_alg2 with protected comparisons.")
+    parser.add_argument("input_path", help=".mtx file or directory")
+    parser.add_argument("--out-dir", required=True, help="Base directory name for dtype-suffixed diagnostics")
+    parser.add_argument("--dtype", default="all", choices=["all", "float32", "float64"])
+    parser.add_argument("--dense-cols", type=int, default=32)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-cusparse", action="store_true", help="Disable cuSPARSE reference timing")
+    parser.add_argument("--with-cusparse", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--top-rows", type=int, default=512, help="Top rows by opt_alg2_vs_torch error")
+    args = parser.parse_args()
+
+    paths = _resolve_input_paths([args.input_path])
+    if not paths:
+        raise ValueError(f"No .mtx files found from input: {args.input_path}")
+
+    dtype_names = ["float32", "float64"] if args.dtype == "all" else [args.dtype]
+    with_cusparse = not args.no_cusparse
+    for dtype_name in dtype_names:
+        _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse)
 
 
 if __name__ == "__main__":

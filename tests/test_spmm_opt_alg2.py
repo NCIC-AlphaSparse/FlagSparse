@@ -48,23 +48,33 @@ SUMMARY_FIELDS = [
     "opt_alg2_symbolic_ms",
     "opt_alg2_compute_ms",
     "opt_alg2_op_total_ms",
+    "opt_alg2_sym_symbolic_ms",
+    "opt_alg2_sym_compute_ms",
+    "opt_alg2_sym_total_ms",
     "torch_ms",
     "cusparse_ms",
     "base_vs_opt_alg2_speedup",
     "torch_vs_opt_alg2_speedup",
     "cusparse_vs_opt_alg2_speedup",
+    "base_vs_opt_alg2_sym_speedup",
+    "torch_vs_opt_alg2_sym_speedup",
+    "cusparse_vs_opt_alg2_sym_speedup",
     "base_vs_torch_err",
     "base_vs_cusparse_err",
     "opt_vs_torch_err",
     "opt_vs_cusparse_err",
     "opt_alg2_vs_torch_err",
     "opt_alg2_vs_cusparse_err",
+    "opt_alg2_sym_vs_torch_err",
+    "opt_alg2_sym_vs_cusparse_err",
     "base_status_vs_torch",
     "base_status_vs_cusparse",
     "opt_status_vs_torch",
     "opt_status_vs_cusparse",
     "opt_alg2_status_vs_torch",
     "opt_alg2_status_vs_cusparse",
+    "opt_alg2_sym_status_vs_torch",
+    "opt_alg2_sym_status_vs_cusparse",
     "matrix_status",
 ]
 
@@ -160,6 +170,41 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
     count = max(1, int(iters))
     for _ in range(count):
         measured_value, elapsed_ms, measured_meta = fs.flagsparse_spmm_csr_opt_alg2(
+            B=B,
+            prepared=measured_prepared,
+            return_time=True,
+            return_meta=True,
+        )
+        symbolic_ms += float(measured_meta["symbolic_ms"])
+        compute_ms += float(measured_meta["compute_ms"])
+        total_ms += float(elapsed_ms)
+    return (
+        measured_value,
+        total_ms / count,
+        measured_prepared,
+        measured_meta,
+        symbolic_ms / count,
+        compute_ms / count,
+    )
+
+
+def _timed_spmm_opt_alg2_symbolic(data, indices, indptr, B, shape, warmup, iters):
+    prepared = fs.prepare_spmm_csr_opt_alg2_symbolic(data, indices, indptr, shape)
+    first, meta = fs.flagsparse_spmm_csr_opt_alg2_symbolic(B=B, prepared=prepared, return_meta=True)
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        _ = fs.flagsparse_spmm_csr_opt_alg2_symbolic(B=B, prepared=prepared)
+    torch.cuda.synchronize()
+
+    total_ms = 0.0
+    symbolic_ms = 0.0
+    compute_ms = 0.0
+    measured_prepared = prepared
+    measured_meta = meta
+    measured_value = first
+    count = max(1, int(iters))
+    for _ in range(count):
+        measured_value, elapsed_ms, measured_meta = fs.flagsparse_spmm_csr_opt_alg2_symbolic(
             B=B,
             prepared=measured_prepared,
             return_time=True,
@@ -364,6 +409,22 @@ def run_one_case(
         warmup,
         iters,
     )
+    (
+        alg2_sym_out,
+        alg2_sym_ms,
+        prepared_alg2_sym,
+        alg2_sym_meta,
+        alg2_sym_symbolic_ms,
+        alg2_sym_compute_ms,
+    ) = _timed_spmm_opt_alg2_symbolic(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        warmup,
+        iters,
+    )
     torch_ref, torch_ms = _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters)
     cusparse_ref, cusparse_ms, sparse_backend_name, sparse_backend_reason = _timed_sparse_backend(
         data,
@@ -379,9 +440,11 @@ def run_one_case(
     base_vs_torch = _error_profile(base_out, torch_ref, dtype)
     opt_vs_torch = _error_profile(opt_out, torch_ref, dtype)
     alg2_vs_torch = _error_profile(alg2_out, torch_ref, dtype)
+    alg2_sym_vs_torch = _error_profile(alg2_sym_out, torch_ref, dtype)
     base_vs_cusparse = _error_profile(base_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(base_out, None, dtype)
     opt_vs_cusparse = _error_profile(opt_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(opt_out, None, dtype)
     alg2_vs_cusparse = _error_profile(alg2_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(alg2_out, None, dtype)
+    alg2_sym_vs_cusparse = _error_profile(alg2_sym_out, cusparse_ref, dtype) if cusparse_ref is not None else _error_profile(alg2_sym_out, None, dtype)
     row_lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
     max_row_nnz = int(row_lengths.max().item()) if row_lengths.numel() > 0 else 0
 
@@ -401,6 +464,9 @@ def run_one_case(
         "opt_alg2_symbolic_ms": alg2_symbolic_ms,
         "opt_alg2_compute_ms": alg2_compute_ms,
         "opt_alg2_op_total_ms": alg2_ms,
+        "opt_alg2_sym_symbolic_ms": alg2_sym_symbolic_ms,
+        "opt_alg2_sym_compute_ms": alg2_sym_compute_ms,
+        "opt_alg2_sym_total_ms": alg2_sym_ms,
         "torch_ms": torch_ms,
         "cusparse_ms": cusparse_ms,
         "base_vs_opt_alg2_speedup": (
@@ -412,19 +478,32 @@ def run_one_case(
         "cusparse_vs_opt_alg2_speedup": (
             cusparse_ms / alg2_ms if cusparse_ms is not None and alg2_ms is not None and alg2_ms > 0 else None
         ),
+        "base_vs_opt_alg2_sym_speedup": (
+            base_ms / alg2_sym_ms if alg2_sym_ms is not None and alg2_sym_ms > 0 else None
+        ),
+        "torch_vs_opt_alg2_sym_speedup": (
+            torch_ms / alg2_sym_ms if torch_ms is not None and alg2_sym_ms is not None and alg2_sym_ms > 0 else None
+        ),
+        "cusparse_vs_opt_alg2_sym_speedup": (
+            cusparse_ms / alg2_sym_ms if cusparse_ms is not None and alg2_sym_ms is not None and alg2_sym_ms > 0 else None
+        ),
         "base_vs_torch_err": base_vs_torch["global_err"],
         "base_vs_cusparse_err": base_vs_cusparse["global_err"],
         "opt_vs_torch_err": opt_vs_torch["global_err"],
         "opt_vs_cusparse_err": opt_vs_cusparse["global_err"],
         "opt_alg2_vs_torch_err": alg2_vs_torch["global_err"],
         "opt_alg2_vs_cusparse_err": alg2_vs_cusparse["global_err"],
+        "opt_alg2_sym_vs_torch_err": alg2_sym_vs_torch["global_err"],
+        "opt_alg2_sym_vs_cusparse_err": alg2_sym_vs_cusparse["global_err"],
         "base_status_vs_torch": base_vs_torch["status"],
         "base_status_vs_cusparse": base_vs_cusparse["status"],
         "opt_status_vs_torch": opt_vs_torch["status"],
         "opt_status_vs_cusparse": opt_vs_cusparse["status"],
         "opt_alg2_status_vs_torch": alg2_vs_torch["status"],
         "opt_alg2_status_vs_cusparse": alg2_vs_cusparse["status"],
-        "matrix_status": alg2_vs_torch["status"],
+        "opt_alg2_sym_status_vs_torch": alg2_sym_vs_torch["status"],
+        "opt_alg2_sym_status_vs_cusparse": alg2_sym_vs_cusparse["status"],
+        "matrix_status": alg2_vs_torch["status"] if alg2_sym_vs_torch["status"] == "PASS" else "FAIL",
     }
 
     if not return_details:
@@ -432,11 +511,14 @@ def run_one_case(
     return {
         "summary": summary,
         "prepared_alg2": prepared_alg2,
+        "prepared_alg2_sym": prepared_alg2_sym,
         "alg2_meta": alg2_meta,
+        "alg2_sym_meta": alg2_sym_meta,
         "outputs": {
             "base_triton": base_out,
             "opt_triton": opt_out,
             "opt_alg2_triton": alg2_out,
+            "opt_alg2_sym_triton": alg2_sym_out,
             "torch_ref": torch_ref,
             "cusparse_ref": cusparse_ref,
         },
@@ -447,6 +529,8 @@ def run_one_case(
             "opt_vs_cusparse": opt_vs_cusparse,
             "opt_alg2_vs_torch": alg2_vs_torch,
             "opt_alg2_vs_cusparse": alg2_vs_cusparse,
+            "opt_alg2_sym_vs_torch": alg2_sym_vs_torch,
+            "opt_alg2_sym_vs_cusparse": alg2_sym_vs_cusparse,
         },
         "sparse_backend_name": sparse_backend_name,
         "sparse_backend_reason": sparse_backend_reason,
