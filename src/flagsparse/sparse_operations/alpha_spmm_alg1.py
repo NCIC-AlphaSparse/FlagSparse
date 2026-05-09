@@ -158,6 +158,7 @@ def _build_alpha_spmm_alg1_runtime_meta(prepared, B):
         "order_row_path": True,
         "alpha": 1,
         "beta": 0,
+        "max_row_nnz": int(prepared.max_row_nnz),
     }
     return meta
 
@@ -318,11 +319,13 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
     FACTOR: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    MAX_ROW_NNZ: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     lane_offsets = tl.arange(0, WARP_SIZE)
+    local_row_offsets = tl.arange(0, BLOCK_ROWS)
     block_row_start = pid_m * BLOCK_ROWS
     block_col_start = pid_n * BLOCK_COLS
     offs0 = block_col_start + lane_offsets
@@ -352,66 +355,85 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
         scope=tle.gpu.smem,
     )
 
-    for local_row in tl.static_range(0, BLOCK_ROWS):
-        row = block_row_start + local_row
-        if row < n_rows:
-            row_start = tl.load(indptr_ptr + row)
-            row_end = tl.load(indptr_ptr + row + 1)
-            acc0 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
-            acc1 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
-            acc2 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
-            acc3 = tl.zeros([WARP_SIZE], dtype=ACC_DTYPE)
+    rows = block_row_start + local_row_offsets
+    row_valid = rows < n_rows
+    row_start = tl.load(indptr_ptr + rows, mask=row_valid, other=0)
+    row_end = tl.load(indptr_ptr + rows + 1, mask=row_valid, other=0)
+    row_nnz = row_end - row_start
 
-            for chunk_start in tl.range(row_start, row_end, WARP_SIZE):
-                elem_offsets = chunk_start + lane_offsets
-                valid_offsets = elem_offsets < row_end
-                staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
-                staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
-                local_rows = tl.full([WARP_SIZE], local_row, dtype=tl.int32)
-                tl.store(tle.gpu.local_ptr(s_col, indices=(local_rows, lane_offsets)), staged_cols, mask=valid_offsets)
-                tl.store(tle.gpu.local_ptr(s_val, indices=(local_rows, lane_offsets)), staged_vals, mask=valid_offsets)
+    zeros_2d = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=tl.int32)
+    row_ids_2d = local_row_offsets[:, None] + zeros_2d
+    lane_ids_2d = lane_offsets[None, :] + zeros_2d
+    acc0 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+    acc1 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+    acc2 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+    acc3 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
 
-                for jj in tl.static_range(0, WARP_SIZE):
-                    elem_idx = chunk_start + jj
-                    valid = elem_idx < row_end
-                    a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row, jj)), mask=valid, other=0)
-                    a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row, jj)), mask=valid, other=0.0).to(ACC_DTYPE)
-                    if FACTOR > 0:
-                        b0 = tl.load(
-                            b_ptr + a_col * stride_bk + offs0 * stride_bn,
-                            mask=mask0 & valid,
-                            other=0.0,
-                        )
-                        acc0 = acc0 + a_val * b0.to(ACC_DTYPE)
-                    if FACTOR > 1:
-                        b1 = tl.load(
-                            b_ptr + a_col * stride_bk + offs1 * stride_bn,
-                            mask=mask1 & valid,
-                            other=0.0,
-                        )
-                        acc1 = acc1 + a_val * b1.to(ACC_DTYPE)
-                    if FACTOR > 2:
-                        b2 = tl.load(
-                            b_ptr + a_col * stride_bk + offs2 * stride_bn,
-                            mask=mask2 & valid,
-                            other=0.0,
-                        )
-                        acc2 = acc2 + a_val * b2.to(ACC_DTYPE)
-                    if FACTOR > 3:
-                        b3 = tl.load(
-                            b_ptr + a_col * stride_bk + offs3 * stride_bn,
-                            mask=mask3 & valid,
-                            other=0.0,
-                        )
-                        acc3 = acc3 + a_val * b3.to(ACC_DTYPE)
+    for chunk_offset in tl.range(0, MAX_ROW_NNZ, WARP_SIZE):
+        elem_offsets = row_start[:, None] + chunk_offset + lane_ids_2d
+        valid_offsets = row_valid[:, None] & ((chunk_offset + lane_ids_2d) < row_nnz[:, None])
+        staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
+        staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
+        tl.store(tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)), staged_cols, mask=valid_offsets)
+        tl.store(tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)), staged_vals, mask=valid_offsets)
 
-            tl.store(c_ptr + row * stride_cm + offs0 * stride_cn, acc0, mask=mask0)
+        for jj in tl.static_range(0, WARP_SIZE):
+            valid = row_valid & ((chunk_offset + jj) < row_nnz)
+            local_jj = tl.full((BLOCK_ROWS,), jj, dtype=tl.int32)
+            a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)), mask=valid, other=0)
+            a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+            if FACTOR > 0:
+                b0 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs0[None, :] * stride_bn,
+                    mask=valid[:, None] & mask0[None, :],
+                    other=0.0,
+                )
+                acc0 = acc0 + a_val[:, None] * b0.to(ACC_DTYPE)
             if FACTOR > 1:
-                tl.store(c_ptr + row * stride_cm + offs1 * stride_cn, acc1, mask=mask1)
+                b1 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs1[None, :] * stride_bn,
+                    mask=valid[:, None] & mask1[None, :],
+                    other=0.0,
+                )
+                acc1 = acc1 + a_val[:, None] * b1.to(ACC_DTYPE)
             if FACTOR > 2:
-                tl.store(c_ptr + row * stride_cm + offs2 * stride_cn, acc2, mask=mask2)
+                b2 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs2[None, :] * stride_bn,
+                    mask=valid[:, None] & mask2[None, :],
+                    other=0.0,
+                )
+                acc2 = acc2 + a_val[:, None] * b2.to(ACC_DTYPE)
             if FACTOR > 3:
-                tl.store(c_ptr + row * stride_cm + offs3 * stride_cn, acc3, mask=mask3)
+                b3 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs3[None, :] * stride_bn,
+                    mask=valid[:, None] & mask3[None, :],
+                    other=0.0,
+                )
+                acc3 = acc3 + a_val[:, None] * b3.to(ACC_DTYPE)
+
+    tl.store(
+        c_ptr + rows[:, None] * stride_cm + offs0[None, :] * stride_cn,
+        acc0,
+        mask=row_valid[:, None] & mask0[None, :],
+    )
+    if FACTOR > 1:
+        tl.store(
+            c_ptr + rows[:, None] * stride_cm + offs1[None, :] * stride_cn,
+            acc1,
+            mask=row_valid[:, None] & mask1[None, :],
+        )
+    if FACTOR > 2:
+        tl.store(
+            c_ptr + rows[:, None] * stride_cm + offs2[None, :] * stride_cn,
+            acc2,
+            mask=row_valid[:, None] & mask2[None, :],
+        )
+    if FACTOR > 3:
+        tl.store(
+            c_ptr + rows[:, None] * stride_cm + offs3[None, :] * stride_cn,
+            acc3,
+            mask=row_valid[:, None] & mask3[None, :],
+        )
 
 
 def is_alpha_spmm_alg1_tle_available():
@@ -459,6 +481,7 @@ def _run_alpha_spmm_alg1_tle(prepared, B, meta):
         FACTOR=meta["factor"],
         BLOCK_ROWS=meta["block_rows"],
         BLOCK_COLS=meta["block_cols"],
+        MAX_ROW_NNZ=meta["max_row_nnz"],
         ACC_DTYPE=_alpha_spmm_alg1_acc_dtype(prepared.data.dtype),
         num_warps=meta["num_warps"],
         num_stages=meta["num_stages"],

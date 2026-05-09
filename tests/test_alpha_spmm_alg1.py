@@ -8,7 +8,6 @@ import glob
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -156,15 +155,7 @@ def _benchmark(op, warmup, iters):
     return out, start.elapsed_time(end) / max(1, int(iters))
 
 
-def _time_host_symbolic(op):
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    result = op()
-    torch.cuda.synchronize()
-    return result, (time.perf_counter() - start) * 1000.0
-
-
-def _prepare_base_symbolic(data, indices, indptr, B, shape):
+def _prepare_base_inputs(data, indices, indptr, B, shape):
     prepared_inputs = _prepare_spmm_csr_inputs(data, indices, indptr, B, shape)
     data_p, indices_p, indptr_p, B_p, n_rows, _n_cols, n_dense_cols = prepared_inputs
     max_row_nnz = (
@@ -191,9 +182,9 @@ def _prepare_base_symbolic(data, indices, indptr, B, shape):
 
 
 def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
-    prepared, symbolic_ms = _time_host_symbolic(
-        lambda: _prepare_base_symbolic(data, indices, indptr, B, shape)
-    )
+    prepared = _prepare_base_inputs(data, indices, indptr, B, shape)
+    # Base has no runtime symbolic phase after setup/descriptor preparation.
+    symbolic_ms = 0.0
     out, compute_ms = _benchmark(
         lambda: _triton_spmm_csr_impl(
             prepared["data"],
@@ -214,9 +205,9 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
 
 
 def _timed_alpha_spmm_alg1(data, indices, indptr, B, shape, warmup, iters):
-    prepared, symbolic_ms = _time_host_symbolic(
-        lambda: fs.prepare_alpha_spmm_alg1(data, indices, indptr, shape)
-    )
+    prepared = fs.prepare_alpha_spmm_alg1(data, indices, indptr, shape)
+    # ALG1 has no separate runtime symbolic kernel after prepare.
+    symbolic_ms = 0.0
     out, compute_ms = _benchmark(
         lambda: fs.flagsparse_alpha_spmm_alg1(B=B, prepared=prepared),
         warmup,
@@ -228,9 +219,10 @@ def _timed_alpha_spmm_alg1(data, indices, indptr, B, shape, warmup, iters):
 def _timed_alpha_spmm_alg1_tle(data, indices, indptr, B, shape, warmup, iters):
     if not fs.is_alpha_spmm_alg1_tle_available():
         return None, None, None, None, None, fs.alpha_spmm_alg1_tle_unavailable_reason()
-    prepared, symbolic_ms = _time_host_symbolic(
-        lambda: fs.prepare_alpha_spmm_alg1_tle(data, indices, indptr, shape)
-    )
+    prepared = fs.prepare_alpha_spmm_alg1_tle(data, indices, indptr, shape)
+    # TLE ALG1 currently restores CUDA-style staging inside the compute kernel;
+    # it does not launch a separate runtime symbolic partition/bucketing phase.
+    symbolic_ms = 0.0
     out, compute_ms = _benchmark(
         lambda: fs.flagsparse_alpha_spmm_alg1_tle(B=B, prepared=prepared),
         warmup,
@@ -493,8 +485,8 @@ def _print_header():
     print("-" * 168)
     print(
         f"{'Matrix':<24} {'dtype':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
-        f"{'BaseC':>9} {'AlphaC':>9} {'TLEC':>9} {'A/Base':>8} {'TLE/Base':>9} "
-        f"{'TLE/A':>8} {'Err(A)':>10} {'Err(TLE)':>10} {'Status':>8}"
+        f"{'Base(ms)':>9} {'Alpha(ms)':>9} {'TLE(ms)':>9} {'Base/Alpha':>10} {'Base/TLE':>9} "
+        f"{'Alpha/TLE':>10} {'Err(A)':>10} {'Err(TLE)':>10} {'Status':>8}"
     )
     print("-" * 168)
 
