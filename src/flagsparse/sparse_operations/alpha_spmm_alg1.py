@@ -334,11 +334,18 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
     offs3 = block_col_start + 3 * WARP_SIZE + lane_offsets
     mask3 = offs3 < n_dense_cols
 
-    s_val = tle.gpu.alloc(
-        (BLOCK_ROWS, WARP_SIZE),
-        dtype=ACC_DTYPE,
-        scope=tle.gpu.smem,
-    )
+    if ACC_DTYPE == tl.float64:
+        s_val = tle.gpu.alloc(
+            (BLOCK_ROWS, WARP_SIZE),
+            dtype=tl.float64,
+            scope=tle.gpu.smem,
+        )
+    else:
+        s_val = tle.gpu.alloc(
+            (BLOCK_ROWS, WARP_SIZE),
+            dtype=tl.float32,
+            scope=tle.gpu.smem,
+        )
     s_col = tle.gpu.alloc(
         (BLOCK_ROWS, WARP_SIZE),
         dtype=tl.int32,
