@@ -1,4 +1,6 @@
 operator,format,index_dtype,value_dtype,op,route,status
+alpha_spmm_alg1,N/A,N/A,float32,N/A,N/A,DISCOVERED_UNMAPPED
+alpha_spmm_alg1,N/A,N/A,float64,N/A,N/A,DISCOVERED_UNMAPPED
 gather,index,int32,float16,non,triton,SUPPORTED
 gather,index,int32,bfloat16,non,triton,SUPPORTED
 gather,index,int32,float32,non,triton,SUPPORTED
@@ -13,6 +15,7 @@ gather,index,int64,float64,non,triton,SUPPORTED
 gather,index,int64,complex32,non,triton,SUPPORTED
 gather,index,int64,complex64,non,triton,SUPPORTED
 gather,index,int64,complex128,non,triton,SUPPORTED
+gather_scatter,N/A,N/A,N/A,N/A,N/A,DISCOVERED_UNMAPPED
 scatter,index,int32,float16,non,triton,SUPPORTED
 scatter,index,int32,bfloat16,non,triton,SUPPORTED
 scatter,index,int32,float32,non,triton,SUPPORTED

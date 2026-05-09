@@ -107,7 +107,7 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 ```bash
 python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <dir/> --csv-csr spsv.csv
-python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CSR; optional --coo-mode auto|direct|csr (default auto)
+python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CSR
 ```
 
 **test_spsm.py** - SpSM (triangular matrix-matrix solve; **square** matrices only):

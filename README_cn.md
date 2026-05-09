@@ -107,7 +107,7 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 ```bash
 python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <目录/> --csv-csr spsv.csv
-python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同；可选 --coo-mode auto|direct|csr（默认 auto）
+python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
 ```
 
 **test_spsm.py** - SpSM（三角矩阵-稠密矩阵求解；**仅方阵**）：

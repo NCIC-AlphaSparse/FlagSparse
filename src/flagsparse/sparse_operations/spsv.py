@@ -1432,57 +1432,6 @@ def _spsv_csr_transpose_cw_kernel_complex(
         row = tl.atomic_add(row_counter_ptr, 1)
 
 
-@triton.jit
-def _spsv_coo_level_kernel_real(
-    data_ptr,
-    row_ptr_ptr,
-    col_ptr,
-    b_ptr,
-    x_ptr,
-    rows_ptr,
-    n_level_rows,
-    BLOCK_NNZ: tl.constexpr,
-    MAX_SEGMENTS: tl.constexpr,
-    LOWER: tl.constexpr,
-    UNIT_DIAG: tl.constexpr,
-    DIAG_EPS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    if pid >= n_level_rows:
-        return
-    row = tl.load(rows_ptr + pid)
-    start = tl.load(row_ptr_ptr + row)
-    end = tl.load(row_ptr_ptr + row + 1)
-    acc = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
-    diag = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
-    if UNIT_DIAG:
-        diag = diag + 1.0
-
-    for seg in range(MAX_SEGMENTS):
-        idx = start + seg * BLOCK_NNZ
-        offsets = idx + tl.arange(0, BLOCK_NNZ)
-        mask = offsets < end
-        a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
-        col = tl.load(col_ptr + offsets, mask=mask, other=0)
-        x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
-
-        if LOWER:
-            solved = col < row
-        else:
-            solved = col > row
-        is_diag = col == row
-
-        acc = acc + tl.sum(tl.where(mask & solved, a * x_vals, 0.0))
-        if not UNIT_DIAG:
-            diag = diag + tl.sum(tl.where(mask & is_diag, a, 0.0))
-
-    rhs = tl.load(b_ptr + row)
-    diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-    x_row = (rhs - acc) / diag_safe
-    x_row = tl.where(x_row == x_row, x_row, 0.0)
-    tl.store(x_ptr + row, x_row)
-
-
 def _build_spsv_levels(indptr, indices, n_rows, lower=True):
     """Build dependency levels for triangular solve so each level can run in parallel."""
     if n_rows == 0:
@@ -2111,6 +2060,11 @@ def _prepare_spsv_coo_inputs(data, row, col, b, shape):
         raise TypeError("row dtype must be torch.int32 or torch.int64")
     if col.dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
         raise TypeError("col dtype must be torch.int32 or torch.int64")
+    input_index_dtype = (
+        torch.int64
+        if row.dtype == torch.int64 or col.dtype == torch.int64
+        else torch.int32
+    )
     row64 = row.to(torch.int64).contiguous()
     col64 = col.to(torch.int64).contiguous()
     if col64.numel() > 0 and int(col64.max().item()) > _INDEX_LIMIT_INT32:
@@ -2129,9 +2083,9 @@ def _prepare_spsv_coo_inputs(data, row, col, b, shape):
         if max_col >= n_cols:
             raise IndexError(f"col indices out of range for n_cols={n_cols}")
 
-    _validate_spsv_non_trans_combo(data.dtype, torch.int32, "COO")
     return (
         data.contiguous(),
+        input_index_dtype,
         row64,
         col64,
         b.contiguous(),
@@ -2158,16 +2112,6 @@ def _csr_transpose(data, indices64, indptr64, n_rows, n_cols, conjugate=False):
         data_eff, new_row, new_col, n_cols, n_rows
     )
     return data_t, indices_t, indptr_t
-
-
-def _coo_is_sorted_unique(row64, col64, n_cols):
-    nnz = row64.numel()
-    if nnz <= 1:
-        return True
-    key = row64 * max(1, n_cols) + col64
-    is_sorted = bool(torch.all(key[1:] >= key[:-1]).item())
-    is_unique = bool(torch.all(key[1:] != key[:-1]).item())
-    return is_sorted and is_unique
 
 
 def _build_coo_row_ptr(row_sorted, n_rows):
@@ -2204,53 +2148,6 @@ def _coo_to_csr_sorted_unique(data, row64, col64, n_rows, n_cols):
     indptr = _build_coo_row_ptr(row_u, n_rows)
     indices = col_u.to(torch.int64)
     return data_u, indices, indptr
-
-
-def _triton_spsv_coo_vector(
-    data,
-    cols,
-    row_ptr,
-    b_vec,
-    n_rows,
-    lower=True,
-    unit_diagonal=False,
-    block_nnz=None,
-    max_segments=None,
-    diag_eps=1e-12,
-    levels=None,
-    block_nnz_use=None,
-    max_segments_use=None,
-):
-    x = torch.zeros_like(b_vec)
-    if n_rows == 0:
-        return x
-    if levels is None:
-        levels = _build_spsv_levels(row_ptr, cols, n_rows, lower=lower)
-    if block_nnz_use is None or max_segments_use is None:
-        block_nnz_use, max_segments_use = _auto_spsv_launch_config(
-            row_ptr, block_nnz=block_nnz, max_segments=max_segments
-        )
-
-    for rows_lv in levels:
-        n_lv = rows_lv.numel()
-        if n_lv == 0:
-            continue
-        grid = (n_lv,)
-        _spsv_coo_level_kernel_real[grid](
-            data,
-            row_ptr,
-            cols,
-            b_vec,
-            x,
-            rows_lv,
-            n_level_rows=n_lv,
-            BLOCK_NNZ=block_nnz_use,
-            MAX_SEGMENTS=max_segments_use,
-            LOWER=lower,
-            UNIT_DIAG=unit_diagonal,
-            DIAG_EPS=diag_eps,
-        )
-    return x
 
 
 def flagsparse_spsv_csr(
@@ -2768,7 +2665,6 @@ def _analyze_spsv_csr(
 
 
 def flagsparse_spsv_coo(
-
     data,
     row,
     col,
@@ -2777,134 +2673,37 @@ def flagsparse_spsv_coo(
     lower=True,
     unit_diagonal=False,
     transpose=False,
-    coo_mode="auto",
     block_nnz=None,
     max_segments=None,
     out=None,
     return_time=False,
 ):
-    """COO SpSV with dual mode:
-    - direct: use COO level kernel directly (requires sorted+unique COO)
-    - csr: convert COO -> CSR (sorted+deduplicated) then call flagsparse_spsv_csr
-    - auto: pick direct when sorted+unique and supported, otherwise csr
-
-    Notes:
-    - direct mode currently supports only non-transposed real-valued inputs
-    - complex dtypes and TRANS/CONJ always route through the CSR implementation
-    """
-    data, row64, col64, b, n_rows, n_cols = _prepare_spsv_coo_inputs(
+    """COO SpSV by canonicalizing COO into CSR, then reusing CSR SpSV."""
+    data, input_index_dtype, row64, col64, b, n_rows, n_cols = _prepare_spsv_coo_inputs(
         data, row, col, b, shape
     )
     if n_rows != n_cols:
         raise ValueError(f"A must be square, got shape={shape}")
 
-    mode = str(coo_mode).lower()
-    if mode not in ("auto", "direct", "csr"):
-        raise ValueError("coo_mode must be one of: 'auto', 'direct', 'csr'")
-
-    sorted_unique = _coo_is_sorted_unique(row64, col64, n_cols)
     trans_mode = _normalize_spsv_transpose_mode(transpose)
-    direct_supported = (trans_mode == "N") and (not torch.is_complex(data))
-    use_direct = direct_supported and (mode == "direct" or (mode == "auto" and sorted_unique))
-    if mode == "direct" and not direct_supported:
-        raise ValueError(
-            "coo_mode='direct' supports only non-transposed real-valued inputs; "
-            "use coo_mode='csr' or 'auto' for TRANS/CONJ or complex dtypes"
-        )
-    if mode == "direct" and not sorted_unique:
-        raise ValueError(
-            "coo_mode='direct' requires COO sorted by (row, col) with no duplicate coordinates; "
-            "use coo_mode='csr' or 'auto' for unsorted/duplicate COO input"
-        )
-
-    if not use_direct:
-        data_csr, indices_csr, indptr_csr = _coo_to_csr_sorted_unique(
-            data, row64, col64, n_rows, n_cols
-        )
-        return flagsparse_spsv_csr(
-            data_csr,
-            indices_csr,
-            indptr_csr,
-            b,
-            shape,
-            lower=lower,
-            unit_diagonal=unit_diagonal,
-            transpose=transpose,
-            block_nnz=block_nnz,
-            max_segments=max_segments,
-            out=out,
-            return_time=return_time,
-        )
-
-    kernel_cols = col64.to(torch.int32)
-    row_ptr = _build_coo_row_ptr(row64, n_rows)
-
-    compute_dtype = data.dtype
-    data_in = data
-    b_in = b
-    if data.dtype == torch.float32 and SPSV_PROMOTE_FP32_TO_FP64:
-        compute_dtype = torch.float64
-        data_in = data.to(torch.float64)
-        b_in = b.to(torch.float64)
-    levels = _build_spsv_levels(row_ptr, kernel_cols, n_rows, lower=lower)
-    block_nnz_use, max_segments_use = _auto_spsv_launch_config(
-        row_ptr, block_nnz=block_nnz, max_segments=max_segments
-    )
-    diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
-
-    if return_time:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-    if b_in.ndim == 1:
-        x = _triton_spsv_coo_vector(
-            data_in,
-            kernel_cols,
-            row_ptr,
-            b_in,
-            n_rows,
-            lower=lower,
-            unit_diagonal=unit_diagonal,
-            block_nnz=block_nnz,
-            max_segments=max_segments,
-            diag_eps=diag_eps,
-            levels=levels,
-            block_nnz_use=block_nnz_use,
-            max_segments_use=max_segments_use,
-        )
+    if trans_mode == "N":
+        _validate_spsv_non_trans_combo(data.dtype, input_index_dtype, "COO")
     else:
-        b_cols = b_in if b_in.is_contiguous() else b_in.contiguous()
-        cols_out = []
-        for bj in torch.unbind(b_cols, dim=1):
-            cols_out.append(
-                _triton_spsv_coo_vector(
-                    data_in,
-                    kernel_cols,
-                    row_ptr,
-                    bj,
-                    n_rows,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                    block_nnz=block_nnz,
-                    max_segments=max_segments,
-                    diag_eps=diag_eps,
-                    levels=levels,
-                    block_nnz_use=block_nnz_use,
-                    max_segments_use=max_segments_use,
-                )
-            )
-        x = torch.stack(cols_out, dim=1)
-    if compute_dtype != data.dtype:
-        x = x.to(data.dtype)
-    if return_time:
-        torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-    if out is not None:
-        if out.shape != x.shape or out.dtype != x.dtype:
-            raise ValueError("out shape/dtype must match result")
-        out.copy_(x)
-        x = out
-
-    if return_time:
-        return x, elapsed_ms
-    return x
+        _validate_spsv_trans_combo(data.dtype, input_index_dtype, "COO")
+    data_csr, indices_csr, indptr_csr = _coo_to_csr_sorted_unique(
+        data, row64, col64, n_rows, n_cols
+    )
+    return flagsparse_spsv_csr(
+        data_csr,
+        indices_csr,
+        indptr_csr,
+        b,
+        shape,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        transpose=transpose,
+        block_nnz=block_nnz,
+        max_segments=max_segments,
+        out=out,
+        return_time=return_time,
+    )

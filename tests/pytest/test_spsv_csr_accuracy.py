@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spsv_coo, flagsparse_spsv_csr
+from flagsparse import flagsparse_spsv_csr
 
 from tests.pytest.param_shapes import SPSV_N
 
@@ -401,34 +401,3 @@ def test_spsv_csr_matches_cusparse_upper_transpose_family(n, dtype, index_dtype,
 
     rtol, atol = _tol(dtype)
     assert torch.allclose(x_trans, x_trans_ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.spsv
-@pytest.mark.parametrize("n", SPSV_N)
-@pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
-def test_spsv_coo_transpose_family_complex128_routes_through_csr(n, op_mode):
-    device = torch.device("cuda")
-    dtype = torch.complex128
-    A = _build_triangular(n, dtype, device, lower=True)
-    b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(
-        _apply_ref_op(A, op_mode), b.unsqueeze(-1), upper=_effective_upper(True, op_mode)
-    ).squeeze(-1)
-
-    A_coo = A.to_sparse_coo().coalesce()
-    row, col = A_coo.indices()
-    data = A_coo.values()
-
-    x = flagsparse_spsv_coo(
-        data,
-        row.to(torch.int32),
-        col.to(torch.int32),
-        b,
-        (n, n),
-        lower=True,
-        unit_diagonal=False,
-        transpose=_transpose_arg(op_mode),
-        coo_mode="auto",
-    )
-    rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
