@@ -1,6 +1,6 @@
 """
 SpMM alg1 test: compare base vs optimised path with PyTorch and cuSPARSE timings.
-Alg1 timings include runtime preprocessing + compute, not prepared-only steady-state time.
+Alg1 timings report CPU-wall runtime preprocessing plus CUDA-event compute time.
 
 Usage:
     python tests/test_spmm_opt.py <dir/> --dense-cols 32
@@ -12,6 +12,7 @@ import csv
 import glob
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+import flagsparse.sparse_operations.spmm_csr as spmm_csr_mod
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
@@ -122,28 +124,39 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
 
 def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
     prepared = fs.prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
-    run = fs.flagsparse_spmm_csr_opt_alg1
-    op = lambda: run(B=B, prepared=prepared)
+    count = max(1, int(iters))
+    runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
+        prepared
+    )
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(count):
+        runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
+            prepared
+        )
+    torch.cuda.synchronize()
+    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
+
+    def op():
+        out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(
+            runtime_prepared, B
+        )
+        return out
+
     out = op()
     torch.cuda.synchronize()
     for _ in range(warmup):
         out = op()
     torch.cuda.synchronize()
-    total_ms = 0.0
-    preprocess_ms = 0.0
-    compute_ms = 0.0
-    count = max(1, int(iters))
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     for _ in range(count):
-        out, elapsed_ms, meta = run(
-            B=B,
-            prepared=prepared,
-            return_time=True,
-            return_meta=True,
-        )
-        total_ms += float(elapsed_ms)
-        preprocess_ms += float(meta["symbolic_ms"])
-        compute_ms += float(meta["compute_ms"])
-    return out, total_ms / count, preprocess_ms / count, compute_ms / count
+        out = op()
+    end.record()
+    torch.cuda.synchronize()
+    compute_ms = start.elapsed_time(end) / count
+    return out, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
 
 def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
@@ -370,7 +383,8 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
             print(
                 "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
                 "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
-                "Alg1(ms) = A1Prep + A1Comp. Speedup = reference / Alg1."
+                "Alg1(ms) = A1Prep CPU wall time + A1Comp CUDA event time. "
+                "Speedup = reference / Alg1."
             )
             print(SEP)
             print(HEADER)
@@ -478,7 +492,8 @@ def main():
     print(
         "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
         "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
-        "Alg1(ms) = A1Prep + A1Comp. Speedup = reference / Alg1."
+        "Alg1(ms) = A1Prep CPU wall time + A1Comp CUDA event time. "
+        "Speedup = reference / Alg1."
     )
     print(SEP)
     print(HEADER)

@@ -11,9 +11,11 @@ import csv
 import glob
 import math
 import os
+import time
 
 import torch
 import flagsparse as fs
+import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
@@ -90,33 +92,37 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 
 
 def _timed_spmv(prepared, x, warmup, iters, use_opt):
-    op = lambda: fs.flagsparse_spmv_csr(
-        x=x,
-        prepared=prepared,
-        return_time=False,
-        use_opt=use_opt,
-    )
+    opt_buckets = None
+    symbolic_ms = 0.0
+    count = max(1, int(iters))
+    if use_opt:
+        opt_buckets = spmv_csr_mod._build_spmv_opt_runtime_buckets(prepared)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(count):
+            opt_buckets = spmv_csr_mod._build_spmv_opt_runtime_buckets(prepared)
+        torch.cuda.synchronize()
+        symbolic_ms = (time.perf_counter() - t0) * 1000.0 / count
+
+    def op():
+        return spmv_csr_mod._run_spmv_prepared_with_fallback(
+            prepared, x, use_opt=use_opt, opt_buckets=opt_buckets
+        )
+
     y = op()
     torch.cuda.synchronize()
     for _ in range(warmup):
-        op()
+        y = op()
     torch.cuda.synchronize()
-    total_ms = 0.0
-    symbolic_ms = 0.0
-    compute_ms = 0.0
-    for _ in range(iters):
-        y, elapsed_ms, meta = fs.flagsparse_spmv_csr(
-            x=x,
-            prepared=prepared,
-            return_time=True,
-            return_meta=True,
-            use_opt=use_opt,
-        )
-        total_ms += float(elapsed_ms)
-        symbolic_ms += float(meta["symbolic_ms"])
-        compute_ms += float(meta["compute_ms"])
-    count = max(1, iters)
-    return y, total_ms / count, symbolic_ms / count, compute_ms / count
+    e0 = torch.cuda.Event(enable_timing=True)
+    e1 = torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(count):
+        y = op()
+    e1.record()
+    torch.cuda.synchronize()
+    compute_ms = e0.elapsed_time(e1) / count
+    return y, symbolic_ms + compute_ms, symbolic_ms, compute_ms
 
 
 def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
@@ -333,7 +339,7 @@ def run_all_csv(paths, csv_path, warmup, iters, dtype_filter=None):
             print(
                 "Base = FlagSparse baseline (fp64-accum for fp32). "
                 "Opt = FlagSparse CSR-Vector (fp32/fp64 native accum, wide tiles, few launches). "
-                "Opt includes runtime symbolic bucket construction + compute. "
+                "Opt(ms) = Sym(ms) CPU wall time + Comp(ms) CUDA event time. "
                 "Speedup = Base/Opt or Ref/Opt."
             )
             print(SEP)
@@ -420,7 +426,7 @@ def main():
         print(
             "Base = FlagSparse baseline (fp64-accum for fp32). "
             "Opt = FlagSparse CSR-Vector (fp32/fp64 native accum, wide tiles, few launches). "
-            "Opt includes runtime symbolic bucket construction + compute. "
+            "Opt(ms) = Sym(ms) CPU wall time + Comp(ms) CUDA event time. "
             "Speedup = Base/Opt or Ref/Opt."
         )
         print(SEP)

@@ -1,5 +1,7 @@
 """
 Diagnostics for CSR SpMM opt_alg2 protected four-way comparisons.
+Timing fields are inherited from test_spmm_opt_alg2: preprocessing is CPU wall
+time, compute is CUDA event time.
 
 Usage:
     python tests/diagnose_spmm_opt_alg2.py path/to/matrix.mtx --dense-cols 32 --out-dir diag_out
