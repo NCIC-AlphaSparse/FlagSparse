@@ -1,6 +1,6 @@
 """
-SpMM alg1/alg1S A/B test: compare base vs optimised paths with PyTorch and cuSPARSE timings.
-Alg1/Alg1S timings include runtime symbolic + compute, not prepared-only steady-state time.
+SpMM alg1 test: compare base vs optimised path with PyTorch and cuSPARSE timings.
+Alg1 timings report CPU-wall runtime preprocessing plus CUDA-event compute time.
 
 Usage:
     python tests/test_spmm_opt.py <dir/> --dense-cols 32
@@ -12,6 +12,7 @@ import csv
 import glob
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+import flagsparse.sparse_operations.spmm_csr as spmm_csr_mod
 
 VALUE_DTYPES = [torch.float32, torch.float64]
 INDEX_DTYPES = [torch.int32]
@@ -120,42 +122,49 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
     return out, start.elapsed_time(end) / iters
 
 
-def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters, symbolic=False):
-    prepared = (
-        fs.prepare_spmm_csr_opt_alg1_symbolic(data, indices, indptr, shape)
-        if symbolic
-        else fs.prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
+def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
+    prepared = fs.prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
+    count = max(1, int(iters))
+    runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
+        prepared
     )
-    run = fs.flagsparse_spmm_csr_opt_alg1_symbolic if symbolic else fs.flagsparse_spmm_csr_opt_alg1
-    op = lambda: run(B=B, prepared=prepared)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(count):
+        runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
+            prepared
+        )
+    torch.cuda.synchronize()
+    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
+
+    def op():
+        out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(
+            runtime_prepared, B
+        )
+        return out
+
     out = op()
     torch.cuda.synchronize()
     for _ in range(warmup):
         out = op()
     torch.cuda.synchronize()
-    total_ms = 0.0
-    symbolic_ms = 0.0
-    compute_ms = 0.0
-    count = max(1, int(iters))
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     for _ in range(count):
-        out, elapsed_ms, meta = run(
-            B=B,
-            prepared=prepared,
-            return_time=True,
-            return_meta=True,
-        )
-        total_ms += float(elapsed_ms)
-        symbolic_ms += float(meta["symbolic_ms"])
-        compute_ms += float(meta["compute_ms"])
-    return out, total_ms / count, symbolic_ms / count, compute_ms / count
+        out = op()
+    end.record()
+    torch.cuda.synchronize()
+    compute_ms = start.elapsed_time(end) / count
+    return out, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
 
 def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
-    return _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters, symbolic=False)
+    return _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters)
 
 
-def _timed_spmm_opt_alg1_symbolic(data, indices, indptr, B, shape, warmup, iters):
-    return _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters, symbolic=True)
+def _timed_spmm_opt_alg1_preprocess(data, indices, indptr, B, shape, warmup, iters):
+    return _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters)
 
 
 def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
@@ -262,12 +271,12 @@ def _err(v):
 
 HEADER = (
     f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8}  "
-    f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Sym':>9} {'A1Comp':>9} "
-    f"{'Alg1S(ms)':>9} {'A1SSym':>9} {'A1SComp':>9} {'PT(ms)':>9} {'CU(ms)':>9}  "
-    f"{'A1/Base':>8} {'A1S/Base':>8} {'A1S/A1':>8} {'A1S/PT':>8} {'A1S/CU':>8}  "
-    f"{'Err(Base)':>10} {'Err(A1)':>10} {'Err(A1S)':>10} {'Status':>6}"
+    f"{'Base(ms)':>9} {'Alg1(ms)':>9} {'A1Prep':>9} {'A1Comp':>9} "
+    f"{'PT(ms)':>9} {'CU(ms)':>9}  "
+    f"{'Base/A1':>8} {'PT/A1':>8} {'CU/A1':>8}  "
+    f"{'Err(Base)':>10} {'Err(A1)':>10} {'Status':>6}"
 )
-SEP = "-" * 260
+SEP = "-" * 205
 
 
 def _seeded_dense_matrix(shape, dtype, device, seed):
@@ -289,10 +298,7 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
     ref = _build_reference(data, indices, indptr, B, shape, dtype)
 
     y_base, base_ms = _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters)
-    y_opt, opt_ms, symbolic_ms, compute_ms = _timed_spmm_opt(
-        data, indices, indptr, B, shape, warmup, iters
-    )
-    y_opt_sym, opt_sym_ms, opt_sym_symbolic_ms, opt_sym_compute_ms = _timed_spmm_opt_alg1_symbolic(
+    y_opt, opt_ms, preprocess_ms, compute_ms = _timed_spmm_opt(
         data, indices, indptr, B, shape, warmup, iters
     )
 
@@ -310,11 +316,9 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
 
     err_base = _error_ratio(y_base, ref, dtype)
     err_opt = _error_ratio(y_opt, ref, dtype)
-    err_opt_sym = _error_ratio(y_opt_sym, ref, dtype)
     base_ok = err_base <= 1.0
     opt_ok = err_opt <= 1.0
-    opt_sym_ok = err_opt_sym <= 1.0
-    status = "PASS" if opt_ok and opt_sym_ok else "FAIL"
+    status = "PASS" if opt_ok else "FAIL"
     return {
         "path": path,
         "shape": shape,
@@ -322,25 +326,17 @@ def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
         "dense_cols": dense_cols,
         "base_ms": base_ms,
         "opt_ms": opt_ms,
-        "symbolic_ms": symbolic_ms,
-        "compute_ms": compute_ms,
-        "op_total_ms": opt_ms,
         "alg1_ms": opt_ms,
-        "alg1_symbolic_ms": symbolic_ms,
+        "alg1_preprocess_ms": preprocess_ms,
         "alg1_compute_ms": compute_ms,
-        "alg1_sym_total_ms": opt_sym_ms,
-        "alg1_sym_symbolic_ms": opt_sym_symbolic_ms,
-        "alg1_sym_compute_ms": opt_sym_compute_ms,
         "pt_ms": pt_ms,
         "cu_ms": cu_ms,
         "err_base": err_base,
         "err_opt": err_opt,
         "err_alg1": err_opt,
-        "err_alg1_sym": err_opt_sym,
         "base_ok": base_ok,
         "opt_ok": opt_ok,
         "status_alg1": "PASS" if opt_ok else "FAIL",
-        "status_alg1_sym": "PASS" if opt_sym_ok else "FAIL",
         "seed": seed,
         "status": status,
     }
@@ -352,16 +348,12 @@ def print_row(row):
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {row['nnz']:>10} {row['dense_cols']:>8}  "
         f"{_fmt(row['base_ms']):>9} {_fmt(row['alg1_ms']):>9} "
-        f"{_fmt(row['alg1_symbolic_ms']):>9} {_fmt(row['alg1_compute_ms']):>9} "
-        f"{_fmt(row['alg1_sym_total_ms']):>9} {_fmt(row['alg1_sym_symbolic_ms']):>9} "
-        f"{_fmt(row['alg1_sym_compute_ms']):>9} "
+        f"{_fmt(row['alg1_preprocess_ms']):>9} {_fmt(row['alg1_compute_ms']):>9} "
         f"{_fmt(row['pt_ms']):>9} {_fmt(row['cu_ms']):>9}  "
         f"{_spd(row['base_ms'], row['alg1_ms']):>8} "
-        f"{_spd(row['base_ms'], row['alg1_sym_total_ms']):>8} "
-        f"{_spd(row['alg1_ms'], row['alg1_sym_total_ms']):>8} "
-        f"{_spd(row['pt_ms'], row['alg1_sym_total_ms']):>8} "
-        f"{_spd(row['cu_ms'], row['alg1_sym_total_ms']):>8}  "
-        f"{_err(row['err_base']):>10} {_err(row['err_alg1']):>10} {_err(row['err_alg1_sym']):>10} {row['status']:>6}"
+        f"{_spd(row['pt_ms'], row['alg1_ms']):>8} "
+        f"{_spd(row['cu_ms'], row['alg1_ms']):>8}  "
+        f"{_err(row['err_base']):>10} {_err(row['err_alg1']):>10} {row['status']:>6}"
     )
 
 
@@ -390,8 +382,9 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
             print(f"Value dtype: {dname}  |  Index dtype: {iname}  |  Dense cols: {dense_cols}")
             print(
                 "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
-                "Alg1 = bucketed CSR SpMM native path. Alg1S = Alg1 with Triton symbolic bucket construction. "
-                "Speedup = reference / main algorithm."
+                "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
+                "Alg1(ms) = A1Prep CPU wall time + A1Comp CUDA event time. "
+                "Speedup = reference / Alg1."
             )
             print(SEP)
             print(HEADER)
@@ -411,35 +404,21 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
                     "seed": row["seed"],
                     "base_ms": row["base_ms"],
                     "opt_ms": row["opt_ms"],
-                    "symbolic_ms": row["symbolic_ms"],
-                    "compute_ms": row["compute_ms"],
-                    "op_total_ms": row["op_total_ms"],
                     "alg1_ms": row["alg1_ms"],
-                    "alg1_symbolic_ms": row["alg1_symbolic_ms"],
+                    "alg1_preprocess_ms": row["alg1_preprocess_ms"],
                     "alg1_compute_ms": row["alg1_compute_ms"],
-                    "alg1_sym_total_ms": row["alg1_sym_total_ms"],
-                    "alg1_sym_symbolic_ms": row["alg1_sym_symbolic_ms"],
-                    "alg1_sym_compute_ms": row["alg1_sym_compute_ms"],
                     "pt_ms": row["pt_ms"],
                     "cu_ms": row["cu_ms"],
                     "opt_vs_base": (row["base_ms"] / row["opt_ms"] if row["opt_ms"] and row["opt_ms"] > 0 else None),
                     "opt_vs_pt": (row["pt_ms"] / row["opt_ms"] if row["pt_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
                     "opt_vs_cu": (row["cu_ms"] / row["opt_ms"] if row["cu_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
-                    "alg1_vs_base": (row["base_ms"] / row["alg1_ms"] if row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "alg1_vs_pt": (row["pt_ms"] / row["alg1_ms"] if row["pt_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "alg1_vs_cu": (row["cu_ms"] / row["alg1_ms"] if row["cu_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
-                    "alg1_sym_vs_base": (row["base_ms"] / row["alg1_sym_total_ms"] if row["alg1_sym_total_ms"] and row["alg1_sym_total_ms"] > 0 else None),
-                    "alg1_sym_vs_pt": (row["pt_ms"] / row["alg1_sym_total_ms"] if row["pt_ms"] and row["alg1_sym_total_ms"] and row["alg1_sym_total_ms"] > 0 else None),
-                    "alg1_sym_vs_cu": (row["cu_ms"] / row["alg1_sym_total_ms"] if row["cu_ms"] and row["alg1_sym_total_ms"] and row["alg1_sym_total_ms"] > 0 else None),
-                    "alg1_vs_alg1_sym_speedup": (row["alg1_ms"] / row["alg1_sym_total_ms"] if row["alg1_sym_total_ms"] and row["alg1_sym_total_ms"] > 0 else None),
-                    "triton_speedup_vs_pytorch": (row["pt_ms"] / row["opt_ms"] if row["pt_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
-                    "triton_speedup_vs_cusparse": (row["cu_ms"] / row["opt_ms"] if row["cu_ms"] and row["opt_ms"] and row["opt_ms"] > 0 else None),
+                    "base_vs_alg1_speedup": (row["base_ms"] / row["alg1_ms"] if row["alg1_ms"] and row["alg1_ms"] > 0 else None),
+                    "torch_vs_alg1_speedup": (row["pt_ms"] / row["alg1_ms"] if row["pt_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
+                    "cusparse_vs_alg1_speedup": (row["cu_ms"] / row["alg1_ms"] if row["cu_ms"] and row["alg1_ms"] and row["alg1_ms"] > 0 else None),
                     "err_base": row["err_base"],
                     "err_opt": row["err_opt"],
                     "err_alg1": row["err_alg1"],
-                    "err_alg1_sym": row["err_alg1_sym"],
                     "status_alg1": row["status_alg1"],
-                    "status_alg1_sym": row["status_alg1_sym"],
                     "status": row["status"],
                 })
     fields = [
@@ -453,35 +432,21 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
         "seed",
         "base_ms",
         "opt_ms",
-        "symbolic_ms",
-        "compute_ms",
-        "op_total_ms",
         "alg1_ms",
-        "alg1_symbolic_ms",
+        "alg1_preprocess_ms",
         "alg1_compute_ms",
-        "alg1_sym_total_ms",
-        "alg1_sym_symbolic_ms",
-        "alg1_sym_compute_ms",
         "pt_ms",
         "cu_ms",
         "opt_vs_base",
         "opt_vs_pt",
         "opt_vs_cu",
-        "alg1_vs_base",
-        "alg1_vs_pt",
-        "alg1_vs_cu",
-        "alg1_sym_vs_base",
-        "alg1_sym_vs_pt",
-        "alg1_sym_vs_cu",
-        "alg1_vs_alg1_sym_speedup",
-        "triton_speedup_vs_pytorch",
-        "triton_speedup_vs_cusparse",
+        "base_vs_alg1_speedup",
+        "torch_vs_alg1_speedup",
+        "cusparse_vs_alg1_speedup",
         "err_base",
         "err_opt",
         "err_alg1",
-        "err_alg1_sym",
         "status_alg1",
-        "status_alg1_sym",
         "status",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
@@ -493,7 +458,7 @@ def run_all_csv(paths, csv_path, dense_cols, warmup, iters, seed=None, value_dty
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SpMM alg1/alg1S A/B: baseline vs optimised, with PyTorch/cuSPARSE timings.")
+    parser = argparse.ArgumentParser(description="SpMM alg1: baseline vs optimised, with PyTorch/cuSPARSE timings.")
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--csv", type=str, default=None, metavar="FILE", help="Export selected dtype to CSV")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
@@ -520,14 +485,15 @@ def main():
         return
 
     print("=" * 182)
-    print("FLAGSPARSE SpMM Alg1 / Alg1S A/B Test")
+    print("FLAGSPARSE SpMM Alg1 Test")
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  Dense cols: {args.dense_cols}  |  Files: {len(paths)}")
     if args.seed is not None:
         print(f"Seed: {args.seed}")
     print(
         "Base = existing CSR SpMM baseline (fp64-accum for fp32). "
-        "Alg1 = bucketed CSR SpMM native path. Alg1S = Alg1 with Triton symbolic bucket construction. "
-        "Speedup = reference / main algorithm."
+        "Alg1 = bucketed CSR SpMM native path with Triton runtime preprocessing. "
+        "Alg1(ms) = A1Prep CPU wall time + A1Comp CUDA event time. "
+        "Speedup = reference / Alg1."
     )
     print(SEP)
     print(HEADER)

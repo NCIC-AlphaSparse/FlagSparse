@@ -75,6 +75,29 @@ def _build_torch_sparse_coo(data, row, col, shape):
     ).coalesce()
 
 
+def _build_random_coo(n_rows, n_cols, nnz, value_dtype, index_dtype, device):
+    nnz = int(nnz)
+    if nnz < 0:
+        raise ValueError("nnz must be non-negative")
+    if int(n_rows) < 0 or int(n_cols) < 0:
+        raise ValueError("matrix dimensions must be non-negative")
+    if index_dtype not in SUPPORTED_INDEX_DTYPES:
+        raise TypeError("index_dtype must be torch.int32 or torch.int64")
+    if value_dtype not in SUPPORTED_SPMM_VALUE_DTYPES:
+        raise TypeError("value_dtype is not supported by COO SpMM")
+
+    data = _build_random_dense(nnz, value_dtype, device)
+    if nnz == 0:
+        row = torch.empty((0,), dtype=index_dtype, device=device)
+        col = torch.empty((0,), dtype=index_dtype, device=device)
+        return data, row, col
+    if n_rows == 0 or n_cols == 0:
+        raise ValueError("nnz must be 0 when either matrix dimension is zero")
+    row = torch.randint(0, int(n_rows), (nnz,), dtype=index_dtype, device=device)
+    col = torch.randint(0, int(n_cols), (nnz,), dtype=index_dtype, device=device)
+    return data, row, col
+
+
 def _prepare_spmm_coo_canonical_prepared(data, row, col, B, n_rows, n_cols, n_dense_cols):
     output_dtype = data.dtype
     compute_dtype = _spmm_coo_compute_dtype(output_dtype)

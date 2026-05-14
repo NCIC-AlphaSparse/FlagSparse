@@ -1,5 +1,7 @@
 """
 Diagnostics for CSR SpMM opt_alg2 protected four-way comparisons.
+Timing fields are inherited from test_spmm_opt_alg2: preprocessing is CPU wall
+time, compute is CUDA event time.
 
 Usage:
     python tests/diagnose_spmm_opt_alg2.py path/to/matrix.mtx --dense-cols 32 --out-dir diag_out
@@ -67,8 +69,6 @@ WORST_ROW_FIELDS = [
     "opt_vs_cusparse_row_err",
     "opt_alg2_vs_torch_row_err",
     "opt_alg2_vs_cusparse_row_err",
-    "opt_alg2_sym_vs_torch_row_err",
-    "opt_alg2_sym_vs_cusparse_row_err",
 ]
 
 
@@ -153,8 +153,6 @@ def _build_worst_rows(matrix_name, prepared, profiles, top_rows):
     opt_vs_torch = profiles["opt_vs_torch"]["row_max_ratio"]
     opt_vs_cusparse = profiles["opt_vs_cusparse"]["row_max_ratio"]
     alg2_vs_cusparse = profiles["opt_alg2_vs_cusparse"]["row_max_ratio"]
-    alg2_sym_vs_torch = profiles["opt_alg2_sym_vs_torch"]["row_max_ratio"]
-    alg2_sym_vs_cusparse = profiles["opt_alg2_sym_vs_cusparse"]["row_max_ratio"]
     row_lengths = prepared.row_lengths.to(torch.int64)
     rows = []
     for row_id in order.to(torch.int64).cpu().tolist():
@@ -169,12 +167,6 @@ def _build_worst_rows(matrix_name, prepared, profiles, top_rows):
                 "opt_alg2_vs_torch_row_err": float(alg2_vs_torch[row_id].item()),
                 "opt_alg2_vs_cusparse_row_err": (
                     float(alg2_vs_cusparse[row_id].item()) if alg2_vs_cusparse is not None else None
-                ),
-                "opt_alg2_sym_vs_torch_row_err": (
-                    float(alg2_sym_vs_torch[row_id].item()) if alg2_sym_vs_torch is not None else None
-                ),
-                "opt_alg2_sym_vs_cusparse_row_err": (
-                    float(alg2_sym_vs_cusparse[row_id].item()) if alg2_sym_vs_cusparse is not None else None
                 ),
             }
         )
@@ -195,8 +187,6 @@ def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
     summary_rows = []
     bucket_rows = []
     launch_rows = []
-    bucket_rows_alg2s = []
-    launch_rows_alg2s = []
     worst_rows = []
     for path in paths:
         data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
@@ -220,34 +210,28 @@ def _run_diagnose_for_dtype(args, paths, dtype_name, with_cusparse):
         summary_rows.append(result["summary"])
         bucket_rows.extend(_build_bucket_rows(matrix_name, result["prepared_alg2"], result["alg2_meta"]))
         launch_rows.extend(_build_launch_rows(matrix_name, dtype_name, args.dense_cols, result["alg2_meta"]))
-        bucket_rows_alg2s.extend(_build_bucket_rows(matrix_name, result["prepared_alg2_sym"], result["alg2_sym_meta"]))
-        launch_rows_alg2s.extend(_build_launch_rows(matrix_name, dtype_name, args.dense_cols, result["alg2_sym_meta"]))
         worst_rows.extend(_build_worst_rows(matrix_name, result["prepared_alg2"], result["profiles"], args.top_rows))
         print(
             f"[{suffix}] "
             f"{matrix_name}: matrix_status={result['summary']['matrix_status']}  "
-            f"opt_alg2_total_ms={result['summary']['opt_alg2_op_total_ms']:.4f}  "
-            f"symbolic_ms={result['summary']['opt_alg2_symbolic_ms']:.4f}  "
-            f"compute_ms={result['summary']['opt_alg2_compute_ms']:.4f}  "
-            f"alg2s_total_ms={result['summary']['opt_alg2_sym_total_ms']:.4f}  "
-            f"alg2s_symbolic_ms={result['summary']['opt_alg2_sym_symbolic_ms']:.4f}  "
-            f"alg2s_compute_ms={result['summary']['opt_alg2_sym_compute_ms']:.4f}  "
-            f"Base/Alg2={result['summary']['base_vs_opt_alg2_speedup']:.2f}x  "
-            f"Torch/Alg2={result['summary']['torch_vs_opt_alg2_speedup']:.2f}x  "
-            f"CU/Alg2={_fmt_speed(result['summary']['cusparse_vs_opt_alg2_speedup'])}  "
-            f"Base/Alg2S={result['summary']['base_vs_opt_alg2_sym_speedup']:.2f}x  "
-            f"Torch/Alg2S={result['summary']['torch_vs_opt_alg2_sym_speedup']:.2f}x  "
-            f"CU/Alg2S={_fmt_speed(result['summary']['cusparse_vs_opt_alg2_sym_speedup'])}  "
+            f"alg1_ms={result['summary']['alg1_ms']:.4f}  "
+            f"alg1_preprocess_ms={result['summary']['alg1_preprocess_ms']:.4f}  "
+            f"alg1_compute_ms={result['summary']['alg1_compute_ms']:.4f}  "
+            f"alg2_ms={result['summary']['alg2_ms']:.4f}  "
+            f"alg2_preprocess_ms={result['summary']['alg2_preprocess_ms']:.4f}  "
+            f"alg2_compute_ms={result['summary']['alg2_compute_ms']:.4f}  "
+            f"Base/Alg1={result['summary']['base_vs_alg1_speedup']:.2f}x  "
+            f"Base/Alg2={result['summary']['base_vs_alg2_speedup']:.2f}x  "
+            f"Alg1/Alg2={result['summary']['alg1_vs_alg2_speedup']:.2f}x  "
+            f"Torch/Alg2={result['summary']['torch_vs_alg2_speedup']:.2f}x  "
+            f"CU/Alg2={_fmt_speed(result['summary']['cusparse_vs_alg2_speedup'])}  "
             f"opt_alg2_vs_torch_err={result['summary']['opt_alg2_vs_torch_err']}"
-            f"  opt_alg2_sym_vs_torch_err={result['summary']['opt_alg2_sym_vs_torch_err']}"
         )
 
     _write_csv(os.path.join(out_dir, f"summary_{suffix}.csv"), summary_rows, SUMMARY_FIELDS)
     _write_csv(os.path.join(out_dir, f"bucket_stats_{suffix}.csv"), bucket_rows, BUCKET_FIELDS)
     _write_csv(os.path.join(out_dir, f"launch_stats_{suffix}.csv"), launch_rows, LAUNCH_FIELDS)
     _write_csv(os.path.join(out_dir, f"worst_rows_{suffix}.csv"), worst_rows, WORST_ROW_FIELDS)
-    _write_csv(os.path.join(out_dir, f"bucket_stats_alg2s_{suffix}.csv"), bucket_rows_alg2s, BUCKET_FIELDS)
-    _write_csv(os.path.join(out_dir, f"launch_stats_alg2s_{suffix}.csv"), launch_rows_alg2s, LAUNCH_FIELDS)
     print(f"Wrote {dtype_name} diagnostics to {os.path.abspath(out_dir)}")
 
 

@@ -19,12 +19,12 @@ import flagsparse.sparse_operations.spsm as fs_spsm_impl
 
 try:
     import cupy as cp
+    import cupyx.cusparse as cpx_cusparse
     import cupyx.scipy.sparse as cpx_sparse
-    from cupyx.scipy.sparse.linalg import spsolve_triangular as cpx_spsolve_triangular
 except Exception:
     cp = None
+    cpx_cusparse = None
     cpx_sparse = None
-    cpx_spsolve_triangular = None
 
 
 FORMATS = ("csr", "coo")
@@ -32,8 +32,8 @@ VALUE_DTYPES = (torch.float32, torch.float64)
 INDEX_DTYPES = [torch.int32]
 CSV_VALUE_DTYPES = [torch.float32, torch.float64]
 CSV_INDEX_DTYPES = [torch.int32]
-WARMUP = 5
-ITERS = 20
+WARMUP = 1
+ITERS = 1
 SPSM_OP_MODES = ["NON", "NON_TRANS"]
 
 
@@ -70,6 +70,11 @@ def _sum_ms(*values):
     if not values:
         return None
     return sum(values)
+
+
+def _spsm_benchmark_schedule(nnz, n_rhs, value_dtype, fmt="csr"):
+    del nnz, n_rhs, value_dtype, fmt
+    return int(WARMUP), int(ITERS)
 
 
 def _csv_export_row_spsm(row):
@@ -180,8 +185,8 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
         return None, None, "unavailable", f"PyTorch sparse solve unavailable ({exc})"
 
 
-def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt):
-    if cp is None or cpx_sparse is None or cpx_spsolve_triangular is None:
+def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
+    if cp is None or cpx_sparse is None or cpx_cusparse is None:
         return None, None, "cusparse unavailable"
     try:
         data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
@@ -194,17 +199,18 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt):
             idx_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.contiguous()))
             ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.contiguous()))
             A_cp = cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
-        for _ in range(WARMUP):
-            _ = cpx_spsolve_triangular(A_cp, B_cp, lower=True, unit_diagonal=False)
+        A_cp.sum_duplicates()
+        for _ in range(warmup):
+            _ = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
         cp.cuda.runtime.deviceSynchronize()
         c0 = cp.cuda.Event()
         c1 = cp.cuda.Event()
         c0.record()
-        for _ in range(ITERS):
-            X_cp = cpx_spsolve_triangular(A_cp, B_cp, lower=True, unit_diagonal=False)
+        for _ in range(iters):
+            X_cp = cpx_cusparse.spsm(A_cp, B_cp, lower=True, unit_diag=False, transa=False)
         c1.record()
         c1.synchronize()
-        ms = cp.cuda.get_elapsed_time(c0, c1) / ITERS
+        ms = cp.cuda.get_elapsed_time(c0, c1) / iters
         X_t = torch.utils.dlpack.from_dlpack(X_cp.toDlpack()).to(B.dtype)
         return X_t, ms, None
     except Exception as exc:
@@ -227,22 +233,25 @@ def _solution_residual_metrics(data, indices, indptr, shape, X, B, value_dtype):
     return err, ok
 
 
-def _benchmark_flagsparse(call):
+def _benchmark_flagsparse(call, warmup, iters):
     X = None
-    for _ in range(WARMUP):
+    for _ in range(warmup):
         X = call()
     torch.cuda.synchronize()
     e0 = torch.cuda.Event(True)
     e1 = torch.cuda.Event(True)
     e0.record()
-    for _ in range(ITERS):
+    for _ in range(iters):
         X = call()
     e1.record()
     torch.cuda.synchronize()
-    return X, e0.elapsed_time(e1) / ITERS
+    return X, e0.elapsed_time(e1) / iters
 
 
 def _benchmark_flagsparse_spsm_csr_split(data, indices, indptr, B, shape):
+    warmup, iters = _spsm_benchmark_schedule(
+        data.numel(), B.shape[1], data.dtype, fmt="csr"
+    )
     analysis_ms = fs_spsm_impl._analyze_spsm_csr(
         data,
         indices,
@@ -266,12 +275,17 @@ def _benchmark_flagsparse_spsm_csr_split(data, indices, indptr, B, shape):
             opA="NON_TRANS",
             opB="NON_TRANS",
             major="row",
-        )
+        ),
+        warmup,
+        iters,
     )
     return X, analysis_ms, solve_ms
 
 
 def _benchmark_flagsparse_spsm_coo_split(data, row, col, B, shape):
+    warmup, iters = _spsm_benchmark_schedule(
+        data.numel(), B.shape[1], data.dtype, fmt="coo"
+    )
     analysis_ms = fs_spsm_impl._analyze_spsm_coo(
         data,
         row,
@@ -295,7 +309,9 @@ def _benchmark_flagsparse_spsm_coo_split(data, row, col, B, shape):
             opA="NON_TRANS",
             opB="NON_TRANS",
             major="row",
-        )
+        ),
+        warmup,
+        iters,
     )
     return X, analysis_ms, solve_ms
 
@@ -390,6 +406,9 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
     B = torch.randn((n_rows, n_rhs), dtype=value_dtype, device=data.device).contiguous()
     atol, rtol = _tol(value_dtype)
     row, col = _csr_to_coo(indices, indptr, n_rows)
+    warmup, iters = _spsm_benchmark_schedule(
+        data.numel(), n_rhs, value_dtype, fmt=fmt
+    )
 
     if fmt == "csr":
         X_fs, analysis_ms, solve_ms = _benchmark_flagsparse_spsm_csr_split(
@@ -408,7 +427,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
             shape,
         )
     X_cu, cusparse_ms, _cusparse_reason = _benchmark_cusparse_reference(
-        data, row, col, indptr, B, shape, fmt
+        data, row, col, indptr, B, shape, fmt, warmup, iters
     )
     X_pt, pytorch_ms, _pt_backend, pytorch_reason = _benchmark_pytorch_reference(
         data, indices, indptr, shape, B
@@ -545,6 +564,10 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
     )
     print("=" * 176)
     print(
+        f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
+        "(Library-main style defaults; override with --warmup/--iters)"
+    )
+    print(
         "PT.total is the aggregated time of one torch.sparse.spsolve call per RHS column; "
         "CU.total is one official sparse triangular solve call on the full matrix RHS. "
         "PT.spdS and CU.spdS compare against FS.solve; PT.spdT and CU.spdT compare against FS.total."
@@ -676,6 +699,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
 
 
 def main():
+    global WARMUP, ITERS
     parser = argparse.ArgumentParser(
         description="SpSM test: synthetic triangular systems and optional .mtx batch CSV."
     )
@@ -695,7 +719,25 @@ def main():
         default="NON",
         help="comma-separated op(A) modes; currently only NON/NON_TRANS is supported",
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=WARMUP,
+        help="Benchmark warmup iterations (Library-main style default: 1)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=ITERS,
+        help="Benchmark timed iterations (Library-main style default: 1)",
+    )
     args = parser.parse_args()
+    WARMUP = max(0, int(args.warmup))
+    ITERS = max(1, int(args.iters))
+
+    ops = _parse_ops_filter(args.ops)
+    if any(op != "NON" for op in ops):
+        raise ValueError("SpSM test currently supports only --ops NON/NON_TRANS")
 
     ops = _parse_ops_filter(args.ops)
     if any(op != "NON" for op in ops):
