@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an improvement to the CI/CD or repository workflow.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the requested change and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What should change, and what should stay untouched?
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Add any constraints, alternatives, or implementation ideas.

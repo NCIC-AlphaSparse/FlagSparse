@@ -1,0 +1,3 @@
+-r requirements-ci.txt
+torch==2.9.0
+triton==3.5.0

@@ -1,0 +1,29 @@
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+categories:
+  - title: "Breaking Changes"
+    labels:
+      - "breaking"
+  - title: "Enhancements"
+    labels:
+      - "feature"
+      - "enhancement"
+  - title: "Fixes"
+    labels:
+      - "bug"
+      - "fix"
+change-template: "- $TITLE (#$NUMBER) @$AUTHOR"
+template: |
+  ## What Changed
+
+  $CHANGES
+
+  ## Notes
+
+  - Generated automatically from merged pull requests.
+  - Release artifacts are built and checksum-verified by CI.
+exclude-labels:
+  - "skip-changelog"
+replacers:
+  - search: "/"
+    replace: "#"
