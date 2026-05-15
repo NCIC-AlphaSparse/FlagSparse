@@ -29,6 +29,7 @@ def test_readme_ci_cd_section_mentions_workflows():
         ".github/workflows/nightly-cpu.yml",
         ".github/workflows/release.yml",
         ".github/workflows/triton-smoke.yml",
+        ".github/workflows/gpu-benchmark.yml",
     ]:
         assert snippet in TEXT
 

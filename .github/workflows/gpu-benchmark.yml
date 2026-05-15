@@ -1,0 +1,91 @@
+name: GPU Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Synthetic benchmark suite to run
+        required: true
+        default: quick
+        type: choice
+        options:
+          - quick
+          - full-synthetic
+          - gather
+          - scatter
+          - spmv
+          - spmv-coo
+          - spmm
+          - spmm-coo
+          - spsv
+          - spsm
+      warmup:
+        description: Warmup iterations for suites that support it
+        required: true
+        default: "5"
+        type: string
+      iters:
+        description: Timed iterations for suites that support it
+        required: true
+        default: "20"
+        type: string
+      use_cusparse:
+        description: Include cuSPARSE baselines when available on the runner
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  benchmark:
+    name: Run GPU benchmark
+    runs-on:
+      - self-hosted
+      - linux
+      - gpu
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/ci/requirements-triton-smoke.lock.txt
+
+      - name: Show GPU inventory
+        run: nvidia-smi
+
+      - name: Install benchmark dependencies
+        run: python -m pip install --upgrade -r tools/ci/requirements-triton-smoke.lock.txt
+
+      - name: Build source and wheel distributions
+        run: python -m build
+
+      - name: Install package
+        run: python -m pip install --force-reinstall --no-deps dist/*.whl
+
+      - name: Validate installed wheel import
+        run: python tools/ci/check_installed_wheel.py --expected-version 1.0.0
+
+      - name: Run selected GPU benchmark suite
+        shell: bash
+        run: |
+          args=(
+            --suite "${{ inputs.suite }}"
+            --warmup "${{ inputs.warmup }}"
+            --iters "${{ inputs.iters }}"
+          )
+          if [ "${{ inputs.use_cusparse }}" = "true" ]; then
+            args+=(--with-cusparse)
+          fi
+          python tools/ci/run_gpu_benchmark.py "${args[@]}"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-benchmark-${{ github.run_id }}
+          path: benchmark_results/

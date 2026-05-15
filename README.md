@@ -129,18 +129,20 @@ python tests/test_spsm.py <dir/> --csv-coo spsm_coo.csv --rhs 32
 - `.github/workflows/nightly-cpu.yml` is a `main`-branch-only nightly CPU check that repeats the package, lint, and shared-runtime smoke tests.
 - `.github/workflows/release.yml` builds source and wheel artifacts, then attaches them to GitHub Releases on `v*` tags.
 - `.github/workflows/triton-smoke.yml` is a manual opt-in job for triton-dependent smoke checks.
+- `.github/workflows/gpu-benchmark.yml` adds an Actions button for synthetic GPU benchmark runs on a self-hosted runner labeled `self-hosted`, `linux`, and `gpu`.
 - `.github/workflows/release-drafter.yml` keeps draft release notes current from merged PRs.
 - `make help` lists the local entry points.
 - `make ci` / `make check` run the same CPU-only pipeline used by CI.
 - `make smoke` is the CPU smoke stage alias.
 - `make release-check` / `make release` build, validate, and checksum release artifacts.
 - `make triton-smoke` and `make triton-deps` are opt-in local targets for the triton-dependent runtime checks.
+- `python tools/ci/run_gpu_benchmark.py --suite quick` mirrors the manual GPU benchmark workflow locally on a CUDA machine.
 - `tools/ci/requirements-ci.lock.txt` and `tools/ci/requirements-triton-smoke.lock.txt` are the pinned local dependency bundles behind those make targets.
 - `.github/dependabot.yml` keeps GitHub Actions and Python dependency updates visible.
 - `.github/ISSUE_TEMPLATE/` keeps issue entry points structured for bugs and feature requests.
 - The CI dependency bundle now stays on packaging and test tooling only; triton-dependent smoke is opt-in through `FLAGSPARSE_TRITON_SMOKE=1`.
 - Release artifacts now ship with a generated `SHA256SUMS` manifest and a matching checksum verification step in CI.
-- Benchmark scripts stay local/manual because the actual kernels still require CUDA hardware.
+- Benchmark scripts still require CUDA hardware; the new GPU benchmark workflow is manual and only runs on a self-hosted GPU runner.
 
 ## License
 
