@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 
 def _sha256(path: Path) -> str:
@@ -52,7 +53,7 @@ def verify_manifest(dist_dir: Path, manifest_name: str = "SHA256SUMS") -> Path:
     return manifest_path
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dist_dir", nargs="?", default="dist")
     parser.add_argument("--verify", action="store_true")

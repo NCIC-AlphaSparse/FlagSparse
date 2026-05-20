@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
+from typing import List, Optional
 
 
 @dataclass(frozen=True)
@@ -19,7 +20,7 @@ class WheelImportCheck:
     module_path: pathlib.Path
 
 
-def validate_installed_wheel(expected_version: str | None = None) -> WheelImportCheck:
+def validate_installed_wheel(expected_version: Optional[str] = None) -> WheelImportCheck:
     """Import flagsparse from a clean interpreter and verify the module path."""
     project_root = pathlib.Path(__file__).resolve().parents[2]
     env = os.environ.copy()
@@ -57,7 +58,7 @@ def validate_installed_wheel(expected_version: str | None = None) -> WheelImport
     return WheelImportCheck(version=version, module_path=module_path)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-version", default=None)
     args = parser.parse_args(argv)

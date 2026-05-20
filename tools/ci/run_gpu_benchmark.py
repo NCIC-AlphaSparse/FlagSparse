@@ -8,6 +8,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,9 +50,11 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _command_specs(args: argparse.Namespace, results_dir: Path) -> list[tuple[str, list[str]]]:
+def _command_specs(
+    args: argparse.Namespace, results_dir: Path
+) -> List[Tuple[str, List[str]]]:
     no_cusparse = [] if args.with_cusparse else ["--no-cusparse"]
-    commands: dict[str, list[str]] = {
+    commands: Dict[str, List[str]] = {
         "gather": [
             "tests/test_gather.py",
             "--warmup",
@@ -122,7 +125,7 @@ def _command_specs(args: argparse.Namespace, results_dir: Path) -> list[tuple[st
             str(args.iters),
         ],
     }
-    suites: dict[str, list[str]] = {
+    suites: Dict[str, List[str]] = {
         "quick": ["gather", "scatter", "spmv", "spmm"],
         "full-synthetic": ["gather", "scatter", "spmv", "spmv-coo", "spmm", "spmm-coo", "spsv", "spsm"],
     }
@@ -130,8 +133,8 @@ def _command_specs(args: argparse.Namespace, results_dir: Path) -> list[tuple[st
     return [(name, commands[name]) for name in selected]
 
 
-def _gpu_metadata() -> dict[str, object]:
-    metadata: dict[str, object] = {
+def _gpu_metadata() -> Dict[str, object]:
+    metadata: Dict[str, object] = {
         "platform": platform.platform(),
         "python": sys.version,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -150,7 +153,7 @@ def _gpu_metadata() -> dict[str, object]:
     return metadata
 
 
-def _run_command(name: str, script_args: list[str], log_path: Path) -> int:
+def _run_command(name: str, script_args: List[str], log_path: Path) -> int:
     full_cmd = [sys.executable, *script_args]
     print(f"==> {name}: {' '.join(full_cmd)}", flush=True)
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -184,7 +187,7 @@ def main() -> int:
     metadata["commands"] = [{"name": name, "argv": [sys.executable, *argv]} for name, argv in commands]
     (results_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-    failures: list[dict[str, object]] = []
+    failures: List[Dict[str, object]] = []
     for name, argv in commands:
         log_path = results_dir / f"{name}.log"
         return_code = _run_command(name, argv, log_path)
