@@ -396,6 +396,15 @@ def _coerce_spsv_alpha(alpha, dtype, device):
     return torch.tensor(alpha, device=device, dtype=dtype)
 
 
+def _spsv_alpha_is_identity(alpha):
+    if torch.is_tensor(alpha):
+        alpha_flat = alpha.reshape(-1)
+        if alpha_flat.numel() != 1:
+            raise ValueError("alpha must be a scalar tensor")
+        return bool((alpha_flat == 1).all().item())
+    return alpha == 1
+
+
 def _workspace_entry(name, numel, dtype):
     return {
         "name": str(name),
@@ -441,6 +450,10 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "csr_roc":
+        return (
+            _workspace_entry("ready", n_rows, torch.int32),
+        )
+    if solve_kind == "csr_smblk":
         return (
             _workspace_entry("ready", n_rows, torch.int32),
         )
@@ -548,7 +561,7 @@ def flagsparse_spsv_buffer_size(
     Triton implementation, rather than the raw CUDA ABI layout.
     """
 
-    fmt = _normalize_spsv_format(format)
+    _normalize_spsv_format(format)
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if n_rows != n_cols:
         raise ValueError(f"SpSV expects a square matrix, got shape={shape}")
@@ -613,7 +626,10 @@ def _normalize_requested_spsv_route(solve_kind, trans_mode):
         "csr_cw": "csr_cw",
         "csr_roc": "csr_roc",
         "roc": "csr_roc",
-        "alg3": "csr_nnz_balance",
+        "alg3": "csr_roc",
+        "csr_smblk": "csr_smblk",
+        "smblk": "csr_smblk",
+        "alg4": "csr_smblk",
         "csr_levelschd": "csr_cw_levelschd",
         "csr_cw_levelschd": "csr_cw_levelschd",
         "levelschd": "csr_cw_levelschd",
@@ -629,7 +645,7 @@ def _normalize_requested_spsv_route(solve_kind, trans_mode):
     route = aliases.get(token)
     if route is None:
         raise ValueError(
-            "solve_kind must be one of: csr_cw, csr_roc, csr_cw_levelschd, csr_nnz_balance, transpose_cw"
+            "solve_kind must be one of: csr_cw, csr_roc, csr_smblk, csr_cw_levelschd, csr_nnz_balance, transpose_cw"
         )
     if trans_mode in ("T", "C") and route != "transpose_cw":
         raise ValueError("TRANS/CONJ SpSV only supports solve_kind='transpose_cw'")
@@ -683,6 +699,32 @@ def _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
     except TypeError:
         order = torch.argsort(key)
     return data[order], indices64[order], indptr64
+
+
+def _csr_rows_are_sorted(indices64, indptr64, n_rows, lower=True):
+    if indices64.numel() <= 1 or int(n_rows) <= 0:
+        return True
+    row_lengths = indptr64[1:] - indptr64[:-1]
+    if row_lengths.numel() == 0 or int(row_lengths.max().item()) <= 1:
+        return True
+    row_ids = torch.repeat_interleave(
+        torch.arange(int(n_rows), device=indices64.device, dtype=torch.int64),
+        row_lengths,
+    )
+    same_row = row_ids[1:] == row_ids[:-1]
+    if not bool(torch.any(same_row).item()):
+        return True
+    if lower:
+        ordered = indices64[1:] >= indices64[:-1]
+    else:
+        ordered = indices64[1:] <= indices64[:-1]
+    return bool(torch.all(ordered | (~same_row)).item())
+
+
+def _maybe_sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
+    if _csr_rows_are_sorted(indices64, indptr64, n_rows, lower=lower):
+        return data, indices64, indptr64
+    return _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=lower)
 
 
 def _cw_rhs_bucket(n_rhs):
@@ -739,11 +781,6 @@ def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
     elif rhs_bucket >= 4:
         target = max(4, (target * 3) // 4)
     return _snap_cw_worker_count(target, n_rows)
-
-    num_re = rhs_re - acc_re
-    num_im = rhs_im - acc_im
-    den = diag_re * diag_re + diag_im * diag_im
-    den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
 
 def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None):
     rhs_bucket = _cw_rhs_bucket(n_rhs)
@@ -857,22 +894,12 @@ def _build_spsv_cw_matrix_stats(indptr64, n_rows):
     }
 
 
-def _spsv_nontrans_prefers_nnz_balance(n_rows, matrix_stats, *, lower, unit_diagonal, value_dtype):
-    if not _supports_spsv_advanced_nontrans_routes("N", lower, unit_diagonal, value_dtype):
-        return False
-    if int(n_rows) < 256:
-        return False
-    avg_nnz_per_row = float(matrix_stats.get("avg_nnz_per_row", 0.0))
-    max_nnz_per_row = int(matrix_stats.get("max_nnz_per_row", 0))
-    return max_nnz_per_row >= 512 or avg_nnz_per_row >= 96.0
-
-
 def _supports_spsv_advanced_nontrans_routes(trans_mode, lower, unit_diagonal, value_dtype):
     return (
         trans_mode == "N"
         and bool(lower)
         and (not bool(unit_diagonal))
-        and value_dtype in (torch.float32, torch.float64)
+        and value_dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128)
     )
 
 
@@ -932,7 +959,9 @@ def _spsv_levelschd_analysis_kernel(
             _publish_ready_flag_i32(ready_ptr, row)
 
 
-def _build_spsv_level_schedule_metadata_lower_gpu(indices64, indptr64, n_rows, *, unit_diagonal):
+def _build_spsv_level_schedule_metadata_lower_gpu(
+    indices64, indptr64, n_rows, *, unit_diagonal, minimal=False
+):
     n_rows = int(n_rows)
     device = indices64.device
     base_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
@@ -1005,6 +1034,14 @@ def _build_spsv_level_schedule_metadata_lower_gpu(indices64, indptr64, n_rows, *
         "avg_frontier": float(avg_frontier),
         "frontier_ratio": (float(max_frontier) / float(n_rows)) if n_rows > 0 else 0.0,
     }
+    if minimal:
+        return {
+            "row_map32": row_map32,
+            "level_ptr32": torch.zeros(1, dtype=torch.int32, device=device),
+            "indegree_init32": torch.empty(0, dtype=torch.int32, device=device),
+            "csr_row_idx32": torch.empty(0, dtype=torch.int32, device=device),
+            "matrix_stats": matrix_stats,
+        }
     return {
         "row_map32": row_map32,
         "level_ptr32": level_ptr32,
@@ -1103,7 +1140,9 @@ def _build_spsv_nnz_balance_metadata(indices64, indptr64, n_rows, *, lower, unit
     }
 
 
-def _build_spsv_level_schedule_metadata(indices64, indptr64, n_rows, *, lower, unit_diagonal):
+def _build_spsv_level_schedule_metadata(
+    indices64, indptr64, n_rows, *, lower, unit_diagonal, minimal=False
+):
     n_rows = int(n_rows)
     device = indices64.device
     base_stats = _build_spsv_cw_matrix_stats(indptr64, n_rows)
@@ -1132,6 +1171,7 @@ def _build_spsv_level_schedule_metadata(indices64, indptr64, n_rows, *, lower, u
             indptr64,
             n_rows,
             unit_diagonal=unit_diagonal,
+            minimal=minimal,
         )
 
     indptr_cpu = indptr64.to("cpu", non_blocking=False).tolist()
@@ -1192,6 +1232,14 @@ def _build_spsv_level_schedule_metadata(indices64, indptr64, n_rows, *, lower, u
         "avg_frontier": float(avg_frontier),
         "frontier_ratio": (float(max_frontier) / float(n_rows)) if n_rows > 0 else 0.0,
     }
+    if minimal:
+        return {
+            "row_map32": torch.tensor(row_map, dtype=torch.int32, device=device),
+            "level_ptr32": torch.zeros(1, dtype=torch.int32, device=device),
+            "indegree_init32": torch.empty(0, dtype=torch.int32, device=device),
+            "csr_row_idx32": torch.empty(0, dtype=torch.int32, device=device),
+            "matrix_stats": matrix_stats,
+        }
     return {
         "row_map32": torch.tensor(row_map, dtype=torch.int32, device=device),
         "level_ptr32": torch.tensor(level_ptr, dtype=torch.int32, device=device),
@@ -1199,27 +1247,6 @@ def _build_spsv_level_schedule_metadata(indices64, indptr64, n_rows, *, lower, u
         "csr_row_idx32": csr_row_idx32,
         "matrix_stats": matrix_stats,
     }
-
-
-def _choose_spsv_nontrans_auto_route(n_rows, matrix_stats, *, lower, unit_diagonal, value_dtype):
-    if not _supports_spsv_advanced_nontrans_routes("N", lower, unit_diagonal, value_dtype):
-        return "csr_cw"
-    if int(n_rows) < 256:
-        return "csr_cw"
-    max_frontier = int(matrix_stats.get("max_frontier", 0))
-    frontier_ratio = float(matrix_stats.get("frontier_ratio", 0.0))
-    num_levels = int(matrix_stats.get("num_levels", 0))
-    if _spsv_nontrans_prefers_nnz_balance(
-        n_rows,
-        matrix_stats,
-        lower=lower,
-        unit_diagonal=unit_diagonal,
-        value_dtype=value_dtype,
-    ):
-        return "csr_nnz_balance"
-    if max_frontier >= 32 and frontier_ratio >= 0.05 and num_levels > 0:
-        return "csr_cw_levelschd"
-    return "csr_cw"
 
 
 def _prepare_spsv_csr_system(
@@ -1235,7 +1262,7 @@ def _prepare_spsv_csr_system(
     storage_view="csr_as_csc",
 ):
     if trans_mode == "N":
-        data, indices64, indptr64 = _sort_csr_rows(
+        data, indices64, indptr64 = _maybe_sort_csr_rows(
             data, indices64, indptr64, n_rows, n_cols, lower=lower
         )
         requested_route = _normalize_requested_spsv_route(requested_solve_kind, trans_mode)
@@ -1262,10 +1289,19 @@ def _prepare_spsv_csr_system(
                 n_rows,
                 lower=lower,
                 unit_diagonal=unit_diagonal,
+                minimal=True,
             )
             matrix_stats = level_meta["matrix_stats"]
             default_solve_kind = "csr_roc"
             supported_solve_kinds = ("csr_roc",)
+        elif requested_route == "csr_smblk":
+            if not bool(lower):
+                raise ValueError("solve_kind='csr_smblk' currently supports lower-triangular CSR/COO only")
+            if bool(unit_diagonal):
+                raise ValueError("solve_kind='csr_smblk' currently supports non-unit diagonal only")
+            matrix_stats = base_stats
+            default_solve_kind = "csr_smblk"
+            supported_solve_kinds = ("csr_smblk",)
         elif requested_route == "csr_cw_levelschd":
             level_meta = _build_spsv_level_schedule_metadata(
                 indices64,
@@ -1289,46 +1325,21 @@ def _prepare_spsv_csr_system(
             default_solve_kind = "csr_nnz_balance"
             supported_solve_kinds = ("csr_nnz_balance",)
         else:
-            if _spsv_nontrans_prefers_nnz_balance(
-                n_rows,
-                base_stats,
-                lower=lower,
-                unit_diagonal=unit_diagonal,
-                value_dtype=data.dtype,
+            if not _supports_spsv_advanced_nontrans_routes(
+                "N", lower, unit_diagonal, data.dtype
             ):
-                nnz_meta = _build_spsv_nnz_balance_metadata(
-                    indices64,
-                    indptr64,
-                    n_rows,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                )
-                matrix_stats = nnz_meta["matrix_stats"]
-                default_solve_kind = "csr_nnz_balance"
-                supported_solve_kinds = ("csr_nnz_balance",)
+                matrix_stats = base_stats
+                default_solve_kind = "csr_cw"
+                supported_solve_kinds = ("csr_cw",)
             else:
-                level_meta = _build_spsv_level_schedule_metadata(
-                    indices64,
-                    indptr64,
-                    n_rows,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                )
-                matrix_stats = level_meta["matrix_stats"]
-                default_solve_kind = _choose_spsv_nontrans_auto_route(
-                    n_rows,
-                    matrix_stats,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                    value_dtype=data.dtype,
-                )
-                if default_solve_kind == "csr_cw_levelschd":
-                    supported_solve_kinds = ("csr_cw_levelschd",)
-                else:
-                    supported_solve_kinds = ("csr_cw",)
+                matrix_stats = base_stats
+                default_solve_kind = "csr_smblk"
+                supported_solve_kinds = ("csr_smblk",)
         route_name = nontrans_variant
         if default_solve_kind == "csr_roc":
             route_name = "csr_n_lo_roc"
+        elif default_solve_kind == "csr_smblk":
+            route_name = "csr_n_lo_smblk"
         elif default_solve_kind == "csr_cw_levelschd":
             route_name = "csr_n_lo_cw_levelschd"
         elif default_solve_kind == "csr_nnz_balance":
@@ -1493,6 +1504,8 @@ def _select_spsv_runtime_plan(solve_plan, trans_mode, requested_solve_kind=None)
         routed["route_name"] = str(solve_plan.get("nontrans_variant", requested_route))
     elif requested_route == "csr_roc":
         routed["route_name"] = "csr_n_lo_roc"
+    elif requested_route == "csr_smblk":
+        routed["route_name"] = "csr_n_lo_smblk"
     elif requested_route == "csr_cw_levelschd":
         routed["route_name"] = "csr_n_lo_cw_levelschd"
     elif requested_route == "csr_nnz_balance":
@@ -2134,6 +2147,177 @@ def _spsv_csr_roc_kernel_complex(
 
 
 @triton.jit
+def _spsv_csr_smblk_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    x_ptr,
+    ready_ptr,
+    n_rows,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+    WARP_SIZE: tl.constexpr,
+):
+    logical_row = tl.program_id(0)
+    if logical_row >= n_rows:
+        return
+    row = logical_row
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    lanes = tl.arange(0, WARP_SIZE)
+    ptr = start + lanes
+    if USE_FP64_ACC:
+        rhs = tl.load(b_ptr + row).to(tl.float64)
+        local_sum = tl.where(lanes == 0, rhs, 0.0).to(tl.float64)
+        zero_vec = tl.zeros((WARP_SIZE,), dtype=tl.float64)
+    else:
+        rhs = tl.load(b_ptr + row).to(tl.float32)
+        local_sum = tl.where(lanes == 0, rhs, 0.0).to(tl.float32)
+        zero_vec = tl.zeros((WARP_SIZE,), dtype=tl.float32)
+
+    loop_done = 0
+    while loop_done == 0:
+        active = ptr < end
+        col = tl.load(indices_ptr + ptr, mask=active, other=row)
+        dep_mask = active & (col < row)
+        if tl.sum(dep_mask.to(tl.int32), axis=0) == 0:
+            loop_done = 1
+        else:
+            dep_ready = tl.atomic_add(
+                ready_ptr + col,
+                tl.zeros((WARP_SIZE,), dtype=tl.int32),
+                mask=dep_mask,
+            )
+            advance_mask = dep_mask & (dep_ready != 0)
+            a = tl.load(data_ptr + ptr, mask=advance_mask, other=0.0)
+            if USE_FP64_ACC:
+                a = a.to(tl.float64)
+                y_dep = tl.atomic_add(x_ptr + col, zero_vec, mask=advance_mask).to(
+                    tl.float64
+                )
+            else:
+                a = a.to(tl.float32)
+                y_dep = tl.atomic_add(x_ptr + col, zero_vec, mask=advance_mask).to(
+                    tl.float32
+                )
+            local_sum += tl.where(advance_mask, -a * y_dep, 0.0)
+            ptr = ptr + tl.where(advance_mask, WARP_SIZE, 0)
+
+    active = ptr < end
+    col = tl.load(indices_ptr + ptr, mask=active, other=row + 1)
+    diag_mask = active & (col == row)
+    diag = tl.load(data_ptr + ptr, mask=diag_mask, other=0.0)
+    if USE_FP64_ACC:
+        diag = diag.to(tl.float64)
+    else:
+        diag = diag.to(tl.float32)
+    diag_val = tl.sum(diag, axis=0)
+    diag_safe = tl.where(tl.abs(diag_val) < DIAG_EPS, 1.0, diag_val)
+    out = tl.sum(local_sum, axis=0) / diag_safe
+    out = tl.where(out == out, out, 0.0)
+    tl.store(x_ptr + row, out)
+    _publish_ready_flag_i32(ready_ptr, row)
+
+
+@triton.jit
+def _spsv_csr_smblk_kernel_complex(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    x_ri_ptr,
+    ready_ptr,
+    n_rows,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+    WARP_SIZE: tl.constexpr,
+):
+    logical_row = tl.program_id(0)
+    if logical_row >= n_rows:
+        return
+    row = logical_row
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    lanes = tl.arange(0, WARP_SIZE)
+    ptr = start + lanes
+
+    rhs_re = tl.load(b_ri_ptr + row * 2)
+    rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+    if USE_FP64_ACC:
+        rhs_re = rhs_re.to(tl.float64)
+        rhs_im = rhs_im.to(tl.float64)
+        local_sum_re = tl.where(lanes == 0, rhs_re, 0.0).to(tl.float64)
+        local_sum_im = tl.where(lanes == 0, rhs_im, 0.0).to(tl.float64)
+        zero_vec = tl.zeros((WARP_SIZE,), dtype=tl.float64)
+    else:
+        rhs_re = rhs_re.to(tl.float32)
+        rhs_im = rhs_im.to(tl.float32)
+        local_sum_re = tl.where(lanes == 0, rhs_re, 0.0).to(tl.float32)
+        local_sum_im = tl.where(lanes == 0, rhs_im, 0.0).to(tl.float32)
+        zero_vec = tl.zeros((WARP_SIZE,), dtype=tl.float32)
+
+    loop_done = 0
+    while loop_done == 0:
+        active = ptr < end
+        col = tl.load(indices_ptr + ptr, mask=active, other=row)
+        dep_mask = active & (col < row)
+        if tl.sum(dep_mask.to(tl.int32), axis=0) == 0:
+            loop_done = 1
+        else:
+            dep_ready = tl.atomic_add(
+                ready_ptr + col,
+                tl.zeros((WARP_SIZE,), dtype=tl.int32),
+                mask=dep_mask,
+            )
+            advance_mask = dep_mask & (dep_ready != 0)
+            a_re = tl.load(data_ri_ptr + ptr * 2, mask=advance_mask, other=0.0)
+            a_im = tl.load(data_ri_ptr + ptr * 2 + 1, mask=advance_mask, other=0.0)
+            x_re = tl.atomic_add(x_ri_ptr + col * 2, zero_vec, mask=advance_mask)
+            x_im = tl.atomic_add(x_ri_ptr + col * 2 + 1, zero_vec, mask=advance_mask)
+            if USE_FP64_ACC:
+                a_re = a_re.to(tl.float64)
+                a_im = a_im.to(tl.float64)
+                x_re = x_re.to(tl.float64)
+                x_im = x_im.to(tl.float64)
+            else:
+                a_re = a_re.to(tl.float32)
+                a_im = a_im.to(tl.float32)
+                x_re = x_re.to(tl.float32)
+                x_im = x_im.to(tl.float32)
+            prod_re = a_re * x_re - a_im * x_im
+            prod_im = a_re * x_im + a_im * x_re
+            local_sum_re += tl.where(advance_mask, -prod_re, 0.0)
+            local_sum_im += tl.where(advance_mask, -prod_im, 0.0)
+            ptr = ptr + tl.where(advance_mask, WARP_SIZE, 0)
+
+    active = ptr < end
+    col = tl.load(indices_ptr + ptr, mask=active, other=row + 1)
+    diag_mask = active & (col == row)
+    diag_re = tl.load(data_ri_ptr + ptr * 2, mask=diag_mask, other=0.0)
+    diag_im = tl.load(data_ri_ptr + ptr * 2 + 1, mask=diag_mask, other=0.0)
+    if USE_FP64_ACC:
+        diag_re = diag_re.to(tl.float64)
+        diag_im = diag_im.to(tl.float64)
+    else:
+        diag_re = diag_re.to(tl.float32)
+        diag_im = diag_im.to(tl.float32)
+    diag_re = tl.sum(diag_re, axis=0)
+    diag_im = tl.sum(diag_im, axis=0)
+    sum_re = tl.sum(local_sum_re, axis=0)
+    sum_im = tl.sum(local_sum_im, axis=0)
+    den = diag_re * diag_re + diag_im * diag_im
+    den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+    out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+    out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
+    out_re = tl.where(out_re == out_re, out_re, 0.0)
+    out_im = tl.where(out_im == out_im, out_im, 0.0)
+    tl.store(x_ri_ptr + row * 2, out_re)
+    tl.store(x_ri_ptr + row * 2 + 1, out_im)
+    _publish_ready_flag_i32(ready_ptr, row)
+
+
+@triton.jit
 def _spsv_csr_cw_levelschd_kernel(
     data_ptr,
     indices_ptr,
@@ -2332,10 +2516,7 @@ def _spsv_csr_nnz_balance_kernel(
                 diag_safe = tl.where(tl.abs(a) < DIAG_EPS, 1.0, a)
                 out = (rhs - sum_val) / diag_safe
                 out = tl.where(out == out, out, 0.0)
-                if USE_FP64_ACC:
-                    tl.atomic_add(x_ptr + row, out.to(tl.float64))
-                else:
-                    tl.atomic_add(x_ptr + row, out.to(tl.float32))
+                tl.store(x_ptr + row, out)
                 _publish_ready_flag_i32(ready_ptr, row)
                 done = 1
 
@@ -2413,8 +2594,8 @@ def _spsv_csr_nnz_balance_kernel_complex(
                 out_im = (num_im * val_re - num_re * val_im) / den_safe
                 out_re = tl.where(out_re == out_re, out_re, 0.0)
                 out_im = tl.where(out_im == out_im, out_im, 0.0)
-                tl.atomic_add(x_ri_ptr + row * 2, out_re)
-                tl.atomic_add(x_ri_ptr + row * 2 + 1, out_im)
+                tl.store(x_ri_ptr + row * 2, out_re)
+                tl.store(x_ri_ptr + row * 2 + 1, out_im)
                 _publish_ready_flag_i32(ready_ptr, row)
                 done = 1
 
@@ -2670,6 +2851,79 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
         indices,
         indptr,
         row_map,
+        b_ri,
+        x_ri,
+        ready,
+        n_rows,
+        USE_FP64_ACC=use_fp64,
+        DIAG_EPS=diag_eps,
+        WARP_SIZE=32,
+        num_warps=1,
+    )
+    return x
+
+
+def _triton_spsv_csr_n_lo_smblk_vector(
+    data,
+    indices,
+    indptr,
+    b_vec,
+    n_rows,
+    *,
+    diag_eps=1e-12,
+    ready_in=None,
+):
+    x = torch.zeros_like(b_vec)
+    ready = ready_in if ready_in is not None else torch.zeros(
+        n_rows, dtype=torch.int32, device=b_vec.device
+    )
+    ready.zero_()
+    if n_rows == 0:
+        return x
+    use_fp64_acc = data.dtype == torch.float64
+    _spsv_csr_smblk_kernel[(n_rows,)](
+        data,
+        indices,
+        indptr,
+        b_vec,
+        x,
+        ready,
+        n_rows,
+        USE_FP64_ACC=use_fp64_acc,
+        DIAG_EPS=diag_eps,
+        WARP_SIZE=32,
+        num_warps=1,
+    )
+    return x
+
+
+def _triton_spsv_csr_n_lo_smblk_vector_complex(
+    data,
+    indices,
+    indptr,
+    b_vec,
+    n_rows,
+    *,
+    diag_eps=1e-12,
+    data_ri_in=None,
+    ready_in=None,
+):
+    x = torch.zeros_like(b_vec)
+    ready = ready_in if ready_in is not None else torch.zeros(
+        n_rows, dtype=torch.int32, device=b_vec.device
+    )
+    ready.zero_()
+    if n_rows == 0:
+        return x
+    data_ri = data_ri_in if data_ri_in is not None else _complex_interleaved_view(data)
+    b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
+    x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
+    component_dtype = _component_dtype_for_complex(data.dtype)
+    use_fp64 = component_dtype == torch.float64
+    _spsv_csr_smblk_kernel_complex[(n_rows,)](
+        data_ri,
+        indices,
+        indptr,
         b_ri,
         x_ri,
         ready,
@@ -3194,7 +3448,7 @@ def _analyze_spsv_csr_descriptor(
         _original_output_dtype,
         trans_mode,
         n_rows,
-        n_cols,
+        _n_cols,
         solve_plan,
     ) = _resolve_spsv_csr_runtime(
         data,
@@ -3300,7 +3554,7 @@ def flagsparse_spsv_analysis_coo(
     """Analyze a COO SpSV problem by canonicalizing COO into CSR first."""
 
     dummy_b = torch.empty(int(shape[0]), dtype=data.dtype, device=data.device)
-    data, _input_index_dtype, row64, col64, _b, n_rows, n_cols = _prepare_spsv_coo_inputs(
+    data, _input_index_dtype, row64, col64, _b, n_rows, _n_cols = _prepare_spsv_coo_inputs(
         data, row, col, dummy_b, shape
     )
     trans_mode = _normalize_spsv_transpose_mode(transpose)
@@ -3373,7 +3627,8 @@ def _execute_spsv_csr_plan(
         data_in = kernel_data.to(compute_dtype)
         b_in = b.to(compute_dtype)
     alpha_in = _coerce_spsv_alpha(alpha, compute_dtype, b.device)
-    b_in = b_in * alpha_in
+    if not _spsv_alpha_is_identity(alpha):
+        b_in = b_in * alpha_in
     solve_stream = _resolve_spsv_stream(handle, stream, b.device)
 
     if solve_kind == "transpose_cw":
@@ -3405,6 +3660,10 @@ def _execute_spsv_csr_plan(
         block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
         vec_real = _triton_spsv_csr_n_lo_roc_vector
         vec_complex = _triton_spsv_csr_n_lo_roc_vector_complex
+    elif solve_kind == "csr_smblk":
+        block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
+        vec_real = _triton_spsv_csr_n_lo_smblk_vector
+        vec_complex = _triton_spsv_csr_n_lo_smblk_vector_complex
     elif solve_kind == "csr_cw_levelschd":
         block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
         vec_real = _triton_spsv_csr_n_lo_cw_levelschd_vector
@@ -3449,9 +3708,6 @@ def _execute_spsv_csr_plan(
     if solve_kind == "csr_nnz_balance":
         if tmp_sum_buf is None or ready_buf is None or indegree_buf is None:
             raise RuntimeError("csr_nnz_balance workspace is missing required buffers")
-        tmp_sum_buf.zero_()
-        ready_buf.zero_()
-        indegree_buf.copy_(nnz_balance_indegree32)
     if solve_kind == "transpose_cw":
         transpose_sig = _transpose_cw_preprocess_signature(
             solve_plan,
@@ -3519,6 +3775,17 @@ def _execute_spsv_csr_plan(
                     kernel_indices,
                     kernel_indptr,
                     level_row_map32,
+                    b_in,
+                    n_rows,
+                    diag_eps=diag_eps,
+                    data_ri_in=complex_kernel_data_ri,
+                    ready_in=ready_buf,
+                    )
+                elif solve_kind == "csr_smblk":
+                    x = vec_complex(
+                    data_in,
+                    kernel_indices,
+                    kernel_indptr,
                     b_in,
                     n_rows,
                     diag_eps=diag_eps,
@@ -3593,6 +3860,16 @@ def _execute_spsv_csr_plan(
                 kernel_indices,
                 kernel_indptr,
                 level_row_map32,
+                b_in,
+                n_rows,
+                diag_eps=diag_eps,
+                ready_in=ready_buf,
+                )
+            elif solve_kind == "csr_smblk":
+                x = vec_real(
+                data_in,
+                kernel_indices,
+                kernel_indptr,
                 b_in,
                 n_rows,
                 diag_eps=diag_eps,
@@ -3741,47 +4018,16 @@ def _materialize_spsv_workspace_state(descr, workspace=None):
     )
     solve_kind = descr.solve_kind
     preprocess_sig = None
-    if solve_kind == "csr_cw":
-        ready = buffers.get("ready")
-        row_counter = buffers.get("row_counter")
-        if ready is not None:
-            ready.zero_()
-        if row_counter is not None:
-            row_counter.zero_()
+    if solve_kind in {
+        "csr_cw",
+        "csr_roc",
+        "csr_smblk",
+        "csr_cw_levelschd",
+        "csr_nnz_balance",
+    }:
         if isinstance(workspace, FlagSparseSpSVWorkspace):
             workspace.prepared_solve_kind = ""
             workspace.prepared_signature = None
-    elif solve_kind == "csr_roc":
-        ready = buffers.get("ready")
-        if ready is not None:
-            ready.zero_()
-        if isinstance(workspace, FlagSparseSpSVWorkspace):
-            workspace.prepared_solve_kind = ""
-            workspace.prepared_signature = None
-    elif solve_kind == "csr_cw_levelschd":
-        ready = buffers.get("ready")
-        if ready is not None:
-            ready.zero_()
-        if isinstance(workspace, FlagSparseSpSVWorkspace):
-            workspace.prepared_solve_kind = ""
-            workspace.prepared_signature = None
-    elif solve_kind == "csr_nnz_balance":
-        tmp_sum = buffers.get("tmp_sum")
-        ready = buffers.get("ready")
-        indegree = buffers.get("indegree")
-        if tmp_sum is not None:
-            tmp_sum.zero_()
-        if ready is not None:
-            ready.zero_()
-        if indegree is not None:
-            indegree.copy_(descr.solve_plan["nnz_balance_indegree32"])
-        preprocess_sig = (
-            "csr_nnz_balance",
-            _tensor_cache_token(descr.solve_plan["nnz_balance_indegree32"]),
-        )
-        if isinstance(workspace, FlagSparseSpSVWorkspace):
-            workspace.prepared_solve_kind = "csr_nnz_balance"
-            workspace.prepared_signature = preprocess_sig
     elif solve_kind == "transpose_cw":
         residual = buffers.get("residual")
         indegree = buffers.get("indegree")
@@ -3822,9 +4068,7 @@ def _materialize_spsv_workspace_state(descr, workspace=None):
             device=descr.data.device,
             buffers=buffers,
             prepared_solve_kind=(
-                "transpose_cw"
-                if solve_kind == "transpose_cw"
-                else ("csr_nnz_balance" if solve_kind == "csr_nnz_balance" else "")
+                "transpose_cw" if solve_kind == "transpose_cw" else ""
             ),
             prepared_signature=preprocess_sig,
         )
@@ -4083,52 +4327,6 @@ def flagsparse_spsv_csr(
         handle=handle,
         stream=stream,
     )
-
-
-def _analyze_spsv_csr(
-    data,
-    indices,
-    indptr,
-    b,
-    shape,
-    lower=True,
-    unit_diagonal=False,
-    transpose=False,
-    solve_kind=None,
-    clear_cache=False,
-    return_time=False,
-):
-    if clear_cache:
-        _clear_spsv_csr_preprocess_cache()
-    if return_time:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-    (
-        _data,
-        _b,
-        _original_output_dtype,
-        trans_mode,
-        _n_rows,
-        _n_cols,
-        solve_plan,
-    ) = _resolve_spsv_csr_runtime(
-        data,
-        indices,
-        indptr,
-        b,
-        shape,
-        lower,
-        transpose,
-        unit_diagonal,
-        requested_solve_kind=solve_kind,
-    )
-    _select_spsv_runtime_plan(
-        solve_plan, trans_mode, requested_solve_kind=solve_kind
-    )
-    if return_time:
-        torch.cuda.synchronize()
-        return (time.perf_counter() - t0) * 1000.0
-
 
 def flagsparse_spsv_coo(
     data,
