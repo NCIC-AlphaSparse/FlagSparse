@@ -5,7 +5,9 @@ import os
 import pytest
 
 if os.environ.get("FLAGSPARSE_TRITON_SMOKE") != "1":
-    pytest.skip("triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True)
+    pytest.skip(
+        "triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True
+    )
 
 torch = pytest.importorskip("torch")
 

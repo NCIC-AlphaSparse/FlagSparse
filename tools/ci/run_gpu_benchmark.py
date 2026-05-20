@@ -35,8 +35,12 @@ def _parse_args() -> argparse.Namespace:
         ],
         help="Benchmark suite to execute.",
     )
-    parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations where supported.")
-    parser.add_argument("--iters", type=int, default=20, help="Timed iterations where supported.")
+    parser.add_argument(
+        "--warmup", type=int, default=5, help="Warmup iterations where supported."
+    )
+    parser.add_argument(
+        "--iters", type=int, default=20, help="Timed iterations where supported."
+    )
     parser.add_argument(
         "--with-cusparse",
         action="store_true",
@@ -127,7 +131,16 @@ def _command_specs(
     }
     suites: Dict[str, List[str]] = {
         "quick": ["gather", "scatter", "spmv", "spmm"],
-        "full-synthetic": ["gather", "scatter", "spmv", "spmv-coo", "spmm", "spmm-coo", "spsv", "spsm"],
+        "full-synthetic": [
+            "gather",
+            "scatter",
+            "spmv",
+            "spmv-coo",
+            "spmm",
+            "spmm-coo",
+            "spsv",
+            "spsm",
+        ],
     }
     selected = suites.get(args.suite, [args.suite])
     return [(name, commands[name]) for name in selected]
@@ -147,9 +160,14 @@ def _gpu_metadata() -> Dict[str, object]:
 
     metadata["torch_version"] = getattr(torch, "__version__", "unknown")
     metadata["cuda_available"] = bool(torch.cuda.is_available())
-    metadata["cuda_device_count"] = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    metadata["cuda_device_count"] = (
+        int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    )
     if torch.cuda.is_available():
-        metadata["devices"] = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
+        metadata["devices"] = [
+            torch.cuda.get_device_name(index)
+            for index in range(torch.cuda.device_count())
+        ]
     return metadata
 
 
@@ -184,18 +202,26 @@ def main() -> int:
     metadata["iters"] = args.iters
     metadata["with_cusparse"] = args.with_cusparse
     commands = _command_specs(args, results_dir)
-    metadata["commands"] = [{"name": name, "argv": [sys.executable, *argv]} for name, argv in commands]
-    (results_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    metadata["commands"] = [
+        {"name": name, "argv": [sys.executable, *argv]} for name, argv in commands
+    ]
+    (results_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
 
     failures: List[Dict[str, object]] = []
     for name, argv in commands:
         log_path = results_dir / f"{name}.log"
         return_code = _run_command(name, argv, log_path)
         if return_code != 0:
-            failures.append({"name": name, "return_code": return_code, "log": str(log_path)})
+            failures.append(
+                {"name": name, "return_code": return_code, "log": str(log_path)}
+            )
 
     if failures:
-        (results_dir / "failures.json").write_text(json.dumps(failures, indent=2), encoding="utf-8")
+        (results_dir / "failures.json").write_text(
+            json.dumps(failures, indent=2), encoding="utf-8"
+        )
         for failure in failures:
             print(
                 f"Benchmark '{failure['name']}' failed with exit code {failure['return_code']} "

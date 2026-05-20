@@ -5,7 +5,9 @@ import os
 import pytest
 
 if os.environ.get("FLAGSPARSE_TRITON_SMOKE") != "1":
-    pytest.skip("triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True)
+    pytest.skip(
+        "triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True
+    )
 
 torch = pytest.importorskip("torch")
 
@@ -62,13 +64,21 @@ def test_spmv_coo_op_normalization(op, expected):
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_op_transpose_contract(op):
     if op == "non":
-        assert spmv_csr_ops._spmv_op_transposes(spmv_csr_ops._normalize_spmv_op(op)) is False
+        assert (
+            spmv_csr_ops._spmv_op_transposes(spmv_csr_ops._normalize_spmv_op(op))
+            is False
+        )
     else:
-        assert spmv_csr_ops._spmv_op_transposes(spmv_csr_ops._normalize_spmv_op(op)) is True
+        assert (
+            spmv_csr_ops._spmv_op_transposes(spmv_csr_ops._normalize_spmv_op(op))
+            is True
+        )
 
 
 def test_scatter_policy_validator_rejects_unknown_policy():
-    with pytest.raises(ValueError, match="index_fallback_policy must be 'auto' or 'strict'"):
+    with pytest.raises(
+        ValueError, match="index_fallback_policy must be 'auto' or 'strict'"
+    ):
         gather_scatter_ops._triton_scatter_impl(
             torch.zeros(1, dtype=torch.float32),
             torch.zeros(1, dtype=torch.int64),

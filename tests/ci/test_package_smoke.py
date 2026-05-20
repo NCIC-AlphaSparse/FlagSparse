@@ -12,4 +12,3 @@ def test_public_exports_are_listed():
     assert "flagsparse_spmv_csr" in exported
     assert "create_csr_matrix" in exported
     assert "read_mtx_file" in exported
-

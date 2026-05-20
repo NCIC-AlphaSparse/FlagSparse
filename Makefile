@@ -2,7 +2,7 @@ PYTHON ?= python
 DIST_DIR ?= dist
 EXPECTED_VERSION ?= 1.0.0
 
-.PHONY: help ci check ci-deps compile lint build install-wheel validate-wheel test-ci smoke triton-smoke triton-deps release-check release clean
+.PHONY: help ci check ci-deps compile format-check lint lint-src build install-wheel validate-wheel test-ci smoke triton-smoke triton-deps release-check release clean
 
 help:
 	@printf '%s\n' \
@@ -10,13 +10,16 @@ help:
 		'  make ci             - run the default CPU-only CI pipeline' \
 		'  make check          - alias for make ci' \
 		'  make smoke          - alias for the CPU smoke test stage' \
+		'  make format-check   - verify CI Python files are ruff-formatted' \
+		'  make lint           - run ruff lint checks for CI files' \
+		'  make lint-src       - run critical ruff checks for package source' \
 		'  make release        - alias for make release-check' \
 		'  make release-check  - build, validate, and checksum release artifacts' \
 		'  make triton-deps    - install the opt-in triton smoke dependency bundle' \
 		'  make triton-smoke   - opt-in triton-dependent smoke tests' \
 		'  make help           - show this list'
 
-ci: ci-deps compile lint build install-wheel validate-wheel test-ci
+ci: ci-deps compile format-check lint lint-src build install-wheel validate-wheel test-ci
 
 check: ci
 
@@ -29,8 +32,14 @@ triton-deps:
 compile:
 	$(PYTHON) -m compileall src tests tools
 
+format-check:
+	ruff format --check tests/ci tools/ci
+
 lint:
 	ruff check tests/ci tools/ci
+
+lint-src:
+	ruff check src --select E9,F63,F7,F82
 
 build:
 	$(PYTHON) -m build
@@ -49,7 +58,7 @@ smoke: test-ci
 triton-smoke:
 	FLAGSPARSE_TRITON_SMOKE=1 pytest tests/ci -q
 
-release-check: ci-deps build install-wheel validate-wheel test-ci
+release-check: ci-deps compile format-check lint lint-src build install-wheel validate-wheel test-ci
 	$(PYTHON) -m twine check $(DIST_DIR)/*.whl $(DIST_DIR)/*.tar.gz
 	$(PYTHON) tools/ci/check_release_artifacts.py $(DIST_DIR)
 	$(PYTHON) tools/ci/write_release_checksums.py $(DIST_DIR)

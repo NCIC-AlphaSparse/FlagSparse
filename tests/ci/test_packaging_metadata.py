@@ -36,7 +36,9 @@ def _extract_requires_python_from_pyproject():
 
 def _extract_python_requires_from_setup_py():
     text = _read_text("setup.py")
-    match = re.search(r'^\s*python_requires\s*=\s*"([^"]+)"\s*,\s*$', text, re.MULTILINE)
+    match = re.search(
+        r'^\s*python_requires\s*=\s*"([^"]+)"\s*,\s*$', text, re.MULTILINE
+    )
     assert match is not None, "setup.py is missing setup(python_requires=...)"
     return match.group(1)
 
@@ -49,7 +51,10 @@ def test_package_version_matches_metadata():
 
 def test_python_requires_matches_metadata():
     assert _extract_requires_python_from_pyproject() == ">=3.12"
-    assert _extract_python_requires_from_setup_py() == _extract_requires_python_from_pyproject()
+    assert (
+        _extract_python_requires_from_setup_py()
+        == _extract_requires_python_from_pyproject()
+    )
 
 
 def test_license_metadata_is_apache_2():

@@ -35,4 +35,3 @@ def test_installed_wheel_import_resolves_outside_repo_tree():
     module_path = Path(lines[1]).resolve()
     assert PROJECT_ROOT not in module_path.parents
     assert module_path.is_file()
-

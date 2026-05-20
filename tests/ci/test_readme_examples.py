@@ -39,7 +39,9 @@ def test_readme_documents_standardized_command_policy():
         "documented invocation standard",
         "CPU-only install, build, help-text, and smoke paths are checked in CI",
         "`make ci` / `make check`",
+        "`make format-check`, `make lint`, and `make lint-src`",
         "`make release-check` / `make release`",
         "`make triton-smoke` and `make triton-deps`",
+        "CI / Build and smoke test",
     ]:
         assert snippet in TEXT

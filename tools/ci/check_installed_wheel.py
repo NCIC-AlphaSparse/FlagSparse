@@ -20,7 +20,9 @@ class WheelImportCheck:
     module_path: pathlib.Path
 
 
-def validate_installed_wheel(expected_version: Optional[str] = None) -> WheelImportCheck:
+def validate_installed_wheel(
+    expected_version: Optional[str] = None,
+) -> WheelImportCheck:
     """Import flagsparse from a clean interpreter and verify the module path."""
     project_root = pathlib.Path(__file__).resolve().parents[2]
     env = os.environ.copy()
