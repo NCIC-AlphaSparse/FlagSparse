@@ -3,15 +3,16 @@
 import os
 
 import pytest
-import torch
 
 if os.environ.get("FLAGSPARSE_TRITON_SMOKE") != "1":
     pytest.skip("triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True)
 
-from flagsparse.sparse_operations import gather_scatter as gather_scatter_ops
-from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops
-from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops
-from flagsparse.sparse_operations import _common
+torch = pytest.importorskip("torch")
+
+from flagsparse.sparse_operations import gather_scatter as gather_scatter_ops  # noqa: E402
+from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops  # noqa: E402
+from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops  # noqa: E402
+from flagsparse.sparse_operations import _common  # noqa: E402
 
 
 def test_scatter_dtype_policy_fallback_is_explicit():
