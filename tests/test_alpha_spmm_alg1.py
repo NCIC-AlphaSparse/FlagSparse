@@ -1,5 +1,5 @@
 """
-Experimental AlphaSparse ALG1 benchmark: base vs alpha_spmm_alg1 vs alpha_spmm_alg1_tle.
+Experimental AlphaSparse ALG1 benchmark: base vs alpha_spmm_alg1_tle vs alpha_spmm_alg1_tle_opt.
 """
 
 import argparse
@@ -48,34 +48,36 @@ SUMMARY_FIELDS = [
     "base_symbolic_ms",
     "base_compute_ms",
     "base_total_ms",
-    "alpha_spmm_alg1_symbolic_ms",
-    "alpha_spmm_alg1_compute_ms",
-    "alpha_spmm_alg1_total_ms",
     "alpha_spmm_alg1_tle_symbolic_ms",
     "alpha_spmm_alg1_tle_compute_ms",
     "alpha_spmm_alg1_tle_total_ms",
-    "alpha_spmm_alg1_compute_speedup_vs_base",
+    "alpha_spmm_alg1_tle_opt_symbolic_ms",
+    "alpha_spmm_alg1_tle_opt_compute_ms",
+    "alpha_spmm_alg1_tle_opt_total_ms",
     "alpha_spmm_alg1_tle_compute_speedup_vs_base",
-    "alpha_spmm_alg1_tle_compute_speedup_vs_alpha_spmm_alg1",
-    "alpha_spmm_alg1_total_speedup_vs_base",
+    "alpha_spmm_alg1_tle_opt_compute_speedup_vs_base",
+    "alpha_spmm_alg1_tle_opt_compute_speedup_vs_alpha_spmm_alg1_tle",
     "alpha_spmm_alg1_tle_total_speedup_vs_base",
-    "alpha_spmm_alg1_tle_total_speedup_vs_alpha_spmm_alg1",
+    "alpha_spmm_alg1_tle_opt_total_speedup_vs_base",
+    "alpha_spmm_alg1_tle_opt_total_speedup_vs_alpha_spmm_alg1_tle",
     "torch_ms",
     "cusparse_ms",
     "base_vs_torch_err",
-    "alpha_spmm_alg1_vs_torch_err",
     "alpha_spmm_alg1_tle_vs_torch_err",
+    "alpha_spmm_alg1_tle_opt_vs_torch_err",
     "base_vs_cusparse_err",
-    "alpha_spmm_alg1_vs_cusparse_err",
     "alpha_spmm_alg1_tle_vs_cusparse_err",
+    "alpha_spmm_alg1_tle_opt_vs_cusparse_err",
     "base_status_vs_torch",
-    "alpha_spmm_alg1_status_vs_torch",
     "alpha_spmm_alg1_tle_status_vs_torch",
+    "alpha_spmm_alg1_tle_opt_status_vs_torch",
     "base_status_vs_cusparse",
-    "alpha_spmm_alg1_status_vs_cusparse",
     "alpha_spmm_alg1_tle_status_vs_cusparse",
+    "alpha_spmm_alg1_tle_opt_status_vs_cusparse",
     "alpha_spmm_alg1_tle_status",
     "alpha_spmm_alg1_tle_reason",
+    "alpha_spmm_alg1_tle_opt_status",
+    "alpha_spmm_alg1_tle_opt_reason",
     "matrix_status",
 ]
 
@@ -93,6 +95,7 @@ LAUNCH_FIELDS = [
     "block_cols",
     "num_warps",
     "num_stages",
+    "loop_strategy",
     "grid_m",
     "grid_n",
 ]
@@ -204,18 +207,6 @@ def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
     return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared
 
 
-def _timed_alpha_spmm_alg1(data, indices, indptr, B, shape, warmup, iters):
-    prepared = fs.prepare_alpha_spmm_alg1(data, indices, indptr, shape)
-    # ALG1 has no separate runtime symbolic kernel after prepare.
-    symbolic_ms = 0.0
-    out, compute_ms = _benchmark(
-        lambda: fs.flagsparse_alpha_spmm_alg1(B=B, prepared=prepared),
-        warmup,
-        iters,
-    )
-    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared, None
-
-
 def _timed_alpha_spmm_alg1_tle(data, indices, indptr, B, shape, warmup, iters):
     if not fs.is_alpha_spmm_alg1_tle_available():
         return None, None, None, None, None, fs.alpha_spmm_alg1_tle_unavailable_reason()
@@ -228,6 +219,23 @@ def _timed_alpha_spmm_alg1_tle(data, indices, indptr, B, shape, warmup, iters):
         warmup,
         iters,
     )
+    return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared, None
+
+
+def _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iters):
+    if not fs.is_alpha_spmm_alg1_tle_opt_available():
+        return None, None, None, None, None, fs.alpha_spmm_alg1_tle_opt_unavailable_reason()
+    try:
+        prepared = fs.prepare_alpha_spmm_alg1_tle_opt(data, indices, indptr, shape)
+        # TLEOpt keeps staging in the compute kernel and has no separate runtime symbolic phase.
+        symbolic_ms = 0.0
+        out, compute_ms = _benchmark(
+            lambda: fs.flagsparse_alpha_spmm_alg1_tle_opt(B=B, prepared=prepared),
+            warmup,
+            iters,
+        )
+    except Exception as exc:
+        return None, None, None, None, None, f"{type(exc).__name__}: {exc}"
     return out, symbolic_ms, compute_ms, symbolic_ms + compute_ms, prepared, None
 
 
@@ -365,12 +373,14 @@ def build_synthetic_case(case_name, dtype, index_dtype, device):
 def _build_summary_status(profiles):
     required = (
         profiles["base_vs_torch"]["status"],
-        profiles["alpha_spmm_alg1_vs_torch"]["status"],
     )
     if any(status != "PASS" for status in required):
         return "FAIL"
     tle_status = profiles["alpha_spmm_alg1_tle_vs_torch"]["status"]
     if tle_status not in ("PASS", "SKIP"):
+        return "FAIL"
+    tle_opt_status = profiles["alpha_spmm_alg1_tle_opt_vs_torch"]["status"]
+    if tle_opt_status not in ("PASS", "SKIP"):
         return "FAIL"
     return "PASS"
 
@@ -396,9 +406,6 @@ def run_one_case(
     base_out, base_sym_ms, base_compute_ms, base_total_ms, prepared_base = _timed_spmm_base(
         data, indices, indptr, B, shape, warmup, iters
     )
-    alpha_out, alpha_sym_ms, alpha_compute_ms, alpha_total_ms, prepared_alpha, _alpha_reason = (
-        _timed_alpha_spmm_alg1(data, indices, indptr, B, shape, warmup, iters)
-    )
     (
         alpha_tle_out,
         alpha_tle_sym_ms,
@@ -407,6 +414,14 @@ def run_one_case(
         prepared_alpha_tle,
         alpha_tle_reason,
     ) = _timed_alpha_spmm_alg1_tle(data, indices, indptr, B, shape, warmup, iters)
+    (
+        alpha_tle_opt_out,
+        alpha_tle_opt_sym_ms,
+        alpha_tle_opt_compute_ms,
+        alpha_tle_opt_total_ms,
+        prepared_alpha_tle_opt,
+        alpha_tle_opt_reason,
+    ) = _timed_alpha_spmm_alg1_tle_opt(data, indices, indptr, B, shape, warmup, iters)
     torch_out, torch_ms = _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters)
     sparse_out, sparse_ms, sparse_name, sparse_reason = _timed_sparse_backend(
         data, indices, indptr, B, shape, warmup, iters, with_cusparse
@@ -414,11 +429,11 @@ def run_one_case(
 
     profiles = {
         "base_vs_torch": _error_profile(base_out, torch_out, dtype),
-        "alpha_spmm_alg1_vs_torch": _error_profile(alpha_out, torch_out, dtype),
         "alpha_spmm_alg1_tle_vs_torch": _error_profile(alpha_tle_out, torch_out, dtype),
+        "alpha_spmm_alg1_tle_opt_vs_torch": _error_profile(alpha_tle_opt_out, torch_out, dtype),
         "base_vs_cusparse": _error_profile(base_out, sparse_out, dtype),
-        "alpha_spmm_alg1_vs_cusparse": _error_profile(alpha_out, sparse_out, dtype),
         "alpha_spmm_alg1_tle_vs_cusparse": _error_profile(alpha_tle_out, sparse_out, dtype),
+        "alpha_spmm_alg1_tle_opt_vs_cusparse": _error_profile(alpha_tle_opt_out, sparse_out, dtype),
     }
     max_row_nnz = int((indptr[1:] - indptr[:-1]).max().item()) if n_rows > 0 else 0
     summary = {
@@ -434,34 +449,36 @@ def run_one_case(
         "base_symbolic_ms": base_sym_ms,
         "base_compute_ms": base_compute_ms,
         "base_total_ms": base_total_ms,
-        "alpha_spmm_alg1_symbolic_ms": alpha_sym_ms,
-        "alpha_spmm_alg1_compute_ms": alpha_compute_ms,
-        "alpha_spmm_alg1_total_ms": alpha_total_ms,
         "alpha_spmm_alg1_tle_symbolic_ms": alpha_tle_sym_ms,
         "alpha_spmm_alg1_tle_compute_ms": alpha_tle_compute_ms,
         "alpha_spmm_alg1_tle_total_ms": alpha_tle_total_ms,
-        "alpha_spmm_alg1_compute_speedup_vs_base": _ratio(base_compute_ms, alpha_compute_ms),
+        "alpha_spmm_alg1_tle_opt_symbolic_ms": alpha_tle_opt_sym_ms,
+        "alpha_spmm_alg1_tle_opt_compute_ms": alpha_tle_opt_compute_ms,
+        "alpha_spmm_alg1_tle_opt_total_ms": alpha_tle_opt_total_ms,
         "alpha_spmm_alg1_tle_compute_speedup_vs_base": _ratio(base_compute_ms, alpha_tle_compute_ms),
-        "alpha_spmm_alg1_tle_compute_speedup_vs_alpha_spmm_alg1": _ratio(alpha_compute_ms, alpha_tle_compute_ms),
-        "alpha_spmm_alg1_total_speedup_vs_base": _ratio(base_total_ms, alpha_total_ms),
+        "alpha_spmm_alg1_tle_opt_compute_speedup_vs_base": _ratio(base_compute_ms, alpha_tle_opt_compute_ms),
+        "alpha_spmm_alg1_tle_opt_compute_speedup_vs_alpha_spmm_alg1_tle": _ratio(alpha_tle_compute_ms, alpha_tle_opt_compute_ms),
         "alpha_spmm_alg1_tle_total_speedup_vs_base": _ratio(base_total_ms, alpha_tle_total_ms),
-        "alpha_spmm_alg1_tle_total_speedup_vs_alpha_spmm_alg1": _ratio(alpha_total_ms, alpha_tle_total_ms),
+        "alpha_spmm_alg1_tle_opt_total_speedup_vs_base": _ratio(base_total_ms, alpha_tle_opt_total_ms),
+        "alpha_spmm_alg1_tle_opt_total_speedup_vs_alpha_spmm_alg1_tle": _ratio(alpha_tle_total_ms, alpha_tle_opt_total_ms),
         "torch_ms": torch_ms,
         "cusparse_ms": sparse_ms,
         "base_vs_torch_err": profiles["base_vs_torch"]["global_err"],
-        "alpha_spmm_alg1_vs_torch_err": profiles["alpha_spmm_alg1_vs_torch"]["global_err"],
         "alpha_spmm_alg1_tle_vs_torch_err": profiles["alpha_spmm_alg1_tle_vs_torch"]["global_err"],
+        "alpha_spmm_alg1_tle_opt_vs_torch_err": profiles["alpha_spmm_alg1_tle_opt_vs_torch"]["global_err"],
         "base_vs_cusparse_err": profiles["base_vs_cusparse"]["global_err"],
-        "alpha_spmm_alg1_vs_cusparse_err": profiles["alpha_spmm_alg1_vs_cusparse"]["global_err"],
         "alpha_spmm_alg1_tle_vs_cusparse_err": profiles["alpha_spmm_alg1_tle_vs_cusparse"]["global_err"],
+        "alpha_spmm_alg1_tle_opt_vs_cusparse_err": profiles["alpha_spmm_alg1_tle_opt_vs_cusparse"]["global_err"],
         "base_status_vs_torch": profiles["base_vs_torch"]["status"],
-        "alpha_spmm_alg1_status_vs_torch": profiles["alpha_spmm_alg1_vs_torch"]["status"],
         "alpha_spmm_alg1_tle_status_vs_torch": profiles["alpha_spmm_alg1_tle_vs_torch"]["status"],
+        "alpha_spmm_alg1_tle_opt_status_vs_torch": profiles["alpha_spmm_alg1_tle_opt_vs_torch"]["status"],
         "base_status_vs_cusparse": profiles["base_vs_cusparse"]["status"],
-        "alpha_spmm_alg1_status_vs_cusparse": profiles["alpha_spmm_alg1_vs_cusparse"]["status"],
         "alpha_spmm_alg1_tle_status_vs_cusparse": profiles["alpha_spmm_alg1_tle_vs_cusparse"]["status"],
+        "alpha_spmm_alg1_tle_opt_status_vs_cusparse": profiles["alpha_spmm_alg1_tle_opt_vs_cusparse"]["status"],
         "alpha_spmm_alg1_tle_status": "SKIP" if alpha_tle_out is None else "PASS",
         "alpha_spmm_alg1_tle_reason": alpha_tle_reason,
+        "alpha_spmm_alg1_tle_opt_status": "SKIP" if alpha_tle_opt_out is None else "PASS",
+        "alpha_spmm_alg1_tle_opt_reason": alpha_tle_opt_reason,
         "matrix_status": _build_summary_status(profiles),
     }
     if not return_details:
@@ -469,8 +486,8 @@ def run_one_case(
     return {
         "summary": summary,
         "prepared_base": prepared_base,
-        "prepared_alpha": prepared_alpha,
         "prepared_alpha_tle": prepared_alpha_tle,
+        "prepared_alpha_tle_opt": prepared_alpha_tle_opt,
         "B": B,
         "profiles": profiles,
         "sparse_backend_name": sparse_name,
@@ -481,14 +498,17 @@ def run_one_case(
 def _print_header():
     tle_available = fs.is_alpha_spmm_alg1_tle_available()
     tle_status = "available" if tle_available else f"unavailable ({fs.alpha_spmm_alg1_tle_unavailable_reason()})"
+    tle_opt_available = fs.is_alpha_spmm_alg1_tle_opt_available()
+    tle_opt_status = "available" if tle_opt_available else f"unavailable ({fs.alpha_spmm_alg1_tle_opt_unavailable_reason()})"
     print(f"TLE alpha_spmm_alg1_tle: {tle_status}")
-    print("-" * 168)
+    print(f"TLEOpt alpha_spmm_alg1_tle_opt: {tle_opt_status}")
+    print("-" * 172)
     print(
         f"{'Matrix':<24} {'dtype':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
-        f"{'Base(ms)':>9} {'Alpha(ms)':>9} {'TLE(ms)':>9} {'Base/Alpha':>10} {'Base/TLE':>9} "
-        f"{'Alpha/TLE':>10} {'Err(A)':>10} {'Err(TLE)':>10} {'Status':>8}"
+        f"{'Base(ms)':>9} {'TLE(ms)':>9} {'TLEOpt(ms)':>11} {'Base/TLE':>9} {'Base/TLEOpt':>12} "
+        f"{'TLE/TLEOpt':>11} {'Err(TLE)':>10} {'Err(Opt)':>10} {'Status':>8}"
     )
-    print("-" * 168)
+    print("-" * 172)
 
 
 def _fmt_ms(value):
@@ -507,17 +527,20 @@ def _print_summary_row(summary):
     print(
         f"{summary['matrix'][:23]:<24} {summary['value_dtype']:>7} {summary['n_rows']:>7} "
         f"{summary['n_cols']:>7} {summary['nnz']:>10} {summary['dense_cols']:>8} "
-        f"{_fmt_ms(summary['base_compute_ms']):>9} {_fmt_ms(summary['alpha_spmm_alg1_compute_ms']):>9} "
+        f"{_fmt_ms(summary['base_compute_ms']):>9} "
         f"{_fmt_ms(summary['alpha_spmm_alg1_tle_compute_ms']):>9} "
-        f"{_fmt_ratio(summary['alpha_spmm_alg1_compute_speedup_vs_base']):>8} "
+        f"{_fmt_ms(summary['alpha_spmm_alg1_tle_opt_compute_ms']):>11} "
         f"{_fmt_ratio(summary['alpha_spmm_alg1_tle_compute_speedup_vs_base']):>9} "
-        f"{_fmt_ratio(summary['alpha_spmm_alg1_tle_compute_speedup_vs_alpha_spmm_alg1']):>8} "
-        f"{_fmt_err(summary['alpha_spmm_alg1_vs_torch_err']):>10} "
+        f"{_fmt_ratio(summary['alpha_spmm_alg1_tle_opt_compute_speedup_vs_base']):>12} "
+        f"{_fmt_ratio(summary['alpha_spmm_alg1_tle_opt_compute_speedup_vs_alpha_spmm_alg1_tle']):>11} "
         f"{_fmt_err(summary['alpha_spmm_alg1_tle_vs_torch_err']):>10} "
+        f"{_fmt_err(summary['alpha_spmm_alg1_tle_opt_vs_torch_err']):>10} "
         f"{summary['matrix_status']:>8}"
     )
     if summary.get("alpha_spmm_alg1_tle_status") == "SKIP" and summary.get("alpha_spmm_alg1_tle_reason"):
         print(f"  alpha_spmm_alg1_tle skipped: {summary['alpha_spmm_alg1_tle_reason']}")
+    if summary.get("alpha_spmm_alg1_tle_opt_status") == "SKIP" and summary.get("alpha_spmm_alg1_tle_opt_reason"):
+        print(f"  alpha_spmm_alg1_tle_opt skipped: {summary['alpha_spmm_alg1_tle_opt_reason']}")
 
 
 def _write_csv(path, rows, fieldnames):
@@ -539,7 +562,9 @@ def _build_launch_row(matrix_name, route, dtype_name, dense_cols, prepared, B):
             "dtype": dtype_name,
             "dense_cols": dense_cols,
         }
-    if route == "alpha_spmm_alg1_tle":
+    if route == "alpha_spmm_alg1_tle_opt":
+        _, meta = fs.flagsparse_alpha_spmm_alg1_tle_opt(B=B, prepared=prepared, return_meta=True)
+    elif route == "alpha_spmm_alg1_tle":
         _, meta = fs.flagsparse_alpha_spmm_alg1_tle(B=B, prepared=prepared, return_meta=True)
     else:
         _, meta = fs.flagsparse_alpha_spmm_alg1(B=B, prepared=prepared, return_meta=True)
@@ -557,6 +582,7 @@ def _build_launch_row(matrix_name, route, dtype_name, dense_cols, prepared, B):
         "block_cols": meta["block_cols"],
         "num_warps": meta["num_warps"],
         "num_stages": meta["num_stages"],
+        "loop_strategy": meta.get("loop_strategy", ""),
         "grid_m": meta["grid_m"],
         "grid_n": meta["grid_n"],
     }
@@ -570,20 +596,20 @@ def _append_launch_rows(launch_rows, result):
     launch_rows.append(
         _build_launch_row(
             summary["matrix"],
-            "alpha_spmm_alg1",
+            "alpha_spmm_alg1_tle",
             dtype_name,
             dense_cols,
-            result["prepared_alpha"],
+            result["prepared_alpha_tle"],
             B,
         )
     )
     launch_rows.append(
         _build_launch_row(
             summary["matrix"],
-            "alpha_spmm_alg1_tle",
+            "alpha_spmm_alg1_tle_opt",
             dtype_name,
             dense_cols,
-            result["prepared_alpha_tle"],
+            result["prepared_alpha_tle_opt"],
             B,
         )
     )
@@ -609,6 +635,11 @@ def main():
         action="store_true",
         help="Fail immediately if alpha_spmm_alg1_tle is unavailable or skipped.",
     )
+    parser.add_argument(
+        "--require-tle-opt",
+        action="store_true",
+        help="Fail immediately if alpha_spmm_alg1_tle_opt is unavailable or skipped.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -618,6 +649,11 @@ def main():
         raise RuntimeError(
             "alpha_spmm_alg1_tle is unavailable: "
             + fs.alpha_spmm_alg1_tle_unavailable_reason()
+        )
+    if args.require_tle_opt and not fs.is_alpha_spmm_alg1_tle_opt_available():
+        raise RuntimeError(
+            "alpha_spmm_alg1_tle_opt is unavailable: "
+            + fs.alpha_spmm_alg1_tle_opt_unavailable_reason()
         )
     _print_header()
     if args.synthetic:
@@ -661,6 +697,11 @@ def main():
                             "alpha_spmm_alg1_tle was skipped: "
                             + str(summary.get("alpha_spmm_alg1_tle_reason") or "")
                         )
+                    if args.require_tle_opt and summary["alpha_spmm_alg1_tle_opt_status"] == "SKIP":
+                        raise RuntimeError(
+                            "alpha_spmm_alg1_tle_opt was skipped: "
+                            + str(summary.get("alpha_spmm_alg1_tle_opt_reason") or "")
+                        )
     else:
         paths = _resolve_input_paths(args.input_path)
         for value_dtype in VALUE_DTYPES:
@@ -696,6 +737,11 @@ def main():
                         raise RuntimeError(
                             "alpha_spmm_alg1_tle was skipped: "
                             + str(summary.get("alpha_spmm_alg1_tle_reason") or "")
+                        )
+                    if args.require_tle_opt and summary["alpha_spmm_alg1_tle_opt_status"] == "SKIP":
+                        raise RuntimeError(
+                            "alpha_spmm_alg1_tle_opt was skipped: "
+                            + str(summary.get("alpha_spmm_alg1_tle_opt_reason") or "")
                         )
     print("-" * 168)
     if args.csv:

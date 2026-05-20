@@ -18,19 +18,14 @@ except ImportError:
     cp = None
     cpx_sparse = None
 
-_TORCH_COMPLEX32_DTYPE = getattr(torch, "complex32", None)
-if _TORCH_COMPLEX32_DTYPE is None:
-    _TORCH_COMPLEX32_DTYPE = getattr(torch, "chalf", None)
-
 _SUPPORTED_VALUE_DTYPES = [
     torch.float16,
     torch.bfloat16,
     torch.float32,
     torch.float64,
+    torch.complex64,
+    torch.complex128,
 ]
-if _TORCH_COMPLEX32_DTYPE is not None:
-    _SUPPORTED_VALUE_DTYPES.append(_TORCH_COMPLEX32_DTYPE)
-_SUPPORTED_VALUE_DTYPES.extend([torch.complex64, torch.complex128])
 SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
@@ -40,8 +35,6 @@ __all__ = (
     "SUPPORTED_VALUE_DTYPES",
     "SUPPORTED_INDEX_DTYPES",
     "_INDEX_LIMIT_INT32",
-    "_torch_complex32_dtype",
-    "_is_complex32_dtype",
     "_is_complex_dtype",
     "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
@@ -68,17 +61,8 @@ __all__ = (
     "tl",
 )
 
-
-def _torch_complex32_dtype():
-    return _TORCH_COMPLEX32_DTYPE
-
-
-def _is_complex32_dtype(value_dtype):
-    return _TORCH_COMPLEX32_DTYPE is not None and value_dtype == _TORCH_COMPLEX32_DTYPE
-
-
 def _is_complex_dtype(value_dtype):
-    return _is_complex32_dtype(value_dtype) or value_dtype in (torch.complex64, torch.complex128)
+    return value_dtype in (torch.complex64, torch.complex128)
 
 
 def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
@@ -95,24 +79,13 @@ def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
             "complex64": torch.complex64,
             "complex128": torch.complex128,
         }
-        if token == "complex32":
-            if _TORCH_COMPLEX32_DTYPE is not None:
-                return _TORCH_COMPLEX32_DTYPE, False, None
-            if dtype_policy == "strict":
-                raise TypeError("complex32 is unavailable in this torch build")
-            return torch.complex64, True, "complex32 is unavailable; fallback to complex64"
         if token not in mapping:
             raise TypeError(f"Unsupported dtype token: {value_dtype}")
         value_dtype = mapping[token]
-    if _is_complex32_dtype(value_dtype):
-        # If complex32 exists in torch dtype table, keep native path.
-        return value_dtype, False, None
     return value_dtype, False, None
 
 
 def _component_dtype_for_complex(value_dtype):
-    if _is_complex32_dtype(value_dtype):
-        return torch.float16
     if value_dtype == torch.complex64:
         return torch.float32
     if value_dtype == torch.complex128:
@@ -123,8 +96,6 @@ def _component_dtype_for_complex(value_dtype):
 def _tolerance_for_dtype(value_dtype):
     if value_dtype == torch.float16:
         return 2e-3, 2e-3
-    if _is_complex32_dtype(value_dtype):
-        return 5e-3, 5e-3
     if value_dtype == torch.bfloat16:
         return 1e-1, 1e-1
     if value_dtype in (torch.float32, torch.complex64):
@@ -155,9 +126,6 @@ def _cupy_dtype_from_torch(torch_dtype):
         torch.int32: cp.int32,
         torch.int64: cp.int64,
     }
-    if _TORCH_COMPLEX32_DTYPE is not None:
-        # CuPy has no native complex32 sparse path; use complex64 for baseline parity.
-        mapping[_TORCH_COMPLEX32_DTYPE] = cp.complex64
     if torch_dtype not in mapping:
         raise TypeError(f"Unsupported dtype conversion to CuPy: {torch_dtype}")
     return mapping[torch_dtype]
@@ -193,8 +161,6 @@ def _to_backend_like(torch_tensor, ref_obj):
 def _cusparse_baseline_skip_reason(value_dtype):
     if value_dtype == torch.bfloat16:
         return "bfloat16 is not supported by the cuSPARSE baseline path; skipped"
-    if _is_complex32_dtype(value_dtype):
-        return "complex32 is not supported by the cuSPARSE baseline path; skipped"
     if cp is None and value_dtype == torch.float16:
         return "float16 is not supported by torch sparse fallback when CuPy is unavailable; skipped"
     return None
@@ -203,9 +169,6 @@ def _cusparse_baseline_skip_reason(value_dtype):
 def _build_random_dense(dense_size, value_dtype, device):
     if value_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
         return torch.randn(dense_size, dtype=value_dtype, device=device)
-    if _is_complex32_dtype(value_dtype):
-        stacked = torch.randn((dense_size, 2), dtype=torch.float16, device=device)
-        return torch.view_as_complex(stacked)
     if _is_complex_dtype(value_dtype):
         component_dtype = _component_dtype_for_complex(value_dtype)
         real = torch.randn(dense_size, dtype=component_dtype, device=device)

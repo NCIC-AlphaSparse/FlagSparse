@@ -6,6 +6,7 @@ import glob
 import hashlib
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -62,7 +63,8 @@ INDEX_DTYPE_NAME_MAP = {
 SPSV_ALG_NUM_TO_SOLVE_KIND = {
     1: "csr_cw",
     2: "csr_cw_levelschd",
-    3: "csr_nnz_balance",
+    3: "csr_roc",
+    4: "csr_smblk",
     8: "csr_nnz_balance",
 }
 
@@ -121,7 +123,7 @@ def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
     alg_num = int(alg_num)
     if alg_num == 1:
         return True
-    if alg_num in (2, 3, 8):
+    if alg_num in (2, 3, 4, 8):
         return (
             fmt in ("CSR", "COO")
             and op_mode == "NON"
@@ -132,12 +134,6 @@ def _alg_num_supports_case(alg_num, fmt, op_mode, lower, value_dtype):
 
 def _fmt_ms(v):
     return "N/A" if v is None else f"{v:.4f}"
-
-
-def _fmt_speedup(other_ms, triton_ms):
-    if other_ms is None or triton_ms is None or triton_ms <= 0:
-        return "N/A"
-    return f"{other_ms / triton_ms:.2f}"
 
 
 def _fmt_ratio(v):
@@ -181,7 +177,7 @@ def _csv_export_row_spsv(row):
         "n_cols": row.get("n_cols"),
         "nnz": row.get("nnz"),
         "analysis_ms": row.get("analysis_ms"),
-        "triton_ms": row.get("triton_ms"),
+        "solve_ms": row.get("solve_ms"),
         "triton_total_ms": row.get("triton_total_ms"),
         "cusparse_ms": row.get("cusparse_ms"),
         "pytorch_ms": row.get("pytorch_ms"),
@@ -588,29 +584,48 @@ def _benchmark_flagsparse(call, *, warmup=WARMUP, iters=ITERS):
     return x, e0.elapsed_time(e1) / iters
 
 
-def _benchmark_flagsparse_spsv_csr(
+def _analyze_flagsparse_spsv_csr_reuse(
     data,
     indices,
     indptr,
-    b,
     shape,
     *,
     lower=True,
     transpose=False,
     solve_kind=None,
+):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    descr = fs_spsv_impl.flagsparse_spsv_analysis_csr(
+        data,
+        indices,
+        indptr,
+        shape,
+        lower=lower,
+        transpose=transpose,
+        solve_kind=solve_kind,
+        clear_cache=True,
+    )
+    workspace = fs_spsv_impl.flagsparse_spsv_create_workspace(descr)
+    if descr.solve_kind == "transpose_cw":
+        fs_spsv_impl.flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
+    torch.cuda.synchronize()
+    return descr, workspace, (time.perf_counter() - t0) * 1000.0
+
+
+def _benchmark_flagsparse_spsv_csr_reuse(
+    descr,
+    workspace,
+    b,
+    *,
     warmup=WARMUP,
     iters=ITERS,
 ):
     return _benchmark_flagsparse(
-        lambda: fs.flagsparse_spsv_csr(
-            data,
-            indices,
-            indptr,
+        lambda: fs_spsv_impl.flagsparse_spsv_solve_csr(
+            descr,
             b,
-            shape,
-            lower=lower,
-            transpose=transpose,
-            solve_kind=solve_kind,
+            workspace=workspace,
         ),
         warmup=warmup,
         iters=iters,
@@ -635,27 +650,19 @@ def _benchmark_flagsparse_spsv_csr_split(
         data.dtype,
         fmt="CSR",
     )
-    analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+    descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
         data,
         indices,
         indptr,
-        b,
         shape,
         lower=lower,
         transpose=transpose,
         solve_kind=solve_kind,
-        clear_cache=True,
-        return_time=True,
     )
-    x, solve_ms = _benchmark_flagsparse_spsv_csr(
-        data,
-        indices,
-        indptr,
+    x, solve_ms = _benchmark_flagsparse_spsv_csr_reuse(
+        descr,
+        workspace,
         b,
-        shape,
-        lower=lower,
-        transpose=transpose,
-        solve_kind=solve_kind,
         warmup=warmup,
         iters=iters,
     )
@@ -690,27 +697,19 @@ def _benchmark_flagsparse_spsv_coo_split(
         data.dtype,
         fmt="COO",
     )
-    analysis_ms = fs_spsv_impl._analyze_spsv_csr(
+    descr, workspace, analysis_ms = _analyze_flagsparse_spsv_csr_reuse(
         data_csr,
         indices_csr,
         indptr_csr,
-        b,
         (n_rows, n_cols),
         lower=lower,
         transpose=transpose,
         solve_kind=solve_kind,
-        clear_cache=True,
-        return_time=True,
     )
-    x, solve_ms = _benchmark_flagsparse_spsv_csr(
-        data_csr,
-        indices_csr,
-        indptr_csr,
+    x, solve_ms = _benchmark_flagsparse_spsv_csr_reuse(
+        descr,
+        workspace,
         b,
-        (n_rows, n_cols),
-        lower=lower,
-        transpose=transpose,
-        solve_kind=solve_kind,
         warmup=warmup,
         iters=iters,
     )
@@ -840,7 +839,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-        "(Library-main style defaults; override with --warmup/--iters)"
+        "(override with --warmup/--iters)"
     )
     print(f"Triangle: {'LOWER' if lower else 'UPPER'}")
     print(f"Algorithm: {_alg_label(alg_num)}")
@@ -924,7 +923,7 @@ def run_spsv_synthetic_all(lower=True, alg_num=None):
                             )
                         torch.cuda.synchronize()
 
-                        x_pt, pytorch_ms, _pt_backend, pt_skip_reason = _benchmark_pytorch_reference(
+                        x_pt, pytorch_ms, _pt_backend, _pt_skip_reason = _benchmark_pytorch_reference(
                             data,
                             indices,
                             indptr,
@@ -1136,7 +1135,7 @@ def _finalize_csv_row(
         "n_cols": n_cols,
         "nnz": int(data.numel()),
         "analysis_ms": analysis_ms,
-        "triton_ms": t_ms,
+        "solve_ms": t_ms,
         "triton_total_ms": _sum_ms(analysis_ms, t_ms),
         "cusparse_ms": cupy_ms,
         "pytorch_ms": pytorch_ms,
@@ -1284,7 +1283,7 @@ def _finalize_csv_row_csr_full(
         "n_cols": n_cols,
         "nnz": int(data.numel()),
         "analysis_ms": analysis_ms,
-        "triton_ms": t_ms,
+        "solve_ms": t_ms,
         "triton_total_ms": _sum_ms(analysis_ms, t_ms),
         "cusparse_ms": cupy_ms,
         "pytorch_ms": pytorch_ms,
@@ -1344,10 +1343,10 @@ def run_all_supported_spsv_csr_csv(
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-                    "(Library-main style defaults; override with --warmup/--iters)"
+                    "(override with --warmup/--iters)"
                 )
                 print(
-                    "RHS is generated directly, matching Library-main's SpSV test style. "
+                    "RHS is generated directly. "
                     "PT.total / CU.total are single official interface call times. "
                     "PT.spdS and CU.spdS compare against FS.solve; PT.spdT and CU.spdT compare against FS.total. "
                     "Err(Ref)=best |FlagSparse-reference|, Err(Res)=|op(A)*x-b|, "
@@ -1374,7 +1373,7 @@ def run_all_supported_spsv_csr_csv(
                         n_rows, n_cols = row["n_rows"], row["n_cols"]
                         nnz = row["nnz"]
                         analysis_ms = row["analysis_ms"]
-                        t_ms = row["triton_ms"]
+                        t_ms = row["solve_ms"]
                         total_ms = row["triton_total_ms"]
                         cupy_ms = row["cusparse_ms"]
                         pytorch_ms = row["pytorch_ms"]
@@ -1403,7 +1402,7 @@ def run_all_supported_spsv_csr_csv(
                                 "n_cols": "ERR",
                                 "nnz": "ERR",
                                 "analysis_ms": None,
-                                "triton_ms": None,
+                                "solve_ms": None,
                                 "triton_total_ms": None,
                                 "cusparse_ms": None,
                                 "pytorch_ms": None,
@@ -1442,7 +1441,7 @@ def run_all_supported_spsv_csr_csv(
         "n_cols",
         "nnz",
         "analysis_ms",
-        "triton_ms",
+        "solve_ms",
         "triton_total_ms",
         "cusparse_ms",
         "pytorch_ms",
@@ -1504,11 +1503,11 @@ def run_all_dtypes_spsv_coo_csv(
                 print(
                     "Formats: FlagSparse=COO input routed through CSR SpSV, cuSPARSE=CSR ref, "
                     "PyTorch(ms)=official sparse solve reference. "
-                    "RHS is generated directly, matching Library-main's SpSV test style."
+                    "RHS is generated directly."
                 )
                 print(
                     f"Benchmark schedule: warmup={WARMUP}, iter={ITERS} "
-                    "(Library-main style defaults; override with --warmup/--iters)"
+                    "(override with --warmup/--iters)"
                 )
                 print(
                     "PT.total / CU.total are single official interface call times. "
@@ -1542,7 +1541,7 @@ def run_all_dtypes_spsv_coo_csv(
                         n_rows, n_cols = row["n_rows"], row["n_cols"]
                         nnz = row["nnz"]
                         analysis_ms = row["analysis_ms"]
-                        t_ms = row["triton_ms"]
+                        t_ms = row["solve_ms"]
                         total_ms = row["triton_total_ms"]
                         cupy_ms = row["cusparse_ms"]
                         pytorch_ms = row["pytorch_ms"]
@@ -1571,7 +1570,7 @@ def run_all_dtypes_spsv_coo_csv(
                                 "n_cols": "ERR",
                                 "nnz": "ERR",
                                 "analysis_ms": None,
-                                "triton_ms": None,
+                                "solve_ms": None,
                                 "triton_total_ms": None,
                                 "cusparse_ms": None,
                                 "pytorch_ms": None,
@@ -1609,7 +1608,7 @@ def run_all_dtypes_spsv_coo_csv(
         "n_cols",
         "nnz",
         "analysis_ms",
-        "triton_ms",
+        "solve_ms",
         "triton_total_ms",
         "cusparse_ms",
         "pytorch_ms",
@@ -1871,7 +1870,7 @@ def main():
         default=None,
         help=(
             "Algorithm selection compatible with allinone style. "
-            "Supported: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), 3=ALG3(csr_nnz_balance), 8=ALG8(csr_nnz_balance). "
+            "Supported: 1=ALG1(csr_cw), 2=ALG2(csr_cw_levelschd), 3=ALG3(csr_roc), 4=ALG4(csr_smblk), 8=ALG8(csr_nnz_balance). "
             "Omit to use AUTO routing."
         ),
     )
@@ -1903,7 +1902,7 @@ def main():
     WARMUP = max(0, int(args.warmup))
     ITERS = max(1, int(args.iters))
     lower = not args.upper
-    if args.alg_num in (2, 3, 8):
+    if args.alg_num in (2, 3, 4, 8):
         if args.check_transpose:
             raise ValueError(
                 f"ALG{args.alg_num} matches allinone's NON-only path; --check-transpose is not supported"

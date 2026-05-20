@@ -35,9 +35,8 @@ VALUE_DTYPE_ORDER = {
     "bfloat16": 1,
     "float32": 2,
     "float64": 3,
-    "complex32": 4,
-    "complex64": 5,
-    "complex128": 6,
+    "complex64": 4,
+    "complex128": 5,
 }
 INDEX_DTYPE_ORDER = {"int32": 0, "int64": 1}
 OP_ORDER = {"non": 0, "trans": 1, "conj": 2}
@@ -109,9 +108,6 @@ class SourceModule:
         if isinstance(node, ast.Call):
             return self._eval_call(node)
         if isinstance(node, ast.IfExp):
-            # Optional complex32/chalf support is represented as an if-expression.
-            # Report the declared capability conservatively, independent of the
-            # local torch build where this script is executed.
             return self._eval(node.body)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             left = self._as_tuple(self._eval(node.left))
@@ -124,8 +120,6 @@ class SourceModule:
 
     def _eval_call(self, node: ast.Call) -> Any:
         if isinstance(node.func, ast.Name):
-            if node.func.id == "_torch_complex32_dtype":
-                return "complex32"
             if node.func.id == "tuple" and node.args:
                 return self._as_tuple(self._eval(node.args[0]))
         return None
@@ -154,8 +148,6 @@ def normalize_dtype_values(value: Any) -> tuple[str, ...]:
         if item is None:
             continue
         token = str(item).replace("torch.", "")
-        if token == "chalf":
-            token = "complex32"
         if token not in dtypes:
             dtypes.append(token)
     return tuple(dtypes)
@@ -179,7 +171,7 @@ def discover_modules(src_root: Path) -> dict[str, SourceModule]:
         # _common.py builds this list with append/extend after initial assignment.
         # Static expression evaluation intentionally avoids executing that code,
         # so keep this fallback aligned with the declared global support set.
-        common_values = DEFAULT_VALUE_DTYPES + ("complex32",)
+        common_values = DEFAULT_VALUE_DTYPES
     shared = {
         "SUPPORTED_VALUE_DTYPES": common_values,
         "SUPPORTED_INDEX_DTYPES": normalize_dtype_values(common.get("SUPPORTED_INDEX_DTYPES")),
@@ -257,9 +249,8 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             "gather_scatter",
             "index",
             "triton",
-            value_const="SUPPORTED_VALUE_DTYPES",
+            value_const="SUPPORTED_SCATTER_VALUE_DTYPES",
             index_const="SUPPORTED_INDEX_DTYPES",
-            notes="effective dtype may fall back for optional complex32 when unavailable in the local torch build",
         ),
         ApiSpec("spmv", "flagsparse_spmv_csr", "spmv_csr", "CSR", "triton", value_const="SUPPORTED_SPMV_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_ops, notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent"),
         ApiSpec("spmv", "flagsparse_spmv_coo", "spmv_coo", "COO", "triton", value_const="SUPPORTED_SPMV_COO_VALUE_DTYPES", index_const="SUPPORTED_INDEX_DTYPES", ops=spmv_coo_ops, notes="COO path stores canonical row/col tensors and supports non/trans/conj"),

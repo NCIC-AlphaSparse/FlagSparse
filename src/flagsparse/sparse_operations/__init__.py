@@ -3,12 +3,16 @@
 from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
 from .alpha_spmm_alg1 import (
     PreparedAlphaSpmmAlg1,
+    alpha_spmm_alg1_tle_opt_unavailable_reason,
     alpha_spmm_alg1_tle_unavailable_reason,
     flagsparse_alpha_spmm_alg1,
     flagsparse_alpha_spmm_alg1_tle,
+    flagsparse_alpha_spmm_alg1_tle_opt,
+    is_alpha_spmm_alg1_tle_opt_available,
     is_alpha_spmm_alg1_tle_available,
     prepare_alpha_spmm_alg1,
     prepare_alpha_spmm_alg1_tle,
+    prepare_alpha_spmm_alg1_tle_opt,
 )
 from .gather_scatter import (
     cusparse_spmv_gather,
@@ -121,6 +125,8 @@ __all__ = [
     "cusparse_spmv_scatter",
     "flagsparse_gather",
     "flagsparse_alpha_spmm_alg1",
+    "flagsparse_alpha_spmm_alg1_tle",
+    "flagsparse_alpha_spmm_alg1_tle_opt",
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
     "flagsparse_spmm_coo",
@@ -154,6 +160,12 @@ __all__ = [
     "flagsparse_spsv_solve_csr",
     "prepare_sddmm_csr",
     "prepare_alpha_spmm_alg1",
+    "prepare_alpha_spmm_alg1_tle",
+    "prepare_alpha_spmm_alg1_tle_opt",
+    "is_alpha_spmm_alg1_tle_available",
+    "is_alpha_spmm_alg1_tle_opt_available",
+    "alpha_spmm_alg1_tle_unavailable_reason",
+    "alpha_spmm_alg1_tle_opt_unavailable_reason",
     "prepare_spgemm_csr",
     "prepare_spmm_csr_opt",
     "prepare_spmm_csr_opt_alg1",

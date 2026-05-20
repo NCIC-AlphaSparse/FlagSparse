@@ -100,6 +100,11 @@ def prepare_alpha_spmm_alg1_tle(data, indices, indptr, shape):
     return prepare_alpha_spmm_alg1(data, indices, indptr, shape)
 
 
+def prepare_alpha_spmm_alg1_tle_opt(data, indices, indptr, shape):
+    """Prepare CSR metadata for the TLE-Struct ALG1 optimization route."""
+    return prepare_alpha_spmm_alg1(data, indices, indptr, shape)
+
+
 def _alpha_spmm_alg1_acc_dtype(dtype):
     return tl.float64 if dtype == torch.float64 else tl.float32
 
@@ -160,6 +165,46 @@ def _build_alpha_spmm_alg1_runtime_meta(prepared, B):
         "beta": 0,
         "max_row_nnz": int(prepared.max_row_nnz),
     }
+    return meta
+
+
+def _resolve_alpha_spmm_alg1_tle_opt_launch(dtype, n_dense_cols, max_row_nnz, block_cols):
+    n_dense_cols = int(n_dense_cols)
+    max_row_nnz = int(max_row_nnz)
+    block_cols = int(block_cols)
+    if n_dense_cols <= 16:
+        num_warps = 2
+    elif n_dense_cols <= 64:
+        num_warps = 4
+    else:
+        num_warps = 8 if max_row_nnz >= 512 else 4
+    if block_cols >= 128:
+        num_warps = max(num_warps, 4)
+    if max_row_nnz >= 1024 and n_dense_cols > 32:
+        num_warps = max(num_warps, 8)
+    if dtype == torch.float64:
+        num_warps = min(num_warps, 8)
+    else:
+        num_warps = min(num_warps, 8)
+    num_stages = 1 if (n_dense_cols > 64 or block_cols >= 128 or max_row_nnz >= 512) else 2
+    return int(num_warps), int(num_stages)
+
+
+def _build_alpha_spmm_alg1_tle_opt_runtime_meta(prepared, B):
+    meta = _build_alpha_spmm_alg1_runtime_meta(prepared, B)
+    num_warps, num_stages = _resolve_alpha_spmm_alg1_tle_opt_launch(
+        prepared.data.dtype,
+        int(B.shape[1]),
+        prepared.max_row_nnz,
+        meta["block_cols"],
+    )
+    meta.update(
+        {
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "loop_strategy": "block_local_row_nnz",
+        }
+    )
     return meta
 
 
@@ -436,6 +481,143 @@ def _alpha_spmm_alg1_tle_rowmajor_kernel(
         )
 
 
+@triton.jit
+def _alpha_spmm_alg1_tle_opt_rowmajor_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_rows,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    WARP_SIZE: tl.constexpr,
+    FACTOR: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    MAX_ROW_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    lane_offsets = tl.arange(0, WARP_SIZE)
+    local_row_offsets = tl.arange(0, BLOCK_ROWS)
+    block_row_start = pid_m * BLOCK_ROWS
+    block_col_start = pid_n * BLOCK_COLS
+    offs0 = block_col_start + lane_offsets
+    mask0 = offs0 < n_dense_cols
+    offs1 = block_col_start + WARP_SIZE + lane_offsets
+    mask1 = offs1 < n_dense_cols
+    offs2 = block_col_start + 2 * WARP_SIZE + lane_offsets
+    mask2 = offs2 < n_dense_cols
+    offs3 = block_col_start + 3 * WARP_SIZE + lane_offsets
+    mask3 = offs3 < n_dense_cols
+
+    if ACC_DTYPE == tl.float64:
+        s_val = tle.gpu.alloc(
+            (BLOCK_ROWS, WARP_SIZE),
+            dtype=tl.float64,
+            scope=tle.gpu.smem,
+        )
+    else:
+        s_val = tle.gpu.alloc(
+            (BLOCK_ROWS, WARP_SIZE),
+            dtype=tl.float32,
+            scope=tle.gpu.smem,
+        )
+    s_col = tle.gpu.alloc(
+        (BLOCK_ROWS, WARP_SIZE),
+        dtype=tl.int32,
+        scope=tle.gpu.smem,
+    )
+
+    rows = block_row_start + local_row_offsets
+    row_valid = rows < n_rows
+    row_start = tl.load(indptr_ptr + rows, mask=row_valid, other=0)
+    row_end = tl.load(indptr_ptr + rows + 1, mask=row_valid, other=0)
+    row_nnz = row_end - row_start
+    block_row_nnz = tl.max(tl.where(row_valid, row_nnz, 0), axis=0)
+
+    zeros_2d = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=tl.int32)
+    row_ids_2d = local_row_offsets[:, None] + zeros_2d
+    lane_ids_2d = lane_offsets[None, :] + zeros_2d
+    acc0 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+    acc1 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+    acc2 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+    acc3 = tl.zeros((BLOCK_ROWS, WARP_SIZE), dtype=ACC_DTYPE)
+
+    # TLEOpt keeps the ALG1 staging structure but limits this program's loop to
+    # the current row block instead of the matrix-wide max row nnz.
+    for chunk_offset in tl.range(0, block_row_nnz, WARP_SIZE):
+        elem_offsets = row_start[:, None] + chunk_offset + lane_ids_2d
+        valid_offsets = row_valid[:, None] & ((chunk_offset + lane_ids_2d) < row_nnz[:, None])
+        staged_cols = tl.load(indices_ptr + elem_offsets, mask=valid_offsets, other=0)
+        staged_vals = tl.load(data_ptr + elem_offsets, mask=valid_offsets, other=0.0).to(ACC_DTYPE)
+        tl.store(tle.gpu.local_ptr(s_col, indices=(row_ids_2d, lane_ids_2d)), staged_cols, mask=valid_offsets)
+        tl.store(tle.gpu.local_ptr(s_val, indices=(row_ids_2d, lane_ids_2d)), staged_vals, mask=valid_offsets)
+
+        for jj in tl.static_range(0, WARP_SIZE):
+            valid = row_valid & ((chunk_offset + jj) < row_nnz)
+            local_jj = tl.full((BLOCK_ROWS,), jj, dtype=tl.int32)
+            a_col = tl.load(tle.gpu.local_ptr(s_col, indices=(local_row_offsets, local_jj)), mask=valid, other=0)
+            a_val = tl.load(tle.gpu.local_ptr(s_val, indices=(local_row_offsets, local_jj)), mask=valid, other=0.0).to(ACC_DTYPE)
+            if FACTOR > 0:
+                b0 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs0[None, :] * stride_bn,
+                    mask=valid[:, None] & mask0[None, :],
+                    other=0.0,
+                )
+                acc0 = acc0 + a_val[:, None] * b0.to(ACC_DTYPE)
+            if FACTOR > 1:
+                b1 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs1[None, :] * stride_bn,
+                    mask=valid[:, None] & mask1[None, :],
+                    other=0.0,
+                )
+                acc1 = acc1 + a_val[:, None] * b1.to(ACC_DTYPE)
+            if FACTOR > 2:
+                b2 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs2[None, :] * stride_bn,
+                    mask=valid[:, None] & mask2[None, :],
+                    other=0.0,
+                )
+                acc2 = acc2 + a_val[:, None] * b2.to(ACC_DTYPE)
+            if FACTOR > 3:
+                b3 = tl.load(
+                    b_ptr + a_col[:, None] * stride_bk + offs3[None, :] * stride_bn,
+                    mask=valid[:, None] & mask3[None, :],
+                    other=0.0,
+                )
+                acc3 = acc3 + a_val[:, None] * b3.to(ACC_DTYPE)
+
+    tl.store(
+        c_ptr + rows[:, None] * stride_cm + offs0[None, :] * stride_cn,
+        acc0,
+        mask=row_valid[:, None] & mask0[None, :],
+    )
+    if FACTOR > 1:
+        tl.store(
+            c_ptr + rows[:, None] * stride_cm + offs1[None, :] * stride_cn,
+            acc1,
+            mask=row_valid[:, None] & mask1[None, :],
+        )
+    if FACTOR > 2:
+        tl.store(
+            c_ptr + rows[:, None] * stride_cm + offs2[None, :] * stride_cn,
+            acc2,
+            mask=row_valid[:, None] & mask2[None, :],
+        )
+    if FACTOR > 3:
+        tl.store(
+            c_ptr + rows[:, None] * stride_cm + offs3[None, :] * stride_cn,
+            acc3,
+            mask=row_valid[:, None] & mask3[None, :],
+        )
+
+
 def is_alpha_spmm_alg1_tle_available():
     return tle is not None
 
@@ -444,6 +626,14 @@ def alpha_spmm_alg1_tle_unavailable_reason():
     if _TLE_IMPORT_ERROR is None:
         return "TLE kernel is not available in this runtime"
     return f"{type(_TLE_IMPORT_ERROR).__name__}: {_TLE_IMPORT_ERROR}"
+
+
+def is_alpha_spmm_alg1_tle_opt_available():
+    return is_alpha_spmm_alg1_tle_available()
+
+
+def alpha_spmm_alg1_tle_opt_unavailable_reason():
+    return alpha_spmm_alg1_tle_unavailable_reason()
 
 
 def _run_alpha_spmm_alg1_tle(prepared, B, meta):
@@ -466,6 +656,49 @@ def _run_alpha_spmm_alg1_tle(prepared, B, meta):
     )
     grid = (meta["grid_m"], meta["grid_n"])
     _alpha_spmm_alg1_tle_rowmajor_kernel[grid](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        prepared.n_rows,
+        int(B.shape[1]),
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        WARP_SIZE=meta["warp_size"],
+        FACTOR=meta["factor"],
+        BLOCK_ROWS=meta["block_rows"],
+        BLOCK_COLS=meta["block_cols"],
+        MAX_ROW_NNZ=meta["max_row_nnz"],
+        ACC_DTYPE=_alpha_spmm_alg1_acc_dtype(prepared.data.dtype),
+        num_warps=meta["num_warps"],
+        num_stages=meta["num_stages"],
+    )
+    return C_out
+
+
+def _run_alpha_spmm_alg1_tle_opt(prepared, B, meta):
+    if tle is None:
+        raise RuntimeError(
+            "flagsparse_alpha_spmm_alg1_tle_opt requires FlagTree/TLE-Struct runtime "
+            f"support ({alpha_spmm_alg1_tle_opt_unavailable_reason()})"
+        )
+    if prepared.n_rows == 0 or int(B.shape[1]) == 0:
+        return torch.zeros(
+            (prepared.n_rows, int(B.shape[1])),
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
+        )
+
+    C_out = torch.empty(
+        (prepared.n_rows, int(B.shape[1])),
+        dtype=prepared.data.dtype,
+        device=prepared.data.device,
+    )
+    grid = (meta["grid_m"], meta["grid_n"])
+    _alpha_spmm_alg1_tle_opt_rowmajor_kernel[grid](
         prepared.data,
         prepared.kernel_indices,
         prepared.kernel_indptr,
@@ -555,6 +788,43 @@ def flagsparse_alpha_spmm_alg1_tle(
         "alpha_spmm_alg1_tle",
     )
     C = _run_alpha_spmm_alg1_tle(prepared, B, meta)
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if return_meta:
+        return C, meta
+    return C
+
+
+def flagsparse_alpha_spmm_alg1_tle_opt(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_meta=False,
+):
+    """Experimental TLE-Struct optimized port of AlphaSparse CUDA CSR ALG1."""
+    if prepared is not None and not isinstance(prepared, PreparedAlphaSpmmAlg1):
+        raise TypeError("prepared must be a PreparedAlphaSpmmAlg1 instance")
+    raw_inputs_provided = any(arg is not None for arg in (data, indices, indptr, shape))
+    if prepared is not None and raw_inputs_provided:
+        raise ValueError("Pass either raw CSR inputs or prepared, not both")
+    if prepared is None:
+        if any(arg is None for arg in (data, indices, indptr, shape)):
+            raise ValueError(
+                "data, indices, indptr, and shape are required when prepared is not provided"
+            )
+        prepared = prepare_alpha_spmm_alg1_tle_opt(data, indices, indptr, shape)
+
+    B = _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out)
+    meta = _with_alpha_spmm_alg1_route(
+        _build_alpha_spmm_alg1_tle_opt_runtime_meta(prepared, B),
+        "alpha_spmm_alg1_tle_opt",
+    )
+    C = _run_alpha_spmm_alg1_tle_opt(prepared, B, meta)
     if out is not None:
         out.copy_(C)
         C = out
