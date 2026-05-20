@@ -94,7 +94,7 @@ class FlagSparseSpSVWorkspace:
     device: torch.device
     buffers: dict = field(default_factory=dict, repr=False)
     prepared_solve_kind: str = ""
-    prepared_signature: tuple | None = None
+    prepared_signature: tuple = None
 
 
 @dataclass

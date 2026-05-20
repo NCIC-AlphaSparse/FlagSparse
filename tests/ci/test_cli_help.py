@@ -11,7 +11,9 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 if os.environ.get("FLAGSPARSE_TRITON_SMOKE") != "1":
-    pytest.skip("triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True)
+    pytest.skip(
+        "triton smoke is opt-in and excluded from CPU-only CI", allow_module_level=True
+    )
 
 SCRIPTS = [
     "run_flagsparse_pytest.py",

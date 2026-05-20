@@ -6,20 +6,21 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import List, Optional, Pattern, Tuple
 
 
 WHEEL_RE = re.compile(r"^flagsparse-(?P<version>[^-]+)-py3-none-any\.whl$")
 SDIST_RE = re.compile(r"^flagsparse-(?P<version>[^-]+)\.tar\.gz$")
 
 
-def _extract_version(path: Path, pattern: re.Pattern[str]) -> str:
+def _extract_version(path: Path, pattern: Pattern[str]) -> str:
     match = pattern.match(path.name)
     if match is None:
         raise AssertionError(f"unexpected artifact name: {path.name}")
     return match.group("version")
 
 
-def validate_release_artifacts(dist_dir: Path) -> tuple[Path, Path]:
+def validate_release_artifacts(dist_dir: Path) -> Tuple[Path, Path]:
     """Return the wheel and sdist after validating their names and versions."""
     wheels = sorted(dist_dir.glob("*.whl"))
     sdists = sorted(dist_dir.glob("*.tar.gz"))
@@ -41,7 +42,7 @@ def validate_release_artifacts(dist_dir: Path) -> tuple[Path, Path]:
     return wheel, sdist
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dist_dir", nargs="?", default="dist")
     args = parser.parse_args(argv)

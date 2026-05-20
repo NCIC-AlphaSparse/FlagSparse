@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 
 def _sha256(path: Path) -> str:
@@ -18,7 +19,9 @@ def _sha256(path: Path) -> str:
 
 def write_manifest(dist_dir: Path, manifest_name: str = "SHA256SUMS") -> Path:
     artifacts = sorted(
-        path for path in dist_dir.iterdir() if path.is_file() and path.name != manifest_name
+        path
+        for path in dist_dir.iterdir()
+        if path.is_file() and path.name != manifest_name
     )
     if not artifacts:
         raise AssertionError(f"no artifacts found in {dist_dir}")
@@ -45,21 +48,25 @@ def verify_manifest(dist_dir: Path, manifest_name: str = "SHA256SUMS") -> Path:
     for filename, digest in expected.items():
         artifact = dist_dir / filename
         if not artifact.is_file():
-            raise AssertionError(f"missing release artifact listed in manifest: {artifact}")
+            raise AssertionError(
+                f"missing release artifact listed in manifest: {artifact}"
+            )
         if _sha256(artifact) != digest:
             raise AssertionError(f"checksum mismatch for {artifact}")
 
     return manifest_path
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dist_dir", nargs="?", default="dist")
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
 
     dist_dir = Path(args.dist_dir)
-    manifest_path = verify_manifest(dist_dir) if args.verify else write_manifest(dist_dir)
+    manifest_path = (
+        verify_manifest(dist_dir) if args.verify else write_manifest(dist_dir)
+    )
     print(manifest_path)
     return 0
 

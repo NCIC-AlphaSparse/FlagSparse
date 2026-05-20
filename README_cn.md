@@ -120,6 +120,21 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 32
 
 **test_gather.py** / **test_scatter.py** - gather/scatter 基准（pytest 或 `python tests/test_gather.py`）。
 
+## CI/CD
+
+- `.github/workflows/ci.yml` 是默认 CPU CI，在 GitHub-hosted runner 上执行编译检查、格式检查、静态检查、源码严重错误检查、构建、安装校验和 smoke 测试。
+- smoke 测试覆盖已安装 wheel 校验、打包元数据、公开 API、算子接口注册表一致性、共享运行时策略、CLI `--help` 和 README 命令片段。
+- `conf/operators.yaml` 是参考 FlagGems 风格维护的算子接口注册表，覆盖公开的 FlagSparse 稀疏算子和稀疏格式辅助接口。
+- `.github/workflows/nightly-cpu.yml` 是 main 分支夜间 CPU 检查，复用默认 CI 流程。
+- `.github/workflows/release.yml` 在 `v*` tag 上构建源码包和 wheel，校验发布产物并上传 GitHub Release。
+- `.github/workflows/triton-smoke.yml` 是手动触发的 Triton smoke 检查。
+- `.github/workflows/gpu-benchmark.yml` 是手动触发的 GPU 性能检查，依赖带 `self-hosted`、`linux`、`gpu` 标签的 runner。
+- `make ci` / `make check` 运行默认 CPU CI 流程。
+- `make format-check`、`make lint`、`make lint-src` 分别对应格式检查、CI 脚本静态检查和源码严重错误检查。
+- `make release-check` / `make release` 构建、校验并生成发布产物 checksum。
+- PR 门禁由默认 CPU CI workflow 提供；需要在 GitHub 分支保护中把 `CI / Build and smoke test` 设置为必需检查。
+- GPU 性能和 Triton smoke 属于手动/可选流程，当前不进入默认 CPU 门禁。
+
 ## 授权许可
 
 本项目采用 [Apache (Version 2.0) license](./LICENSE) 许可证授权。

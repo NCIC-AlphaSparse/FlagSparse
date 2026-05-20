@@ -1,0 +1,352 @@
+ops:
+  - id: gather
+    description: |
+      Gathers values from a dense tensor by index using the FlagSparse gather path.
+    for:
+      - flagsparse_gather
+    labels:
+      - flagsparse
+      - sparse
+      - triton
+      - public-api
+    kind:
+      - Sparse
+    stages:
+      - beta: "1.0"
+
+  - id: scatter
+    description: |
+      Scatters values into a dense tensor by index using the FlagSparse scatter path.
+    for:
+      - flagsparse_scatter
+    labels:
+      - flagsparse
+      - sparse
+      - triton
+      - public-api
+    kind:
+      - Sparse
+    stages:
+      - beta: "1.0"
+
+  - id: spmv_csr
+    description: |
+      Computes sparse matrix-vector multiplication for a CSR matrix.
+    for:
+      - flagsparse_spmv_csr
+      - prepare_spmv_csr
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmv_coo
+    description: |
+      Computes sparse matrix-vector multiplication for a COO matrix.
+    for:
+      - flagsparse_spmv_coo
+      - prepare_spmv_coo
+    labels:
+      - flagsparse
+      - sparse
+      - coo
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmv_coo_tocsr
+    description: |
+      Computes COO SpMV through a COO-to-CSR preparation path.
+    for:
+      - flagsparse_spmv_coo_tocsr
+      - prepare_spmv_coo_tocsr
+    labels:
+      - flagsparse
+      - sparse
+      - coo
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmm_csr
+    description: |
+      Computes sparse matrix-dense matrix multiplication for a CSR matrix.
+    for:
+      - flagsparse_spmm_csr
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmm_coo
+    description: |
+      Computes sparse matrix-dense matrix multiplication for a COO matrix.
+    for:
+      - flagsparse_spmm_coo
+    labels:
+      - flagsparse
+      - sparse
+      - coo
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmm_csr_opt
+    description: |
+      Computes optimized CSR sparse matrix-dense matrix multiplication.
+    for:
+      - flagsparse_spmm_csr_opt
+      - prepare_spmm_csr_opt
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - optimized
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmm_csr_opt_alg1
+    description: |
+      Computes optimized CSR SpMM using the algorithm 1 path.
+    for:
+      - flagsparse_spmm_csr_opt_alg1
+      - flagsparse_spmm_csr_opt_alg1_preprocess
+      - prepare_spmm_csr_opt_alg1
+      - prepare_spmm_csr_opt_alg1_preprocess
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - optimized
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spmm_csr_opt_alg2
+    description: |
+      Computes optimized CSR SpMM using the algorithm 2 path.
+    for:
+      - flagsparse_spmm_csr_opt_alg2
+      - flagsparse_spmm_csr_opt_alg2_preprocess
+      - prepare_spmm_csr_opt_alg2
+      - prepare_spmm_csr_opt_alg2_preprocess
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - optimized
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: alpha_spmm_alg1
+    description: |
+      Computes AlphaSparse-style CSR SpMM using the algorithm 1 implementation family.
+    for:
+      - flagsparse_alpha_spmm_alg1
+      - flagsparse_alpha_spmm_alg1_tle
+      - flagsparse_alpha_spmm_alg1_tle_opt
+      - prepare_alpha_spmm_alg1
+      - prepare_alpha_spmm_alg1_tle
+      - prepare_alpha_spmm_alg1_tle_opt
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - alpha-sparse
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spgemm_csr
+    description: |
+      Computes sparse matrix-sparse matrix multiplication for CSR inputs.
+    for:
+      - flagsparse_spgemm_csr
+      - prepare_spgemm_csr
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: sddmm_csr
+    description: |
+      Computes sampled dense-dense matrix multiplication on a CSR sparsity pattern.
+    for:
+      - flagsparse_sddmm_csr
+      - prepare_sddmm_csr
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
+  - id: spsv_csr
+    description: |
+      Solves sparse triangular systems represented in CSR format.
+    for:
+      - flagsparse_spsv_csr
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseSolver
+    stages:
+      - beta: "1.0"
+
+  - id: spsv_coo
+    description: |
+      Solves sparse triangular systems represented in COO format.
+    for:
+      - flagsparse_spsv_coo
+    labels:
+      - flagsparse
+      - sparse
+      - coo
+      - triton
+      - public-api
+    kind:
+      - SparseSolver
+    stages:
+      - beta: "1.0"
+
+  - id: spsv_descriptor_api
+    description: |
+      Provides descriptor, buffer-size, analysis, preprocess, and solve APIs for SpSV workflows.
+    for:
+      - flagsparse_create_spsv_handle
+      - flagsparse_create_dnvec
+      - flagsparse_create_spmat_csr
+      - flagsparse_create_spmat_coo
+      - flagsparse_spsv_buffer_size
+      - flagsparse_spsv_buffer_size_ex
+      - flagsparse_spsv_create_workspace
+      - flagsparse_spsv_analysis_csr
+      - flagsparse_spsv_analysis_coo
+      - flagsparse_spsv_analysis_ex
+      - flagsparse_spsv_preprocess_csr
+      - flagsparse_spsv_preprocess_coo
+      - flagsparse_spsv_solve_csr
+      - flagsparse_spsv_solve_coo
+      - flagsparse_spsv_solve_ex
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - coo
+      - descriptor
+      - public-api
+    kind:
+      - SparseSolver
+      - Utility
+    stages:
+      - beta: "1.0"
+
+  - id: spsm_csr
+    description: |
+      Solves sparse triangular systems with dense matrix right-hand sides in CSR format.
+    for:
+      - flagsparse_spsm_csr
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - triton
+      - public-api
+    kind:
+      - SparseSolver
+    stages:
+      - beta: "1.0"
+
+  - id: spsm_coo
+    description: |
+      Solves sparse triangular systems with dense matrix right-hand sides in COO format.
+    for:
+      - flagsparse_spsm_coo
+    labels:
+      - flagsparse
+      - sparse
+      - coo
+      - triton
+      - public-api
+    kind:
+      - SparseSolver
+    stages:
+      - beta: "1.0"
+
+  - id: sparse_format_constructors
+    description: |
+      Creates sparse matrix containers and converts COO data into supported sparse formats.
+    for:
+      - create_csr_matrix
+      - create_coo_matrix
+      - create_csc_matrix
+      - create_bsr_matrix
+      - create_sell_matrix
+      - create_blocked_ell_matrix
+      - coo_to_csr
+      - coo_to_csc
+      - coo_to_bsr
+      - coo_to_sell
+      - coo_to_blocked_ell
+      - generate_random_sparse_matrix
+      - read_mtx_file
+    labels:
+      - flagsparse
+      - sparse
+      - format
+      - public-api
+    kind:
+      - SparseFormat
+      - Utility
+    stages:
+      - beta: "1.0"
