@@ -14,9 +14,10 @@ COPY . /workspace/FlagSparse
 
 RUN SPEC_VERSION=$(grep '^Version:' /workspace/FlagSparse/packaging/rpm/specs/flagsparse.spec | awk '{print $2}') && \
     tar czf /root/rpmbuild/SOURCES/flagsparse-${SPEC_VERSION}.tar.gz \
-        -C /workspace \
-        --transform "s|^FlagSparse|flagsparse-${SPEC_VERSION}|" \
-        FlagSparse
+        -C /workspace/FlagSparse \
+        --transform "s|^\./|flagsparse-${SPEC_VERSION}/|" \
+        --exclude='./.git' \
+        .
 
 RUN rpmbuild -ba /workspace/FlagSparse/packaging/rpm/specs/flagsparse.spec 2>&1 || \
     { echo "=== build failed ==="; \
