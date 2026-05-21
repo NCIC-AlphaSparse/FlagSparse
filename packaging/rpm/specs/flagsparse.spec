@@ -7,8 +7,7 @@ Summary:        FlagSparse — sparse compute kernels for FlagOS
 
 License:        Apache-2.0
 URL:            https://github.com/flagos-ai/FlagSparse
-Source0:        flagsparse-%{version}.tar.gz
-
+Source0:        %{url}/archive/v%{version}/flagsparse-%{version}.tar.gz
 BuildArch:      noarch
 BuildRequires:  python3-devel
 BuildRequires:  python3-setuptools >= 60
