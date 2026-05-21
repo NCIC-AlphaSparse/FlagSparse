@@ -17,7 +17,7 @@ export PYBUILD_NAME = flagsparse
 override_dh_auto_test:
 	@echo "=== smoke find_spec test ==="
 	@found_dir=""; \
-	for d in .pybuild/cpython3_*/build $(CURDIR)/src $(CURDIR); do \
+	for d in .pybuild/cpython3_*/build; do \
 	    if [ -d "$$d/flagsparse" ]; then \
 	        found_dir="$$d"; \
 	        break; \
