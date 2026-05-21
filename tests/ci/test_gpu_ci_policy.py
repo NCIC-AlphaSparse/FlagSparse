@@ -38,6 +38,9 @@ def test_gpu_benchmark_workflow_uploads_artifacts():
     assert "self-hosted" in text
     assert "gpu" in text
     assert "tools/ci/run_gpu_benchmark.py" in text
+    assert "matrix_dir:" in text
+    for suite_name in ["alpha-spmm-alg1", "spmm-opt-alg2", "spgemm", "sddmm"]:
+        assert suite_name in text
     assert "actions/upload-artifact@v4" in text
 
 

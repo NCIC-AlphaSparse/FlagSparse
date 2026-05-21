@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Synthetic benchmark suite to run
+        description: GPU benchmark suite to run
         required: true
         default: quick
         type: choice
         options:
           - quick
+          - full
           - full-synthetic
           - gather
           - scatter
@@ -19,6 +20,15 @@ on:
           - spmm-coo
           - spsv
           - spsm
+          - alpha-spmm-alg1
+          - spmm-opt-alg2
+          - spgemm
+          - sddmm
+      matrix_dir:
+        description: MatrixMarket file or directory used by mtx-backed suites
+        required: true
+        default: tests/data
+        type: string
       warmup:
         description: Warmup iterations for suites that support it
         required: true
@@ -79,6 +89,7 @@ jobs:
         run: |
           args=(
             --suite "${{ inputs.suite }}"
+            --matrix-dir "${{ inputs.matrix_dir }}"
             --warmup "${{ inputs.warmup }}"
             --iters "${{ inputs.iters }}"
           )

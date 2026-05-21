@@ -147,6 +147,7 @@ outputs compare against CPU int32 references.
 - `make gpu-env-check` validates CUDA visibility through `tools/ci/check_gpu_environment.py` on a GPU runner.
 - `make gpu-benchmark` runs the quick synthetic benchmark suite on a CUDA machine.
 - `python tools/ci/run_gpu_benchmark.py --suite quick` mirrors the manual GPU benchmark workflow locally on a CUDA machine.
+- `python tools/ci/run_gpu_benchmark.py --suite full --matrix-dir tests/data` runs the full benchmark matrix, including `.mtx`-backed SpGEMM and SDDMM suites against the repository test matrices.
 - `tools/ci/requirements-ci.lock.txt` and `tools/ci/requirements-triton-smoke.lock.txt` are the pinned local dependency bundles behind those make targets.
 - `.github/dependabot.yml` keeps GitHub Actions and Python dependency updates visible.
 - `.github/ISSUE_TEMPLATE/` keeps issue entry points structured for bugs and feature requests.
@@ -161,6 +162,7 @@ outputs compare against CPU int32 references.
 - `benchmark/attri_util.py` and `benchmark/core_shapes.yaml` keep default and special shape grids centralized.
 - `benchmark/summary_for_plot.py` reads recorded benchmark CSV files and reports the two-level speedup summary.
 - `benchmark/test_sparse_perf.py` is an opt-in pytest entry point; real GPU runs remain manual or self-hosted because GitHub-hosted runners do not provide CUDA GPUs.
+- `tests/data/*.mtx` can be used as the default MatrixMarket smoke dataset for mtx-backed GPU benchmark suites.
 
 ## License
 

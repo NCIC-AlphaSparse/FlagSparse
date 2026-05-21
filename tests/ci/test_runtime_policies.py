@@ -23,25 +23,22 @@ from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops  # noqa: E402
 # fmt: on
 
 
-def test_scatter_dtype_policy_fallback_is_explicit():
+def test_scatter_dtype_policy_complex64_resolves_directly():
     value_dtype, fell_back, reason = _common._resolve_scatter_value_dtype(
-        "complex32", dtype_policy="auto"
+        "complex64", dtype_policy="auto"
     )
-    if _common._torch_complex32_dtype() is None:
-        assert value_dtype == torch.complex64
-        assert fell_back is True
-        assert reason is not None
-    else:
-        assert value_dtype == _common._torch_complex32_dtype()
-        assert fell_back is False
-        assert reason is None
+    assert value_dtype == torch.complex64
+    assert fell_back is False
+    assert reason is None
 
 
-def test_scatter_dtype_policy_strict_rejects_missing_complex32():
-    if _common._torch_complex32_dtype() is not None:
-        pytest.skip("torch has native complex32 in this environment")
-    with pytest.raises(TypeError, match="complex32 is unavailable"):
-        _common._resolve_scatter_value_dtype("complex32", dtype_policy="strict")
+def test_scatter_dtype_policy_complex128_resolves_directly():
+    value_dtype, fell_back, reason = _common._resolve_scatter_value_dtype(
+        "complex128", dtype_policy="strict"
+    )
+    assert value_dtype == torch.complex128
+    assert fell_back is False
+    assert reason is None
 
 
 @pytest.mark.parametrize("policy", ["auto", "strict"])

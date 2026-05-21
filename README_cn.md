@@ -138,6 +138,7 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 32
 - `make release-check` / `make release` 构建、校验并生成发布产物 checksum。
 - `make gpu-env-check` 通过 `tools/ci/check_gpu_environment.py` 在 GPU runner 上检查 CUDA 可见性。
 - `make gpu-benchmark` 在 CUDA 机器上运行 quick 合成性能套件。
+- `python tools/ci/run_gpu_benchmark.py --suite full --matrix-dir tests/data` 可运行完整 GPU benchmark 集合，其中 `spgemm`、`sddmm` 会使用仓库内的 `.mtx` 测试矩阵。
 - PR 门禁由默认 CPU CI workflow 提供；需要在 GitHub 分支保护中把 `CI / Build and smoke test` 设置为必需检查。
 - GPU 精度、GPU 性能和 Triton smoke 属于手动/可选流程，当前不进入默认 CPU 门禁。
 
@@ -147,6 +148,7 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 32
 - `benchmark/attri_util.py` 和 `benchmark/core_shapes.yaml` 集中维护默认形状和特殊形状。
 - `benchmark/summary_for_plot.py` 用于解析记录文件并输出两级平均加速比统计。
 - `benchmark/test_sparse_perf.py` 是可选 pytest 入口；真实 GPU 性能测试仍需手动或 self-hosted GPU runner 执行。
+- `tests/data/*.mtx` 可作为依赖矩阵输入的 GPU benchmark 默认烟测数据集。
 
 ## 授权许可
 
