@@ -38,7 +38,7 @@ PYTHONDONTWRITEBYTECODE=1 \
     python3 -c "import importlib.util; s = importlib.util.find_spec('flagsparse'); assert s and s.origin, 'flagsparse not findable'; print('OK: flagsparse at', s.origin)"
 
 %files -f %{pyproject_files}
-%license LICENSE*
+%license LICENSE
 
 %changelog
 * Wed May 13 2026 FlagOS Contributors <contact@flagos.io> - 1.0.0-1
