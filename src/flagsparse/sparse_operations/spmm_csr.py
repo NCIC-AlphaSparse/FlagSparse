@@ -2,6 +2,7 @@
 
 from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
+from dataclasses import dataclass
 
 SUPPORTED_SPMM_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 
@@ -504,6 +505,297 @@ def _resolve_spmm_base_triton_launch(
         "num_warps": int(num_warps),
         "num_stages": int(num_stages),
     }
+
+
+@dataclass(frozen=True)
+class SpmmCsrAlgorithm:
+    """Registered CSR SpMM route for the AlphaSparse-style run API."""
+
+    name: str
+    display_name: str
+    supported_ops: tuple
+    supported_dtypes: tuple
+    run: object
+
+
+class PreparedCsrSpmmRoute:
+    """Matrix-level CSR SpMM route preparation shared by route algorithms."""
+
+    __slots__ = (
+        "data",
+        "kernel_indices",
+        "kernel_indptr",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "row_lengths",
+        "max_row_nnz",
+        "nnz",
+        "avg_nnz_per_row",
+        "op",
+        "alg",
+    )
+
+    def __init__(
+        self,
+        data,
+        kernel_indices,
+        kernel_indptr,
+        shape,
+        n_rows,
+        n_cols,
+        row_lengths,
+        max_row_nnz,
+        op,
+        alg,
+    ):
+        self.data = data
+        self.kernel_indices = kernel_indices
+        self.kernel_indptr = kernel_indptr
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows = int(n_rows)
+        self.n_cols = int(n_cols)
+        self.row_lengths = row_lengths
+        self.max_row_nnz = int(max_row_nnz)
+        self.nnz = int(data.numel())
+        self.avg_nnz_per_row = float(self.nnz) / float(max(1, self.n_rows))
+        self.op = str(op)
+        self.alg = str(alg)
+
+
+def _normalize_spmm_csr_alg(alg):
+    token = "auto" if alg is None else str(alg).strip().lower()
+    if token in ("base", "csr", "csr_base"):
+        return "csr_base"
+    if token == "auto":
+        return "auto"
+    return token
+
+
+def _validate_spmm_route_runtime_inputs(prepared, B):
+    if not isinstance(prepared, PreparedCsrSpmmRoute):
+        raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
+    if B is None:
+        raise ValueError("B is required")
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != prepared.data.device:
+        raise ValueError("B must be on the same CUDA device as sparse matrix data")
+    if B.dtype != prepared.data.dtype:
+        raise TypeError("B dtype must match sparse matrix dtype")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+    return B.contiguous()
+
+
+def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
+    B = _validate_spmm_route_runtime_inputs(prepared, B)
+    device_props = _normalize_spmm_base_device_props(prepared.data.device)
+    launch = _resolve_spmm_base_triton_launch(
+        prepared.data.dtype,
+        int(B.shape[1]),
+        prepared.max_row_nnz,
+        device_props=device_props,
+    )
+    process_cpu_ms = 0.0
+    process_gpu_ms = 0.0 if timing else None
+    compute_ms = None
+    if timing:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    C = _triton_spmm_csr_impl(
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        prepared.n_rows,
+        int(B.shape[1]),
+        block_n=launch["block_n"],
+        block_nnz=launch["block_nnz"],
+        num_warps=launch["num_warps"],
+        num_stages=launch["num_stages"],
+    )
+    if timing:
+        end.record()
+        torch.cuda.synchronize()
+        compute_ms = start.elapsed_time(end)
+    meta = {
+        "alg": "csr_base",
+        "display_name": "Base",
+        "op": prepared.op,
+        "process_cpu_ms": process_cpu_ms,
+        "process_gpu_ms": process_gpu_ms,
+        "compute_ms": compute_ms,
+    }
+    if diagnostics:
+        meta["diagnostics"] = {
+            "launch_config_scope": "matrix",
+            "launch_config_count": 1,
+            "bucket_count": 0,
+            "long_row_count": 0,
+            "launch_version": "csr_base_v1",
+            "block_n": launch["block_n"],
+            "block_nnz": launch["block_nnz"],
+            "num_warps": launch["num_warps"],
+            "num_stages": launch["num_stages"],
+            "required_segments": launch["required_segments"],
+            "warp_size": launch["warp_size"],
+            "factor": launch["factor"],
+        }
+    return C, meta
+
+
+SPMM_CSR_ALGORITHMS = {
+    "csr_base": SpmmCsrAlgorithm(
+        name="csr_base",
+        display_name="Base",
+        supported_ops=tuple(SPMM_OP_NAMES.values()),
+        supported_dtypes=SUPPORTED_SPMM_VALUE_DTYPES,
+        run=_run_spmm_csr_base_route,
+    )
+}
+
+
+def resolve_spmm_csr_algorithm(alg, op, dtype):
+    token = _normalize_spmm_csr_alg(alg)
+    if token == "auto":
+        token = "csr_base"
+    if token not in SPMM_CSR_ALGORITHMS:
+        supported = ", ".join(sorted(SPMM_CSR_ALGORITHMS))
+        raise ValueError(f"unsupported CSR SpMM algorithm {alg!r}; supported: auto, {supported}")
+    algorithm = SPMM_CSR_ALGORITHMS[token]
+    op_name = _spmm_op_to_name(op)
+    if op_name not in algorithm.supported_ops:
+        raise ValueError(f"algorithm {token!r} does not support op {op_name!r}")
+    if dtype not in algorithm.supported_dtypes:
+        raise TypeError(f"algorithm {token!r} does not support dtype {dtype}")
+    return algorithm
+
+
+def list_spmm_csr_algorithms(op=None, dtype=None):
+    op_name = None if op is None else _spmm_op_to_name(op)
+    names = []
+    for name, algorithm in SPMM_CSR_ALGORITHMS.items():
+        if op_name is not None and op_name not in algorithm.supported_ops:
+            continue
+        if dtype is not None and dtype not in algorithm.supported_dtypes:
+            continue
+        names.append(name)
+    return tuple(names)
+
+
+def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"):
+    """Prepare matrix-level CSR SpMM metadata for the route-based run API."""
+    op_code = _normalize_spmm_op(op)
+    op_name = _spmm_op_to_name(op_code)
+    if _spmm_op_transposes(op_code):
+        data, indices, indptr, shape = _materialize_spmm_csr_op(
+            data,
+            indices,
+            indptr,
+            shape,
+            op_code,
+        )
+    (
+        data,
+        kernel_indices,
+        kernel_indptr,
+        n_rows,
+        n_cols,
+        row_lengths,
+        max_row_nnz,
+    ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
+    resolved_alg = _normalize_spmm_csr_alg(alg)
+    if resolved_alg != "auto":
+        resolve_spmm_csr_algorithm(resolved_alg, op_name, data.dtype)
+    return PreparedCsrSpmmRoute(
+        data=data,
+        kernel_indices=kernel_indices,
+        kernel_indptr=kernel_indptr,
+        shape=shape,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        row_lengths=row_lengths,
+        max_row_nnz=max_row_nnz,
+        op=op_name,
+        alg=resolved_alg,
+    )
+
+
+def flagsparse_spmm_csr_run(
+    prepared,
+    B,
+    *,
+    alg=None,
+    op=None,
+    return_time=False,
+    return_meta=False,
+    timing=False,
+    diagnostics=False,
+):
+    """Run a registered CSR SpMM route.
+
+    The default operator timing follows the AlphaSparse-style benchmark policy:
+    ``gpu_ms`` is a CUDA event around the route run, while process CPU time is
+    reported separately by the route. Stage timing is only collected when
+    ``timing=True``.
+    """
+    if not isinstance(prepared, PreparedCsrSpmmRoute):
+        raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
+    op_name = prepared.op if op is None else _spmm_op_to_name(op)
+    if op_name != prepared.op:
+        raise ValueError(
+            "op must match prepared.op; call prepare_spmm_csr_route again for a different op"
+        )
+    alg_name = prepared.alg if alg is None else _normalize_spmm_csr_alg(alg)
+    algorithm = resolve_spmm_csr_algorithm(alg_name, op_name, prepared.data.dtype)
+    B = _validate_spmm_route_runtime_inputs(prepared, B)
+
+    start = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    end = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    if start is not None:
+        torch.cuda.synchronize()
+        start.record()
+    C, route_meta = algorithm.run(
+        prepared,
+        B,
+        timing=bool(timing),
+        diagnostics=bool(diagnostics),
+    )
+    if end is not None:
+        end.record()
+        torch.cuda.synchronize()
+        gpu_ms = start.elapsed_time(end)
+    else:
+        gpu_ms = None
+
+    process_cpu_ms = float(route_meta.get("process_cpu_ms", 0.0) or 0.0)
+    operator_ms = (process_cpu_ms + float(gpu_ms)) if gpu_ms is not None else None
+    meta = None
+    if return_meta:
+        meta = {
+            "alg": algorithm.name,
+            "display_name": algorithm.display_name,
+            "op": op_name,
+            "operator_ms": operator_ms,
+            "gpu_ms": gpu_ms,
+            "process_cpu_ms": process_cpu_ms,
+        }
+        if timing:
+            meta["process_gpu_ms"] = route_meta.get("process_gpu_ms")
+            meta["compute_ms"] = route_meta.get("compute_ms")
+        if diagnostics and "diagnostics" in route_meta:
+            meta["diagnostics"] = route_meta["diagnostics"]
+    if return_time and return_meta:
+        return C, operator_ms, meta
+    if return_time:
+        return C, operator_ms
+    if return_meta:
+        return C, meta
+    return C
 
 
 class PreparedCsrSpmmOpt:

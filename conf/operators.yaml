@@ -86,6 +86,8 @@ ops:
       Computes sparse matrix-dense matrix multiplication for a CSR matrix.
     for:
       - flagsparse_spmm_csr
+      - flagsparse_spmm_csr_run
+      - prepare_spmm_csr_route
     labels:
       - flagsparse
       - sparse
