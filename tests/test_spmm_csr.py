@@ -76,6 +76,7 @@ DIAG_FIELDS = [
     "launch_config_count",
     "bucket_count",
     "long_row_count",
+    "long_part_count",
     "num_warps",
     "num_stages",
     "block_n",
