@@ -518,6 +518,10 @@ class SpmmCsrAlgorithm:
     run: object
 
 
+class SpmmCsrAlgorithmUnavailable(RuntimeError):
+    """Raised when a registered SpMM CSR route is unavailable in this runtime."""
+
+
 class PreparedCsrSpmmRoute:
     """Matrix-level CSR SpMM route preparation shared by route algorithms."""
 
@@ -590,6 +594,59 @@ def _validate_spmm_route_runtime_inputs(prepared, B):
     return B.contiguous()
 
 
+def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op_name):
+    kernel_indptr = indptr.to(torch.int64)
+    row_lengths = (
+        kernel_indptr[1:] - kernel_indptr[:-1]
+        if int(shape[0]) > 0
+        else kernel_indptr.new_empty((0,))
+    )
+    max_row_nnz = int(row_lengths.max().item()) if int(shape[0]) > 0 else 0
+    kernel_indices = indices.to(torch.int32) if indices.dtype == torch.int64 else indices
+    return PreparedCsrSpmmRoute(
+        data=data.contiguous(),
+        kernel_indices=kernel_indices.contiguous(),
+        kernel_indptr=kernel_indptr.contiguous(),
+        shape=shape,
+        n_rows=int(shape[0]),
+        n_cols=int(shape[1]),
+        row_lengths=row_lengths,
+        max_row_nnz=max_row_nnz,
+        op=op_name,
+        alg=prepared.alg,
+    )
+
+
+def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
+    if op_name == "non":
+        return prepared, 0.0 if timing else None
+
+    start = torch.cuda.Event(enable_timing=True) if timing else None
+    end = torch.cuda.Event(enable_timing=True) if timing else None
+    if start is not None:
+        start.record()
+    data, indices, indptr, shape = _materialize_spmm_csr_op(
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        prepared.shape,
+        _normalize_spmm_op(op_name),
+    )
+    runtime_prepared = _spmm_csr_route_from_materialized(
+        prepared,
+        data,
+        indices,
+        indptr,
+        shape,
+        op_name,
+    )
+    if end is not None:
+        end.record()
+        torch.cuda.synchronize()
+        return runtime_prepared, start.elapsed_time(end)
+    return runtime_prepared, None
+
+
 def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     device_props = _normalize_spmm_base_device_props(prepared.data.device)
@@ -648,6 +705,114 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
     return C, meta
 
 
+def _build_alpha_spmm_alg1_route_prepared(prepared):
+    from .alpha_spmm_alg1 import PreparedAlphaSpmmAlg1
+
+    return PreparedAlphaSpmmAlg1(
+        data=prepared.data,
+        kernel_indices=prepared.kernel_indices,
+        kernel_indptr=prepared.kernel_indptr,
+        shape=prepared.shape,
+        n_rows=prepared.n_rows,
+        n_cols=prepared.n_cols,
+        row_lengths=prepared.row_lengths,
+        max_row_nnz=prepared.max_row_nnz,
+    )
+
+
+def _run_alpha_spmm_alg1_tle_route(
+    prepared,
+    B,
+    *,
+    route_name,
+    availability_fn_name,
+    unavailable_reason_fn_name,
+    build_meta_fn_name,
+    run_fn_name,
+    timing=False,
+    diagnostics=False,
+):
+    B = _validate_spmm_route_runtime_inputs(prepared, B)
+    from . import alpha_spmm_alg1 as alpha_mod
+    availability_fn = getattr(alpha_mod, availability_fn_name)
+    unavailable_reason_fn = getattr(alpha_mod, unavailable_reason_fn_name)
+    if not availability_fn():
+        raise SpmmCsrAlgorithmUnavailable(unavailable_reason_fn())
+
+    alpha_prepared = _build_alpha_spmm_alg1_route_prepared(prepared)
+    build_meta_fn = getattr(alpha_mod, build_meta_fn_name)
+    run_fn = getattr(alpha_mod, run_fn_name)
+    launch_meta = build_meta_fn(alpha_prepared, B)
+
+    process_cpu_ms = 0.0
+    process_gpu_ms = 0.0 if timing else None
+    compute_ms = None
+    if timing:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    C = run_fn(B=B, prepared=alpha_prepared, meta=launch_meta)
+    if timing:
+        end.record()
+        torch.cuda.synchronize()
+        compute_ms = start.elapsed_time(end)
+    meta = {
+        "alg": route_name,
+        "display_name": route_name,
+        "op": prepared.op,
+        "process_cpu_ms": process_cpu_ms,
+        "process_gpu_ms": process_gpu_ms,
+        "compute_ms": compute_ms,
+    }
+    if diagnostics:
+        meta["diagnostics"] = {
+            "launch_config_scope": "matrix",
+            "launch_config_count": 1,
+            "bucket_count": 0,
+            "long_row_count": 0,
+            "launch_version": launch_meta.get("launch_version"),
+            "block_n": launch_meta.get("block_cols"),
+            "block_nnz": launch_meta.get("warp_size"),
+            "num_warps": launch_meta.get("num_warps"),
+            "num_stages": launch_meta.get("num_stages"),
+            "warp_size": launch_meta.get("warp_size"),
+            "factor": launch_meta.get("factor"),
+            "block_rows": launch_meta.get("block_rows"),
+            "block_cols": launch_meta.get("block_cols"),
+            "grid_m": launch_meta.get("grid_m"),
+            "grid_n": launch_meta.get("grid_n"),
+        }
+    return C, meta
+
+
+def _run_alpha_spmm_alg1_tle_opt_route(prepared, B, *, timing=False, diagnostics=False):
+    return _run_alpha_spmm_alg1_tle_route(
+        prepared,
+        B,
+        route_name="alpha_alg1_tle_opt",
+        availability_fn_name="is_alpha_spmm_alg1_tle_opt_available",
+        unavailable_reason_fn_name="alpha_spmm_alg1_tle_opt_unavailable_reason",
+        build_meta_fn_name="build_alpha_spmm_alg1_tle_opt_meta",
+        run_fn_name="flagsparse_alpha_spmm_alg1_tle_opt",
+        timing=timing,
+        diagnostics=diagnostics,
+    )
+
+
+def _run_alpha_spmm_alg1_tle_opt2_route(prepared, B, *, timing=False, diagnostics=False):
+    return _run_alpha_spmm_alg1_tle_route(
+        prepared,
+        B,
+        route_name="alpha_alg1_tle_opt2",
+        availability_fn_name="is_alpha_spmm_alg1_tle_opt2_available",
+        unavailable_reason_fn_name="alpha_spmm_alg1_tle_opt2_unavailable_reason",
+        build_meta_fn_name="build_alpha_spmm_alg1_tle_opt2_meta",
+        run_fn_name="flagsparse_alpha_spmm_alg1_tle_opt2",
+        timing=timing,
+        diagnostics=diagnostics,
+    )
+
+
 SPMM_CSR_ALGORITHMS = {
     "csr_base": SpmmCsrAlgorithm(
         name="csr_base",
@@ -655,7 +820,21 @@ SPMM_CSR_ALGORITHMS = {
         supported_ops=tuple(SPMM_OP_NAMES.values()),
         supported_dtypes=SUPPORTED_SPMM_VALUE_DTYPES,
         run=_run_spmm_csr_base_route,
-    )
+    ),
+    "alpha_alg1_tle_opt": SpmmCsrAlgorithm(
+        name="alpha_alg1_tle_opt",
+        display_name="TLEOpt",
+        supported_ops=("non",),
+        supported_dtypes=(torch.float32, torch.float64),
+        run=_run_alpha_spmm_alg1_tle_opt_route,
+    ),
+    "alpha_alg1_tle_opt2": SpmmCsrAlgorithm(
+        name="alpha_alg1_tle_opt2",
+        display_name="TLEOpt2",
+        supported_ops=("non",),
+        supported_dtypes=(torch.float32, torch.float64),
+        run=_run_alpha_spmm_alg1_tle_opt2_route,
+    ),
 }
 
 
@@ -691,14 +870,6 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
     """Prepare matrix-level CSR SpMM metadata for the route-based run API."""
     op_code = _normalize_spmm_op(op)
     op_name = _spmm_op_to_name(op_code)
-    if _spmm_op_transposes(op_code):
-        data, indices, indptr, shape = _materialize_spmm_csr_op(
-            data,
-            indices,
-            indptr,
-            shape,
-            op_code,
-        )
     (
         data,
         kernel_indices,
@@ -746,21 +917,31 @@ def flagsparse_spmm_csr_run(
     if not isinstance(prepared, PreparedCsrSpmmRoute):
         raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
     op_name = prepared.op if op is None else _spmm_op_to_name(op)
-    if op_name != prepared.op:
-        raise ValueError(
-            "op must match prepared.op; call prepare_spmm_csr_route again for a different op"
-        )
     alg_name = prepared.alg if alg is None else _normalize_spmm_csr_alg(alg)
     algorithm = resolve_spmm_csr_algorithm(alg_name, op_name, prepared.data.dtype)
-    B = _validate_spmm_route_runtime_inputs(prepared, B)
+    if B is None or not torch.is_tensor(B):
+        raise TypeError("B must be a torch.Tensor")
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense tensor")
+    if not B.is_cuda:
+        raise ValueError("B must be a CUDA tensor")
+    if B.device != prepared.data.device:
+        raise ValueError("B must be on the same CUDA device as sparse matrix data")
+    if B.dtype != prepared.data.dtype:
+        raise TypeError("B dtype must match sparse matrix dtype")
 
     start = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
     end = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
     if start is not None:
         torch.cuda.synchronize()
         start.record()
-    C, route_meta = algorithm.run(
+    runtime_prepared, op_process_gpu_ms = _materialize_spmm_csr_route_op(
         prepared,
+        op_name,
+        timing=bool(timing),
+    )
+    C, route_meta = algorithm.run(
+        runtime_prepared,
         B,
         timing=bool(timing),
         diagnostics=bool(diagnostics),
@@ -773,6 +954,11 @@ def flagsparse_spmm_csr_run(
         gpu_ms = None
 
     process_cpu_ms = float(route_meta.get("process_cpu_ms", 0.0) or 0.0)
+    route_process_gpu_ms = route_meta.get("process_gpu_ms")
+    if timing:
+        process_gpu_ms = float(op_process_gpu_ms or 0.0) + float(route_process_gpu_ms or 0.0)
+    else:
+        process_gpu_ms = None
     operator_ms = (process_cpu_ms + float(gpu_ms)) if gpu_ms is not None else None
     meta = None
     if return_meta:
@@ -785,7 +971,7 @@ def flagsparse_spmm_csr_run(
             "process_cpu_ms": process_cpu_ms,
         }
         if timing:
-            meta["process_gpu_ms"] = route_meta.get("process_gpu_ms")
+            meta["process_gpu_ms"] = process_gpu_ms
             meta["compute_ms"] = route_meta.get("compute_ms")
         if diagnostics and "diagnostics" in route_meta:
             meta["diagnostics"] = route_meta["diagnostics"]

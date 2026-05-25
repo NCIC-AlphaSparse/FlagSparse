@@ -39,6 +39,7 @@ DTYPE_MAP = {
     "complex128": torch.complex128,
 }
 DEFAULT_DTYPE_NAMES = ("float32", "float64", "complex64", "complex128")
+DEFAULT_RUN_DTYPE_NAMES = ("float32", "float64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 
@@ -61,6 +62,7 @@ PERF_FIELDS = [
     "err_vs_torch",
     "err_vs_cusparse",
     "status",
+    "reason",
 ]
 
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
@@ -78,6 +80,12 @@ DIAG_FIELDS = [
     "num_stages",
     "block_n",
     "block_nnz",
+    "warp_size",
+    "factor",
+    "block_rows",
+    "block_cols",
+    "grid_m",
+    "grid_n",
     "launch_version",
 ]
 
@@ -146,10 +154,11 @@ def _resolve_input_paths(input_paths):
     return paths
 
 
-def _parse_csv_names(value, allowed, option_name):
+def _parse_csv_names(value, all_names, option_name, explicit_names=None):
     value = str(value).strip().lower()
     if value == "all":
-        return list(allowed)
+        return list(all_names)
+    allowed = tuple(all_names if explicit_names is None else explicit_names)
     names = [token.strip().lower() for token in value.split(",") if token.strip()]
     if not names:
         raise ValueError(f"{option_name} must not be empty")
@@ -185,8 +194,6 @@ def _expand_algs(alg_names, op, dtype):
         elif alg == "auto":
             expanded.append("auto")
         else:
-            # Validate now so unsupported dtype/op combinations are skipped cleanly.
-            fs.resolve_spmm_csr_algorithm(alg, op, dtype)
             expanded.append(alg)
     deduped = []
     for alg in expanded:
@@ -254,13 +261,40 @@ def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False):
     }
     if timing:
         row["process_gpu_ms"] = meta.get("process_gpu_ms")
-        # csr_base has no process kernels, so the externally measured run GPU
-        # time is the compute time for the current v1 route.
         row["compute_ms"] = meta.get("compute_ms")
         if row["compute_ms"] is None and row["alg"] == "csr_base":
             row["compute_ms"] = gpu_ms
         if row["process_gpu_ms"] is None and row["alg"] == "csr_base":
             row["process_gpu_ms"] = 0.0
+    return row
+
+
+def _skip_row(path, dtype, op, alg, shape, nnz, dense_cols, torch_ms, cusparse_ms, reason, timing):
+    n_rows, n_cols = shape
+    row = {
+        "matrix": os.path.basename(path),
+        "dtype": _dtype_name(dtype),
+        "op": op,
+        "alg": alg,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "nnz": int(nnz),
+        "dense_cols": dense_cols,
+        "ms": None,
+        "gpu_ms": None,
+        "process_cpu_ms": None,
+        "torch_ms": torch_ms,
+        "cusparse_ms": cusparse_ms,
+        "torch_vs_alg_speedup": None,
+        "cusparse_vs_alg_speedup": None,
+        "err_vs_torch": None,
+        "err_vs_cusparse": None,
+        "status": "SKIP",
+        "reason": reason,
+    }
+    if timing:
+        row["process_gpu_ms"] = None
+        row["compute_ms"] = None
     return row
 
 
@@ -309,15 +343,34 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
     diag_rows = []
     prepared = fs.prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="auto")
     for alg in _expand_algs(alg_names, op, dtype):
-        result = _time_route(
-            prepared,
-            B,
-            alg,
-            warmup,
-            iters,
-            timing=timing,
-            diagnose=diagnose,
-        )
+        try:
+            fs.resolve_spmm_csr_algorithm(alg, op, dtype)
+            result = _time_route(
+                prepared,
+                B,
+                alg,
+                warmup,
+                iters,
+                timing=timing,
+                diagnose=diagnose,
+            )
+        except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError) as exc:
+            rows.append(
+                _skip_row(
+                    path,
+                    dtype,
+                    op,
+                    alg,
+                    shape,
+                    data.numel(),
+                    dense_cols,
+                    torch_ms,
+                    cusparse_ms,
+                    str(exc),
+                    timing,
+                )
+            )
+            continue
         out = result.pop("out")
         diagnostics = result.pop("diagnostics")
         torch_profile = _error_profile(out, ref, dtype)
@@ -341,6 +394,7 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
             "err_vs_torch": torch_profile["global_err"],
             "err_vs_cusparse": cusparse_profile["global_err"],
             "status": torch_profile["status"],
+            "reason": "",
         }
         if timing:
             row["process_gpu_ms"] = result["process_gpu_ms"]
@@ -408,10 +462,10 @@ def main():
     parser.add_argument("--alg", default="auto", help="auto, all, or comma-separated algorithms")
     parser.add_argument(
         "--dtype",
-        default="all",
+        default=",".join(DEFAULT_RUN_DTYPE_NAMES),
         help=(
-            "all or comma-separated dtype names. all runs float32,float64,"
-            "complex64,complex128 by default; float16/bfloat16 are opt-in."
+            "Comma-separated dtype names. Default: float32,float64. "
+            "all runs float32,float64,complex64,complex128; float16/bfloat16 are opt-in."
         ),
     )
     parser.add_argument("--op", default="all", help="all or comma-separated ops: non,trans,conj")
@@ -433,7 +487,12 @@ def main():
         print("No .mtx files found.")
         return
     try:
-        dtype_names = _parse_csv_names(args.dtype, DEFAULT_DTYPE_NAMES, "--dtype")
+        dtype_names = _parse_csv_names(
+            args.dtype,
+            DEFAULT_DTYPE_NAMES,
+            "--dtype",
+            explicit_names=tuple(DTYPE_MAP),
+        )
         op_names = _parse_csv_names(args.op, DEFAULT_OP_NAMES, "--op")
         alg_names = _parse_algs(args.alg)
     except ValueError as exc:

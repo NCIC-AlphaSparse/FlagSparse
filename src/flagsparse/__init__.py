@@ -97,6 +97,7 @@ __all__ = [
     "resolve_spmm_csr_algorithm",
     "SPMM_CSR_ALGORITHMS",
     "SpmmCsrAlgorithm",
+    "SpmmCsrAlgorithmUnavailable",
     "create_csr_matrix",
     "create_coo_matrix",
     "create_csc_matrix",
@@ -213,6 +214,7 @@ _OPS_EXPORTS = {
     "resolve_spmm_csr_algorithm",
     "SPMM_CSR_ALGORITHMS",
     "SpmmCsrAlgorithm",
+    "SpmmCsrAlgorithmUnavailable",
 }
 
 _FORMAT_EXPORTS = {
