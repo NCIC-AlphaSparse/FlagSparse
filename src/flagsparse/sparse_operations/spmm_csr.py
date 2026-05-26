@@ -1,5 +1,7 @@
 """CSR SpMM kernels, helpers, and benchmark entry points."""
 
+import math
+
 from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
