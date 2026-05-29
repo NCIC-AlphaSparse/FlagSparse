@@ -582,6 +582,63 @@ def _normalize_spmm_csr_alg(alg):
     return token
 
 
+def _normalize_dense_layout(layout):
+    token = "row" if layout is None else str(layout).strip().lower()
+    if token in ("auto", "default"):
+        return "row"
+    if token in ("row", "row_major", "row-major", "c", "c_order"):
+        return "row"
+    if token in ("col", "column", "col_major", "column_major", "col-major", "column-major", "f", "fortran"):
+        return "col"
+    raise ValueError("dense_layout must be one of: auto, row, col")
+
+
+def _is_col_major_2d(tensor):
+    return (
+        torch.is_tensor(tensor)
+        and tensor.ndim == 2
+        and tensor.stride(0) == 1
+        and tensor.stride(1) >= max(1, int(tensor.shape[0]))
+    )
+
+
+def _dense_layout_name(tensor):
+    if not torch.is_tensor(tensor) or tensor.ndim != 2:
+        return "unknown"
+    if tensor.is_contiguous():
+        return "row"
+    if _is_col_major_2d(tensor):
+        return "col"
+    return "strided"
+
+
+def _empty_dense_layout(shape, dtype, device, layout):
+    layout = _normalize_dense_layout(layout)
+    rows, cols = int(shape[0]), int(shape[1])
+    if layout == "col":
+        return torch.empty_strided((rows, cols), (1, max(1, rows)), dtype=dtype, device=device)
+    return torch.empty((rows, cols), dtype=dtype, device=device)
+
+
+def _zeros_dense_layout(shape, dtype, device, layout):
+    out = _empty_dense_layout(shape, dtype, device, layout)
+    out.zero_()
+    return out
+
+
+def _materialize_dense_layout(tensor, layout):
+    layout = _normalize_dense_layout(layout)
+    if tensor.ndim != 2:
+        raise ValueError("dense layout materialization expects a 2D tensor")
+    if layout == "row":
+        return tensor.contiguous()
+    if _is_col_major_2d(tensor):
+        return tensor
+    out = _empty_dense_layout(tensor.shape, tensor.dtype, tensor.device, layout)
+    out.copy_(tensor)
+    return out
+
+
 def _validate_spmm_route_runtime_inputs(prepared, B):
     if not isinstance(prepared, PreparedCsrSpmmRoute):
         raise TypeError("prepared must be a PreparedCsrSpmmRoute instance")
@@ -597,7 +654,7 @@ def _validate_spmm_route_runtime_inputs(prepared, B):
         raise TypeError("B dtype must match sparse matrix dtype")
     if B.shape[0] != prepared.n_cols:
         raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
-    return B.contiguous()
+    return B
 
 
 def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op_name):
@@ -653,8 +710,18 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     return runtime_prepared, None
 
 
-def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
+def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False, dense_layout="row"):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    if dense_layout == "col" and _is_complex_dtype(prepared.data.dtype):
+        raise SpmmCsrAlgorithmUnavailable("csr_base col-major layout does not support complex dtypes yet")
+    B = _materialize_dense_layout(B, dense_layout)
+    C_out = _empty_dense_layout(
+        (prepared.n_rows, int(B.shape[1])),
+        prepared.data.dtype,
+        prepared.data.device,
+        dense_layout,
+    )
     device_props = _normalize_spmm_base_device_props(prepared.data.device)
     launch = _resolve_spmm_base_triton_launch(
         prepared.data.dtype,
@@ -680,6 +747,8 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
         block_nnz=launch["block_nnz"],
         num_warps=launch["num_warps"],
         num_stages=launch["num_stages"],
+        out=C_out,
+        dense_layout=dense_layout,
     )
     if timing:
         end.record()
@@ -692,6 +761,10 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_cpu_ms": process_cpu_ms,
         "process_gpu_ms": process_gpu_ms,
         "compute_ms": compute_ms,
+        "dense_layout": dense_layout,
+        "b_stride": tuple(int(v) for v in B.stride()),
+        "c_stride": tuple(int(v) for v in C.stride()),
+        "output_layout": _dense_layout_name(C),
     }
     if diagnostics:
         meta["diagnostics"] = {
@@ -707,6 +780,10 @@ def _run_spmm_csr_base_route(prepared, B, *, timing=False, diagnostics=False):
             "required_segments": launch["required_segments"],
             "warp_size": launch["warp_size"],
             "factor": launch["factor"],
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
         }
     return C, meta
 
@@ -1996,6 +2073,7 @@ def flagsparse_spmm_csr_run(
     *,
     alg=None,
     op=None,
+    dense_layout="auto",
     return_time=False,
     return_meta=False,
     timing=False,
@@ -2013,6 +2091,11 @@ def flagsparse_spmm_csr_run(
     op_name = prepared.op if op is None else _spmm_op_to_name(op)
     alg_name = prepared.alg if alg is None else _normalize_spmm_csr_alg(alg)
     algorithm = resolve_spmm_csr_algorithm(alg_name, op_name, prepared.data.dtype)
+    dense_layout = _normalize_dense_layout(dense_layout)
+    if dense_layout == "col" and algorithm.name != "csr_base":
+        raise SpmmCsrAlgorithmUnavailable(
+            "col-major layout is currently supported only by csr_base"
+        )
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -2034,12 +2117,21 @@ def flagsparse_spmm_csr_run(
         op_name,
         timing=bool(timing),
     )
-    C, route_meta = algorithm.run(
-        runtime_prepared,
-        B,
-        timing=bool(timing),
-        diagnostics=bool(diagnostics),
-    )
+    if algorithm.name == "csr_base":
+        C, route_meta = algorithm.run(
+            runtime_prepared,
+            B,
+            timing=bool(timing),
+            diagnostics=bool(diagnostics),
+            dense_layout=dense_layout,
+        )
+    else:
+        C, route_meta = algorithm.run(
+            runtime_prepared,
+            B,
+            timing=bool(timing),
+            diagnostics=bool(diagnostics),
+        )
     if end is not None:
         end.record()
         torch.cuda.synchronize()
@@ -2063,6 +2155,10 @@ def flagsparse_spmm_csr_run(
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
+            "dense_layout": route_meta.get("dense_layout", dense_layout),
+            "b_stride": route_meta.get("b_stride"),
+            "c_stride": route_meta.get("c_stride"),
+            "output_layout": route_meta.get("output_layout"),
         }
         if timing:
             meta["process_gpu_ms"] = process_gpu_ms
@@ -2596,11 +2692,22 @@ def _triton_spmm_csr_impl(
     block_nnz,
     num_warps,
     num_stages,
+    out=None,
+    dense_layout="row",
 ):
     device = data.device
     dtype = data.dtype
+    dense_layout = _normalize_dense_layout(dense_layout)
+    if out is not None:
+        if out.shape != (int(n_rows), int(n_dense_cols)) or out.dtype != dtype:
+            raise ValueError("out shape/dtype must match result")
+        if out.device != device:
+            raise ValueError("out must be on the same CUDA device as data")
     if n_rows == 0 or n_dense_cols == 0 or B.shape[0] == 0:
-        return torch.zeros((n_rows, n_dense_cols), dtype=dtype, device=device)
+        if out is not None:
+            out.zero_()
+            return out
+        return _zeros_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
 
     if not _is_complex_dtype(dtype):
         compute_dtype = dtype
@@ -2609,13 +2716,17 @@ def _triton_spmm_csr_impl(
         if dtype in (torch.float16, torch.bfloat16):
             compute_dtype = torch.float32
             data_in = data.to(torch.float32)
-            B_in = B.to(torch.float32)
+            B_in = _materialize_dense_layout(B.to(torch.float32), dense_layout)
         elif dtype == torch.float32:
             compute_dtype = torch.float64
             data_in = data.to(torch.float64)
-            B_in = B.to(torch.float64)
+            B_in = _materialize_dense_layout(B.to(torch.float64), dense_layout)
 
-        C_compute = torch.empty((n_rows, n_dense_cols), dtype=compute_dtype, device=device)
+        C_compute = (
+            out
+            if out is not None and compute_dtype == dtype
+            else _empty_dense_layout((n_rows, n_dense_cols), compute_dtype, device, dense_layout)
+        )
         grid = (n_rows, triton.cdiv(n_dense_cols, block_n))
         acc_dtype = tl.float64 if compute_dtype == torch.float64 else tl.float32
         _spmm_csr_real_kernel[grid](
@@ -2637,9 +2748,19 @@ def _triton_spmm_csr_impl(
             num_stages=num_stages,
         )
         if compute_dtype != dtype:
-            C_compute = C_compute.to(dtype)
+            C_cast = C_compute.to(dtype)
+            if out is not None:
+                out.copy_(C_cast)
+                return out
+            if dense_layout == "col":
+                C_out = _empty_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+                C_out.copy_(C_cast)
+                return C_out
+            return C_cast
         return C_compute
 
+    if dense_layout == "col" or (out is not None and _is_col_major_2d(out)):
+        raise SpmmCsrAlgorithmUnavailable("csr_base col-major layout does not support complex dtypes yet")
     data_ri = torch.view_as_real(data).contiguous().reshape(-1)
     B_ri = torch.view_as_real(B).contiguous()
     C_ri = torch.empty((n_rows, n_dense_cols, 2), dtype=B_ri.dtype, device=device)

@@ -47,11 +47,14 @@ PERF_FIELDS = [
     "matrix",
     "dtype",
     "op",
+    "layout",
     "alg",
     "n_rows",
     "n_cols",
     "nnz",
     "dense_cols",
+    "b_stride",
+    "c_stride",
     "ms",
     "gpu_ms",
     "process_cpu_ms",
@@ -63,6 +66,7 @@ PERF_FIELDS = [
     "err_vs_cusparse",
     "status",
     "reason",
+    "cusparse_reason",
 ]
 
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
@@ -71,6 +75,7 @@ DIAG_FIELDS = [
     "matrix",
     "dtype",
     "op",
+    "layout",
     "alg",
     "launch_config_scope",
     "launch_config_count",
@@ -88,18 +93,25 @@ DIAG_FIELDS = [
     "grid_m",
     "grid_n",
     "launch_version",
+    "dense_layout",
+    "b_stride",
+    "c_stride",
+    "output_layout",
 ]
 
 BEST_FIELDS = [
     "matrix",
     "dtype",
     "op",
+    "layout",
     "best_alg",
     "best_ms",
     "best_gpu_ms",
     "best_torch_speedup",
     "best_cusparse_speedup",
 ]
+
+LAYOUT_NAMES = ("row", "col")
 
 
 def _dtype_name(dtype):
@@ -118,6 +130,42 @@ def _ratio(numerator, denominator):
     if numerator is None or denominator is None or denominator <= 0:
         return None
     return float(numerator) / float(denominator)
+
+
+def _normalize_layout_name(layout):
+    token = str(layout).strip().lower()
+    if token in ("row", "row_major", "row-major", "c", "c_order"):
+        return "row"
+    if token in ("col", "column", "col_major", "column_major", "col-major", "column-major", "f", "fortran"):
+        return "col"
+    raise ValueError("layout must be one of: row, col, all")
+
+
+def _layout_names(value):
+    value = str(value).strip().lower()
+    if value == "all":
+        return list(LAYOUT_NAMES)
+    return [_normalize_layout_name(value)]
+
+
+def _materialize_dense_layout_for_test(tensor, layout):
+    layout = _normalize_layout_name(layout)
+    if layout == "row":
+        return tensor.contiguous()
+    out = torch.empty_strided(
+        tuple(tensor.shape),
+        (1, max(1, int(tensor.shape[0]))),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    out.copy_(tensor)
+    return out
+
+
+def _stride_string(tensor):
+    if tensor is None:
+        return ""
+    return "x".join(str(int(v)) for v in tensor.stride())
 
 
 def _reference_tolerance(dtype):
@@ -235,9 +283,9 @@ def _cupy_event_benchmark(op, warmup, iters):
     return out, cp.cuda.get_elapsed_time(start, end) / max(1, int(iters))
 
 
-def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False):
+def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False, layout="row"):
     out, gpu_ms = _cuda_event_benchmark(
-        lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg),
+        lambda: fs.flagsparse_spmm_csr_run(prepared, B, alg=alg, dense_layout=layout),
         warmup,
         iters,
     )
@@ -245,6 +293,7 @@ def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False):
         prepared,
         B,
         alg=alg,
+        dense_layout=layout,
         return_meta=True,
         timing=bool(timing),
         diagnostics=bool(diagnose),
@@ -257,6 +306,10 @@ def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False):
         "process_cpu_ms": process_cpu_ms,
         "process_gpu_ms": None,
         "compute_ms": None,
+        "dense_layout": meta.get("dense_layout", layout),
+        "b_stride": meta.get("b_stride"),
+        "c_stride": meta.get("c_stride"),
+        "output_layout": meta.get("output_layout"),
         "diagnostics": meta.get("diagnostics", {}),
         "out": out,
     }
@@ -270,17 +323,35 @@ def _time_route(prepared, B, alg, warmup, iters, timing=False, diagnose=False):
     return row
 
 
-def _skip_row(path, dtype, op, alg, shape, nnz, dense_cols, torch_ms, cusparse_ms, reason, timing):
+def _skip_row(
+    path,
+    dtype,
+    op,
+    layout,
+    alg,
+    shape,
+    nnz,
+    dense_cols,
+    b_stride,
+    torch_ms,
+    cusparse_ms,
+    reason,
+    timing,
+    cusparse_reason="",
+):
     n_rows, n_cols = shape
     row = {
         "matrix": os.path.basename(path),
         "dtype": _dtype_name(dtype),
         "op": op,
+        "layout": layout,
         "alg": alg,
         "n_rows": n_rows,
         "n_cols": n_cols,
         "nnz": int(nnz),
         "dense_cols": dense_cols,
+        "b_stride": b_stride,
+        "c_stride": "",
         "ms": None,
         "gpu_ms": None,
         "process_cpu_ms": None,
@@ -292,6 +363,7 @@ def _skip_row(path, dtype, op, alg, shape, nnz, dense_cols, torch_ms, cusparse_m
         "err_vs_cusparse": None,
         "status": "SKIP",
         "reason": reason,
+        "cusparse_reason": cusparse_reason or "",
     }
     if timing:
         row["process_gpu_ms"] = None
@@ -299,7 +371,7 @@ def _skip_row(path, dtype, op, alg, shape, nnz, dense_cols, torch_ms, cusparse_m
     return row
 
 
-def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters):
+def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="row"):
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
     try:
@@ -317,27 +389,38 @@ def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters):
             A = A.transpose().tocsr()
         elif op == "conj":
             A = A.transpose().conj().tocsr()
-        out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
+        try:
+            out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
+        except Exception:
+            if layout != "col":
+                raise
+            B_cp = cp.asfortranarray(B_cp)
+            out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         return out, ms, None
     except Exception as exc:
         return None, None, str(exc)
 
 
-def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusparse, timing, diagnose):
+def run_one_case(path, dtype, op, layout, alg_names, dense_cols, warmup, iters, run_cusparse, timing, diagnose):
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(path, dtype=dtype, device=device)
     indices = indices.to(torch.int32)
     n_rows, n_cols = shape
     b_rows = n_rows if op in ("trans", "conj") else n_cols
-    B = _build_dense_matrix(b_rows, dense_cols, dtype, device)
+    B = _materialize_dense_layout_for_test(
+        _build_dense_matrix(b_rows, dense_cols, dtype, device),
+        layout,
+    )
+    b_stride = _stride_string(B)
     ref, torch_op, _torch_format = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
     _torch_out, torch_ms = _cuda_event_benchmark(torch_op, warmup, iters)
     cusparse_out = None
     cusparse_ms = None
+    cusparse_reason = ""
     if run_cusparse:
-        cusparse_out, cusparse_ms, _cusparse_reason = _time_cusparse(
-            data, indices, indptr, shape, B, op, warmup, iters
+        cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse(
+            data, indices, indptr, shape, B, op, warmup, iters, layout=layout
         )
 
     rows = []
@@ -345,7 +428,27 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
     prepared = fs.prepare_spmm_csr_route(data, indices, indptr, shape, op=op, alg="auto")
     for alg in _expand_algs(alg_names, op, dtype):
         try:
-            fs.resolve_spmm_csr_algorithm(alg, op, dtype)
+            resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
+            if layout == "col" and resolved.name != "csr_base":
+                rows.append(
+                    _skip_row(
+                        path,
+                        dtype,
+                        op,
+                        layout,
+                        alg,
+                        shape,
+                        data.numel(),
+                        dense_cols,
+                        b_stride,
+                        torch_ms,
+                        cusparse_ms,
+                        "col-major layout is currently supported only by csr_base",
+                        timing,
+                        cusparse_reason=cusparse_reason,
+                    )
+                )
+                continue
             result = _time_route(
                 prepared,
                 B,
@@ -354,6 +457,7 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
                 iters,
                 timing=timing,
                 diagnose=diagnose,
+                layout=layout,
             )
         except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError) as exc:
             rows.append(
@@ -361,14 +465,17 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
                     path,
                     dtype,
                     op,
+                    layout,
                     alg,
                     shape,
                     data.numel(),
                     dense_cols,
+                    b_stride,
                     torch_ms,
                     cusparse_ms,
                     str(exc),
                     timing,
+                    cusparse_reason=cusparse_reason,
                 )
             )
             continue
@@ -380,11 +487,14 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
             "matrix": os.path.basename(path),
             "dtype": _dtype_name(dtype),
             "op": op,
+            "layout": layout,
             "alg": result["alg"],
             "n_rows": n_rows,
             "n_cols": n_cols,
             "nnz": int(data.numel()),
             "dense_cols": dense_cols,
+            "b_stride": _stride_string(B),
+            "c_stride": _stride_string(out),
             "ms": result["ms"],
             "gpu_ms": result["gpu_ms"],
             "process_cpu_ms": result["process_cpu_ms"],
@@ -396,6 +506,7 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
             "err_vs_cusparse": cusparse_profile["global_err"],
             "status": torch_profile["status"],
             "reason": "",
+            "cusparse_reason": cusparse_reason or "",
         }
         if timing:
             row["process_gpu_ms"] = result["process_gpu_ms"]
@@ -406,6 +517,7 @@ def run_one_case(path, dtype, op, alg_names, dense_cols, warmup, iters, run_cusp
                 "matrix": os.path.basename(path),
                 "dtype": _dtype_name(dtype),
                 "op": op,
+                "layout": layout,
                 "alg": result["alg"],
             }
             for field in DIAG_FIELDS:
@@ -420,16 +532,17 @@ def _best_rows(rows):
     for row in rows:
         if row.get("status") != "PASS" or row.get("ms") is None:
             continue
-        key = (row["matrix"], row["dtype"], row["op"])
+        key = (row["matrix"], row["dtype"], row["op"], row["layout"])
         groups.setdefault(key, []).append(row)
     best = []
-    for (matrix, dtype, op), group in sorted(groups.items()):
+    for (matrix, dtype, op, layout), group in sorted(groups.items()):
         selected = min(group, key=lambda item: item["ms"])
         best.append(
             {
                 "matrix": matrix,
                 "dtype": dtype,
                 "op": op,
+                "layout": layout,
                 "best_alg": selected["alg"],
                 "best_ms": selected["ms"],
                 "best_gpu_ms": selected["gpu_ms"],
@@ -449,7 +562,7 @@ def _write_csv(path, rows, fields):
 
 def _print_row(row):
     print(
-        f"{row['matrix']:<28} {row['dtype']:<10} {row['op']:<5} {row['alg']:<10} "
+        f"{row['matrix']:<28} {row['dtype']:<10} {row['op']:<5} {row['layout']:<4} {row['alg']:<10} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
         f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9} "
         f"{_fmt(row['torch_vs_alg_speedup'], 2):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>9} "
@@ -470,6 +583,7 @@ def main():
         ),
     )
     parser.add_argument("--op", default="all", help="all or comma-separated ops: non,trans,conj")
+    parser.add_argument("--layout", default="row", help="row, col, or all")
     parser.add_argument("--dense-cols", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
@@ -495,6 +609,7 @@ def main():
             explicit_names=tuple(DTYPE_MAP),
         )
         op_names = _parse_csv_names(args.op, DEFAULT_OP_NAMES, "--op")
+        layout_names = _layout_names(args.layout)
         alg_names = _parse_algs(args.alg)
     except ValueError as exc:
         parser.error(str(exc))
@@ -504,33 +619,35 @@ def main():
     rows = []
     diag_rows = []
     print(
-        f"{'Matrix':<28} {'DType':<10} {'Op':<5} {'Alg':<10} "
+        f"{'Matrix':<28} {'DType':<10} {'Op':<5} {'Lay':<4} {'Alg':<10} "
         f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {'cu':>9} "
         f"{'PT/Alg':>9} {'CU/Alg':>9} {'ErrPT':>10} {'Status':>6}"
     )
     for dtype_name in dtype_names:
         dtype = DTYPE_MAP[dtype_name]
         for op in op_names:
-            for path in paths:
-                try:
-                    case_rows, case_diag = run_one_case(
-                        path,
-                        dtype,
-                        op,
-                        alg_names,
-                        args.dense_cols,
-                        args.warmup,
-                        args.iters,
-                        not args.no_cusparse,
-                        args.timing,
-                        args.diagnose,
-                    )
-                    rows.extend(case_rows)
-                    diag_rows.extend(case_diag)
-                    for row in case_rows:
-                        _print_row(row)
-                except Exception as exc:
-                    print(f"  ERROR on {os.path.basename(path)} dtype={dtype_name} op={op}: {exc}")
+            for layout in layout_names:
+                for path in paths:
+                    try:
+                        case_rows, case_diag = run_one_case(
+                            path,
+                            dtype,
+                            op,
+                            layout,
+                            alg_names,
+                            args.dense_cols,
+                            args.warmup,
+                            args.iters,
+                            not args.no_cusparse,
+                            args.timing,
+                            args.diagnose,
+                        )
+                        rows.extend(case_rows)
+                        diag_rows.extend(case_diag)
+                        for row in case_rows:
+                            _print_row(row)
+                    except Exception as exc:
+                        print(f"  ERROR on {os.path.basename(path)} dtype={dtype_name} op={op} layout={layout}: {exc}")
     if args.csv:
         csv_path = _normalize_csv_path(args.csv)
         _write_csv(csv_path, rows, fields)
