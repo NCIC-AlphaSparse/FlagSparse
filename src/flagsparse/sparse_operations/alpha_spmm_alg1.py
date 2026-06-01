@@ -95,6 +95,11 @@ def _prepare_alpha_spmm_alg1_common(data, indices, indptr, shape):
     )
 
 
+def prepare_alpha_spmm_alg1(data, indices, indptr, shape):
+    """Prepare CSR metadata for the baseline ALG1 route."""
+    return _prepare_alpha_spmm_alg1_common(data, indices, indptr, shape)
+
+
 def prepare_alpha_spmm_alg1_tle(data, indices, indptr, shape):
     """Prepare CSR metadata for the TLE-Struct ALG1 route."""
     return _prepare_alpha_spmm_alg1_common(data, indices, indptr, shape)
@@ -1027,6 +1032,43 @@ def _run_alpha_spmm_alg1_tle_opt2(prepared, B, meta):
         num_stages=meta["num_stages"],
     )
     return C_out
+
+
+def flagsparse_alpha_spmm_alg1(
+    data=None,
+    indices=None,
+    indptr=None,
+    B=None,
+    shape=None,
+    prepared=None,
+    out=None,
+    return_meta=False,
+):
+    """Experimental Triton baseline port of AlphaSparse CUDA CSR ALG1."""
+    if prepared is not None and not isinstance(prepared, PreparedAlphaSpmmAlg1):
+        raise TypeError("prepared must be a PreparedAlphaSpmmAlg1 instance")
+    raw_inputs_provided = any(arg is not None for arg in (data, indices, indptr, shape))
+    if prepared is not None and raw_inputs_provided:
+        raise ValueError("Pass either raw CSR inputs or prepared, not both")
+    if prepared is None:
+        if any(arg is None for arg in (data, indices, indptr, shape)):
+            raise ValueError(
+                "data, indices, indptr, and shape are required when prepared is not provided"
+            )
+        prepared = prepare_alpha_spmm_alg1(data, indices, indptr, shape)
+
+    B = _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out)
+    meta = _with_alpha_spmm_alg1_route(
+        _build_alpha_spmm_alg1_runtime_meta(prepared, B),
+        "alpha_spmm_alg1",
+    )
+    C = _run_alpha_spmm_alg1(prepared, B, meta)
+    if out is not None:
+        out.copy_(C)
+        C = out
+    if return_meta:
+        return C, meta
+    return C
 
 
 def flagsparse_alpha_spmm_alg1_tle(
