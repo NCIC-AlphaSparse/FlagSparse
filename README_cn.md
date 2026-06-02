@@ -26,16 +26,28 @@ pip install torch triton cupy-cuda12x
 
 在项目根目录执行，或先 `cd tests` 再运行脚本（.mtx 目录可用 `../matrix` 等相对路径）。
 
-**pytest accuracy suite** - 小规模合成 CUDA 用例，可按算子 marker 选择：
+**统一算子测试 runner** - 按 YAML 算子清单逐算子运行精度/性能测试：
+
+```bash
+python run_flagsparse_pytest.py --list-ops
+python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0
+python run_flagsparse_pytest.py --phase both --mode quick --gpus 0,1 --benchmark-input matrix --results-dir pytest_results
+python run_flagsparse_pytest.py --phase performance --ops spmv_csr,spmm_csr --benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20
+```
+
+默认情况下，`run_flagsparse_pytest.py` 从 `conf/operators.yaml` 读取算子 id，可用 `--stages` 过滤，并按 `--gpus` 把算子分配到不同 GPU。`--ops` 和 `--op-list` 会覆盖 YAML 选择。默认全量测试会排除手工测试项 `alpha_spmm_alg1` 和 `spmv_coo_tocsr`；需要运行时用 `--ops` 或 `--op-list` 显式指定。`spsv_descriptor_api`、`sparse_format_constructors` 这类辅助接口不是算子测试项。
+
+精度阶段会启动 `pytest tests/pytest -m <operator marker> --mode quick|normal`，使用合成 CUDA 数据。性能阶段会按算子启动对应的 `tests/test_*.py` benchmark 命令；依赖 MatrixMarket 矩阵的命令接收 `--benchmark-input`（默认 `tests/data`，本地矩阵目录可传 `matrix`）。结果默认写入 `pytest_results_<timestamp>/`，也可通过 `--results-dir` 指定。每个算子目录包含对应阶段的 `accuracy.log`、`performance.log` 和 `performance.csv`；根目录汇总包含 `summary.json`、`summary.csv`，安装 `openpyxl` 时还会生成 `summary.xlsx`。
+
+**直接运行 pytest 精度测试** - 面向开发调试的小规模正确性用例，可按 marker 选择：
 
 ```bash
 pytest tests/pytest --mode quick
 pytest tests/pytest --mode normal -m "spmv_csr or spmm_csr"
-python run_flagsparse_pytest.py --mode quick --ops gather,spmv_csr,spmm_csr --gpus 0
-python run_flagsparse_pytest.py --op-list ops.txt --gpus 0,1 --results-dir pytest_results
+pytest tests/pytest --mode quick -m "spmv_coo_tocsr"
 ```
 
-runner 会为每个算子写入 `accuracy.log`，并生成 `summary.json`、`summary.csv`；安装 `openpyxl` 时还会生成 `summary.xlsx`。
+新增或修改算子测试项时，需要同步维护算子实现/API 注册、`conf/operators.yaml` 注册、`pytest.ini` marker、精度测试、性能命令以及公开替换/导出注册。
 
 **test_spmv.py** - CSR SpMV（SuiteSparse `.mtx`、合成数据或 CSR CSV）：
 
@@ -128,7 +140,7 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 32
 
 - `.github/workflows/ci.yml` 是默认 CPU CI，在 GitHub-hosted runner 上执行编译检查、格式检查、静态检查、源码严重错误检查、构建、安装校验和 smoke 测试。
 - smoke 测试覆盖已安装 wheel 校验、打包元数据、公开 API、算子接口注册表一致性、共享运行时策略、CLI `--help` 和 README 命令片段。
-- `conf/operators.yaml` 是参考 FlagGems 风格维护的算子接口注册表，覆盖公开的 FlagSparse 稀疏算子和稀疏格式辅助接口。
+- `conf/operators.yaml` 是参考 FlagGems 风格维护的公开 FlagSparse 稀疏算子接口注册表，并作为统一测试 runner 的默认算子清单。
 - `.github/workflows/nightly-cpu.yml` 是 main 分支夜间 CPU 检查，复用默认 CI 流程。
 - `.github/workflows/release.yml` 在 `v*` tag 上构建源码包和 wheel，校验发布产物并上传 GitHub Release。
 - `.github/workflows/triton-smoke.yml` 是手动触发的 Triton smoke 检查。

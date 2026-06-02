@@ -3,6 +3,7 @@ import torch
 
 from flagsparse import flagsparse_spmm_coo
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import MNK_SHAPES, SPMM_OPT_DTYPES, SPMM_OPT_DTYPE_IDS
 
 
@@ -20,9 +21,7 @@ def _random_coo_mk(M, K, dtype, device):
 
 
 def _tol(dtype):
-    if dtype == torch.float32:
-        return 1e-4, 1e-4
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 @pytest.mark.spmm_coo

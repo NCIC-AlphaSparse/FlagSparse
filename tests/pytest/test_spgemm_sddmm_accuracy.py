@@ -3,6 +3,7 @@ import torch
 
 from flagsparse import flagsparse_sddmm_csr, flagsparse_spgemm_csr
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import (
     SDDMM_DTYPES,
     SDDMM_DTYPE_IDS,
@@ -39,9 +40,7 @@ def _csr_to_dense(data, indices, indptr, shape):
 
 
 def _tol(dtype):
-    if dtype == torch.float32:
-        return 1e-4, 1e-4
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 @pytest.mark.spgemm_csr

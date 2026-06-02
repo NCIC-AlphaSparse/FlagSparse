@@ -4,6 +4,7 @@ import torch
 from flagsparse import flagsparse_gather, flagsparse_scatter
 from flagsparse.sparse_operations import gather_scatter as gather_scatter_ops
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import FLOAT_DTYPES, GATHER_SCATTER_SHAPES
 
 
@@ -85,7 +86,8 @@ def test_gather_complex128_matches_indexing(index_dtype):
     indices = torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
     ref = dense.index_select(0, indices.to(torch.int64))
     got = flagsparse_gather(dense, indices)
-    assert torch.allclose(got, ref, atol=1e-10, rtol=1e-8)
+    rtol, atol = close_tolerances(torch.complex128)
+    assert torch.allclose(got, ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.scatter

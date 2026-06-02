@@ -22,6 +22,7 @@ from flagsparse import (
 )
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import SPSV_N
 
 try:
@@ -34,7 +35,10 @@ except Exception:
     cpx_spsolve_triangular = None
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.spsv_csr,
+]
 SUPPORTED_COMPLEX_DTYPES = [torch.complex64, torch.complex128]
 
 SUPPORTED_DTYPES = [torch.float32, torch.float64, *SUPPORTED_COMPLEX_DTYPES]
@@ -48,9 +52,7 @@ def _dtype_id(dtype):
 
 
 def _tol(dtype):
-    if dtype in (torch.float32, torch.complex64):
-        return 1e-4, 1e-3
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 def _rand_like(dtype, shape, device):
@@ -162,8 +164,7 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
         lower=True,
         unit_diagonal=False,
     )
-    rtol = 1e-4 if dtype == torch.float32 else 1e-10
-    atol = 1e-5 if dtype == torch.float32 else 1e-10
+    rtol, atol = _tol(dtype)
     assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
 
 

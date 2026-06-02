@@ -4,16 +4,27 @@
 
 ### 运行方式
 
-`tests/pytest` 是面向算子正确性的 CUDA pytest 集合。形状和 dtype 网格主要来自 `param_shapes.py`，`--mode quick|normal` 由 `conftest.py` 切换。
+`tests/pytest` 是面向算子正确性的 CUDA pytest 集合。形状和 dtype 网格主要来自 `param_shapes.py`，`--mode quick|normal` 由 `conftest.py` 切换。项目推荐用 `run_flagsparse_pytest.py` 作为统一入口：它从 `conf/operators.yaml` 读取算子列表，在指定 GPU 上对每个算子分别运行精度和/或性能测试，并汇总结果。
 
 常用命令：
 
 ```bash
+python run_flagsparse_pytest.py --list-ops
+python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0
+python run_flagsparse_pytest.py --phase both --mode quick --gpus 0,1 --benchmark-input matrix --results-dir pytest_results
+python run_flagsparse_pytest.py --phase performance --ops spmv_csr,spmm_csr --benchmark-input matrix
 pytest tests/pytest --mode quick -m "spmv_csr or spmm_csr"
-python run_flagsparse_pytest.py --mode quick --ops gather,scatter,spmv_csr --gpus 0
 ```
 
-`run_flagsparse_pytest.py` 按算子 marker 单独启动 pytest，设置每个子进程的 `CUDA_VISIBLE_DEVICES`，保存每个算子的 `accuracy.log`，并输出 `summary.json`、`summary.csv` 和可选的 `summary.xlsx`。如果子进程非正常退出且没有 pytest summary，runner 会标记为 `CRASH`。
+`run_flagsparse_pytest.py` 默认按 `conf/operators.yaml` 的算子 id 选择测试项，可用 `--stages`、`--start` 过滤；`--ops` 和 `--op-list` 会覆盖 YAML 选择。默认全量 sweep 排除手工测试项 `alpha_spmm_alg1`、`spmv_coo_tocsr`，需要时显式指定即可运行。`spsv_descriptor_api`、`sparse_format_constructors` 这类辅助接口不是算子测试项。
+
+精度阶段按算子 marker 单独启动 pytest，设置每个子进程的 `CUDA_VISIBLE_DEVICES`，保存每个算子的 `accuracy.log`。性能阶段按算子启动对应 `tests/test_*.py` benchmark 命令，依赖矩阵的命令使用 `--benchmark-input` 指向 MatrixMarket 文件或目录（默认 `tests/data`，本地完整性能测试通常传 `matrix`）。runner 输出 `summary.json`、`summary.csv` 和可选的 `summary.xlsx`；各算子目录保存 `performance.log` 和 `performance.csv`。如果子进程非正常退出且没有 pytest summary，runner 会标记为 `CRASH`。
+
+### 精度策略
+
+精度测试统一使用 `tests/pytest/accuracy_utils.py` 中的 dtype 容差表和 helper。测试文件可以保留本地 `_tol(dtype)` 包装，但不能在各文件中自定义不同的浮点容差。计算类算子以 CPU-FP64 golden reference 为基准，并在断言前转换为被测 dtype；精确/逻辑类输出使用 `atol=0, rtol=0` 判等。
+
+新增或修改算子测试项时，最小闭环包括：算子实现代码、精度测试代码、性能测试代码、`conf/operators.yaml` 注册、`pytest.ini` marker，以及公开替换/导出注册。
 
 ### 数据构造
 
@@ -39,16 +50,27 @@ python run_flagsparse_pytest.py --mode quick --ops gather,scatter,spmv_csr --gpu
 
 ### Running
 
-`tests/pytest` is the CUDA accuracy suite for FlagSparse operators. Shape and dtype grids live mostly in `param_shapes.py`; `--mode quick|normal` is handled by `conftest.py`.
+`tests/pytest` is the CUDA accuracy suite for FlagSparse operators. Shape and dtype grids live mostly in `param_shapes.py`; `--mode quick|normal` is handled by `conftest.py`. The recommended entry point is `run_flagsparse_pytest.py`: it reads operator ids from `conf/operators.yaml`, runs accuracy and/or performance for each operator on the requested GPUs, and summarizes the results.
 
 Common commands:
 
 ```bash
+python run_flagsparse_pytest.py --list-ops
+python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0
+python run_flagsparse_pytest.py --phase both --mode quick --gpus 0,1 --benchmark-input matrix --results-dir pytest_results
+python run_flagsparse_pytest.py --phase performance --ops spmv_csr,spmm_csr --benchmark-input matrix
 pytest tests/pytest --mode quick -m "spmv_csr or spmm_csr"
-python run_flagsparse_pytest.py --mode quick --ops gather,scatter,spmv_csr --gpus 0
 ```
 
-`run_flagsparse_pytest.py` launches one pytest subprocess per operator marker, sets per-process `CUDA_VISIBLE_DEVICES`, writes per-op `accuracy.log`, and summarizes to `summary.json`, `summary.csv`, and optional `summary.xlsx`. If a subprocess exits abnormally without a pytest summary, the runner reports `CRASH`.
+`run_flagsparse_pytest.py` selects operators from `conf/operators.yaml` by default and supports `--stages` and `--start` filters. `--ops` and `--op-list` override YAML selection. The default full sweep excludes manual-test entries `alpha_spmm_alg1` and `spmv_coo_tocsr`; include them explicitly when needed. Helper APIs such as `spsv_descriptor_api` and `sparse_format_constructors` are not operator test entries.
+
+The accuracy phase launches one pytest subprocess per operator marker, sets per-process `CUDA_VISIBLE_DEVICES`, and writes per-op `accuracy.log`. The performance phase launches the configured `tests/test_*.py` benchmark command per operator; MatrixMarket-backed commands use `--benchmark-input` for the matrix file or directory (default `tests/data`, or `matrix` for the local full matrix directory). The runner writes `summary.json`, `summary.csv`, and optional `summary.xlsx`; each operator directory also stores `performance.log` and `performance.csv`. If a subprocess exits abnormally without a pytest summary, the runner reports `CRASH`.
+
+### Accuracy Policy
+
+Accuracy tests use the shared dtype tolerance table and helpers in `tests/pytest/accuracy_utils.py`. Test files may keep local `_tol(dtype)` wrappers, but they should not define per-file floating-point tolerances. Numeric compute operators compare against CPU-FP64 golden references cast back to the dtype under test before assertion; exact/logical outputs use `atol=0, rtol=0` equality checks.
+
+When adding or changing an operator test entry, keep the minimum loop complete: operator implementation, accuracy test, performance test, `conf/operators.yaml` registration, `pytest.ini` marker, and public replacement/export registration.
 
 ### Data Construction
 

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmv_csr
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 
@@ -55,15 +56,7 @@ def _reference_dtype(dtype):
 
 
 def _tol(dtype):
-    if dtype == torch.float16:
-        return 5e-3, 5e-3
-    if dtype == torch.bfloat16:
-        return 1e-1, 1e-1
-    if dtype == torch.float32:
-        return 1e-4, 1e-4
-    if dtype == torch.complex64:
-        return 1e-4, 1e-4
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 def _random_csr_mn(M, N, dtype, index_dtype, device):
@@ -177,7 +170,8 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
         index_fallback_policy="auto",
     )
     assert state["forced_once"]
-    assert torch.allclose(out.to(torch.float64), ref, rtol=1e-4, atol=1e-4)
+    rtol, atol = _tol(torch.float32)
+    assert torch.allclose(out.to(torch.float64), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spmv_csr

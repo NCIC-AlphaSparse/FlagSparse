@@ -283,6 +283,60 @@ def _timed_flagsparse_coo(
     return y, e0.elapsed_time(e1) / iters
 
 
+def _timed_flagsparse_coo_tocsr_runtime(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    warmup,
+    iters,
+):
+    spmv_op = lambda: fs.flagsparse_spmv_coo_tocsr(
+        data,
+        row,
+        col,
+        x,
+        shape=shape,
+        assume_sorted=False,
+    )
+    y = spmv_op()
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        y = spmv_op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    for _ in range(iters):
+        y = spmv_op()
+    e1.record()
+    torch.cuda.synchronize()
+    return y, e0.elapsed_time(e1) / iters
+
+
+def _timed_flagsparse_coo_tocsr_prepared(
+    prepared,
+    x,
+    warmup,
+    iters,
+):
+    spmv_op = lambda: fs.flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
+    y = spmv_op()
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        y = spmv_op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    for _ in range(iters):
+        y = spmv_op()
+    e1.record()
+    torch.cuda.synchronize()
+    return y, e0.elapsed_time(e1) / iters
+
+
 def _run_flagsparse_coo_prepared_non(
     prepared,
     x,
@@ -325,7 +379,13 @@ def _run_flagsparse_coo_runtime_op(
     )
 
 
-def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
+def run_synthetic(
+    value_dtypes=None,
+    index_dtypes=None,
+    ops=None,
+    warmup=WARMUP,
+    iters=ITERS,
+):
     if not torch.cuda.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
         return
@@ -334,7 +394,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
     print("FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO.")
     print("=" * 172)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Warmup: {WARMUP} | Iters: {ITERS}")
+    print(f"Warmup: {warmup} | Iters: {iters}")
     print()
 
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
@@ -374,8 +434,8 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, ops=None):
                         index_dtype=index_dtype,
                         op=op,
                         matrix_name=f"{m}x{n}",
-                        warmup=WARMUP,
-                        iters=ITERS,
+                        warmup=warmup,
+                        iters=iters,
                     )
                     _print_coo_result(result)
                 print(COO_SEP)
@@ -484,6 +544,91 @@ def _run_one_coo_case(
     }
 
 
+def _run_one_tocsr_case(
+    data,
+    row,
+    col,
+    shape,
+    dtype,
+    index_dtype,
+    matrix_name,
+    warmup,
+    iters,
+):
+    row = row.to(index_dtype).contiguous()
+    col = col.to(index_dtype).contiguous()
+    x = _random_values((shape[1],), dtype, data.device)
+    atol, rtol = _tol_for_dtype(dtype)
+    y_runtime, runtime_ms = _timed_flagsparse_coo_tocsr_runtime(
+        data,
+        row,
+        col,
+        x,
+        shape,
+        warmup,
+        iters,
+    )
+    prepared = fs.prepare_spmv_coo_tocsr(data, row, col, shape)
+    y_prepared, prepared_ms = _timed_flagsparse_coo_tocsr_prepared(
+        prepared,
+        x,
+        warmup,
+        iters,
+    )
+    y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op="non")
+    err_runtime = _allclose_error_ratio(y_runtime, y_ref, atol, rtol)
+    err_prepared = _allclose_error_ratio(y_prepared, y_ref, atol, rtol)
+    pt_ms = _time_pytorch_coo(data, row, col, x, shape, "non", warmup, iters)
+    cu_ms = None
+    err_cu = None
+    triton_ok_cu = False
+    if cp is not None and cpx_sparse is not None:
+        try:
+            cu_ms = _time_cupy_coo(data, row, col, x, shape, "non", warmup, iters)
+            y_cu = _cupy_coo_reference(data, row, col, x, shape, dtype, op="non")
+            err_cu = _allclose_error_ratio(y_prepared, y_cu, atol, rtol)
+            triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
+        except Exception:
+            cu_ms = None
+            err_cu = None
+    triton_ok_pt = (not math.isnan(err_prepared)) and err_prepared <= 1.0
+    status = (
+        "PASS"
+        if (
+            (not math.isnan(err_runtime))
+            and (not math.isnan(err_prepared))
+            and err_runtime <= 1.0
+            and err_prepared <= 1.0
+        )
+        else "FAIL"
+    )
+    n_rows, n_cols = shape
+    return {
+        "matrix": matrix_name,
+        "value_dtype": _dtype_name(dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "op": "non",
+        "out_size": n_rows,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "nnz": int(data.numel()),
+        "runtime_ms": runtime_ms,
+        "prepared_ms": prepared_ms,
+        "cusparse_ms": cu_ms,
+        "pytorch_ms": pt_ms,
+        "prepared_speedup_vs_runtime": _speedup_ratio(runtime_ms, prepared_ms),
+        "prepared_speedup_vs_cusparse": _speedup_ratio(cu_ms, prepared_ms),
+        "prepared_speedup_vs_pytorch": _speedup_ratio(pt_ms, prepared_ms),
+        "pt_status": _status_str(triton_ok_pt, True),
+        "cu_status": _status_str(triton_ok_cu, err_cu is not None),
+        "status": status,
+        "err_runtime": err_runtime,
+        "err_prepared": err_prepared,
+        "err_pt": err_prepared,
+        "err_cu": err_cu,
+    }
+
+
 def _build_torch_sparse_coo(data, row, col, shape):
     return torch.sparse_coo_tensor(
         torch.stack([row, col]),
@@ -580,6 +725,32 @@ def _print_coo_result(row):
         f"{_spd(row['pytorch_ms'], row['opt_ms']):>8} "
         f"{_spd(row['cusparse_ms'], row['opt_ms']):>8}  "
         f"{_fmt_err(row['err_base']):>10} {_fmt_err(row['err_opt']):>10} "
+        f"{row['status']:>6}"
+    )
+
+
+TOCSR_SEP = "-" * 200
+TOCSR_HEADER = (
+    f"{'Matrix':<28} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
+    f"{'Runtime(ms)':>11} {'Prepared(ms)':>12} {'PT(ms)':>9} {'CU(ms)':>9}  "
+    f"{'Prep/Run':>9} {'Prep/PT':>8} {'Prep/CU':>8}  "
+    f"{'Err(Runtime)':>12} {'Err(Prepared)':>13} {'Status':>6}"
+)
+
+
+def _print_tocsr_result(row):
+    name = str(row["matrix"])[:27]
+    if len(str(row["matrix"])) > 27:
+        name += "..."
+    print(
+        f"{name:<28} {row['out_size']:>7} "
+        f"{row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>10}  "
+        f"{_fmt_ms(row['runtime_ms']):>11} {_fmt_ms(row['prepared_ms']):>12} "
+        f"{_fmt_ms(row['pytorch_ms']):>9} {_fmt_ms(row['cusparse_ms']):>9}  "
+        f"{_spd(row['runtime_ms'], row['prepared_ms']):>9} "
+        f"{_spd(row['pytorch_ms'], row['prepared_ms']):>8} "
+        f"{_spd(row['cusparse_ms'], row['prepared_ms']):>8}  "
+        f"{_fmt_err(row['err_runtime']):>12} {_fmt_err(row['err_prepared']):>13} "
         f"{row['status']:>6}"
     )
 
@@ -711,12 +882,41 @@ def _error_row(path, dtype, index_dtype, op):
     }
 
 
+def _error_row_tocsr(path, dtype, index_dtype):
+    return {
+        "matrix": os.path.basename(path),
+        "value_dtype": _dtype_name(dtype),
+        "index_dtype": _dtype_name(index_dtype),
+        "op": "non",
+        "out_size": "ERR",
+        "n_rows": "ERR",
+        "n_cols": "ERR",
+        "nnz": "ERR",
+        "runtime_ms": None,
+        "prepared_ms": None,
+        "cusparse_ms": None,
+        "pytorch_ms": None,
+        "prepared_speedup_vs_runtime": None,
+        "prepared_speedup_vs_cusparse": None,
+        "prepared_speedup_vs_pytorch": None,
+        "pt_status": "N/A",
+        "cu_status": "N/A",
+        "status": "ERROR",
+        "err_runtime": None,
+        "err_prepared": None,
+        "err_pt": None,
+        "err_cu": None,
+    }
+
+
 def run_all_dtypes_coo_csv(
     mtx_paths,
     csv_path,
     value_dtypes=None,
     index_dtypes=None,
     ops=None,
+    warmup=WARMUP,
+    iters=ITERS,
 ):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
@@ -734,8 +934,8 @@ def run_all_dtypes_coo_csv(
         "PyTorch/CuPy timings use original dtype."
     )
     print(
-        f"prepare_spmv_coo once per variant + {WARMUP} warmup + "
-        f"{ITERS} CUDA-event-averaged SpMV per backend."
+        f"prepare_spmv_coo once per variant + {warmup} warmup + "
+        f"{iters} CUDA-event-averaged SpMV per backend."
     )
     print("=" * 200)
     for dtype in value_dtypes:
@@ -762,8 +962,8 @@ def run_all_dtypes_coo_csv(
                             index_dtype=index_dtype,
                             op=op,
                             matrix_name=os.path.basename(path),
-                            warmup=WARMUP,
-                            iters=ITERS,
+                            warmup=warmup,
+                            iters=iters,
                         )
                         rows_out.append(result)
                         _print_coo_result(result)
@@ -804,6 +1004,94 @@ def run_all_dtypes_coo_csv(
     print(f"Wrote {len(rows_out)} rows to {csv_path}")
 
 
+def run_all_dtypes_tocsr_csv(
+    mtx_paths,
+    csv_path,
+    value_dtypes=None,
+    index_dtypes=None,
+    warmup=WARMUP,
+    iters=ITERS,
+):
+    if not torch.cuda.is_available():
+        print("CUDA is not available.")
+        return
+    device = torch.device("cuda")
+    rows_out = []
+    value_dtypes = (torch.float32, torch.float64) if value_dtypes is None else value_dtypes
+    index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
+    print("=" * 200)
+    print("Input: MatrixMarket -> COO. FlagSparse: COO-to-CSR preparation path.")
+    print("Runtime(ms) includes COO->CSR conversion; Prepared(ms) measures repeated CSR steady-state calls.")
+    print(
+        f"prepare_spmv_coo_tocsr once per variant + {warmup} warmup + "
+        f"{iters} CUDA-event-averaged SpMV per backend."
+    )
+    print("=" * 200)
+    for dtype in value_dtypes:
+        for index_dtype in index_dtypes:
+            print(TOCSR_SEP)
+            print(
+                f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: non"
+            )
+            print(TOCSR_SEP)
+            print(TOCSR_HEADER)
+            print(TOCSR_SEP)
+            for path in mtx_paths:
+                try:
+                    data, row, col, shape = _load_mtx_to_coo_torch(
+                        path, dtype=dtype, device=device
+                    )
+                    result = _run_one_tocsr_case(
+                        data=data,
+                        row=row,
+                        col=col,
+                        shape=shape,
+                        dtype=dtype,
+                        index_dtype=index_dtype,
+                        matrix_name=os.path.basename(path),
+                        warmup=warmup,
+                        iters=iters,
+                    )
+                    rows_out.append(result)
+                    _print_tocsr_result(result)
+                except Exception as e:
+                    row_out = _error_row_tocsr(path, dtype, index_dtype)
+                    rows_out.append(row_out)
+                    _print_tocsr_result(row_out)
+                    print(f"  ERROR: {e}")
+            print(TOCSR_SEP)
+    fieldnames = [
+        "matrix",
+        "value_dtype",
+        "index_dtype",
+        "op",
+        "out_size",
+        "n_rows",
+        "n_cols",
+        "nnz",
+        "runtime_ms",
+        "prepared_ms",
+        "cusparse_ms",
+        "pytorch_ms",
+        "prepared_speedup_vs_runtime",
+        "prepared_speedup_vs_cusparse",
+        "prepared_speedup_vs_pytorch",
+        "pt_status",
+        "cu_status",
+        "status",
+        "err_runtime",
+        "err_prepared",
+        "err_pt",
+        "err_cu",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows_out:
+            w.writerow(r)
+    print(f"Wrote {len(rows_out)} rows to {csv_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SpMV COO test: synthetic dense->COO and optional .mtx, export CSV."
@@ -824,6 +1112,13 @@ def main():
         help="Run all dtypes on given .mtx and export COO SpMV results to CSV",
     )
     parser.add_argument(
+        "--csv-tocsr",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Run all dtypes on given .mtx and export COO-to-CSR SpMV results to CSV",
+    )
+    parser.add_argument(
         "--dtypes",
         type=str,
         default="float32,float64,complex64,complex128",
@@ -838,18 +1133,27 @@ def main():
     parser.add_argument(
         "--ops",
         type=str,
-        default="non,trans,conj",
-        help="Comma-separated matrix ops: non,trans,conj",
+        default=None,
+        help="Comma-separated matrix ops: non,trans,conj; defaults to all COO ops, or non for --csv-tocsr",
     )
+    parser.add_argument("--warmup", type=int, default=WARMUP)
+    parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
         args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes"
     )
-    ops = _parse_ops(args.ops)
+    ops_arg = args.ops or ("non" if args.csv_tocsr else "non,trans,conj")
+    ops = _parse_ops(ops_arg)
 
     if args.synthetic:
-        run_synthetic(value_dtypes=value_dtypes, index_dtypes=index_dtypes, ops=ops)
+        run_synthetic(
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
+            ops=ops,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
         return
 
     paths = []
@@ -870,10 +1174,30 @@ def main():
             value_dtypes=value_dtypes,
             index_dtypes=index_dtypes,
             ops=ops,
+            warmup=args.warmup,
+            iters=args.iters,
         )
         return
 
-    print("Use --synthetic or --csv-coo to run COO SpMV tests.")
+    if args.csv_tocsr:
+        if not paths:
+            paths = sorted(glob.glob("*.mtx"))
+        if not paths:
+            print("No .mtx files found for --csv-tocsr")
+            return
+        if any(op != "non" for op in ops):
+            raise ValueError("spmv_coo_tocsr performance only supports --ops non")
+        run_all_dtypes_tocsr_csv(
+            paths,
+            args.csv_tocsr,
+            value_dtypes=value_dtypes,
+            index_dtypes=index_dtypes,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        return
+
+    print("Use --synthetic, --csv-coo, or --csv-tocsr to run COO SpMV tests.")
 
 
 if __name__ == "__main__":

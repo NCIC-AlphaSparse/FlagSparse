@@ -10,6 +10,7 @@ from tests.pytest.param_shapes import (
     SPMM_OPT_DTYPES,
     SPMM_OPT_DTYPE_IDS,
 )
+from tests.pytest.accuracy_utils import close_tolerances
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -60,13 +61,7 @@ def _apply_dense_op(dense, op):
 
 
 def _tol(dtype):
-    if dtype == torch.bfloat16:
-        return 1e-1, 1e-1
-    if dtype == torch.float32:
-        return 1e-4, 1e-4
-    if dtype == torch.complex64:
-        return 1e-4, 1e-4
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 SPMM_OP_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -202,6 +197,7 @@ def test_spmm_csr_op_validation_errors():
         )
 
 
+@pytest.mark.spmm_csr_opt_alg1
 @pytest.mark.spmm_csr_opt
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize("dtype", SPMM_OPT_DTYPES, ids=SPMM_OPT_DTYPE_IDS)

@@ -28,16 +28,28 @@ Run from project root, or `cd tests` then run scripts (paths like `../matrix` fo
 
 The commands below are the repository's documented invocation standard. CPU-only install, build, help-text, and smoke paths are checked in CI; GPU-specific examples are documented but not executed there unless you opt into the triton smoke job locally.
 
-**pytest accuracy suite** - small synthetic CUDA cases, selectable by operator marker:
+**Unified operator test runner** - YAML-driven accuracy/performance runs by operator:
+
+```bash
+python run_flagsparse_pytest.py --list-ops
+python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0
+python run_flagsparse_pytest.py --phase both --mode quick --gpus 0,1 --benchmark-input matrix --results-dir pytest_results
+python run_flagsparse_pytest.py --phase performance --ops spmv_csr,spmm_csr --benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20
+```
+
+By default, `run_flagsparse_pytest.py` reads operator ids from `conf/operators.yaml`, filters by `--stages`, and distributes operators across `--gpus`. `--ops` and `--op-list` override the YAML selection. The default sweep excludes manual-test entries `alpha_spmm_alg1` and `spmv_coo_tocsr`; include them explicitly with `--ops` or `--op-list` when needed. Helper APIs such as `spsv_descriptor_api` and `sparse_format_constructors` are not operator test entries.
+
+The accuracy phase launches `pytest tests/pytest -m <operator marker> --mode quick|normal` and uses synthetic CUDA data. The performance phase launches the configured `tests/test_*.py` benchmark command for each operator; MatrixMarket-backed commands receive `--benchmark-input` (default `tests/data`, or pass `matrix` for the local matrix directory). Results are written under `pytest_results_<timestamp>/` unless `--results-dir` is provided. Each operator directory contains `accuracy.log`, `performance.log`, and `performance.csv` when that phase runs; the root summary contains `summary.json`, `summary.csv`, and `summary.xlsx` when `openpyxl` is installed.
+
+**Direct pytest accuracy suite** - development-oriented accuracy checks, selectable by marker:
 
 ```bash
 pytest tests/pytest --mode quick
 pytest tests/pytest --mode normal -m "spmv_csr or spmm_csr"
-python run_flagsparse_pytest.py --mode quick --ops gather,spmv_csr,spmm_csr --gpus 0
-python run_flagsparse_pytest.py --op-list ops.txt --gpus 0,1 --results-dir pytest_results
+pytest tests/pytest --mode quick -m "spmv_coo_tocsr"
 ```
 
-The runner writes per-operator `accuracy.log` files plus `summary.json`, `summary.csv`, and `summary.xlsx` when `openpyxl` is installed.
+When adding or changing an operator test entry, keep the implementation/API registration, `conf/operators.yaml` entry, pytest marker in `pytest.ini`, accuracy test, performance command, and public replacement/export registration in sync.
 
 **test_spmv.py** - CSR SpMV (SuiteSparse `.mtx`, synthetic, or CSR CSV export):
 
@@ -132,7 +144,7 @@ outputs compare against CPU int32 references.
 
 - `.github/workflows/ci.yml` is CPU-only and runs compile, format checks, lint, source-critical static checks, build, install, and smoke tests on GitHub-hosted runners.
 - The smoke set now covers installed-wheel validation, packaging metadata, public API surface, operator registry consistency, shared runtime policy helpers, CLI `--help`, and README command snippets.
-- `conf/operators.yaml` is the FlagGems-style operator interface registry for public FlagSparse sparse operators and sparse-format helpers.
+- `conf/operators.yaml` is the FlagGems-style operator interface registry for public FlagSparse sparse operators used by the unified test runner.
 - `.github/workflows/nightly-cpu.yml` is a `main`-branch-only nightly CPU check that repeats the package, lint, and shared-runtime smoke tests.
 - `.github/workflows/release.yml` builds source and wheel artifacts, then attaches them to GitHub Releases on `v*` tags.
 - `.github/workflows/triton-smoke.yml` is a manual opt-in job for triton-dependent smoke checks.

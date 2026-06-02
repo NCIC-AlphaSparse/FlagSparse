@@ -3,6 +3,7 @@ import torch
 
 from flagsparse import flagsparse_spsm_coo, flagsparse_spsm_csr
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import SPSM_N_RHS, TRIANGULAR_DTYPE_IDS, TRIANGULAR_DTYPES
 
 
@@ -16,9 +17,7 @@ def _build_lower_dense(n, dtype, device):
 
 
 def _tol(dtype):
-    if dtype == torch.float32:
-        return 1e-4, 1e-5
-    return 1e-10, 1e-10
+    return close_tolerances(dtype)
 
 
 @pytest.mark.spsm

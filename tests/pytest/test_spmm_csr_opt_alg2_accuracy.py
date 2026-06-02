@@ -6,6 +6,7 @@ from flagsparse import (
     prepare_spmm_csr_opt_alg2,
 )
 
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import MNK_SHAPES, SPMM_OPT_DTYPES, SPMM_OPT_DTYPE_IDS
 
 
@@ -28,9 +29,7 @@ def _random_csr_mk(M, K, dtype, device):
 
 
 def _tol(dtype):
-    if dtype == torch.float32:
-        return 1e-4, 1e-4
-    return 1e-10, 1e-8
+    return close_tolerances(dtype)
 
 
 def _torch_reference(Asp, data, indices, indptr, B, shape, dtype, index_dtype):

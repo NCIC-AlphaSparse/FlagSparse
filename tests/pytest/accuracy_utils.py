@@ -47,6 +47,12 @@ def tolerance_for_dtype(dtype, default=1e-4):
     return TOLERANCE_BY_DTYPE.get(dtype, default)
 
 
+def close_tolerances(dtype, default=1e-4):
+    """Return ``(rtol, atol)`` using the shared FlagGems-style dtype tolerance."""
+    tolerance = tolerance_for_dtype(dtype, default=default)
+    return tolerance, tolerance
+
+
 def golden_reference_close(reference, dtype):
     """Cast a CPU-FP64 golden reference to the dtype being validated."""
     if not torch.is_tensor(reference):

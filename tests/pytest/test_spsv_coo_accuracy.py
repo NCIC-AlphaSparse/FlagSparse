@@ -28,7 +28,10 @@ from tests.pytest.test_spsv_csr_accuracy import (
 )
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.spsv_coo,
+]
 
 
 @pytest.mark.spsv
