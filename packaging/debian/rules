@@ -1,0 +1,32 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+export PYBUILD_NAME = flagsparse
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+# Smoke find_spec test (not actual import) — verifies the built
+# module lands at the expected path. Doesn't import the module
+# because module-level deps (torch, triton, cupy, ...) are install-
+# time concerns not satisfied in the build container. Catches:
+# wrong install path, missing __init__.py, dh_python install bugs.
+# Note: prior version used `import ; exit 0` which silently passed
+# on import failures. Loop just locates the build dir, then runs
+# the actual check once outside the loop — avoids the trap of
+# relying on `&& exit 0` inside the loop body to gate success.
+override_dh_auto_test:
+	@echo "=== smoke find_spec test ==="
+	@found_dir=""; \
+	for d in .pybuild/cpython3_*/build; do \
+	    if [ -d "$$d/flagsparse" ]; then \
+	        found_dir="$$d"; \
+	        break; \
+	    fi; \
+	done; \
+	if [ -z "$$found_dir" ]; then \
+	    echo "ERROR: could not find a built flagsparse module"; \
+	    exit 1; \
+	fi; \
+	echo "Found build dir: $$found_dir"; \
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$$found_dir" python3 -c \
+	    "import importlib.util; s = importlib.util.find_spec('flagsparse'); assert s and s.origin, 'flagsparse not findable'; print('OK: flagsparse at', s.origin)"

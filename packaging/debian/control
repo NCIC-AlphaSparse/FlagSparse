@@ -1,0 +1,21 @@
+Source: flagsparse
+Section: python
+Priority: optional
+Maintainer: FlagOS Contributors <contact@flagos.io>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+               python3-wheel,
+               pybuild-plugin-pyproject
+Standards-Version: 4.6.2
+Homepage: https://github.com/flagos-ai/FlagSparse
+Vcs-Browser: https://github.com/flagos-ai/FlagSparse
+Vcs-Git: https://github.com/flagos-ai/FlagSparse.git
+Rules-Requires-Root: no
+
+Package: python3-flagsparse
+Architecture: all
+Depends: python3:any, ${misc:Depends}
+Description: FlagSparse — sparse compute kernels for FlagOS
+ Sparse-matrix operators (SpMM, SpMV, sampled dense-dense) for FlagOS-supported accelerators.
