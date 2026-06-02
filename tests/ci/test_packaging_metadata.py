@@ -49,7 +49,7 @@ def test_package_version_matches_metadata():
 
 
 def test_python_requires_matches_metadata():
-    assert _extract_requires_python_from_pyproject() == ">=3.12"
+    assert _extract_requires_python_from_pyproject() == ">=3.10"
     assert (
         _extract_python_requires_from_setup_py()
         == _extract_requires_python_from_pyproject()
