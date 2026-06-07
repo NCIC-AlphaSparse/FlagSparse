@@ -126,9 +126,9 @@ python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
 **test_spsm.py** - SpSM（三角矩阵-稠密矩阵求解；**仅方阵**）：
 
 ```bash
-python tests/test_spsm.py --synthetic --n 512 --rhs 32
-python tests/test_spsm.py <目录/> --csv-csr spsm_csr.csv --rhs 32
-python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 32
+python tests/test_spsm.py --synthetic --n 512 --rhs 1024
+python tests/test_spsm.py <目录/> --csv-csr spsm_csr.csv --rhs 1024
+python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 1024
 ```
 
 **test_gather.py** / **test_scatter.py** - gather/scatter 基准（pytest 或 `python tests/test_gather.py`）。

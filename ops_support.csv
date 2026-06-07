@@ -163,12 +163,12 @@ spmv,CSR,int64,complex128,trans,triton,SUPPORTED
 spmv,CSR,int64,complex128,conj,triton,SUPPORTED
 spsm,COO,int32,float32,non,triton,SUPPORTED
 spsm,COO,int32,float64,non,triton,SUPPORTED
-spsm,COO,int64,float32,non,triton,SUPPORTED
-spsm,COO,int64,float64,non,triton,SUPPORTED
+spsm,COO,int32,complex64,non,triton,SUPPORTED
+spsm,COO,int32,complex128,non,triton,SUPPORTED
 spsm,CSR,int32,float32,non,triton,SUPPORTED
 spsm,CSR,int32,float64,non,triton,SUPPORTED
-spsm,CSR,int64,float32,non,triton,SUPPORTED
-spsm,CSR,int64,float64,non,triton,SUPPORTED
+spsm,CSR,int32,complex64,non,triton,SUPPORTED
+spsm,CSR,int32,complex128,non,triton,SUPPORTED
 spsv,COO,int32,float32,non,triton,SUPPORTED
 spsv,COO,int32,float32,trans,triton,SUPPORTED
 spsv,COO,int32,float64,non,triton,SUPPORTED

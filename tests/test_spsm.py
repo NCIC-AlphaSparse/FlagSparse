@@ -28,9 +28,9 @@ except Exception:
 
 
 FORMATS = ("csr", "coo")
-VALUE_DTYPES = (torch.float32, torch.float64)
+VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = [torch.int32]
-CSV_VALUE_DTYPES = [torch.float32, torch.float64]
+CSV_VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 CSV_INDEX_DTYPES = [torch.int32]
 WARMUP = 1
 ITERS = 1
@@ -42,9 +42,47 @@ def _dtype_name(dtype):
 
 
 def _tol(dtype):
-    if dtype == torch.float32:
+    if dtype in (torch.float32, torch.complex64):
         return 1e-4, 1e-3
     return 1e-12, 1e-10
+
+
+def _reference_check_threshold(dtype):
+    if dtype in (torch.float32, torch.complex64):
+        return 1e-6
+    return 1e-12
+
+
+def _reference_max_relative_error(answer, result, dtype):
+    if answer is None or result is None:
+        return None
+    if answer.numel() != result.numel():
+        return float("inf")
+    if answer.numel() == 0:
+        return 0.0
+    if dtype in (torch.complex64, torch.complex128):
+        answer_cmp = torch.abs(answer)
+        result_cmp = torch.abs(result)
+        diff = torch.abs(answer_cmp - result_cmp)
+    else:
+        diff = torch.abs(answer - result)
+        result_cmp = torch.abs(result)
+    if not bool(torch.isfinite(diff).all().item()) or not bool(torch.isfinite(result_cmp).all().item()):
+        return float("inf")
+    max_error = torch.max(diff)
+    max_result = torch.max(result_cmp)
+    if float(max_result.item()) == 0.0:
+        return 0.0 if float(max_error.item()) == 0.0 else float("inf")
+    return float((max_error / max_result).item())
+
+
+def _is_fatal_cuda_error(exc):
+    msg = str(exc).lower()
+    return (
+        "illegal memory access" in msg
+        or "device-side assert" in msg
+        or "unspecified launch failure" in msg
+    )
 
 
 def _fmt_ms(v):
@@ -125,10 +163,11 @@ def _parse_ops_filter(raw):
     return normalized
 
 
-def _build_triangular_case(n=512, n_rhs=32, value_dtype=torch.float32):
+def _build_triangular_case(n=512, n_rhs=1024, value_dtype=torch.float32):
     device = torch.device("cuda")
     A = torch.tril(torch.randn((n, n), dtype=value_dtype, device=device) * 0.02)
-    diag = torch.rand((n,), dtype=value_dtype, device=device) + 2.0
+    diag_base_dtype = torch.float32 if value_dtype == torch.complex64 else torch.float64
+    diag = (torch.rand((n,), dtype=diag_base_dtype, device=device) + 2.0).to(value_dtype)
     A = A + torch.diag(diag)
     coo = A.to_sparse().coalesce()
     row = coo.indices()[0].to(torch.int64)
@@ -362,7 +401,11 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
             continue
         r = int(parts[0]) - 1
         c = int(parts[1]) - 1
-        if len(parts) >= 3:
+        if mm_field == "complex":
+            if len(parts) < 4:
+                raise ValueError("MatrixMarket complex entry requires real and imag parts")
+            v = complex(float(parts[2]), float(parts[3]))
+        elif len(parts) >= 3:
             v = float(parts[2])
         elif mm_field == "pattern":
             v = 1.0
@@ -414,7 +457,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
         X_fs, analysis_ms, solve_ms = _benchmark_flagsparse_spsm_csr_split(
             data,
             indices.to(index_dtype),
-            indptr,
+            indptr.to(index_dtype),
             B,
             shape,
         )
@@ -435,27 +478,28 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
 
     err_cu = None
     ok_cu = None
+    rel_cu = None
     if X_cu is not None:
         err_cu = float(torch.max(torch.abs(X_fs - X_cu)).item()) if X_fs.numel() else 0.0
-        ok_cu = torch.allclose(X_fs, X_cu, atol=atol, rtol=rtol)
+        rel_cu = _reference_max_relative_error(X_cu, X_fs, value_dtype)
+        ok_cu = rel_cu <= _reference_check_threshold(value_dtype)
 
     err_pt = None
     ok_pt = None
+    rel_pt = None
     if X_pt is not None:
         err_pt = float(torch.max(torch.abs(X_fs - X_pt)).item()) if X_fs.numel() else 0.0
-        ok_pt = torch.allclose(X_fs, X_pt, atol=atol, rtol=rtol)
+        rel_pt = _reference_max_relative_error(X_pt, X_fs, value_dtype)
+        ok_pt = rel_pt <= _reference_check_threshold(value_dtype)
 
     err_res, ok_res = _solution_residual_metrics(data, indices, indptr, shape, X_fs, B, value_dtype)
     ref_errors = [v for v in (err_pt, err_cu) if v is not None]
     err_ref = min(ref_errors) if ref_errors else None
-    ref_ok = False
-    if ok_pt is not None:
-        ref_ok = ref_ok or ok_pt
-    if ok_cu is not None:
-        ref_ok = ref_ok or ok_cu
 
-    if ref_ok:
-        status = "PASS"
+    if ok_cu is not None:
+        status = "PASS" if ok_cu else "FAIL"
+    elif ok_pt is not None:
+        status = "PASS" if ok_pt else "FAIL"
     elif X_pt is None and X_cu is None:
         status = "REF_FAIL"
     else:
@@ -486,7 +530,7 @@ def _run_one_spsm_case(data, indices, indptr, shape, value_dtype, index_dtype, n
     }
 
 
-def run_spsm_synthetic_all(n=512, n_rhs=32):
+def run_spsm_synthetic_all(n=512, n_rhs=1024):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -547,7 +591,7 @@ def run_spsm_synthetic_all(n=512, n_rhs=32):
     print("=" * 160)
 
 
-def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
+def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
     if not torch.cuda.is_available():
         print("CUDA is not available.")
         return
@@ -627,6 +671,13 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=32):
                             print(f"  NOTE: {row['pytorch_reason']}")
                 except Exception as exc:
                     err_msg = str(exc)
+                    if _is_fatal_cuda_error(exc):
+                        print(
+                            f"  FATAL CUDA ERROR: {exc}\n"
+                            "  CUDA context is no longer reliable. Restart the Python/Singularity session "
+                            "and rerun the single failing matrix with CUDA_LAUNCH_BLOCKING=1."
+                        )
+                        raise
                     status = "SKIP" if "SpSM requires square matrices" in err_msg else "ERROR"
                     row = {
                         **base,
@@ -710,7 +761,12 @@ def main():
     )
     parser.add_argument("--synthetic", action="store_true", help="Run synthetic triangular tests")
     parser.add_argument("--n", type=int, default=512, help="matrix size (synthetic)")
-    parser.add_argument("--rhs", type=int, default=32, help="number of RHS columns")
+    parser.add_argument(
+        "--rhs",
+        type=int,
+        default=1024,
+        help="number of RHS columns (default: 1024, matching all-in-one SpSM)",
+    )
     parser.add_argument("--csv-csr", type=str, default=None, metavar="FILE")
     parser.add_argument("--csv-coo", type=str, default=None, metavar="FILE")
     parser.add_argument(

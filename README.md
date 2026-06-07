@@ -128,9 +128,9 @@ python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CS
 **test_spsm.py** - SpSM (triangular matrix-matrix solve; **square** matrices only):
 
 ```bash
-python tests/test_spsm.py --synthetic --n 512 --rhs 32
-python tests/test_spsm.py <dir/> --csv-csr spsm_csr.csv --rhs 32
-python tests/test_spsm.py <dir/> --csv-coo spsm_coo.csv --rhs 32
+python tests/test_spsm.py --synthetic --n 512 --rhs 1024
+python tests/test_spsm.py <dir/> --csv-csr spsm_csr.csv --rhs 1024
+python tests/test_spsm.py <dir/> --csv-coo spsm_coo.csv --rhs 1024
 ```
 
 **test_gather.py** / **test_scatter.py** - gather/scatter benchmarks (pytest or `python tests/test_gather.py`).

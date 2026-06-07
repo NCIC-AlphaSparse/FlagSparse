@@ -3,11 +3,14 @@ import torch
 
 from flagsparse import flagsparse_spsm_coo, flagsparse_spsm_csr
 
-from tests.pytest.accuracy_utils import close_tolerances
-from tests.pytest.param_shapes import SPSM_N_RHS, TRIANGULAR_DTYPE_IDS, TRIANGULAR_DTYPES
+from tests.pytest.param_shapes import SPSM_N_RHS
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+SPSM_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+SPSM_DTYPE_IDS = ("float32", "float64", "complex64", "complex128")
 
 
 def _build_lower_dense(n, dtype, device):
@@ -17,13 +20,15 @@ def _build_lower_dense(n, dtype, device):
 
 
 def _tol(dtype):
-    return close_tolerances(dtype)
+    if dtype in (torch.float32, torch.complex64):
+        return 1e-4, 1e-5
+    return 1e-10, 1e-10
 
 
 @pytest.mark.spsm
 @pytest.mark.spsm_csr
 @pytest.mark.parametrize("n, n_rhs", SPSM_N_RHS)
-@pytest.mark.parametrize("dtype", TRIANGULAR_DTYPES, ids=TRIANGULAR_DTYPE_IDS)
+@pytest.mark.parametrize("dtype", SPSM_DTYPES, ids=SPSM_DTYPE_IDS)
 def test_spsm_csr_lower_matches_dense(n, n_rhs, dtype):
     device = torch.device("cuda")
     A = _build_lower_dense(n, dtype, device)
@@ -32,8 +37,8 @@ def test_spsm_csr_lower_matches_dense(n, n_rhs, dtype):
     Acsr = A.to_sparse_csr()
     out = flagsparse_spsm_csr(
         Acsr.values(),
-        Acsr.col_indices(),
-        Acsr.crow_indices(),
+        Acsr.col_indices().to(torch.int32),
+        Acsr.crow_indices().to(torch.int32),
         B,
         (n, n),
         lower=True,
@@ -46,7 +51,7 @@ def test_spsm_csr_lower_matches_dense(n, n_rhs, dtype):
 @pytest.mark.spsm
 @pytest.mark.spsm_coo
 @pytest.mark.parametrize("n, n_rhs", SPSM_N_RHS)
-@pytest.mark.parametrize("dtype", TRIANGULAR_DTYPES, ids=TRIANGULAR_DTYPE_IDS)
+@pytest.mark.parametrize("dtype", SPSM_DTYPES, ids=SPSM_DTYPE_IDS)
 def test_spsm_coo_lower_matches_dense(n, n_rhs, dtype):
     device = torch.device("cuda")
     A = _build_lower_dense(n, dtype, device)
@@ -56,8 +61,8 @@ def test_spsm_coo_lower_matches_dense(n, n_rhs, dtype):
     indices = Acoo.indices()
     out = flagsparse_spsm_coo(
         Acoo.values(),
-        indices[0].contiguous(),
-        indices[1].contiguous(),
+        indices[0].to(torch.int32).contiguous(),
+        indices[1].to(torch.int32).contiguous(),
         B,
         (n, n),
         lower=True,
