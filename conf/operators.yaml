@@ -261,6 +261,38 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spsv_descriptor_api
+    description: |
+      Provides descriptor, buffer-size, analysis, preprocess, and solve APIs for SpSV workflows.
+    for:
+      - flagsparse_create_spsv_handle
+      - flagsparse_create_dnvec
+      - flagsparse_create_spmat_csr
+      - flagsparse_create_spmat_coo
+      - flagsparse_spsv_buffer_size
+      - flagsparse_spsv_buffer_size_ex
+      - flagsparse_spsv_create_workspace
+      - flagsparse_spsv_analysis_csr
+      - flagsparse_spsv_analysis_coo
+      - flagsparse_spsv_analysis_ex
+      - flagsparse_spsv_preprocess_csr
+      - flagsparse_spsv_preprocess_coo
+      - flagsparse_spsv_solve_csr
+      - flagsparse_spsv_solve_coo
+      - flagsparse_spsv_solve_ex
+    labels:
+      - flagsparse
+      - sparse
+      - csr
+      - coo
+      - descriptor
+      - public-api
+    kind:
+      - SparseSolver
+      - Utility
+    stages:
+      - beta: "1.0"
+
   - id: spsm_csr
     description: |
       Solves sparse triangular systems with dense matrix right-hand sides in CSR format.
@@ -290,5 +322,33 @@ ops:
       - public-api
     kind:
       - SparseSolver
+    stages:
+      - beta: "1.0"
+
+  - id: sparse_format_constructors
+    description: |
+      Creates sparse matrix containers and converts COO data into supported sparse formats.
+    for:
+      - create_csr_matrix
+      - create_coo_matrix
+      - create_csc_matrix
+      - create_bsr_matrix
+      - create_sell_matrix
+      - create_blocked_ell_matrix
+      - coo_to_csr
+      - coo_to_csc
+      - coo_to_bsr
+      - coo_to_sell
+      - coo_to_blocked_ell
+      - generate_random_sparse_matrix
+      - read_mtx_file
+    labels:
+      - flagsparse
+      - sparse
+      - format
+      - public-api
+    kind:
+      - SparseFormat
+      - Utility
     stages:
       - beta: "1.0"

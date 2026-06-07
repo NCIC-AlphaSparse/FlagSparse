@@ -1,4 +1,4 @@
-"""Run SpSM synthetic benchmark. From project root: python benchmark/benchmark_spsm.py [--n 512 --rhs 32]."""
+"""Run SpSM synthetic benchmark. From project root: python benchmark/benchmark_spsm.py [--n 512 --rhs 1024]."""
 
 import sys
 from pathlib import Path
