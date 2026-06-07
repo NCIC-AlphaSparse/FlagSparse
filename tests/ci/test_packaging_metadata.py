@@ -58,5 +58,5 @@ def test_python_requires_matches_metadata():
 
 def test_license_metadata_is_apache_2():
     pyproject = _read_text("pyproject.toml")
-    assert 'license = "Apache-2.0"' in pyproject
+    assert 'license = { text = "Apache-2.0" }' in pyproject
     assert "Apache (Version 2.0)" in _read_text("README.md")
