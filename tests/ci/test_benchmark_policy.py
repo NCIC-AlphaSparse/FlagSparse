@@ -4,6 +4,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_DIR = PROJECT_ROOT / "benchmark"
+BENCHMARK_CONFTEST = BENCHMARK_DIR / "conftest.py"
 
 
 def _read(path):
@@ -35,3 +36,16 @@ def test_summary_for_plot_entrypoint_exists():
     text = _read("summary_for_plot.py")
     assert "two_level_average_speedup" in text
     assert "result_file" in text
+
+
+def test_benchmark_pytest_json_record_plugin_exists():
+    text = BENCHMARK_CONFTEST.read_text(encoding="utf-8")
+    for snippet in [
+        '"--record"',
+        '"--output"',
+        "def update_result",
+        "RECORD_JSON",
+        "pytest_terminal_summary",
+        "benchmark_result.json",
+    ]:
+        assert snippet in text

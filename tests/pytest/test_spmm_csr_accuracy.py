@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from flagsparse import flagsparse_spmm_csr, flagsparse_spmm_csr_opt, prepare_spmm_csr_opt
+from flagsparse import (
+    flagsparse_spmm_csr,
+    flagsparse_spmm_csr_opt,
+    prepare_spmm_csr_opt,
+)
 
 from tests.pytest.param_shapes import (
     MNK_SHAPES,
@@ -24,6 +28,10 @@ def _random_csr_mk(M, K, dtype, device):
         mask[0, 0] = True
     vals = torch.randn(M, K, dtype=dtype, device=device) * mask.to(dtype=dtype)
     return vals.to_sparse_csr()
+
+
+def _plain_sparse_values(sparse_tensor):
+    return sparse_tensor.values().clone()
 
 
 def _random_dense(shape, dtype, device):
@@ -78,7 +86,7 @@ def test_spmm_csr_matches_torch(M, N, K, dtype):
         pytest.skip("bfloat16 not supported on this GPU")
     device = torch.device("cuda")
     Asp = _random_csr_mk(M, K, dtype, device)
-    data = Asp.values()
+    data = _plain_sparse_values(Asp)
     indices = Asp.col_indices()
     indptr = Asp.crow_indices()
     B = torch.randn(K, N, dtype=dtype, device=device)
@@ -102,12 +110,14 @@ def test_spmm_csr_matches_torch(M, N, K, dtype):
 @pytest.mark.spmm_csr
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize("dtype", SPMM_OP_DTYPES, ids=SPMM_OP_DTYPE_IDS)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmm_csr_op_matches_dense_reference(M, N, K, dtype, index_dtype, op):
     device = torch.device("cuda")
     Asp = _random_csr_mk(M, K, dtype, device)
-    data = Asp.values()
+    data = _plain_sparse_values(Asp)
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
     dense = Asp.to_dense()
@@ -124,7 +134,7 @@ def test_spmm_csr_op_matches_dense_reference(M, N, K, dtype, index_dtype, op):
 def test_spmm_csr_return_meta_times_transpose_path():
     device = torch.device("cuda")
     Asp = _random_csr_mk(8, 12, torch.float32, device)
-    data = Asp.values()
+    data = _plain_sparse_values(Asp)
     indices = Asp.col_indices().to(torch.int64)
     indptr = Asp.crow_indices().to(torch.int64)
     B = torch.randn(8, 4, dtype=torch.float32, device=device)
@@ -143,14 +153,16 @@ def test_spmm_csr_return_meta_times_transpose_path():
     assert meta["symbolic_ms"] >= 0.0
     assert meta["compute_ms"] >= 0.0
     assert elapsed_ms == pytest.approx(meta["op_total_ms"])
-    assert meta["op_total_ms"] == pytest.approx(meta["symbolic_ms"] + meta["compute_ms"])
+    assert meta["op_total_ms"] == pytest.approx(
+        meta["symbolic_ms"] + meta["compute_ms"]
+    )
 
 
 @pytest.mark.spmm_csr
 def test_spmm_csr_non_meta_has_zero_symbolic_time():
     device = torch.device("cuda")
     Asp = _random_csr_mk(8, 12, torch.float32, device)
-    data = Asp.values()
+    data = _plain_sparse_values(Asp)
     indices = Asp.col_indices()
     indptr = Asp.crow_indices()
     B = torch.randn(12, 4, dtype=torch.float32, device=device)
@@ -172,7 +184,7 @@ def test_spmm_csr_non_meta_has_zero_symbolic_time():
 def test_spmm_csr_op_validation_errors():
     device = torch.device("cuda")
     Asp = _random_csr_mk(8, 12, torch.float32, device)
-    data = Asp.values()
+    data = _plain_sparse_values(Asp)
     indices = Asp.col_indices()
     indptr = Asp.crow_indices()
     B_non = torch.randn(12, 4, dtype=torch.float32, device=device)
@@ -180,9 +192,13 @@ def test_spmm_csr_op_validation_errors():
     with pytest.raises(ValueError, match="op must be one of"):
         flagsparse_spmm_csr(data, indices, indptr, B_non, (8, 12), op="bad")
     with pytest.raises(ValueError, match="transpose conflicts with op"):
-        flagsparse_spmm_csr(data, indices, indptr, B_non, (8, 12), op="non", transpose=True)
+        flagsparse_spmm_csr(
+            data, indices, indptr, B_non, (8, 12), op="non", transpose=True
+        )
     with pytest.raises(ValueError, match="transpose conflicts with op"):
-        flagsparse_spmm_csr(data, indices, indptr, B_trans, (8, 12), op="trans", transpose=False)
+        flagsparse_spmm_csr(
+            data, indices, indptr, B_trans, (8, 12), op="trans", transpose=False
+        )
     with pytest.raises(ValueError, match="B.shape\\[0\\] must be n_cols=8"):
         flagsparse_spmm_csr(data, indices, indptr, B_non, (8, 12), op="trans")
     with pytest.raises(ValueError, match="out shape/dtype must match result"):
@@ -204,7 +220,7 @@ def test_spmm_csr_op_validation_errors():
 def test_spmm_csr_opt_matches_torch(M, N, K, dtype):
     device = torch.device("cuda")
     Asp = _random_csr_mk(M, K, dtype, device)
-    data = Asp.values()
+    data = _plain_sparse_values(Asp)
     indices = Asp.col_indices()
     indptr = Asp.crow_indices()
     B = torch.randn(K, N, dtype=dtype, device=device)

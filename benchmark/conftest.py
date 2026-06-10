@@ -1,8 +1,4 @@
-"""Pytest hooks for FlagSparse accuracy tests.
-
-``--mode quick|normal`` toggles shape/dtype lists via ``QUICK_MODE``.
-``--record json --output <path>`` writes FlagGems-compatible case results.
-"""
+"""FlagGems-compatible pytest benchmark recording hooks."""
 
 from __future__ import annotations
 
@@ -11,10 +7,6 @@ from pathlib import Path
 
 import pytest
 
-QUICK_MODE = False
-RECORD_JSON = False
-REPORT_FILE = "accuracy_result.json"
-TEST_RESULTS: dict[str, dict[str, object]] = {}
 BUILTIN_MARKS = {
     "filterwarnings",
     "parametrize",
@@ -26,23 +18,27 @@ BUILTIN_MARKS = {
     "usefixtures",
     "xfail",
 }
+REPORT_FILE = "benchmark_result.json"
+RECORD_JSON = False
+TEST_RESULTS: dict[str, dict[str, object]] = {}
+
+
+def update_result(op: str, data: dict[str, object]) -> None:
+    if not RECORD_JSON:
+        return
+    TEST_RESULTS.setdefault(op, {})
+    TEST_RESULTS[op].setdefault("details", [])
+    TEST_RESULTS[op]["details"].append(data)  # type: ignore[index]
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--mode",
-        action="store",
-        default="normal",
-        choices=["normal", "quick"],
-        help="quick: fewer shapes/dtypes (FlagGems-style QUICK_MODE).",
-    )
     try:
         parser.addoption(
             "--record",
             action="store",
             default="none",
             choices=["none", "log", "json"],
-            help="record test results in log/json files or not",
+            help="record benchmark results in log/json files or not",
         )
         parser.addoption(
             "--output", default=REPORT_FILE, help="path to JSON result file"
@@ -53,27 +49,18 @@ def pytest_addoption(parser):
         parser.addoption(
             "--collect-marks",
             action="store_true",
-            help="collect tests with marker information without executing them",
+            help="collect benchmark tests with marker information without executing them",
         )
     except ValueError:
         pass
 
 
 def pytest_configure(config):
-    global QUICK_MODE
     global RECORD_JSON
     global REPORT_FILE
-    QUICK_MODE = config.getoption("--mode") == "quick"
     RECORD_JSON = config.getoption("--record") == "json"
     if RECORD_JSON:
         REPORT_FILE = config.getoption("--output") or REPORT_FILE
-
-
-def _params_for_item(item) -> dict[str, object]:
-    callspec = getattr(item, "callspec", None)
-    if callspec is None:
-        return {}
-    return dict(callspec.params)
 
 
 def _operator_marks(item) -> list[str]:
@@ -93,29 +80,28 @@ def _reason_from_report(report) -> str:
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    marks = _operator_marks(item)
+    report.opid = marks[0] if marks else item.nodeid
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_logreport(report):
     if not RECORD_JSON:
         return
 
-    result = TEST_RESULTS.setdefault(
-        item.nodeid,
-        {
-            "params": _params_for_item(item),
-            "result": None,
-            "opname": _operator_marks(item),
-        },
-    )
-
+    op = getattr(report, "opid", report.nodeid)
+    TEST_RESULTS.setdefault(op, {})
     if report.when == "setup" and report.outcome == "skipped":
-        result["result"] = "skipped"
-        result["reason"] = _reason_from_report(report)
+        TEST_RESULTS[op]["result"] = "skipped"
+        TEST_RESULTS[op]["reason"] = _reason_from_report(report)
+        TEST_RESULTS[op]["test_case"] = report.nodeid
     elif report.when == "call":
-        result["result"] = report.outcome
-        result["reason"] = (
-            _reason_from_report(report) if report.outcome != "passed" else None
-        )
-    elif report.when == "teardown" and report.outcome == "failed":
-        result["result"] = "failed"
-        result["reason"] = _reason_from_report(report)
+        TEST_RESULTS[op]["result"] = report.outcome
+        TEST_RESULTS[op]["test_case"] = report.nodeid
+        if report.outcome in {"failed", "skipped"}:
+            TEST_RESULTS[op]["reason"] = _reason_from_report(report)
+        else:
+            TEST_RESULTS[op]["reason"] = None
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

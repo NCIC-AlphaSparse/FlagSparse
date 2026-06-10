@@ -43,12 +43,14 @@ def test_spsv_coo_transpose_family_complex128_routes_through_csr(n, op_mode):
     A = _build_triangular(n, dtype, device, lower=True)
     b = _rand_like(dtype, (n,), device)
     x_ref = torch.linalg.solve_triangular(
-        _apply_ref_op(A, op_mode), b.unsqueeze(-1), upper=_effective_upper(True, op_mode)
+        _apply_ref_op(A, op_mode),
+        b.unsqueeze(-1),
+        upper=_effective_upper(True, op_mode),
     ).squeeze(-1)
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -67,7 +69,9 @@ def test_spsv_coo_transpose_family_complex128_routes_through_csr(n, op_mode):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_coo_trans_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=True)
@@ -82,7 +86,7 @@ def test_spsv_coo_trans_supported_combos(n, dtype, index_dtype):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -101,7 +105,9 @@ def test_spsv_coo_trans_supported_combos(n, dtype, index_dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_coo_upper_trans_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
@@ -116,7 +122,7 @@ def test_spsv_coo_upper_trans_supported_combos(n, dtype, index_dtype):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -135,7 +141,9 @@ def test_spsv_coo_upper_trans_supported_combos(n, dtype, index_dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_coo_conj_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=True)
@@ -150,7 +158,7 @@ def test_spsv_coo_conj_supported_combos(n, dtype, index_dtype):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -169,7 +177,9 @@ def test_spsv_coo_conj_supported_combos(n, dtype, index_dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_coo_upper_conj_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
@@ -184,7 +194,7 @@ def test_spsv_coo_upper_conj_supported_combos(n, dtype, index_dtype):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -203,7 +213,9 @@ def test_spsv_coo_upper_conj_supported_combos(n, dtype, index_dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_coo_non_trans_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=True)
@@ -214,7 +226,7 @@ def test_spsv_coo_non_trans_supported_combos(n, dtype, index_dtype):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -233,7 +245,9 @@ def test_spsv_coo_non_trans_supported_combos(n, dtype, index_dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_coo_non_trans_upper_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
@@ -244,7 +258,7 @@ def test_spsv_coo_non_trans_upper_supported_combos(n, dtype, index_dtype):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -268,13 +282,11 @@ def test_spsv_coo_non_trans_routes_through_csr(monkeypatch):
     n = SPSV_N[0]
     A = _build_triangular(n, dtype, device, lower=True)
     b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(
-        A, b.unsqueeze(-1), upper=False
-    ).squeeze(-1)
+    x_ref = torch.linalg.solve_triangular(A, b.unsqueeze(-1), upper=False).squeeze(-1)
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     called = {"hit": False}
     real_csr_impl = fs_spsv_impl.flagsparse_spsv_csr
@@ -283,7 +295,9 @@ def test_spsv_coo_non_trans_routes_through_csr(monkeypatch):
         called["hit"] = True
         return real_csr_impl(*args, **kwargs)
 
-    monkeypatch.setattr(fs_spsv_impl, "flagsparse_spsv_csr", _wrapped_flagsparse_spsv_csr)
+    monkeypatch.setattr(
+        fs_spsv_impl, "flagsparse_spsv_csr", _wrapped_flagsparse_spsv_csr
+    )
 
     x = flagsparse_spsv_coo(
         data,
@@ -327,7 +341,7 @@ def test_spsv_coo_analysis_workspace_solve_matches_direct():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     descr = flagsparse_spsv_analysis_coo(
         data,
@@ -368,7 +382,7 @@ def test_spsv_coo_explicit_roc_route_matches_dense():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -397,7 +411,7 @@ def test_spsv_coo_explicit_complex_level_routes_match_dense(dtype, solve_kind):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -426,7 +440,7 @@ def test_spsv_coo_explicit_complex_nnz_balance_routes_match_dense(dtype, solve_k
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -454,7 +468,7 @@ def test_spsv_coo_explicit_levelschd_route_matches_dense():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -483,7 +497,7 @@ def test_spsv_coo_explicit_nnz_balance_route_matches_dense():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -511,7 +525,7 @@ def test_spsv_coo_roc_analysis_workspace_solve_matches_direct():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     descr = flagsparse_spsv_analysis_coo(
         data,
@@ -554,7 +568,7 @@ def test_spsv_coo_levelschd_analysis_workspace_solve_matches_direct():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     descr = flagsparse_spsv_analysis_coo(
         data,
@@ -598,7 +612,7 @@ def test_spsv_coo_nnz_balance_analysis_workspace_solve_matches_direct():
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     descr = flagsparse_spsv_analysis_coo(
         data,
@@ -633,8 +647,10 @@ def test_spsv_coo_nnz_balance_analysis_workspace_solve_matches_direct():
 
 @pytest.mark.spsv
 @pytest.mark.parametrize("dtype", SUPPORTED_COMPLEX_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("solve_kind", ["csr_nnz_balance", "alg3"])
-def test_spsv_coo_complex_nnz_balance_analysis_workspace_matches_direct(dtype, solve_kind):
+@pytest.mark.parametrize("solve_kind", ["csr_nnz_balance", "alg8"])
+def test_spsv_coo_complex_nnz_balance_analysis_workspace_matches_direct(
+    dtype, solve_kind
+):
     device = torch.device("cuda")
     n = 64
     A = _build_triangular(n, dtype, device, lower=True)
@@ -642,7 +658,7 @@ def test_spsv_coo_complex_nnz_balance_analysis_workspace_matches_direct(dtype, s
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     descr = flagsparse_spsv_analysis_coo(
         data,
@@ -678,7 +694,9 @@ def test_spsv_coo_complex_nnz_balance_analysis_workspace_matches_direct(dtype, s
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
 def test_spsv_coo_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
     device = torch.device("cuda")
@@ -688,7 +706,7 @@ def test_spsv_coo_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,
@@ -707,7 +725,9 @@ def test_spsv_coo_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_coo_unit_transpose_family_supported_combos(
@@ -726,7 +746,7 @@ def test_spsv_coo_unit_transpose_family_supported_combos(
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices()
-    data = A_coo.values()
+    data = A_coo.values().clone()
 
     x = flagsparse_spsv_coo(
         data,

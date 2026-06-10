@@ -37,7 +37,7 @@ python run_flagsparse_pytest.py --phase performance --ops spmv_csr,spmm_csr --be
 
 默认情况下，`run_flagsparse_pytest.py` 从 `conf/operators.yaml` 读取算子 id，可用 `--stages` 过滤，并按 `--gpus` 把算子分配到不同 GPU。`--ops` 和 `--op-list` 会覆盖 YAML 选择。默认全量测试会排除手工测试项 `alpha_spmm_alg1` 和 `spmv_coo_tocsr`；需要运行时用 `--ops` 或 `--op-list` 显式指定。`spsv_descriptor_api`、`sparse_format_constructors` 这类辅助接口不是算子测试项。
 
-精度阶段会启动 `pytest tests/pytest -m <operator marker> --mode quick|normal`，使用合成 CUDA 数据。性能阶段会按算子启动对应的 `tests/test_*.py` benchmark 命令；依赖 MatrixMarket 矩阵的命令接收 `--benchmark-input`（默认 `tests/data`，本地矩阵目录可传 `matrix`）。结果默认写入 `pytest_results_<timestamp>/`，也可通过 `--results-dir` 指定。每个算子目录包含对应阶段的 `accuracy.log`、`performance.log` 和 `performance.csv`；根目录汇总包含 `summary.json`、`summary.csv`，安装 `openpyxl` 时还会生成 `summary.xlsx`。
+精度阶段会启动 `pytest tests/pytest -m <operator marker> --mode quick|normal --record json --output <op>/accuracy_result.json`，使用合成 CUDA 数据。性能阶段会按算子启动对应的 `tests/test_*.py` benchmark 命令；依赖 MatrixMarket 矩阵的命令接收 `--benchmark-input`（默认 `tests/data`，本地矩阵目录可传 `matrix`），CSV 输出也会规范化成 FlagGems 风格的 `<op>/performance_result.json`。结果默认写入 `pytest_results_<timestamp>/`，也可通过 `--results-dir` 指定。每个算子目录在对应阶段运行后包含 `accuracy.log`、`accuracy_result.json`、`accuracy_detail.json`、`performance.log`、`performance.csv`、`performance_result.json` 和 `performance_detail.json`。根目录 `summary.json` 使用 FlagGems 的 `timestamp` / `env` / `result` 结构。GPU id、命令、日志、totals、pytest case 明细和规范化 benchmark 记录等 FlagSparse 扩展字段保存在 `summary_flat.json` 和各算子的 `*_detail.json` 中。`summary.csv` 和可选 `summary.xlsx` 用于表格查看。
 
 **直接运行 pytest 精度测试** - 面向开发调试的小规模正确性用例，可按 marker 选择：
 

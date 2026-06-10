@@ -63,11 +63,14 @@ def _rand_like(dtype, shape, device):
     i = torch.randn(shape, dtype=base, device=device)
     return torch.complex(r, i)
 
+
 def _apply_ref_op(A, op_mode):
     if op_mode == "TRANS":
         return A.transpose(-2, -1)
     if op_mode == "CONJ":
-        return A.transpose(-2, -1).conj() if torch.is_complex(A) else A.transpose(-2, -1)
+        return (
+            A.transpose(-2, -1).conj() if torch.is_complex(A) else A.transpose(-2, -1)
+        )
     return A
 
 
@@ -120,8 +123,12 @@ def _cupy_csr_from_torch(data, indices, indptr, shape):
     if cp is None or cpx_sparse is None:
         return None
     data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data.contiguous()))
-    idx_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64).contiguous()))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.to(torch.int64).contiguous()))
+    idx_cp = cp.from_dlpack(
+        torch.utils.dlpack.to_dlpack(indices.to(torch.int64).contiguous())
+    )
+    ptr_cp = cp.from_dlpack(
+        torch.utils.dlpack.to_dlpack(indptr.to(torch.int64).contiguous())
+    )
     return cpx_sparse.csr_matrix((data_cp, idx_cp, ptr_cp), shape=shape)
 
 
@@ -148,11 +155,9 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
     eye = torch.eye(n, dtype=dtype, device=device)
     A = base + eye * (float(n) * 0.5 + 2.0)
     b = torch.randn(n, dtype=dtype, device=device)
-    x_ref = torch.linalg.solve_triangular(
-        A, b.unsqueeze(-1), upper=False
-    ).squeeze(-1)
+    x_ref = torch.linalg.solve_triangular(A, b.unsqueeze(-1), upper=False).squeeze(-1)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices()
     indptr = Asp.crow_indices().to(torch.int64)
     x = flagsparse_spsv_csr(
@@ -171,7 +176,9 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=True)
@@ -181,7 +188,7 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
 
@@ -208,7 +215,7 @@ def test_spsv_csr_rejects_matrix_rhs():
     b = torch.randn(n, 2, dtype=dtype, device=device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
 
@@ -228,7 +235,9 @@ def test_spsv_csr_rejects_matrix_rhs():
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
 def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
     device = torch.device("cuda")
@@ -237,7 +246,7 @@ def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=lower, unit_diagonal=True)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
 
@@ -258,7 +267,9 @@ def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_unit_transpose_family_supported_combos(
@@ -276,7 +287,7 @@ def test_spsv_csr_unit_transpose_family_supported_combos(
     )
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
 
@@ -301,7 +312,7 @@ def test_spsv_csr_complex_non_trans_defaults_to_cw_route():
     dtype = torch.complex64
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     b = _rand_like(dtype, (n,), device)
@@ -320,7 +331,7 @@ def test_spsv_csr_complex_upper_non_trans_defaults_to_smblk_route():
     dtype = torch.complex128
     A = _build_triangular(n, dtype, device, lower=False)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     b = _rand_like(dtype, (n,), device)
@@ -340,7 +351,7 @@ def test_spsv_csr_transpose_family_defaults_to_cw_route(op_mode):
     dtype = torch.complex128
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     b = _rand_like(dtype, (n,), device)
@@ -408,7 +419,6 @@ def test_spsv_auto_route_promotes_dense_real_upper_to_nnz_balance():
 @pytest.mark.spsv
 def test_spsv_levelschd_analysis_builds_sorted_row_map():
     device = torch.device("cuda")
-    data = torch.tensor([4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 4.0, 7.0], dtype=torch.float64, device=device)
     indices = torch.tensor([0, 0, 1, 0, 2, 1, 2, 3], dtype=torch.int64, device=device)
     indptr = torch.tensor([0, 1, 3, 5, 8], dtype=torch.int64, device=device)
     meta = fs_spsv_impl._build_spsv_level_schedule_metadata(
@@ -480,10 +490,18 @@ def test_spsv_nnz_balance_analysis_builds_upper_row_idx_and_indegree():
 def test_spsv_csr_row_sorted_check_respects_row_boundaries():
     device = torch.device("cuda")
     indptr = torch.tensor([0, 3, 5, 8], dtype=torch.int64, device=device)
-    lower_sorted = torch.tensor([0, 1, 2, 0, 2, 0, 1, 2], dtype=torch.int64, device=device)
-    lower_unsorted = torch.tensor([0, 2, 1, 0, 2, 0, 1, 2], dtype=torch.int64, device=device)
-    upper_sorted = torch.tensor([2, 1, 0, 2, 0, 2, 1, 0], dtype=torch.int64, device=device)
-    upper_unsorted = torch.tensor([2, 0, 1, 2, 0, 2, 1, 0], dtype=torch.int64, device=device)
+    lower_sorted = torch.tensor(
+        [0, 1, 2, 0, 2, 0, 1, 2], dtype=torch.int64, device=device
+    )
+    lower_unsorted = torch.tensor(
+        [0, 2, 1, 0, 2, 0, 1, 2], dtype=torch.int64, device=device
+    )
+    upper_sorted = torch.tensor(
+        [2, 1, 0, 2, 0, 2, 1, 0], dtype=torch.int64, device=device
+    )
+    upper_unsorted = torch.tensor(
+        [2, 0, 1, 2, 0, 2, 1, 0], dtype=torch.int64, device=device
+    )
 
     assert fs_spsv_impl._csr_rows_are_sorted(lower_sorted, indptr, 3, lower=True)
     assert not fs_spsv_impl._csr_rows_are_sorted(lower_unsorted, indptr, 3, lower=True)
@@ -538,7 +556,7 @@ def test_spsv_csr_transpose_descriptor_keeps_preprocess_metadata():
     n = SPSV_N[0]
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
 
@@ -567,7 +585,7 @@ def test_spsv_csr_transpose_public_solve_uses_transpose_kernel(monkeypatch, op_m
     n = SPSV_N[0]
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     b = _rand_like(dtype, (n,), device)
@@ -617,7 +635,7 @@ def test_spsv_csr_explicit_roc_route_matches_dense():
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -642,7 +660,7 @@ def test_spsv_csr_explicit_complex_level_routes_match_dense(dtype, solve_kind):
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -667,7 +685,7 @@ def test_spsv_csr_explicit_complex_nnz_balance_routes_match_dense(dtype, solve_k
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -689,7 +707,7 @@ def test_spsv_csr_explicit_roc_analysis_builds_only_level_metadata():
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -714,7 +732,7 @@ def test_spsv_csr_explicit_levelschd_route_matches_dense():
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -736,7 +754,7 @@ def test_spsv_csr_explicit_levelschd_analysis_builds_only_level_metadata():
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -762,7 +780,7 @@ def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -785,7 +803,7 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_only_nnz_metadata():
     A = A + torch.eye(n, dtype=dtype, device=device) * 3.0
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -796,7 +814,9 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_only_nnz_metadata():
     )
     assert descr.solve_kind == "csr_nnz_balance"
     assert int(descr.solve_plan["level_row_map32"].numel()) == 0
-    assert int(descr.solve_plan["nnz_balance_row_idx32"].numel()) == int(Asp.values().numel())
+    assert int(descr.solve_plan["nnz_balance_row_idx32"].numel()) == int(
+        Asp.values().numel()
+    )
     assert int(descr.solve_plan["nnz_balance_indegree32"].numel()) == n
 
 
@@ -814,7 +834,7 @@ def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind)
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -842,7 +862,7 @@ def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -856,7 +876,7 @@ def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -879,7 +899,7 @@ def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -894,7 +914,7 @@ def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -910,7 +930,9 @@ def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
 @pytest.mark.spsv
 @pytest.mark.parametrize("dtype", SUPPORTED_COMPLEX_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("solve_kind", ["csr_roc", "csr_cw_levelschd", "alg2"])
-def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(dtype, solve_kind):
+def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(
+    dtype, solve_kind
+):
     device = torch.device("cuda")
     n = 64
     A = _build_triangular(n, dtype, device, lower=True)
@@ -918,7 +940,7 @@ def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(dtype, s
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -932,7 +954,7 @@ def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(dtype, s
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -947,8 +969,10 @@ def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(dtype, s
 
 @pytest.mark.spsv
 @pytest.mark.parametrize("dtype", SUPPORTED_COMPLEX_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("solve_kind", ["csr_nnz_balance", "alg3"])
-def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(dtype, solve_kind):
+@pytest.mark.parametrize("solve_kind", ["csr_nnz_balance", "alg8"])
+def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(
+    dtype, solve_kind
+):
     device = torch.device("cuda")
     n = 64
     A = _build_triangular(n, dtype, device, lower=True)
@@ -956,7 +980,7 @@ def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(dtype, s
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -971,7 +995,7 @@ def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(dtype, s
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -994,7 +1018,7 @@ def test_spsv_csr_levelschd_analysis_workspace_solve_matches_direct():
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -1009,7 +1033,7 @@ def test_spsv_csr_levelschd_analysis_workspace_solve_matches_direct():
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -1033,7 +1057,7 @@ def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -1048,7 +1072,7 @@ def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
@@ -1068,7 +1092,7 @@ def test_spsv_csr_analysis_workspace_solve_matches_direct():
     n = SPSV_N[0]
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     b = _rand_like(dtype, (n,), device)
@@ -1081,6 +1105,7 @@ def test_spsv_csr_analysis_workspace_solve_matches_direct():
         lower=True,
         unit_diagonal=False,
         transpose=False,
+        solve_kind="csr_cw",
     )
     assert isinstance(descr, FlagSparseSpSVDescr)
     assert descr.solve_kind == "csr_cw"
@@ -1091,7 +1116,14 @@ def test_spsv_csr_analysis_workspace_solve_matches_direct():
     assert workspace.buffer_size == descr.buffer_size
 
     x_direct = flagsparse_spsv_csr(
-        data, indices, indptr, b, (n, n), lower=True, unit_diagonal=False
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        solve_kind="csr_cw",
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     rtol, atol = _tol(dtype)
@@ -1106,7 +1138,7 @@ def test_spsv_csr_transpose_analysis_workspace_route(op_mode):
     n = SPSV_N[0]
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     b = _rand_like(dtype, (n,), device)
@@ -1122,7 +1154,7 @@ def test_spsv_csr_transpose_analysis_workspace_route(op_mode):
     )
     assert descr.solve_kind == "transpose_cw"
     assert descr.route_name == "transpose_cw"
-    assert descr.solve_plan.get("transpose_lower") is True
+    assert descr.solve_plan.get("lower_eff") is False
     layout_names = [entry["name"] for entry in descr.workspace_layout]
     assert layout_names == ["residual", "indegree", "row_counter"]
 
@@ -1150,7 +1182,7 @@ def test_spsv_csr_descriptor_exposes_cuda_style_fields():
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -1173,7 +1205,7 @@ def test_spsv_csr_preprocess_initializes_workspace():
     A = _build_triangular(n, dtype, device, lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -1188,7 +1220,8 @@ def test_spsv_csr_preprocess_initializes_workspace():
     indegree_expected = torch.zeros(n, dtype=torch.int32, device=device)
     row_ids = torch.repeat_interleave(
         torch.arange(n, device=device, dtype=torch.int64),
-        Asp.crow_indices().to(torch.int64)[1:] - Asp.crow_indices().to(torch.int64)[:-1],
+        Asp.crow_indices().to(torch.int64)[1:]
+        - Asp.crow_indices().to(torch.int64)[:-1],
     )
     mask = Asp.col_indices().to(torch.int64) <= row_ids
     if bool(torch.any(mask).item()):
@@ -1208,9 +1241,9 @@ def test_spsv_ex_interfaces_match_direct_route():
     Asp = A.to_sparse_csr()
     b = _rand_like(dtype, (n,), device)
 
-    handle = flagsparse_create_spsv_handle(device=device)
+    handle = flagsparse_create_spsv_handle(device=b.device)
     mat = flagsparse_create_spmat_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         (n, n),
@@ -1229,21 +1262,35 @@ def test_spsv_ex_interfaces_match_direct_route():
         mat,
         vec,
         compute_dtype=torch.float64,
+        solve_kind="csr_cw",
     )
     workspace = flagsparse_spsv_preprocess_csr(
         descr, workspace=flagsparse_spsv_create_workspace(descr)
     )
-    x_ex = flagsparse_spsv_solve_ex(handle, False, 1, mat, vec, descr=descr, workspace=workspace)
+    x_ex = flagsparse_spsv_solve_ex(
+        handle,
+        False,
+        1,
+        mat,
+        vec,
+        descr=descr,
+        workspace=workspace,
+        solve_kind="csr_cw",
+    )
     x_direct = flagsparse_spsv_csr(
-        Asp.values(),
+        Asp.values().clone(),
         Asp.col_indices().to(torch.int32),
         Asp.crow_indices().to(torch.int32),
         b,
         (n, n),
         lower=True,
         unit_diagonal=False,
+        solve_kind="csr_cw",
     )
-    assert flagsparse_spsv_buffer_size_ex(handle, False, 1, mat, vec) == descr.buffer_size
+    assert (
+        flagsparse_spsv_buffer_size_ex(handle, False, 1, mat, vec, solve_kind="csr_cw")
+        == descr.buffer_size
+    )
     rtol, atol = _tol(dtype)
     assert torch.allclose(x_ex, x_direct, rtol=rtol, atol=atol)
 
@@ -1251,7 +1298,9 @@ def test_spsv_ex_interfaces_match_direct_route():
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mode):
     device = torch.device("cuda")
@@ -1260,11 +1309,13 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
     A_ref = A.to(dtype)
     b_ref = b.to(dtype)
     x_ref = torch.linalg.solve_triangular(
-        _apply_ref_op(A_ref, op_mode), b_ref.unsqueeze(-1), upper=_effective_upper(True, op_mode)
+        _apply_ref_op(A_ref, op_mode),
+        b_ref.unsqueeze(-1),
+        upper=_effective_upper(True, op_mode),
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
 
@@ -1295,13 +1346,20 @@ def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
 
     x_non = flagsparse_spsv_csr(
-        data, indices, indptr, b, (n, n), lower=True, unit_diagonal=False, transpose=False
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=True,
+        unit_diagonal=False,
+        transpose=False,
     )
     x_non_ref = _cupy_ref_spsv(A_cp, b, lower=True, unit_diagonal=False)
 
@@ -1316,7 +1374,9 @@ def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
 )
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mode):
     device = torch.device("cuda")
@@ -1324,7 +1384,7 @@ def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mo
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
@@ -1353,7 +1413,9 @@ def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mo
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
@@ -1363,7 +1425,7 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
 
@@ -1384,20 +1446,26 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
-def test_spsv_csr_upper_transpose_family_supported_combos(n, dtype, index_dtype, op_mode):
+def test_spsv_csr_upper_transpose_family_supported_combos(
+    n, dtype, index_dtype, op_mode
+):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
     b = _rand_like(dtype, (n,), device)
     A_ref = A.to(dtype)
     b_ref = b.to(dtype)
     x_ref = torch.linalg.solve_triangular(
-        _apply_ref_op(A_ref, op_mode), b_ref.unsqueeze(-1), upper=_effective_upper(False, op_mode)
+        _apply_ref_op(A_ref, op_mode),
+        b_ref.unsqueeze(-1),
+        upper=_effective_upper(False, op_mode),
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
 
@@ -1428,13 +1496,20 @@ def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(torch.int32)
     indptr = Asp.crow_indices().to(torch.int32)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
 
     x_non = flagsparse_spsv_csr(
-        data, indices, indptr, b, (n, n), lower=False, unit_diagonal=False, transpose=False
+        data,
+        indices,
+        indptr,
+        b,
+        (n, n),
+        lower=False,
+        unit_diagonal=False,
+        transpose=False,
     )
     x_non_ref = _cupy_ref_spsv(A_cp, b, lower=False, unit_diagonal=False)
 
@@ -1449,15 +1524,19 @@ def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
 )
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize(
+    "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
+)
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
-def test_spsv_csr_matches_cusparse_upper_transpose_family(n, dtype, index_dtype, op_mode):
+def test_spsv_csr_matches_cusparse_upper_transpose_family(
+    n, dtype, index_dtype, op_mode
+):
     device = torch.device("cuda")
     A = _build_triangular(n, dtype, device, lower=False)
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values()
+    data = Asp.values().clone()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
