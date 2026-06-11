@@ -108,6 +108,14 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
 
     html_report = (tmp_path / "result.html").read_text(encoding="utf-8")
     assert "FlagSparse Test Report" in html_report
+    assert "<h3>Test Environment</h3>" in html_report
+    assert "<h3>Test Result</h3>" in html_report
+    assert 'class="table-stats"' in html_report
+    assert "AccRes<br>" in html_report
+    assert "PerfRes<br>" in html_report
+    assert "OPAverageSpeedUp" in html_report
+    assert "filterTable()" in html_report
+    assert "sortTable(5, 'asc')" in html_report
     assert "gather" in html_report
     assert "accuracy_result.json" in html_report
 

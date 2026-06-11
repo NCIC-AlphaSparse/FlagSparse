@@ -1685,6 +1685,261 @@ def _format_html_json(value: object) -> str:
         return str(value)
 
 
+FLAGGEMS_HTML_STYLE = """<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 20px;
+    color: #333;
+}
+h3 {
+    color: #2c3e50;
+    border-bottom: 2px solid #3498db;
+    padding-bottom: 6px;
+}
+h4 {
+    color: #34495e;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-bottom: 20px;
+    font-size: 14px;
+}
+thead th {
+    background-color: #3498db;
+    color: #fff;
+    padding: 8px 10px;
+    text-align: left;
+}
+tbody td {
+    padding: 6px 10px;
+    border-bottom: 1px solid #ddd;
+}
+tbody tr:nth-child(even) {
+    background-color: #f9f9f9;
+}
+tbody tr:hover {
+    background-color: #eaf2f8;
+}
+tt {
+    background-color: #ecf0f1;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+blockquote {
+    margin: 4px 0;
+    padding: 4px 8px;
+    border-left: 3px solid #e74c3c;
+    background-color: #fdf2f2;
+}
+details summary {
+    cursor: pointer;
+    color: #2980b9;
+    text-decoration: underline;
+}
+details summary:hover {
+    color: #1a5276;
+}
+pre.log-content {
+    max-height: 400px;
+    overflow: auto;
+    background-color: #2d2d2d;
+    color: #f8f8f2;
+    padding: 10px;
+    border-radius: 0 4px 4px 4px;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin-top: 0;
+}
+.log-tabs {
+    margin-top: 6px;
+}
+.tab-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    border-bottom: 2px solid #3498db;
+}
+.tab-btn {
+    padding: 4px 10px;
+    border: 1px solid #ccc;
+    border-bottom: none;
+    background: #ecf0f1;
+    cursor: pointer;
+    font-size: 12px;
+    border-radius: 4px 4px 0 0;
+}
+.tab-btn.active {
+    background: #3498db;
+    color: #fff;
+    border-color: #3498db;
+}
+.tab-btn:hover:not(.active) {
+    background: #d5e8f7;
+}
+.tab-panel {
+    border: 1px solid #ccc;
+    border-top: none;
+}
+.table-stats {
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background-color: #eaf2f8;
+    border-radius: 4px;
+    font-size: 14px;
+    color: #2c3e50;
+}
+.table-stats span {
+    font-weight: bold;
+}
+.table-wrapper {
+    overflow-x: auto;
+    overflow-y: auto;
+    max-height: 85vh;
+    position: relative;
+}
+thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background-color: #3498db;
+}
+.sticky-col {
+    position: sticky;
+    background-color: inherit;
+    z-index: 2;
+}
+.sticky-col-0 {
+    left: 0;
+    min-width: 40px;
+}
+.sticky-col-1 {
+    left: 40px;
+    min-width: 120px;
+    border-right: 2px solid #bdc3c7;
+}
+thead .sticky-col {
+    z-index: 4;
+}
+thead .sticky-col-0 {
+    background-color: #3498db;
+}
+thead .sticky-col-1 {
+    background-color: #3498db;
+}
+tbody tr .sticky-col {
+    background-color: #fff;
+}
+tbody tr:nth-child(even) .sticky-col {
+    background-color: #f9f9f9;
+}
+tbody tr:hover .sticky-col {
+    background-color: #eaf2f8;
+}
+.filter-select {
+    width: 100%;
+    margin-top: 4px;
+    font-size: 12px;
+    padding: 2px;
+}
+.sort-btn {
+    border: none;
+    background: transparent;
+    color: #fff;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 2px;
+}
+.sort-btn:hover {
+    color: #f1c40f;
+}
+</style>"""
+
+
+FLAGGEMS_HTML_SCRIPT = """<script>
+function switchTab(containerId, idx) {
+  var container = document.getElementById(containerId);
+  var btns = container.querySelectorAll('.tab-btn');
+  var panels = container.querySelectorAll('.tab-panel');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].classList.remove('active');
+    panels[i].style.display = 'none';
+  }
+  btns[idx].classList.add('active');
+  panels[idx].style.display = '';
+}
+
+var originalOrder = [];
+(function() {
+  var table = document.getElementById('main-table');
+  if (!table) return;
+  var rows = table.tBodies[0].rows;
+  for (var i = 0; i < rows.length; i++) originalOrder.push(rows[i]);
+})();
+
+function getCellText(row, col) {
+  var cell = row.cells[col];
+  if (!cell) return '';
+  var summary = cell.querySelector('summary');
+  if (summary) return summary.textContent.trim();
+  return cell.textContent.trim();
+}
+
+function filterTable() {
+  var table = document.getElementById('main-table');
+  if (!table) return;
+  var selects = table.querySelectorAll('thead .filter-select');
+  var accVal = selects[0] ? selects[0].value : '';
+  var perfVal = selects[1] ? selects[1].value : '';
+  var rows = table.tBodies[0].rows;
+  var visible = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var show = true;
+    if (accVal && getCellText(rows[i], 2) !== accVal) show = false;
+    if (perfVal && getCellText(rows[i], 4) !== perfVal) show = false;
+    rows[i].style.display = show ? '' : 'none';
+    if (show) visible++;
+  }
+  var el = document.getElementById('visible-count');
+  if (el) el.textContent = visible;
+}
+
+function sortTable(col, dir) {
+  var table = document.getElementById('main-table');
+  if (!table) return;
+  var tbody = table.tBodies[0];
+  var rows = Array.from(tbody.rows);
+  if (dir === 'reset') {
+    originalOrder.forEach(function(r) { tbody.appendChild(r); });
+    return;
+  }
+  rows.sort(function(a, b) {
+    var va = parseFloat(getCellText(a, col)) || 0;
+    var vb = parseFloat(getCellText(b, col)) || 0;
+    return dir === 'asc' ? va - vb : vb - va;
+  });
+  rows.forEach(function(r) { tbody.appendChild(r); });
+}
+</script>"""
+
+
+HTML_SPEEDUP_DTYPES = (
+    ("fp16", ("float16", "torch.float16", "half")),
+    ("fp32", ("float32", "torch.float32", "float")),
+    ("bf16", ("bfloat16", "torch.bfloat16")),
+    ("int16", ("int16", "torch.int16")),
+    ("int32", ("int32", "torch.int32")),
+    ("int8", ("int8", "torch.int8")),
+    ("uint8", ("uint8", "torch.uint8")),
+    ("int64", ("int64", "torch.int64", "long")),
+    ("bool", ("bool", "torch.bool")),
+    ("cf64", ("complex64", "torch.complex64", "cfloat", "cf64")),
+    ("float8_e4m3fn", ("float8_e4m3fn", "torch.float8_e4m3fn")),
+    ("float8_e5m2", ("float8_e5m2", "torch.float8_e5m2")),
+)
+
+
 def _phase_counts_text(phase_result: dict[str, object] | None) -> str:
     if not isinstance(phase_result, dict):
         return ""
@@ -1710,14 +1965,141 @@ def _phase_status_for_html(phase_result: dict[str, object] | None) -> str:
     return _flaggems_status(str(phase_result.get("status") or "UNKNOWN"))
 
 
-def _relative_path_for_html(path_value: object, root: Path) -> str:
-    if not path_value:
+def _phase_note_for_html(phase_result: dict[str, object] | None) -> str:
+    if not isinstance(phase_result, dict):
         return ""
-    path = Path(str(path_value))
-    try:
-        return str(path.relative_to(root))
-    except ValueError:
-        return str(path)
+    reason = phase_result.get("reason")
+    if reason:
+        return str(reason)
+    details = phase_result.get("details")
+    if isinstance(details, dict):
+        failed = details.get("failed")
+        if failed:
+            return _format_html_json(failed)
+        error = details.get("error")
+        if error:
+            return str(error)
+    return ""
+
+
+def _html_status_filter() -> str:
+    options = ["Failed", "NotFound", "Passed", "Skipped", "Timeout"]
+    return (
+        '<select class="filter-select" onchange="filterTable()"><option value="">All</option> '
+        + " ".join(
+            f'<option value="{_html_text(option)}">{_html_text(option)}</option>'
+            for option in options
+        )
+        + "</select>"
+    )
+
+
+def _env_value(env_info: dict[str, object], *path: str) -> object:
+    value: object = env_info
+    for key in path:
+        if not isinstance(value, dict):
+            return ""
+        value = value.get(key, "")
+    return value
+
+
+def _html_environment_rows(env_info: dict[str, object], generated_at: str) -> list[str]:
+    platform_info = _env_value(env_info, "platform", "platform")
+    os_info = platform_info or " ".join(
+        str(part)
+        for part in (
+            _env_value(env_info, "platform", "system"),
+            _env_value(env_info, "platform", "release"),
+        )
+        if part
+    )
+    cuda_info = _env_value(env_info, "cuda", "version")
+    device = "cuda" if _env_value(env_info, "cuda", "available") else ""
+    devices = _env_value(env_info, "cuda", "devices")
+    if isinstance(devices, list) and devices:
+        first_device = devices[0]
+        if isinstance(first_device, dict) and first_device.get("name"):
+            device = (
+                f"{device}:{first_device['name']}" if device else first_device["name"]
+            )
+    rows = [
+        ("Time", generated_at),
+        ("Architecture", _env_value(env_info, "platform", "machine")),
+        ("OS", os_info),
+        ("Python", _env_value(env_info, "python", "version")),
+        ("Torch", _env_value(env_info, "packages", "torch", "version")),
+        ("Triton", _env_value(env_info, "packages", "triton", "version")),
+        ("FlagSparse", _env_value(env_info, "packages", "flagsparse", "version")),
+        ("CUDA", cuda_info),
+        ("Device", device),
+    ]
+    return [
+        f"<tr><td>{_html_text(key)}</td><td><tt>{_html_text(value)}</tt></td></tr>"
+        for key, value in rows
+        if value not in (None, "")
+    ]
+
+
+def _format_speedup_for_html(value: object) -> str:
+    number = _to_float(value)
+    if number is None:
+        return ""
+    return f" {number:.3f}"
+
+
+def _dtype_bucket(dtype: object) -> str | None:
+    text = str(dtype or "").strip().lower()
+    if not text:
+        return None
+    for display, aliases in HTML_SPEEDUP_DTYPES:
+        if text in aliases or text.replace("torch.", "") in aliases:
+            return display
+    return None
+
+
+def _performance_speedups_for_html(
+    phase_result: dict[str, object] | None,
+) -> tuple[float | None, dict[str, float]]:
+    if not isinstance(phase_result, dict):
+        return None, {}
+
+    by_dtype: dict[str, list[float]] = {}
+    data = phase_result.get("data")
+    if isinstance(data, dict):
+        for dtype, dtype_data in data.items():
+            bucket = _dtype_bucket(dtype)
+            if not bucket or not isinstance(dtype_data, dict):
+                continue
+            number = _to_float(dtype_data.get("speedup"))
+            if number is not None:
+                by_dtype.setdefault(bucket, []).append(number)
+
+    if not by_dtype:
+        records = phase_result.get("records")
+        if isinstance(records, list):
+            for row in records:
+                if not isinstance(row, dict):
+                    continue
+                bucket = _dtype_bucket(_row_dtype(row))
+                if not bucket:
+                    continue
+                speedup_key, _, _ = _performance_schema(row)
+                number = _to_float(row.get(speedup_key))
+                if number is not None:
+                    by_dtype.setdefault(bucket, []).append(number)
+
+    dtype_speedups = {
+        dtype: statistics.mean(values) for dtype, values in by_dtype.items() if values
+    }
+    all_values = [value for values in by_dtype.values() for value in values]
+    overall = (
+        _to_float(phase_result.get("speedup"))
+        if phase_result.get("speedup") not in (None, "")
+        else None
+    )
+    if overall is None and all_values:
+        overall = statistics.mean(all_values)
+    return overall, dtype_speedups
 
 
 def _html_tab_group(group_id: str, tabs: list[tuple[str, str]]) -> str:
@@ -1764,25 +2146,12 @@ def _phase_html_details(
             )
         )
     stdout_path = _stdout_log_file(phase_result)
-    stderr_path = _stderr_log_file(phase_result)
     if stdout_path:
         tabs.append((Path(str(stdout_path)).name, _read_text_for_html(stdout_path)))
-    if stderr_path:
-        tabs.append((Path(str(stderr_path)).name, _read_text_for_html(stderr_path)))
-    detail_path = (
-        Path(str(result_path)).with_name(f"{phase}_detail.json")
-        if result_path
-        else None
-    )
-    if detail_path and detail_path.exists():
-        tabs.append((detail_path.name, _read_text_for_html(detail_path)))
-    if phase == "performance" and phase_result.get("data_path"):
-        csv_path = Path(str(phase_result["data_path"]))
-        if csv_path.exists():
-            tabs.append((csv_path.name, _read_text_for_html(csv_path)))
     if not tabs:
         tabs.append((f"{phase}.json", _format_html_json(phase_result)))
-    return _html_tab_group(f"tabs-{phase}-{op}", tabs)
+    phase_id = "acc" if phase == "accuracy" else "perf"
+    return _html_tab_group(f"tabs-{phase_id}-{op}", tabs)
 
 
 def write_result_html(
@@ -1791,20 +2160,22 @@ def write_result_html(
     env_info: dict[str, object],
 ) -> None:
     ordered = sorted(results, key=lambda item: str(item["operator"]))
-    rows = _phase_rows(ordered)
-    totals = _totals(rows)
-    generated_at = _dt.datetime.now().isoformat(timespec="seconds")
-    env_rows = []
-    for key, value in sorted(env_info.items()):
-        env_rows.append(
-            f"<tr><td>{_html_text(key)}</td><td><tt>{_html_text(_format_html_json(value) if isinstance(value, (dict, list)) else value)}</tt></td></tr>"
-        )
-    total_rows = []
-    for phase, by_status in sorted(totals.get("by_phase", {}).items()):
-        total_rows.append(
-            f"<tr><td>{_html_text(phase)}</td><td><tt>{_html_text(by_status)}</tt></td></tr>"
-        )
-
+    generated_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    env_rows = _html_environment_rows(env_info, generated_at)
+    table_stats_html = (
+        f'<div class="table-stats">Total: <span id="total-count">{len(ordered)}</span> '
+        f'| Showing: <span id="visible-count">{len(ordered)}</span></div>'
+    )
+    speedup_header_html = (
+        "<th>OPAverageSpeedUp<br>"
+        '<button class="sort-btn" onclick="sortTable(5, \'asc\')">&#9650;</button>'
+        '<button class="sort-btn" onclick="sortTable(5, \'desc\')">&#9660;</button>'
+        '<button class="sort-btn" onclick="sortTable(5, \'reset\')">&#8634;</button>'
+        "</th>"
+    )
+    dtype_header_html = "".join(
+        f"<th>{_html_text(dtype)}</th>" for dtype, _ in HTML_SPEEDUP_DTYPES
+    )
     op_rows = []
     for index, result in enumerate(ordered, start=1):
         op = str(result["operator"])
@@ -1812,16 +2183,24 @@ def write_result_html(
         performance = result.get("performance")
         acc_status = _phase_status_for_html(accuracy)
         perf_status = _phase_status_for_html(performance)
+        avg_speedup, dtype_speedups = _performance_speedups_for_html(performance)
+        note = _phase_note_for_html(accuracy) or _phase_note_for_html(performance)
+        dtype_cells = "".join(
+            f"<td>{_html_text(_format_speedup_for_html(dtype_speedups.get(dtype)))}</td>"
+            for dtype, _ in HTML_SPEEDUP_DTYPES
+        )
         op_rows.append(
             "<tr>"
             f'<td class="sticky-col sticky-col-0">{index}</td>'
             f'<td class="sticky-col sticky-col-1">{_html_text(op)}</td>'
-            f'<td><details><summary class="status-{_html_text(acc_status.lower())}">{_html_text(acc_status)}</summary>'
+            f"<td><details><summary>{_html_text(acc_status)}</summary>"
             f"{_phase_html_details('accuracy', op, accuracy, results_dir)}</details></td>"
             f"<td>{_html_text(_phase_counts_text(accuracy))}</td>"
-            f'<td><details><summary class="status-{_html_text(perf_status.lower())}">{_html_text(perf_status)}</summary>'
+            f"<td><details><summary>{_html_text(perf_status)}</summary>"
             f"{_phase_html_details('performance', op, performance, results_dir)}</details></td>"
-            f"<td>{_html_text(_phase_counts_text(performance))}</td>"
+            f"<td>{_html_text(_format_speedup_for_html(avg_speedup))}</td>"
+            f"{dtype_cells}"
+            f"<td>{_html_text(note)}</td>"
             "</tr>"
         )
 
@@ -1830,57 +2209,36 @@ def write_result_html(
 <head>
 <meta charset="utf-8">
 <title>FlagSparse Test Report</title>
-<style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; color: #333; }}
-h3 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 6px; }}
-table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; font-size: 14px; }}
-thead th {{ background-color: #3498db; color: #fff; padding: 8px 10px; text-align: left; position: sticky; top: 0; z-index: 2; }}
-tbody td {{ padding: 6px 10px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
-tbody tr:nth-child(even) {{ background: #f8fafc; }}
-details summary {{ cursor: pointer; font-weight: 600; }}
-.status-passed {{ color: #15803d; }}
-.status-failed, .status-error, .status-timeout {{ color: #b91c1c; }}
-.status-skipped, .status-notfound {{ color: #a16207; }}
-.log-tabs {{ margin-top: 8px; }}
-.tab-buttons {{ margin-bottom: 6px; }}
-.tab-btn {{ border: 1px solid #cbd5e1; background: #f8fafc; padding: 4px 8px; cursor: pointer; }}
-.tab-btn.active {{ background: #2563eb; color: white; border-color: #2563eb; }}
-.log-content {{ max-height: 420px; overflow: auto; background: #0f172a; color: #e2e8f0; padding: 10px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; }}
-.sticky-col {{ position: sticky; background: inherit; z-index: 1; }}
-.sticky-col-0 {{ left: 0; min-width: 42px; }}
-.sticky-col-1 {{ left: 48px; min-width: 180px; font-weight: 600; }}
-</style>
+{FLAGGEMS_HTML_STYLE}
 </head>
 <body>
-<h3>FlagSparse Test Report</h3>
-<h4>Environment</h4>
-<table><thead><tr><th>Env</th><th>Setting</th></tr></thead><tbody>
-<tr><td>Generated</td><td><tt>{_html_text(generated_at)}</tt></td></tr>
+<h3>Test Environment</h3>
+<table>
+<thead><tr><th>Env</th><th>Setting</th></tr></thead>
+<tbody>
 {"".join(env_rows)}
 </tbody></table>
-<h4>Totals</h4>
-<table><thead><tr><th>Phase</th><th>Status Counts</th></tr></thead><tbody>
-{"".join(total_rows)}
-</tbody></table>
-<h4>Operators</h4>
+<h3>Test Result</h3>
+{table_stats_html}
+<div class="table-wrapper">
 <table id="main-table">
-<thead><tr><th>#</th><th>Operator</th><th>Accuracy</th><th>Passed/Failed/Skipped</th><th>Performance</th><th>Rows/Speedup</th></tr></thead>
+<thead>
+<tr>
+<th class="sticky-col sticky-col-0">No.</th>
+<th class="sticky-col sticky-col-1">ID</th>
+<th>AccRes<br>{_html_status_filter()}</th>
+<th>AccStat(pass/fail/skip)</th>
+<th>PerfRes<br>{_html_status_filter()}</th>
+{speedup_header_html}
+{dtype_header_html}
+<th>Note</th>
+</tr>
+</thead>
 <tbody>
 {"".join(op_rows)}
 </tbody></table>
-<script>
-function switchTab(containerId, idx) {{
-  var container = document.getElementById(containerId);
-  var btns = container.querySelectorAll('.tab-btn');
-  var panels = container.querySelectorAll('.tab-panel');
-  for (var i = 0; i < btns.length; i++) {{
-    btns[i].classList.remove('active');
-    panels[i].style.display = 'none';
-  }}
-  btns[idx].classList.add('active');
-  panels[idx].style.display = '';
-}}
-</script>
+</div>
+{FLAGGEMS_HTML_SCRIPT}
 </body>
 </html>
 """
