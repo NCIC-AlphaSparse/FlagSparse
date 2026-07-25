@@ -110,6 +110,14 @@ python tests/test_spmm_coo.py <dir/> --csv out.csv      # only --route rowrun or
 # same tuning flags as CSR SpMM where applicable: --op, --dense-cols, --block-n, --block-nnz, --warmup, --iters, --no-cusparse
 ```
 
+**test_spmm_bsr.py** - native BSR SpMM with padded block-grid output:
+
+```bash
+python tests/test_spmm_bsr.py --synthetic --block-dims 2 --ops non
+python tests/test_spmm_bsr.py <dir/> --csv-bsr out.csv --block-dims 2 --ops non --dense-cols 32
+# correctness uses the same BSR arrays expanded to COO as Ref=torch_spmm_coo; PyTorch/CuPy BSR are same-format baselines only when available.
+```
+
 **test_sddmm.py** - CSR SDDMM (`.mtx` batch or `--csv`):
 
 ```bash

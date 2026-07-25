@@ -163,6 +163,24 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spmm_bsr
+    description: |
+      Computes sparse matrix-dense matrix multiplication for a BSR matrix.
+    for:
+      - flagsparse_spmm_bsr
+      - flagsparse_spmm_bsr_run
+      - prepare_spmm_bsr_route
+    labels:
+      - flagsparse
+      - sparse
+      - bsr
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
   - id: spmm_csr_opt
     description: |
       Computes optimized CSR sparse matrix-dense matrix multiplication.

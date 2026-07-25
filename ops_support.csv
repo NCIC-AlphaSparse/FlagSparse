@@ -35,6 +35,14 @@ spgemm,CSR,int32,float32,non,triton,SUPPORTED
 spgemm,CSR,int32,float64,non,triton,SUPPORTED
 spgemm,CSR,int64,float32,non,triton,SUPPORTED
 spgemm,CSR,int64,float64,non,triton,SUPPORTED
+spmm,BSR,int32,float32,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int32,float64,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int32,complex64,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int32,complex128,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int64,float32,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int64,float64,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int64,complex64,non,triton_bsr_base,SUPPORTED
+spmm,BSR,int64,complex128,non,triton_bsr_base,SUPPORTED
 spmm,COO,int32,float16,non,triton,SUPPORTED
 spmm,COO,int32,float16,trans,triton,SUPPORTED
 spmm,COO,int32,float16,conj,triton,SUPPORTED

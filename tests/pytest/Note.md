@@ -95,6 +95,7 @@ All parametrized accuracy tests build synthetic tensors on `torch.device("cuda")
 - Gather/Scatter use `GATHER_SCATTER_SHAPES` and `GATHER_SCATTER_FLOAT_DTYPES`; references are PyTorch indexing and `index_copy_`.
 - CSR/COO SpMV use synthetic sparse matrices; references use `torch.sparse.mm`.
 - BSR SpMV covers `non` / `trans` / `conj`; native output uses padded block-grid length and tests compare the logical slice against a BSR-expanded COO reference. PyTorch BSR is recorded only as a same-format baseline, never as the golden reference. The `blockrow_reduce` algorithm is a `non`-only optimized path with GPU bucket preprocessing counted as `process_gpu_ms`.
+- BSR SpMM v1 covers `op="non"` with padded block-grid output; tests compare the logical slice against `Ref=torch_spmm_coo`, built by expanding the same BSR arrays to COO for correctness only.
 - CSR/COO SpMM, SpSM, SpGEMM, and SDDMM use small synthetic matrices and PyTorch dense/sparse or sampled dense references.
 - SpSV uses diagonally strengthened triangular matrices; references use `torch.linalg.solve_triangular`; optional CuPy/cuSPARSE references run only when available.
 
