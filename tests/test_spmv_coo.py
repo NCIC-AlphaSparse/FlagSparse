@@ -879,83 +879,13 @@ def _mtx_value_for_dtype(raw_value, dtype):
 
 
 def _load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    """Load a .mtx into COO torch tensors via the C-accelerated scipy reader
+    (see tests/mtx_fast.py); the former pure-Python parser took minutes on
+    large SuiteSparse matrices. Returns (vals, rows, cols, shape)."""
+    from mtx_fast import load_coo
 
-    mm_field = "real"
-    mm_symmetry = "general"
-    data_lines = []
-    header_info = None
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("%%MatrixMarket"):
-            tokens = stripped.split()
-            if len(tokens) >= 5:
-                mm_field = tokens[3].lower()
-                mm_symmetry = tokens[4].lower()
-            continue
-        if stripped.startswith("%"):
-            continue
-        if not header_info and stripped:
-            parts = stripped.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if stripped:
-            data_lines.append(stripped)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-    n_rows, n_cols, nnz = header_info
-
-    is_pattern = mm_field == "pattern"
-    is_complex_field = mm_field == "complex"
-    is_symmetric = mm_symmetry == "symmetric"
-    is_hermitian = mm_symmetry == "hermitian"
-    is_skew = mm_symmetry == "skew-symmetric"
-
-    rows_host = []
-    cols_host = []
-    vals_host = []
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        if is_pattern:
-            raw = 1.0
-        elif is_complex_field:
-            real = float(parts[2]) if len(parts) >= 3 else 0.0
-            imag = float(parts[3]) if len(parts) >= 4 else 0.0
-            raw = complex(real, imag)
-        else:
-            raw = float(parts[2]) if len(parts) >= 3 else 0.0
-        v = _mtx_value_for_dtype(raw, dtype)
-        if 0 <= r < n_rows and 0 <= c < n_cols:
-            rows_host.append(r)
-            cols_host.append(c)
-            vals_host.append(v)
-            if r != c:
-                if is_symmetric and 0 <= c < n_rows and 0 <= r < n_cols:
-                    rows_host.append(c)
-                    cols_host.append(r)
-                    vals_host.append(v)
-                elif is_hermitian and 0 <= c < n_rows and 0 <= r < n_cols:
-                    rows_host.append(c)
-                    cols_host.append(r)
-                    vals_host.append(v.conjugate() if isinstance(v, complex) else v)
-                elif is_skew and 0 <= c < n_rows and 0 <= r < n_cols:
-                    rows_host.append(c)
-                    cols_host.append(r)
-                    vals_host.append(-v)
-    rows = torch.tensor(rows_host, dtype=torch.int64, device=device)
-    cols = torch.tensor(cols_host, dtype=torch.int64, device=device)
-    vals = torch.tensor(vals_host, dtype=dtype, device=device)
-    return vals, rows, cols, (n_rows, n_cols)
+    data, rows, cols, shape = load_coo(file_path, dtype=dtype, device=device)
+    return data, rows, cols, shape
 
 
 # Dense PyTorch reference for SpSV can OOM on large matrices.

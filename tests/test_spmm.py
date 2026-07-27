@@ -204,115 +204,14 @@ def _scaled_allclose_error(candidate, reference, value_dtype=None):
 
 
 def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
-    """Load SuiteSparse / Matrix Market .mtx file into CSR as torch tensors."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as handle:
-        lines = handle.readlines()
+    """Load SuiteSparse / Matrix Market .mtx file into CSR as torch tensors.
 
-    mm_field = "real"
-    mm_symmetry = "general"
-    data_lines = []
-    header_info = None
-    for line in lines:
-        line = line.strip()
-        if line.startswith("%%MatrixMarket"):
-            parts = line.split()
-            if len(parts) >= 5:
-                mm_field = parts[3].lower()
-                mm_symmetry = parts[4].lower()
-            continue
-        if line.startswith("%"):
-            continue
-        if not header_info and line:
-            parts = line.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if line:
-            data_lines.append(line)
+    Backed by the C-accelerated scipy reader (see tests/mtx_fast.py); the former
+    pure-Python parser took minutes on large SuiteSparse matrices.
+    """
+    from mtx_fast import load_csr
 
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-
-    n_rows, n_cols, nnz = header_info
-    if nnz == 0:
-        data = torch.tensor([], dtype=dtype, device=device)
-        indices = torch.tensor([], dtype=torch.int64, device=device)
-        indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
-        return data, indices, indptr, (n_rows, n_cols)
-
-    if mm_field == "complex" and dtype not in (torch.complex64, torch.complex128):
-        raise TypeError(
-            f"Matrix Market file {file_path} stores complex values but requested dtype {dtype}"
-        )
-
-    is_pattern = mm_field == "pattern"
-    is_complex = mm_field == "complex"
-    is_symmetric = mm_symmetry == "symmetric"
-    is_skew = mm_symmetry == "skew-symmetric"
-    is_hermitian = mm_symmetry == "hermitian"
-
-    entries = {}
-
-    def _accumulate(row_idx, col_idx, value):
-        key = (row_idx, col_idx)
-        entries[key] = entries.get(key, 0.0) + value
-
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        row_idx = int(parts[0]) - 1
-        col_idx = int(parts[1]) - 1
-        if not (0 <= row_idx < n_rows and 0 <= col_idx < n_cols):
-            continue
-
-        if is_pattern:
-            value = 1.0
-        elif is_complex:
-            if len(parts) < 4:
-                raise ValueError(
-                    f"Complex Matrix Market entry is missing an imaginary part: {line}"
-                )
-            value = complex(float(parts[2]), float(parts[3]))
-        else:
-            if len(parts) < 3:
-                raise ValueError(
-                    f"Matrix Market entry is missing a numeric value: {line}"
-                )
-            value = float(parts[2])
-
-        _accumulate(row_idx, col_idx, value)
-        if row_idx != col_idx:
-            if is_symmetric and 0 <= col_idx < n_rows and 0 <= row_idx < n_cols:
-                _accumulate(col_idx, row_idx, value)
-            elif is_skew and 0 <= col_idx < n_rows and 0 <= row_idx < n_cols:
-                _accumulate(col_idx, row_idx, -value)
-            elif is_hermitian and 0 <= col_idx < n_rows and 0 <= row_idx < n_cols:
-                twin = value.conjugate() if isinstance(value, complex) else value
-                _accumulate(col_idx, row_idx, twin)
-
-    sorted_entries = sorted(entries.items(), key=lambda item: item[0])
-    cols_sorted = []
-    vals_sorted = []
-    indptr_list = [0]
-    current_row = 0
-    for (row_idx, col_idx), value in sorted_entries:
-        while current_row < row_idx:
-            indptr_list.append(len(cols_sorted))
-            current_row += 1
-        cols_sorted.append(col_idx)
-        vals_sorted.append(value)
-    while len(indptr_list) < n_rows + 1:
-        indptr_list.append(len(cols_sorted))
-
-    data = torch.tensor(vals_sorted, dtype=dtype, device=device)
-    indices = torch.tensor(cols_sorted, dtype=torch.int64, device=device)
-    indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
-    return data, indices, indptr, (n_rows, n_cols)
+    return load_csr(file_path, dtype=dtype, device=device)
 
 
 def _apply_torch_sparse_op(sparse_matrix, B, op):

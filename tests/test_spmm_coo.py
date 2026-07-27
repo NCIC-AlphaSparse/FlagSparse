@@ -425,104 +425,13 @@ def _best_rows(rows):
 
 
 def load_mtx_to_coo_torch(file_path, dtype=torch.float32, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as handle:
-        lines = handle.readlines()
+    """Load a .mtx into COO torch tensors via the C-accelerated scipy reader
+    (see tests/mtx_fast.py); the former pure-Python parser took minutes on
+    large SuiteSparse matrices. Returns (data, row, col, shape)."""
+    from mtx_fast import load_coo
 
-    mm_field = "real"
-    mm_symmetry = "general"
-    data_lines = []
-    header_info = None
-    for line in lines:
-        line = line.strip()
-        if line.startswith("%%MatrixMarket"):
-            parts = line.split()
-            if len(parts) >= 5:
-                mm_field = parts[3].lower()
-                mm_symmetry = parts[4].lower()
-            continue
-        if line.startswith("%"):
-            continue
-        if not header_info and line:
-            parts = line.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if line:
-            data_lines.append(line)
-
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-
-    n_rows, n_cols, nnz = header_info
-    if nnz == 0:
-        empty_index = torch.tensor([], dtype=torch.int64, device=device)
-        data = torch.tensor([], dtype=dtype, device=device)
-        return data, empty_index, empty_index.clone(), (n_rows, n_cols)
-
-    if mm_field == "complex" and dtype not in (torch.complex64, torch.complex128):
-        raise TypeError(
-            f"Matrix Market file {file_path} stores complex values but requested dtype {dtype}"
-        )
-
-    is_pattern = mm_field == "pattern"
-    is_complex = mm_field == "complex"
-    is_symmetric = mm_symmetry == "symmetric"
-    is_skew = mm_symmetry == "skew-symmetric"
-    is_hermitian = mm_symmetry == "hermitian"
-
-    entries = {}
-
-    def _accumulate(row_idx, col_idx, value):
-        key = (row_idx, col_idx)
-        entries[key] = entries.get(key, 0.0) + value
-
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        row_idx = int(parts[0]) - 1
-        col_idx = int(parts[1]) - 1
-        if not (0 <= row_idx < n_rows and 0 <= col_idx < n_cols):
-            continue
-
-        if is_pattern:
-            value = 1.0
-        elif is_complex:
-            if len(parts) < 4:
-                raise ValueError(
-                    f"Complex Matrix Market entry is missing an imaginary part: {line}"
-                )
-            value = complex(float(parts[2]), float(parts[3]))
-        else:
-            if len(parts) < 3:
-                raise ValueError(
-                    f"Matrix Market entry is missing a numeric value: {line}"
-                )
-            value = float(parts[2])
-
-        _accumulate(row_idx, col_idx, value)
-        if row_idx != col_idx:
-            if is_symmetric and 0 <= col_idx < n_rows and 0 <= row_idx < n_cols:
-                _accumulate(col_idx, row_idx, value)
-            elif is_skew and 0 <= col_idx < n_rows and 0 <= row_idx < n_cols:
-                _accumulate(col_idx, row_idx, -value)
-            elif is_hermitian and 0 <= col_idx < n_rows and 0 <= row_idx < n_cols:
-                twin = value.conjugate() if isinstance(value, complex) else value
-                _accumulate(col_idx, row_idx, twin)
-
-    sorted_entries = sorted(entries.items(), key=lambda item: item[0])
-    rows = [key[0] for key, _ in sorted_entries]
-    cols = [key[1] for key, _ in sorted_entries]
-    vals = [value for _, value in sorted_entries]
-
-    data = torch.tensor(vals, dtype=dtype, device=device)
-    row = torch.tensor(rows, dtype=torch.int64, device=device)
-    col = torch.tensor(cols, dtype=torch.int64, device=device)
-    return data, row, col, (n_rows, n_cols)
+    data, row, col, shape = load_coo(file_path, dtype=dtype, device=device)
+    return data, row, col, shape
 
 
 def _normalize_route(route):

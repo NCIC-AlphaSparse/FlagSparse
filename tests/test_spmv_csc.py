@@ -424,86 +424,13 @@ def _mtx_value_for_dtype(raw_value, dtype):
 
 
 def load_mtx_to_csc_torch(path, dtype=torch.float32, device=None):
-    device = torch.device("cuda" if device is None else device)
-    with open(path, "r", encoding="utf-8") as handle:
-        lines = handle.readlines()
-    mm_field = "real"
-    mm_symmetry = "general"
-    header = None
-    data_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("%%MatrixMarket"):
-            parts = stripped.split()
-            if len(parts) >= 5:
-                mm_field = parts[3].lower()
-                mm_symmetry = parts[4].lower()
-            continue
-        if stripped.startswith("%"):
-            continue
-        if header is None and stripped:
-            parts = stripped.split()
-            header = (
-                int(parts[0]),
-                int(parts[1]),
-                int(parts[2]) if len(parts) > 2 else 0,
-            )
-            continue
-        if stripped:
-            data_lines.append(stripped)
-    if header is None:
-        raise ValueError(f"Cannot parse .mtx header: {path}")
-    n_rows, n_cols, nnz = header
-    entries = {}
+    """Load a .mtx into CSC torch tensors via the C-accelerated scipy reader
+    (see tests/mtx_fast.py); the former pure-Python parser took minutes on
+    large SuiteSparse matrices. Returns (data, row_indices, col_indptr, shape)."""
+    from mtx_fast import load_csc
 
-    def add_entry(r, c, value):
-        key = (int(r), int(c))
-        entries[key] = entries.get(key, 0.0) + value
-
-    is_pattern = mm_field == "pattern"
-    is_complex = mm_field == "complex"
-    is_symmetric = mm_symmetry == "symmetric"
-    is_skew = mm_symmetry == "skew-symmetric"
-    is_hermitian = mm_symmetry == "hermitian"
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        if not (0 <= r < n_rows and 0 <= c < n_cols):
-            continue
-        if is_pattern:
-            value = 1.0
-        elif is_complex:
-            value = complex(float(parts[2]), float(parts[3]))
-        else:
-            value = float(parts[2])
-        add_entry(r, c, value)
-        if r != c:
-            if is_symmetric and 0 <= c < n_rows and 0 <= r < n_cols:
-                add_entry(c, r, value)
-            elif is_skew and 0 <= c < n_rows and 0 <= r < n_cols:
-                add_entry(c, r, -value)
-            elif is_hermitian and 0 <= c < n_rows and 0 <= r < n_cols:
-                add_entry(
-                    c, r, value.conjugate() if isinstance(value, complex) else value
-                )
-    sorted_entries = sorted(entries.items(), key=lambda item: (item[0][1], item[0][0]))
-    rows = [key[0] for key, _ in sorted_entries]
-    cols = [key[1] for key, _ in sorted_entries]
-    vals = [_mtx_value_for_dtype(value, dtype) for _, value in sorted_entries]
-    data = torch.tensor(vals, dtype=dtype, device=device)
-    indices = torch.tensor(rows, dtype=torch.int64, device=device)
-    col_tensor = torch.tensor(cols, dtype=torch.int64, device=device)
-    col_counts = (
-        torch.bincount(col_tensor, minlength=n_cols)
-        if col_tensor.numel()
-        else torch.zeros(n_cols, dtype=torch.int64, device=device)
-    )
-    indptr = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
-    indptr[1:] = torch.cumsum(col_counts, dim=0)
-    return data, indices, indptr, (n_rows, n_cols)
+    data, indices, indptr, shape = load_csc(path, dtype=dtype, device=device)
+    return data, indices, indptr, shape
 
 
 def run_synthetic(

@@ -48,75 +48,12 @@ DEFAULT_SEED = None
 
 
 def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as handle:
-        lines = handle.readlines()
+    """Load a .mtx into CSR torch tensors via the C-accelerated scipy reader
+    (see tests/mtx_fast.py); the former pure-Python parser took minutes on
+    large SuiteSparse matrices."""
+    from mtx_fast import load_csr
 
-    mm_field = "real"
-    mm_symmetry = "general"
-    data_lines = []
-    header_info = None
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("%%MatrixMarket"):
-            tokens = stripped.split()
-            if len(tokens) >= 5:
-                mm_field = tokens[3].lower()
-                mm_symmetry = tokens[4].lower()
-            continue
-        if stripped.startswith("%"):
-            continue
-        if not header_info and stripped:
-            parts = stripped.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if stripped:
-            data_lines.append(stripped)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-
-    n_rows, n_cols, nnz = header_info
-    if nnz == 0:
-        data = torch.tensor([], dtype=dtype, device=device)
-        indices = torch.tensor([], dtype=torch.int64, device=device)
-        indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
-        return data, indices, indptr, (n_rows, n_cols)
-
-    is_pattern = mm_field == "pattern"
-    is_symmetric = mm_symmetry in ("symmetric", "hermitian")
-    is_skew = mm_symmetry == "skew-symmetric"
-    row_maps = [dict() for _ in range(n_rows)]
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        row = int(parts[0]) - 1
-        col = int(parts[1]) - 1
-        value = 1.0 if is_pattern else float(parts[2])
-        if 0 <= row < n_rows and 0 <= col < n_cols:
-            row_maps[row][col] = row_maps[row].get(col, 0.0) + value
-            if row != col:
-                if is_symmetric and 0 <= col < n_rows and 0 <= row < n_cols:
-                    row_maps[col][row] = row_maps[col].get(row, 0.0) + value
-                elif is_skew and 0 <= col < n_rows and 0 <= row < n_cols:
-                    row_maps[col][row] = row_maps[col].get(row, 0.0) - value
-
-    cols_sorted = []
-    vals_sorted = []
-    indptr_list = [0]
-    for row in range(n_rows):
-        row_map = row_maps[row]
-        for col in sorted(row_map.keys()):
-            cols_sorted.append(col)
-            vals_sorted.append(row_map[col])
-        indptr_list.append(len(cols_sorted))
-
-    data = torch.tensor(vals_sorted, dtype=dtype, device=device)
-    indices = torch.tensor(cols_sorted, dtype=torch.int64, device=device)
-    indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
-    return data, indices, indptr, (n_rows, n_cols)
+    return load_csr(file_path, dtype=dtype, device=device)
 
 
 def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):

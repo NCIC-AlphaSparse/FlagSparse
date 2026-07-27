@@ -471,107 +471,13 @@ def _csr_transpose(data, indices, indptr, shape, conjugate=False):
 
 
 def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None, lower=True):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    data_lines = []
-    header_info = None
-    mm_field = "real"
-    mm_symmetry = "general"
-    for line in lines:
-        line = line.strip()
-        if line.startswith("%%MatrixMarket"):
-            parts = line.split()
-            if len(parts) >= 5:
-                mm_field = parts[3].lower()
-                mm_symmetry = parts[4].lower()
-            continue
-        if line.startswith("%"):
-            continue
-        if not header_info and line:
-            parts = line.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if line:
-            data_lines.append(line)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-    n_rows, n_cols, nnz = header_info
-    if n_rows != n_cols:
-        raise ValueError("SpSV requires square matrices")
-    row_maps = [dict() for _ in range(n_rows)]
+    """Load a .mtx into a well-conditioned triangular-ready CSR via the fast
+    scipy reader (see tests/mtx_fast.py). Ensures a structural diagonal and
+    row-normalizes so the triangular solve stays diagonally dominant; the former
+    pure-Python parser took minutes on large SuiteSparse matrices."""
+    from mtx_fast import load_csr_spsv
 
-    def _accum(r, c, v):
-        row = row_maps[r]
-        if c in row:
-            row[c] += v
-        else:
-            row[c] = v
-
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        v = _matrix_market_value(parts, mm_field)
-        _accum(r, c, v)
-        if mm_symmetry == "symmetric" and r != c:
-            _accum(c, r, v)
-        elif mm_symmetry == "hermitian" and r != c:
-            _accum(c, r, v.conjugate() if isinstance(v, complex) else v)
-        elif mm_symmetry == "skew-symmetric" and r != c:
-            _accum(c, r, -v)
-
-    for r in range(n_rows):
-        row = row_maps[r]
-        if r not in row:
-            if dtype == torch.complex64:
-                row[r] = complex(1.0, 1.0)
-            elif dtype == torch.complex128:
-                row[r] = complex(1.0, 1.0)
-            else:
-                row[r] = 1.0
-
-    for r in range(n_rows):
-        row = row_maps[r]
-        if dtype in (torch.float32, torch.float64):
-            partial_sum = sum(abs(v) for v in row.values())
-            diag_val = partial_sum + 1.0
-            row[r] = diag_val
-            for c in list(row.keys()):
-                row[c] = row[c] / partial_sum
-        else:
-            partial_sum_real = sum(abs(complex(v).real) for v in row.values())
-            partial_sum_imag = sum(abs(complex(v).imag) for v in row.values())
-            row[r] = complex(partial_sum_real + 1.0, partial_sum_imag + 1.0)
-            for c in list(row.keys()):
-                v = complex(row[c])
-                real_part = (
-                    v.real / partial_sum_real if partial_sum_real != 0.0 else 0.0
-                )
-                imag_part = (
-                    v.imag / partial_sum_imag if partial_sum_imag != 0.0 else 0.0
-                )
-                row[c] = complex(real_part, imag_part)
-
-    cols_s = []
-    vals_s = []
-    indptr_list = [0]
-    for r in range(n_rows):
-        row = row_maps[r]
-        for c in sorted(row.keys()):
-            cols_s.append(c)
-            vals_s.append(row[c])
-        indptr_list.append(len(cols_s))
-    data = _tensor_from_scalar_values(vals_s, dtype, device)
-    indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
-    indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
-    return data, indices, indptr, (n_rows, n_cols)
+    return load_csr_spsv(file_path, dtype=dtype, device=device, lower=lower)
 
 
 def _coo_inputs_for_csv(data, indices, indptr, shape, index_dtype=torch.int64):

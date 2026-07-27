@@ -70,6 +70,12 @@ DEFAULT_EXCLUDED_OPS = {
     "spmv_coo_tocsr",
     "spsv_descriptor_api",
     "sparse_format_constructors",
+    # spmm_csr now routes to the optimized (alg1) kernel by default, so the
+    # standalone opt operators are dropped from the default CI run. They remain
+    # configured and can still be run explicitly via --ops.
+    "spmm_csr_opt",
+    "spmm_csr_opt_alg1",
+    "spmm_csr_opt_alg2",
 }
 STATUS_TO_FLAGGEMS = {
     "PASS": "Passed",
