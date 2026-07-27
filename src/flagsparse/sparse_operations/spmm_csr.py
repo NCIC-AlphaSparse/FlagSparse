@@ -4016,6 +4016,30 @@ def flagsparse_spmm_csr(
     if max_segments is not None and max_segments <= 0:
         raise ValueError("max_segments must be positive when provided")
 
+    # Default fast path: for the plain A @ B case in float32/float64 with no base
+    # tuning overrides, route to the optimized (alg1) kernel. Transpose/conj,
+    # other dtypes, explicit block tuning, and return_meta (whose meta schema is
+    # specific to this base path) fall through to the base implementation below.
+    if (
+        not _spmm_op_transposes(op_code)
+        and block_n is None
+        and block_nnz is None
+        and max_segments is None
+        and not return_meta
+        and torch.is_tensor(data)
+        and data.dtype in (torch.float32, torch.float64)
+    ):
+        return flagsparse_spmm_csr_opt_alg1(
+            data=data,
+            indices=indices,
+            indptr=indptr,
+            B=B,
+            shape=shape,
+            out=out,
+            return_time=return_time,
+            return_meta=False,
+        )
+
     (
         data,
         kernel_indices,

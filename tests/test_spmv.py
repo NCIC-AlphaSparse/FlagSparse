@@ -118,75 +118,13 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     Load SuiteSparse / Matrix Market .mtx file into CSR as torch tensors.
     Correctly handles pattern matrices and symmetric/skew-symmetric expansions.
     Returns (data, indices, indptr, shape) on device.
+
+    Backed by the C-accelerated scipy reader (see tests/mtx_fast.py); the former
+    pure-Python parser took minutes on large SuiteSparse matrices.
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    from mtx_fast import load_csr
 
-    mm_field = "real"
-    mm_symmetry = "general"
-    data_lines = []
-    header_info = None
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("%%MatrixMarket"):
-            tokens = stripped.split()
-            if len(tokens) >= 5:
-                mm_field = tokens[3].lower()
-                mm_symmetry = tokens[4].lower()
-            continue
-        if stripped.startswith("%"):
-            continue
-        if not header_info and stripped:
-            parts = stripped.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if stripped:
-            data_lines.append(stripped)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-
-    n_rows, n_cols, nnz = header_info
-    if nnz == 0:
-        data = torch.tensor([], dtype=dtype, device=device)
-        indices = torch.tensor([], dtype=torch.int64, device=device)
-        indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
-        return data, indices, indptr, (n_rows, n_cols)
-
-    is_pattern = mm_field == "pattern"
-    is_symmetric = mm_symmetry in ("symmetric", "hermitian")
-    is_skew = mm_symmetry == "skew-symmetric"
-
-    row_maps = [dict() for _ in range(n_rows)]
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        v = 1.0 if is_pattern else float(parts[2])
-        if 0 <= r < n_rows and 0 <= c < n_cols:
-            row_maps[r][c] = row_maps[r].get(c, 0.0) + v
-            if r != c:
-                if is_symmetric and 0 <= c < n_rows and 0 <= r < n_cols:
-                    row_maps[c][r] = row_maps[c].get(r, 0.0) + v
-                elif is_skew and 0 <= c < n_rows and 0 <= r < n_cols:
-                    row_maps[c][r] = row_maps[c].get(r, 0.0) - v
-
-    cols_s = []
-    vals_s = []
-    indptr_list = [0]
-    for row in row_maps:
-        for c in sorted(row.keys()):
-            cols_s.append(c)
-            vals_s.append(row[c])
-        indptr_list.append(len(cols_s))
-    data = torch.tensor(vals_s, dtype=dtype, device=device)
-    indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
-    indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
-    return data, indices, indptr, (n_rows, n_cols)
+    return load_csr(file_path, dtype=dtype, device=device)
 
 
 def _allclose_error_ratio(actual, reference, atol, rtol):

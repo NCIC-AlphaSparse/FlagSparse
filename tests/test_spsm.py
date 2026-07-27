@@ -935,87 +935,15 @@ def _benchmark_flagsparse_spsm_coo_total(data, row, col, B, shape):
 
 
 def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    data_lines = []
-    header_info = None
-    mm_field = "real"
-    mm_symmetry = "general"
-    for line in lines:
-        line = line.strip()
-        if line.startswith("%%MatrixMarket"):
-            parts = line.split()
-            if len(parts) >= 5:
-                mm_field = parts[3].lower()
-                mm_symmetry = parts[4].lower()
-            continue
-        if line.startswith("%"):
-            continue
-        if not header_info and line:
-            parts = line.split()
-            n_rows = int(parts[0])
-            n_cols = int(parts[1])
-            nnz = int(parts[2]) if len(parts) > 2 else 0
-            header_info = (n_rows, n_cols, nnz)
-            continue
-        if line:
-            data_lines.append(line)
-    if header_info is None:
-        raise ValueError(f"Cannot parse .mtx header: {file_path}")
-    n_rows, n_cols, nnz = header_info
-    if n_rows != n_cols:
+    """Load a square .mtx into CSR torch tensors via the C-accelerated scipy
+    reader (see tests/mtx_fast.py). Triangular stabilization happens downstream
+    in _stabilize_lower_triangular_csr, so this only needs the raw CSR."""
+    from mtx_fast import load_csr
+
+    data, indices, indptr, shape = load_csr(file_path, dtype=dtype, device=device)
+    if shape[0] != shape[1]:
         raise ValueError("SpSM requires square matrices")
-
-    row_maps = [dict() for _ in range(n_rows)]
-
-    def _accum(r, c, v):
-        row = row_maps[r]
-        if c in row:
-            row[c] += v
-        else:
-            row[c] = v
-
-    for line in data_lines[:nnz]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        r = int(parts[0]) - 1
-        c = int(parts[1]) - 1
-        if mm_field == "complex":
-            if len(parts) < 4:
-                raise ValueError(
-                    "MatrixMarket complex entry requires real and imag parts"
-                )
-            v = complex(float(parts[2]), float(parts[3]))
-        elif len(parts) >= 3:
-            v = float(parts[2])
-        elif mm_field == "pattern":
-            v = 1.0
-        else:
-            continue
-        _accum(r, c, v)
-        if mm_symmetry in ("symmetric", "hermitian") and r != c:
-            _accum(c, r, v.conjugate() if mm_symmetry == "hermitian" else v)
-        elif mm_symmetry == "skew-symmetric" and r != c:
-            _accum(c, r, -v)
-
-    cols_s = []
-    vals_s = []
-    indptr_list = [0]
-    for r in range(n_rows):
-        row = row_maps[r]
-        for c in sorted(row.keys()):
-            cols_s.append(c)
-            vals_s.append(row[c])
-        indptr_list.append(len(cols_s))
-
-    data = torch.tensor(vals_s, dtype=dtype, device=device)
-    indices = torch.tensor(cols_s, dtype=torch.int64, device=device)
-    indptr = torch.tensor(indptr_list, dtype=torch.int64, device=device)
-    return data, indices, indptr, (n_rows, n_cols)
-
+    return data, indices, indptr, shape
 
 def _run_one_spsm_case(
     data, indices, indptr, shape, value_dtype, index_dtype, n_rhs, fmt
