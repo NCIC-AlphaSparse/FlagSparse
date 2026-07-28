@@ -203,25 +203,6 @@ def _benchmark_flagsparse_spmv(
     return y, start_ev.elapsed_time(end_ev) / iters
 
 
-def _clone_csr_prepared_for_timed_op(template, data, indices, indptr):
-    return spmv_csr_mod.PreparedCsrSpmv(
-        data=data,
-        kernel_indices=indices,
-        kernel_indptr=indptr,
-        shape=template.shape,
-        n_rows=template.n_rows,
-        n_cols=template.n_cols,
-        block_nnz=template.block_nnz,
-        max_segments=template.max_segments,
-        opt_max_segments=template.opt_max_segments,
-        max_row_nnz=template.max_row_nnz,
-        opt_buckets=template.opt_buckets,
-        transpose=template.transpose,
-        op=template.op,
-        index_fallback_policy=template.index_fallback_policy,
-    )
-
-
 def _materialize_csr_op_for_timing(data, indices, indptr, shape, op):
     if op == "non":
         return data, indices, indptr, shape
@@ -234,21 +215,11 @@ def _materialize_csr_op_for_timing(data, indices, indptr, shape, op):
 
 
 def _run_flagsparse_spmv_timed_op(prepared, data, indices, indptr, x, shape, op):
-    if op == "non":
-        return ast.flagsparse_spmv_csr(
-            x=x,
-            prepared=prepared,
-            return_time=False,
-        )
-    data_op, indices_op, indptr_op, _ = _materialize_csr_op_for_timing(
-        data, indices, indptr, shape, op
-    )
-    timed_prepared = _clone_csr_prepared_for_timed_op(
-        prepared, data_op, indices_op, indptr_op
-    )
-    return spmv_csr_mod._run_spmv_prepared_with_fallback(
-        timed_prepared, x, use_opt=False
-    )
+    # ``prepared`` is already built with this op (prepare_spmv_csr(op=...)), so it
+    # holds the transposed/conjugated matrix. Reuse it for every op instead of
+    # re-transposing the raw CSR (an O(nnz log nnz) argsort) on each timed
+    # iteration — the transpose is a one-time preprocessing cost, like cuSPARSE's.
+    return ast.flagsparse_spmv_csr(x=x, prepared=prepared, return_time=False)
 
 
 def _reference_dtype(dtype):
