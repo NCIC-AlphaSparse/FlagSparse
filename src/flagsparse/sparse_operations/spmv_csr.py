@@ -177,67 +177,112 @@ _SPMV_OPT_ACC_MODES = ("fast", "mixed", "accurate")
 
 
 @triton.jit
-def _spmv_csr_real_kernel(
+def _spmv_seg_add(row_a, val_a, row_b, val_b):
+    """Associative combine for a segmented (per-row) inclusive sum."""
+    return row_b, val_b + tl.where(row_a == row_b, val_a, val_b - val_b)
+
+
+@triton.jit
+def _spmv_csr_segbin_kernel(
     data_ptr,
     indices_ptr,
     indptr_ptr,
     x_ptr,
     y_ptr,
+    nnz,
     n_rows,
-    BLOCK_NNZ: tl.constexpr,
-    MAX_SEGMENTS: tl.constexpr,
+    STEPS: tl.constexpr,
+    ACC: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    start = tl.load(indptr_ptr + row)
-    end = tl.load(indptr_ptr + row + 1)
-    acc = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
-    for seg in range(MAX_SEGMENTS):
-        idx = start + seg * BLOCK_NNZ
-        offsets = idx + tl.arange(0, BLOCK_NNZ)
-        mask = offsets < end
-        a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
-        col = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
-        part = tl.where(mask, a * x_vals, 0.0)
-        acc = acc + tl.sum(part)
-    tl.store(y_ptr + row, acc)
+    """Preprocessing-free, load-balanced CSR SpMV.
+
+    Each program owns a fixed BLOCK-sized run of nonzeros (balanced regardless of
+    the row-length distribution). The row of each nonzero is found in-kernel by an
+    upper-bound binary search on indptr (no per-nonzero row-id array). A segmented
+    inclusive scan sums products belonging to the same row within the tile, so
+    each row-run contributes with a single atomic add — bounding atomic contention
+    even for very dense rows. y must be pre-zeroed and typed as the accumulator."""
+    pid = tl.program_id(0)
+    lane = tl.arange(0, BLOCK)
+    offs = pid * BLOCK + lane
+    mask = offs < nnz
+    # row = max r such that indptr[r] <= offs (upper-bound binary search).
+    lo = tl.zeros((BLOCK,), dtype=tl.int32)
+    hi = tl.full((BLOCK,), n_rows, dtype=tl.int32)
+    for _ in tl.static_range(STEPS):
+        mid = (lo + hi + 1) // 2
+        v = tl.load(indptr_ptr + mid, mask=mask, other=0)
+        take = v <= offs
+        lo = tl.where(take, mid, lo)
+        hi = tl.where(take, hi, mid - 1)
+    row = lo
+    a = tl.load(data_ptr + offs, mask=mask, other=0.0)
+    col = tl.load(indices_ptr + offs, mask=mask, other=0)
+    xv = tl.load(x_ptr + col, mask=mask, other=0.0)
+    prod = a.to(ACC) * xv.to(ACC)
+    _, seg = tl.associative_scan((row, prod), axis=0, combine_fn=_spmv_seg_add)
+    # Flush a row-run's partial sum at its last nonzero within this tile (either
+    # the row genuinely ends here, or the tile ends; a row spanning tiles is
+    # summed across tiles by the atomics).
+    row_end = tl.load(indptr_ptr + row + 1, mask=mask, other=0) - 1
+    is_bnd = mask & ((offs == row_end) | (lane == BLOCK - 1))
+    tl.atomic_add(y_ptr + row, tl.where(is_bnd, seg, seg - seg), mask=is_bnd)
 
 
 @triton.jit
-def _spmv_csr_complex_kernel(
+def _spmv_seg_add_complex(row_a, re_a, im_a, row_b, re_b, im_b):
+    """Associative combine for a segmented (per-row) inclusive complex sum."""
+    same = row_a == row_b
+    zero = re_b - re_b
+    return row_b, re_b + tl.where(same, re_a, zero), im_b + tl.where(same, im_a, zero)
+
+
+@triton.jit
+def _spmv_csr_complex_segbin_kernel(
     data_ri_ptr,
     indices_ptr,
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    nnz,
     n_rows,
-    BLOCK_NNZ: tl.constexpr,
-    MAX_SEGMENTS: tl.constexpr,
+    STEPS: tl.constexpr,
+    ACC: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    start = tl.load(indptr_ptr + row)
-    end = tl.load(indptr_ptr + row + 1)
-    acc_re = tl.load(data_ri_ptr + start * 2, mask=start < end, other=0.0) * 0
-    acc_im = tl.load(data_ri_ptr + start * 2 + 1, mask=start < end, other=0.0) * 0
-    for seg in range(MAX_SEGMENTS):
-        idx = start + seg * BLOCK_NNZ
-        offsets = idx + tl.arange(0, BLOCK_NNZ)
-        mask = offsets < end
-        a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
-        a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
-        col = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        x_re = tl.load(x_ri_ptr + col * 2, mask=mask, other=0.0)
-        x_im = tl.load(x_ri_ptr + col * 2 + 1, mask=mask, other=0.0)
-        prod_re = tl.where(mask, a_re * x_re - a_im * x_im, 0.0)
-        prod_im = tl.where(mask, a_re * x_im + a_im * x_re, 0.0)
-        acc_re = acc_re + tl.sum(prod_re)
-        acc_im = acc_im + tl.sum(prod_im)
-    tl.store(y_ri_ptr + row * 2, acc_re)
-    tl.store(y_ri_ptr + row * 2 + 1, acc_im)
+    """Complex counterpart of _spmv_csr_segbin_kernel. Values are stored as
+    interleaved real/imag pairs; each nonzero's row is found by binary search and
+    a segmented inclusive scan over (row, re, im) bounds atomic contention on
+    dense rows. y (interleaved) must be pre-zeroed and typed as the accumulator."""
+    pid = tl.program_id(0)
+    lane = tl.arange(0, BLOCK)
+    offs = pid * BLOCK + lane
+    mask = offs < nnz
+    lo = tl.zeros((BLOCK,), dtype=tl.int32)
+    hi = tl.full((BLOCK,), n_rows, dtype=tl.int32)
+    for _ in tl.static_range(STEPS):
+        mid = (lo + hi + 1) // 2
+        v = tl.load(indptr_ptr + mid, mask=mask, other=0)
+        take = v <= offs
+        lo = tl.where(take, mid, lo)
+        hi = tl.where(take, hi, mid - 1)
+    row = lo
+    a_re = tl.load(data_ri_ptr + offs * 2, mask=mask, other=0.0).to(ACC)
+    a_im = tl.load(data_ri_ptr + offs * 2 + 1, mask=mask, other=0.0).to(ACC)
+    col = tl.load(indices_ptr + offs, mask=mask, other=0)
+    x_re = tl.load(x_ri_ptr + col * 2, mask=mask, other=0.0).to(ACC)
+    x_im = tl.load(x_ri_ptr + col * 2 + 1, mask=mask, other=0.0).to(ACC)
+    p_re = a_re * x_re - a_im * x_im
+    p_im = a_re * x_im + a_im * x_re
+    _, s_re, s_im = tl.associative_scan(
+        (row, p_re, p_im), axis=0, combine_fn=_spmv_seg_add_complex
+    )
+    row_end = tl.load(indptr_ptr + row + 1, mask=mask, other=0) - 1
+    is_bnd = mask & ((offs == row_end) | (lane == BLOCK - 1))
+    zero = s_re - s_re
+    tl.atomic_add(y_ri_ptr + row * 2, tl.where(is_bnd, s_re, zero), mask=is_bnd)
+    tl.atomic_add(y_ri_ptr + row * 2 + 1, tl.where(is_bnd, s_im, zero), mask=is_bnd)
 
 
 # ── Optimised SpMV (CSR-Vector, perf-oriented, no CuPy) ─────────────
@@ -702,48 +747,67 @@ def _get_spmv_baseline_data(prepared):
 def _triton_spmv_csr_impl_prepared(prepared, x):
     device = prepared.data.device
     dtype = prepared.data.dtype
-    y = torch.empty(prepared.n_rows, dtype=dtype, device=device)
     if prepared.n_rows == 0:
-        return y
-    compute_dtype, data_in = _get_spmv_baseline_data(prepared)
-    x_in = x
-    if compute_dtype != dtype:
-        x_in = x.to(compute_dtype)
+        return torch.empty(0, dtype=dtype, device=device)
+    compute_dtype = prepared._baseline_compute_dtype
+    # Fast path: preprocessing-free, load-balanced segmented nnz-split. Real dtype
+    # only; native fp32/fp64 accumulation (fp16/bf16 accumulate in fp32). No
+    # per-nonzero row-id or long-row metadata is needed — the row is found by an
+    # in-kernel binary search on indptr, so this is fair to compare cold against
+    # cuSPARSE (which also needs no separable analysis).
     if not _is_complex_dtype(compute_dtype):
-        y_out = torch.empty(prepared.n_rows, dtype=compute_dtype, device=device)
-        grid = (prepared.n_rows,)
-        _spmv_csr_real_kernel[grid](
-            data_in,
+        # fp32 accumulates natively (bandwidth-optimal, cuSPARSE-like); fp64
+        # accumulates in fp64; fp16/bf16 accumulate in fp32. Native fp32
+        # summation is order-dependent, so results carry standard fp32 SpMV error
+        # (not the fp64-then-cast accuracy of the former baseline).
+        acc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
+        nnz = int(prepared.data.numel())
+        y_out = torch.zeros(prepared.n_rows, dtype=acc_dtype, device=device)
+        if nnz > 0:
+            acc_tl = tl.float64 if acc_dtype == torch.float64 else tl.float32
+            steps = max(1, (prepared.n_rows + 1).bit_length())
+            BLOCK = 256
+            grid = ((nnz + BLOCK - 1) // BLOCK,)
+            _spmv_csr_segbin_kernel[grid](
+                prepared.data,
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                x,
+                y_out,
+                nnz,
+                prepared.n_rows,
+                STEPS=steps,
+                ACC=acc_tl,
+                BLOCK=BLOCK,
+            )
+        return y_out if acc_dtype == dtype else y_out.to(dtype)
+    # Complex path: same preprocessing-free segmented nnz-split on interleaved
+    # real/imag values, accumulating in native component precision (fp32 for
+    # complex64, fp64 for complex128). complex64 therefore carries standard fp32
+    # SpMV error, like the real fp32 path.
+    data_ri = torch.view_as_real(prepared.data).reshape(-1)
+    x_ri = torch.view_as_real(x.contiguous()).reshape(-1)
+    comp_dtype = data_ri.dtype
+    nnz = int(prepared.data.numel())
+    y_ri = torch.zeros(prepared.n_rows * 2, dtype=comp_dtype, device=device)
+    if nnz > 0:
+        acc_tl = tl.float64 if comp_dtype == torch.float64 else tl.float32
+        steps = max(1, (prepared.n_rows + 1).bit_length())
+        BLOCK = 256
+        grid = ((nnz + BLOCK - 1) // BLOCK,)
+        _spmv_csr_complex_segbin_kernel[grid](
+            data_ri,
             prepared.kernel_indices,
             prepared.kernel_indptr,
-            x_in,
-            y_out,
-            n_rows=prepared.n_rows,
-            BLOCK_NNZ=prepared.block_nnz,
-            MAX_SEGMENTS=prepared.max_segments,
+            x_ri,
+            y_ri,
+            nnz,
+            prepared.n_rows,
+            STEPS=steps,
+            ACC=acc_tl,
+            BLOCK=BLOCK,
         )
-        if dtype != compute_dtype:
-            y_out = y_out.to(dtype)
-        y.copy_(y_out)
-        return y
-    data_ri = torch.view_as_real(data_in).reshape(-1)
-    x_ri = torch.view_as_real(x_in).reshape(-1)
-    comp_dtype = data_ri.dtype
-    y_ri = torch.empty(prepared.n_rows * 2, dtype=comp_dtype, device=device)
-    grid = (prepared.n_rows,)
-    _spmv_csr_complex_kernel[grid](
-        data_ri,
-        prepared.kernel_indices,
-        prepared.kernel_indptr,
-        x_ri,
-        y_ri,
-        n_rows=prepared.n_rows,
-        BLOCK_NNZ=prepared.block_nnz,
-        MAX_SEGMENTS=prepared.max_segments,
-    )
-    y_ri = y_ri.reshape(prepared.n_rows, 2)
-    y.copy_(torch.view_as_complex(y_ri))
-    return y
+    return torch.view_as_complex(y_ri.reshape(prepared.n_rows, 2))
 
 
 def _spmv_uses_int64_indices(prepared):
