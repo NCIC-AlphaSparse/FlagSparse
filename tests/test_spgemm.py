@@ -913,8 +913,24 @@ def _benchmark_flagsparse_spgemm(
 
     out_buffers = (first_result[0], first_result[1], first_result[2])
     _log_stage(mtx_path, f"timed-run warmup={eff_warmup} iters={eff_iters}", start_time)
+    # ``prepare`` is inside the timed window. The cuSPARSE baseline has no
+    # amortisable setup -- every cupy ``A @ B`` redoes createDescr ->
+    # workEstimation -> compute -> copy with no cross-call caching -- so timing
+    # only the compute half would compare unequal amounts of work, and would let
+    # cost be "saved" merely by relocating it into prepare. ``prepare_ms`` is
+    # still reported separately for diagnosis.
     triton_result, triton_ms = ast_ops._benchmark_cuda_op(
-        lambda: ast.flagsparse_spgemm_csr(prepared=prepared, out=out_buffers),
+        lambda: ast.flagsparse_spgemm_csr(
+            a_data,
+            a_indices,
+            a_indptr,
+            a_shape,
+            b_data,
+            b_indices,
+            b_indptr,
+            b_shape,
+            out=out_buffers,
+        ),
         warmup=eff_warmup,
         iters=eff_iters,
     )
@@ -1281,24 +1297,57 @@ def run_mtx_batch(
     total = len(mtx_paths)
     for idx, path in enumerate(mtx_paths, start=1):
         print(f"[SpGEMM] ({idx}/{total}) {path}", flush=True)
-        entry = run_one_mtx(
-            path,
-            value_dtype=value_dtype,
-            index_dtype=index_dtype,
-            warmup=warmup,
-            iters=iters,
-            run_cusparse=run_cusparse,
-            input_mode=input_mode,
-            adaptive_loops=adaptive_loops,
-            target_window_seconds=target_window_seconds,
-            ref_blocked_retry=ref_blocked_retry,
-            ref_block_rows=ref_block_rows,
-            ref_isolated_retry=ref_isolated_retry,
-            ref_cleanup=ref_cleanup,
-            compare_device=compare_device,
-        )
+        try:
+            entry = run_one_mtx(
+                path,
+                value_dtype=value_dtype,
+                index_dtype=index_dtype,
+                warmup=warmup,
+                iters=iters,
+                run_cusparse=run_cusparse,
+                input_mode=input_mode,
+                adaptive_loops=adaptive_loops,
+                target_window_seconds=target_window_seconds,
+                ref_blocked_retry=ref_blocked_retry,
+                ref_block_rows=ref_block_rows,
+                ref_isolated_retry=ref_isolated_retry,
+                ref_cleanup=ref_cleanup,
+                compare_device=compare_device,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            # One matrix must not sink the whole sweep: an OOM (often in the
+            # reference worker, whose result then fails to load) used to abort
+            # the run before any CSV was written. Record the failure and go on.
+            print(
+                f"[SpGEMM][{os.path.basename(path)}] FAILED "
+                f"{type(exc).__name__}: {str(exc)[:200]}",
+                flush=True,
+            )
+            # keys the CSV builder dereferences directly must all be present
+            entry = {
+                "path": path,
+                "shape": (None, None),
+                "shape_a": (None, None),
+                "shape_b": (None, None),
+                "nnz": None,
+                "nnz_a": None,
+                "nnz_b": None,
+                "nnz_c": None,
+                "value_dtype": str(value_dtype),
+                "index_dtype": str(index_dtype),
+                "status": "ERROR",
+                "compare_status": f"{type(exc).__name__}: {str(exc)[:180]}",
+                "input_mode": input_mode,
+                "compare_device": compare_device,
+            }
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         results.append(entry)
-        if on_result is not None:
+        # the row printer formats numeric fields with widths, so it cannot take
+        # the placeholder entry produced for a failed matrix
+        if on_result is not None and entry.get("status") != "ERROR":
             on_result(entry)
     return results
 

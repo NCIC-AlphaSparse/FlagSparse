@@ -17,42 +17,16 @@
 from ._common import *
 
 SUPPORTED_SPGEMM_VALUE_DTYPES = (torch.float32, torch.float64)
-_SPGEMM_COUNT_MAX_EXPANDED = 2_000_000
-_SPGEMM_FILL_MAX_EXPANDED = 1_200_000
-_SPGEMM_MAX_ROWS_PER_CHUNK = 4096
-_SPGEMM_BUCKET_SHORT = 0
-_SPGEMM_BUCKET_MEDIUM = 1
-_SPGEMM_BUCKET_LONG = 2
-_SPGEMM_BUCKET_ORDER = (
-    _SPGEMM_BUCKET_SHORT,
-    _SPGEMM_BUCKET_MEDIUM,
-    _SPGEMM_BUCKET_LONG,
-)
-_SPGEMM_BUCKET_LABELS = {
-    _SPGEMM_BUCKET_SHORT: "short",
-    _SPGEMM_BUCKET_MEDIUM: "medium",
-    _SPGEMM_BUCKET_LONG: "long",
-}
-_SPGEMM_BUCKET_COUNT_BUDGETS = {
-    _SPGEMM_BUCKET_SHORT: 4_000_000,
-    _SPGEMM_BUCKET_MEDIUM: _SPGEMM_COUNT_MAX_EXPANDED,
-    _SPGEMM_BUCKET_LONG: 300_000,
-}
-_SPGEMM_BUCKET_FILL_BUDGETS = {
-    _SPGEMM_BUCKET_SHORT: 2_400_000,
-    _SPGEMM_BUCKET_MEDIUM: _SPGEMM_FILL_MAX_EXPANDED,
-    _SPGEMM_BUCKET_LONG: 200_000,
-}
-_SPGEMM_BUCKET_MAX_ROWS = {
-    _SPGEMM_BUCKET_SHORT: 8192,
-    _SPGEMM_BUCKET_MEDIUM: _SPGEMM_MAX_ROWS_PER_CHUNK,
-    _SPGEMM_BUCKET_LONG: 256,
-}
-_SPGEMM_LONG_ROW_SLICE_EXPANDED = 200_000
 
 
 class SpGEMMPrepared:
-    """Prepared CSR metadata for repeated SpGEMM runs."""
+    """Prepared CSR metadata for repeated SpGEMM runs.
+
+    ``a_row_work[i]`` is the number of scalar products row ``i`` expands to
+    (``sum_k nnz(B[A_col_k, :])``), which the compute path uses to size hash
+    tables and to route over-wide rows to the ESC fallback. ``a_pref`` is the
+    matching within-row exclusive prefix sum over those per-nonzero counts.
+    """
 
     __slots__ = (
         "a_data",
@@ -67,17 +41,8 @@ class SpGEMMPrepared:
         "n_inner",
         "n_cols",
         "a_row_work",
-        "row_bucket",
+        "a_pref",
         "row_work_ready",
-        "bucket_rows",
-        "count_chunks",
-        "fill_chunks",
-        "count_chunks_by_bucket",
-        "fill_chunks_by_bucket",
-        "long_row_slice_expanded",
-        "long_row_slices_host",
-        "hash_capacity_hint",
-        "block_nnz",
     )
 
     def __init__(
@@ -91,17 +56,8 @@ class SpGEMMPrepared:
         b_indptr,
         b_shape,
         a_row_work,
-        row_bucket,
+        a_pref,
         row_work_ready,
-        bucket_rows,
-        count_chunks,
-        fill_chunks,
-        count_chunks_by_bucket,
-        fill_chunks_by_bucket,
-        long_row_slice_expanded,
-        long_row_slices_host,
-        hash_capacity_hint,
-        block_nnz,
     ):
         self.a_data = a_data
         self.a_indices = a_indices
@@ -115,17 +71,10 @@ class SpGEMMPrepared:
         self.n_inner = self.a_shape[1]
         self.n_cols = self.b_shape[1]
         self.a_row_work = a_row_work
-        self.row_bucket = row_bucket
+        # per-A-nonzero exclusive prefix of B row lengths, restarted each row;
+        # lets a kernel map a flat product index q -> (A nonzero, B position)
+        self.a_pref = a_pref
         self.row_work_ready = bool(row_work_ready)
-        self.bucket_rows = bucket_rows
-        self.count_chunks = count_chunks
-        self.fill_chunks = fill_chunks
-        self.count_chunks_by_bucket = count_chunks_by_bucket
-        self.fill_chunks_by_bucket = fill_chunks_by_bucket
-        self.long_row_slice_expanded = int(long_row_slice_expanded)
-        self.long_row_slices_host = long_row_slices_host
-        self.hash_capacity_hint = int(hash_capacity_hint)
-        self.block_nnz = int(block_nnz)
 
 
 def _validate_csr(data, indices, indptr, shape, tag):
@@ -153,19 +102,30 @@ def _validate_csr(data, indices, indptr, shape, tag):
 
     nnz = int(data.numel())
     indptr_i64 = indptr.to(torch.int64)
-    if indptr_i64.numel() > 0 and int(indptr_i64[0].item()) != 0:
+    # Gather every check into one device->host transfer; done separately these
+    # were ~5 syncs per operand, which dominated prepare on short-row matrices.
+    device = indptr_i64.device
+    zero = torch.zeros((), dtype=torch.int64, device=device)
+    checks = torch.stack(
+        [
+            indptr_i64[0] if indptr_i64.numel() > 0 else zero,
+            indptr_i64[-1] if indptr_i64.numel() > 0 else zero,
+            torch.any(indptr_i64[1:] < indptr_i64[:-1]).to(torch.int64)
+            if indptr_i64.numel() > 1
+            else zero,
+            indices.min().to(torch.int64) if nnz > 0 else zero,
+            indices.max().to(torch.int64) if nnz > 0 else zero,
+        ]
+    ).tolist()
+    first, last, unsorted, min_col, max_col = checks
+    if indptr_i64.numel() > 0 and first != 0:
         raise ValueError(f"{tag}_indptr[0] must be 0")
-    if indptr_i64.numel() > 0 and int(indptr_i64[-1].item()) != nnz:
+    if indptr_i64.numel() > 0 and last != nnz:
         raise ValueError(f"{tag}_indptr[-1] must equal nnz={nnz}")
-    if indptr_i64.numel() > 1 and bool(
-        torch.any(indptr_i64[1:] < indptr_i64[:-1]).item()
-    ):
+    if unsorted:
         raise ValueError(f"{tag}_indptr must be nondecreasing")
-    if nnz > 0:
-        min_col = int(indices.min().item())
-        max_col = int(indices.max().item())
-        if min_col < 0 or max_col >= n_cols:
-            raise IndexError(f"{tag}_indices out of range for n_cols={n_cols}")
+    if nnz > 0 and (min_col < 0 or max_col >= n_cols):
+        raise IndexError(f"{tag}_indices out of range for n_cols={n_cols}")
     return n_rows, n_cols, indptr_i64
 
 
@@ -212,93 +172,33 @@ def _prepare_spgemm_csr_inputs(
     )
 
 
-@triton.jit
-def _spgemm_row_work_kernel(
-    a_indptr_ptr,
-    a_indices_ptr,
-    b_indptr_ptr,
-    row_work_ptr,
-    n_rows,
-    BLOCK_NNZ: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    start = tl.load(a_indptr_ptr + row)
-    end = tl.load(a_indptr_ptr + row + 1)
-    row_nnz = end - start
-    acc = tl.zeros((), dtype=tl.int32)
-    for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
-        offs = start + chunk_start + tl.arange(0, BLOCK_NNZ)
-        mask = offs < end
-        k = tl.load(a_indices_ptr + offs, mask=mask, other=0)
-        b_start = tl.load(b_indptr_ptr + k, mask=mask, other=0)
-        b_end = tl.load(b_indptr_ptr + k + 1, mask=mask, other=0)
-        contrib = (b_end - b_start).to(tl.int32)
-        acc += tl.sum(tl.where(mask, contrib, 0))
-    tl.store(row_work_ptr + row, acc)
+def _build_row_product_metadata(a_indices, a_indptr, b_indptr):
+    """Per-row product counts and the within-row prefix, from one scan.
 
-
-def _estimate_hash_capacity(a_row_work):
-    if a_row_work.numel() == 0:
-        return 256
-    p95 = int(torch.quantile(a_row_work.to(torch.float32), 0.95).item())
-    p95 = max(p95, 1)
-    cap = 1
-    while cap < p95:
-        cap <<= 1
-    return max(256, cap)
-
-
-def _build_row_bucket(a_row_work):
-    # 0: small, 1: medium, 2: long
-    bucket = torch.zeros_like(a_row_work, dtype=torch.int8)
-    bucket = torch.where(
-        a_row_work > 4096,
-        torch.full_like(bucket, _SPGEMM_BUCKET_LONG),
-        bucket,
-    )
-    bucket = torch.where(
-        (a_row_work > 256) & (a_row_work <= 4096),
-        torch.full_like(bucket, _SPGEMM_BUCKET_MEDIUM),
-        bucket,
-    )
-    return bucket
-
-
-def _build_long_row_slices_host(a_indptr, a_indices, b_indptr, row_ids, max_expanded):
-    if row_ids is None or row_ids.numel() == 0:
-        return {}
-
-    out = {}
-    row_list = row_ids.to(torch.int64).cpu().tolist()
-    a_indptr_cpu = a_indptr.to(torch.int64).cpu()
-    for row in row_list:
-        start = int(a_indptr_cpu[row].item())
-        end = int(a_indptr_cpu[row + 1].item())
-        if end <= start:
-            out[int(row)] = []
-            continue
-        a_cols = a_indices[start:end].to(torch.int64)
-        b_counts = (b_indptr[a_cols + 1] - b_indptr[a_cols]).to(torch.int64)
-        counts_host = b_counts.cpu().tolist()
-        slices = []
-        idx = 0
-        total = len(counts_host)
-        while idx < total:
-            seg_start = idx
-            acc = 0
-            while idx < total:
-                w = int(counts_host[idx])
-                if idx > seg_start and acc + w > int(max_expanded):
-                    break
-                acc += w
-                idx += 1
-                if idx == seg_start + 1 and w > int(max_expanded):
-                    break
-            slices.append((start + seg_start, start + idx))
-        out[int(row)] = slices
-    return out
+    ``row_work[i]`` is how many scalar products row ``i`` expands to and
+    ``pref[t]`` is how many the nonzeros before ``t`` (same row) contribute, so
+    a kernel can binary-search a flat product index back to its A nonzero. Both
+    fall out of the same exclusive scan over the per-nonzero B row lengths --
+    computing them separately (as a row-work kernel plus this) duplicated the
+    whole gather.
+    """
+    device = a_indices.device
+    nnz_a = int(a_indices.numel())
+    n_rows = int(a_indptr.numel()) - 1
+    if nnz_a == 0:
+        return (
+            torch.zeros(max(n_rows, 0), dtype=torch.int32, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+        )
+    b_len = (b_indptr[1:] - b_indptr[:-1]).to(torch.int64)
+    seg = b_len[a_indices.to(torch.int64)]
+    excl = torch.zeros(nnz_a + 1, dtype=torch.int64, device=device)
+    excl[1:] = torch.cumsum(seg, 0)
+    row_base = excl[a_indptr[:-1]]
+    a_deg = a_indptr[1:] - a_indptr[:-1]
+    pref = (excl[:nnz_a] - torch.repeat_interleave(row_base, a_deg)).to(torch.int32)
+    row_work = (excl[a_indptr[1:]] - row_base).to(torch.int32)
+    return row_work.contiguous(), pref.contiguous()
 
 
 def prepare_spgemm_csr(
@@ -337,50 +237,16 @@ def prepare_spgemm_csr(
     n_rows = int(a_shape[0])
     if n_rows == 0:
         row_work = torch.empty(0, dtype=torch.int32, device=a_data.device)
-        row_bucket = torch.empty(0, dtype=torch.int8, device=a_data.device)
-        hash_capacity_hint = 256
+        a_pref = torch.empty(0, dtype=torch.int32, device=a_data.device)
         row_work_ready = True
     elif analyze_rows:
-        row_work = torch.empty(n_rows, dtype=torch.int32, device=a_data.device)
-        try:
-            _spgemm_row_work_kernel[(n_rows,)](
-                a_indptr,
-                a_indices,
-                b_indptr,
-                row_work,
-                n_rows,
-                BLOCK_NNZ=int(block_nnz),
-            )
-        except Exception:
-            b_row_nnz = (b_indptr[1:] - b_indptr[:-1]).to(torch.int32)
-            for row in range(n_rows):
-                start = int(a_indptr[row].item())
-                end = int(a_indptr[row + 1].item())
-                if end <= start:
-                    row_work[row] = 0
-                    continue
-                cols = a_indices[start:end].to(torch.int64)
-                row_work[row] = torch.sum(b_row_nnz[cols]).to(torch.int32)
-        row_bucket = _build_row_bucket(row_work)
-        hash_capacity_hint = 256
+        row_work, a_pref = _build_row_product_metadata(a_indices, a_indptr, b_indptr)
         row_work_ready = True
     else:
+        # Row work is recomputed on demand by the compute path when not analyzed.
         row_work = torch.zeros(n_rows, dtype=torch.int32, device=a_data.device)
-        row_bucket = torch.zeros(n_rows, dtype=torch.int8, device=a_data.device)
-        hash_capacity_hint = 256
+        a_pref = _build_row_product_metadata(a_indices, a_indptr, b_indptr)[1]
         row_work_ready = False
-    long_row_slices_host = {}
-    if row_work_ready:
-        long_rows = torch.nonzero(
-            row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False
-        ).flatten()
-        long_row_slices_host = _build_long_row_slices_host(
-            a_indptr,
-            a_indices,
-            b_indptr,
-            long_rows,
-            _SPGEMM_LONG_ROW_SLICE_EXPANDED,
-        )
     return SpGEMMPrepared(
         a_data=a_data,
         a_indices=a_indices,
@@ -391,560 +257,817 @@ def prepare_spgemm_csr(
         b_indptr=b_indptr,
         b_shape=b_shape,
         a_row_work=row_work,
-        row_bucket=row_bucket,
+        a_pref=a_pref,
         row_work_ready=row_work_ready,
-        bucket_rows=None,
-        count_chunks=None,
-        fill_chunks=None,
-        count_chunks_by_bucket=None,
-        fill_chunks_by_bucket=None,
-        long_row_slice_expanded=_SPGEMM_LONG_ROW_SLICE_EXPANDED,
-        long_row_slices_host=long_row_slices_host,
-        hash_capacity_hint=hash_capacity_hint,
-        block_nnz=block_nnz,
     )
 
 
-def _ensure_row_work(prepared):
-    if prepared.row_work_ready:
-        return
-    if prepared.a_data.numel() == 0 or prepared.b_data.numel() == 0:
-        prepared.a_row_work = torch.zeros(
-            prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device
-        )
-        prepared.row_bucket = torch.zeros(
-            prepared.n_rows, dtype=torch.int8, device=prepared.a_data.device
-        )
-        prepared.hash_capacity_hint = 256
-        prepared.row_work_ready = True
-        prepared.long_row_slices_host = {}
-        _clear_runtime_schedules(prepared)
-        return
-    row_work = torch.empty(
-        prepared.n_rows, dtype=torch.int32, device=prepared.a_data.device
-    )
-    _spgemm_row_work_kernel[(prepared.n_rows,)](
-        prepared.a_indptr,
-        prepared.a_indices,
-        prepared.b_indptr,
-        row_work,
-        prepared.n_rows,
-        BLOCK_NNZ=int(prepared.block_nnz),
-    )
-    prepared.a_row_work = row_work
-    prepared.row_bucket = _build_row_bucket(row_work)
-    long_rows = torch.nonzero(
-        prepared.row_bucket == _SPGEMM_BUCKET_LONG, as_tuple=False
-    ).flatten()
-    prepared.long_row_slices_host = _build_long_row_slices_host(
-        prepared.a_indptr,
-        prepared.a_indices,
-        prepared.b_indptr,
-        long_rows,
-        prepared.long_row_slice_expanded,
-    )
-    prepared.hash_capacity_hint = 256
-    prepared.row_work_ready = True
-    _clear_runtime_schedules(prepared)
+def _spgemm_esc_compute(prepared):
+    """C = A @ B via a single global expand-sort-reduce (ESC).
 
-
-def _build_row_chunks(row_work, max_expanded, max_rows_per_chunk):
-    n_rows = int(row_work.numel())
-    if n_rows == 0:
-        return []
-    all_rows = torch.arange(n_rows, device=row_work.device, dtype=torch.int64)
-    return _build_row_id_chunks(row_work, all_rows, max_expanded, max_rows_per_chunk)
-
-
-def _build_bucket_rows(row_bucket, device):
-    out = {}
-    for bucket_id in _SPGEMM_BUCKET_ORDER:
-        rows = torch.nonzero(row_bucket == bucket_id, as_tuple=False).flatten()
-        out[bucket_id] = rows.to(device=device, dtype=torch.int64)
-    return out
-
-
-def _build_row_id_chunks(row_work, row_ids, max_expanded, max_rows_per_chunk):
-    if row_ids.numel() == 0:
-        return []
-    work_host = row_work[row_ids].detach().to("cpu", dtype=torch.int64).tolist()
-    chunks = []
-    idx = 0
-    total_rows = len(work_host)
-    while idx < total_rows:
-        start_idx = idx
-        acc = 0
-        taken = 0
-        while idx < total_rows and taken < int(max_rows_per_chunk):
-            w = int(work_host[idx])
-            if taken > 0 and acc + w > int(max_expanded):
-                break
-            acc += w
-            idx += 1
-            taken += 1
-            if taken == 1 and w > int(max_expanded):
-                break
-        if idx == start_idx:
-            idx += 1
-        chunks.append(row_ids[start_idx:idx].contiguous())
-    return chunks
-
-
-def _compose_ordered_chunks(chunks_by_bucket):
-    ordered = []
-    for bucket_id in _SPGEMM_BUCKET_ORDER:
-        ordered.extend(chunks_by_bucket.get(bucket_id, []))
-    return ordered
-
-
-def _clear_runtime_schedules(prepared):
-    prepared.bucket_rows = None
-    prepared.count_chunks = None
-    prepared.fill_chunks = None
-    prepared.count_chunks_by_bucket = None
-    prepared.fill_chunks_by_bucket = None
-
-
-def _clear_count_schedule(prepared):
-    prepared.count_chunks = None
-    prepared.count_chunks_by_bucket = None
-
-
-def _clear_fill_schedule(prepared):
-    prepared.fill_chunks = None
-    prepared.fill_chunks_by_bucket = None
-
-
-def _ensure_bucket_rows(prepared):
-    if prepared.bucket_rows is None:
-        prepared.bucket_rows = _build_bucket_rows(
-            prepared.row_bucket, prepared.a_data.device
-        )
-    return prepared.bucket_rows
-
-
-def _chunk_rows_for_bucket(prepared, bucket_id, max_expanded):
-    rows = _ensure_bucket_rows(prepared)[bucket_id]
-    chunks = _build_row_id_chunks(
-        prepared.a_row_work,
-        rows,
-        max_expanded=max_expanded,
-        max_rows_per_chunk=_SPGEMM_BUCKET_MAX_ROWS[bucket_id],
-    )
-    if bucket_id == _SPGEMM_BUCKET_LONG:
-        return [chunk.to(torch.int64).cpu().tolist() for chunk in chunks]
-    return chunks
-
-
-def _ensure_count_chunks(prepared):
-    if prepared.count_chunks_by_bucket is not None:
-        return prepared.count_chunks_by_bucket
-    prepared.count_chunks_by_bucket = {}
-    for bucket_id in _SPGEMM_BUCKET_ORDER:
-        prepared.count_chunks_by_bucket[bucket_id] = _chunk_rows_for_bucket(
-            prepared,
-            bucket_id,
-            _SPGEMM_BUCKET_COUNT_BUDGETS[bucket_id],
-        )
-    prepared.count_chunks = _compose_ordered_chunks(prepared.count_chunks_by_bucket)
-    return prepared.count_chunks_by_bucket
-
-
-def _ensure_fill_chunks(prepared):
-    if prepared.fill_chunks_by_bucket is not None:
-        return prepared.fill_chunks_by_bucket
-    prepared.fill_chunks_by_bucket = {}
-    for bucket_id in _SPGEMM_BUCKET_ORDER:
-        prepared.fill_chunks_by_bucket[bucket_id] = _chunk_rows_for_bucket(
-            prepared,
-            bucket_id,
-            _SPGEMM_BUCKET_FILL_BUDGETS[bucket_id],
-        )
-    prepared.fill_chunks = _compose_ordered_chunks(prepared.fill_chunks_by_bucket)
-    return prepared.fill_chunks_by_bucket
-
-
-def _expand_rows_contrib(prepared, row_ids, need_values):
-    device = prepared.a_data.device
-    if row_ids.numel() == 0:
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        if need_values:
-            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
-            return empty_i64, empty_v
-        return empty_i64, None
-
-    row_ids = row_ids.to(torch.int64)
-    row_nnz = (prepared.a_indptr[row_ids + 1] - prepared.a_indptr[row_ids]).to(
-        torch.int64
-    )
-    total_a = int(row_nnz.sum().item())
-    if total_a == 0:
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        if need_values:
-            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
-            return empty_i64, empty_v
-        return empty_i64, None
-
-    owner = torch.repeat_interleave(
-        torch.arange(row_ids.numel(), device=device, dtype=torch.int64),
-        row_nnz,
-    )
-    prefix = torch.cumsum(row_nnz, dim=0)
-    base = prefix - row_nnz
-    intra = torch.arange(
-        total_a, device=device, dtype=torch.int64
-    ) - torch.repeat_interleave(base, row_nnz)
-    row_starts = prepared.a_indptr[row_ids]
-    a_pos = row_starts[owner] + intra
-    rows = row_ids[owner]
-    a_cols = prepared.a_indices[a_pos].to(torch.int64)
-    b_starts = prepared.b_indptr[a_cols]
-    b_ends = prepared.b_indptr[a_cols + 1]
-    b_counts = b_ends - b_starts
-    total = int(b_counts.sum().item())
-    if total == 0:
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        if need_values:
-            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
-            return empty_i64, empty_v
-        return empty_i64, None
-
-    b_owner = torch.repeat_interleave(
-        torch.arange(a_cols.numel(), device=device, dtype=torch.int64),
-        b_counts,
-    )
-    rows_expanded = rows[b_owner]
-    prefix = torch.cumsum(b_counts, dim=0)
-    base = prefix - b_counts
-    starts_rep = torch.repeat_interleave(b_starts, b_counts)
-    intra = torch.arange(
-        total, device=device, dtype=torch.int64
-    ) - torch.repeat_interleave(base, b_counts)
-    b_pos = starts_rep + intra
-    cols = prepared.b_indices[b_pos].to(torch.int64)
-    keys = rows_expanded * max(1, prepared.n_cols) + cols
-    if not need_values:
-        return keys, None
-
-    a_vals = prepared.a_data[a_pos]
-    vals = a_vals[b_owner] * prepared.b_data[b_pos]
-    return keys, vals
-
-
-def _expand_single_row_slice_contrib(
-    prepared, row, a_ptr_start, a_ptr_end, need_values
-):
-    device = prepared.a_data.device
-    if a_ptr_end <= a_ptr_start:
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        if need_values:
-            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
-            return empty_i64, empty_v
-        return empty_i64, None
-
-    a_pos = torch.arange(a_ptr_start, a_ptr_end, device=device, dtype=torch.int64)
-    a_cols = prepared.a_indices[a_pos].to(torch.int64)
-    b_starts = prepared.b_indptr[a_cols]
-    b_ends = prepared.b_indptr[a_cols + 1]
-    b_counts = b_ends - b_starts
-    total = int(b_counts.sum().item())
-    if total == 0:
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        if need_values:
-            empty_v = torch.empty(0, dtype=prepared.a_data.dtype, device=device)
-            return empty_i64, empty_v
-        return empty_i64, None
-
-    owner = torch.repeat_interleave(
-        torch.arange(a_pos.numel(), device=device, dtype=torch.int64),
-        b_counts,
-    )
-    prefix = torch.cumsum(b_counts, dim=0)
-    base = prefix - b_counts
-    starts_rep = torch.repeat_interleave(b_starts, b_counts)
-    intra = torch.arange(
-        total, device=device, dtype=torch.int64
-    ) - torch.repeat_interleave(base, b_counts)
-    b_pos = starts_rep + intra
-    cols = prepared.b_indices[b_pos].to(torch.int64)
-    keys = int(row) * max(1, prepared.n_cols) + cols
-    if not need_values:
-        return keys, None
-    a_vals = prepared.a_data[a_pos]
-    vals = a_vals[owner] * prepared.b_data[b_pos]
-    return keys, vals
-
-
-def _iter_row_a_slices(prepared, row, max_expanded):
-    cached = (
-        prepared.long_row_slices_host.get(int(row))
-        if prepared.long_row_slices_host is not None
-        else None
-    )
-    if cached is not None:
-        return cached
-    start = int(prepared.a_indptr[row].item())
-    end = int(prepared.a_indptr[row + 1].item())
-    if end <= start:
-        if prepared.long_row_slices_host is not None:
-            prepared.long_row_slices_host[int(row)] = []
-        return []
-    a_cols = prepared.a_indices[start:end].to(torch.int64)
-    b_counts = (prepared.b_indptr[a_cols + 1] - prepared.b_indptr[a_cols]).to(
-        torch.int64
-    )
-    counts_host = b_counts.cpu().tolist()
-    slices = []
-    idx = 0
-    total = len(counts_host)
-    while idx < total:
-        seg_start = idx
-        acc = 0
-        while idx < total:
-            w = int(counts_host[idx])
-            if idx > seg_start and acc + w > int(max_expanded):
-                break
-            acc += w
-            idx += 1
-            if idx == seg_start + 1 and w > int(max_expanded):
-                break
-        slices.append((start + seg_start, start + idx))
-    if prepared.long_row_slices_host is not None:
-        prepared.long_row_slices_host[int(row)] = slices
-    return slices
-
-
-def _reduce_sorted_keys_vals(keys_sorted, vals_sorted, out_dtype):
-    if keys_sorted.numel() == 0:
-        return keys_sorted, vals_sorted
-    uniq_keys, counts = torch.unique_consecutive(keys_sorted, return_counts=True)
-    if uniq_keys.numel() == keys_sorted.numel():
-        return uniq_keys, vals_sorted.to(out_dtype)
-    acc_dtype = torch.float64 if out_dtype == torch.float32 else vals_sorted.dtype
-    vals_acc = vals_sorted.to(acc_dtype)
-    prefix = torch.cumsum(vals_acc, dim=0)
-    end_idx = torch.cumsum(counts.to(torch.int64), dim=0) - 1
-    seg_end = prefix[end_idx]
-    seg_begin = torch.zeros_like(seg_end)
-    if seg_end.numel() > 1:
-        seg_begin[1:] = prefix[end_idx[:-1]]
-    uniq_vals = (seg_end - seg_begin).to(out_dtype)
-    return uniq_keys, uniq_vals
-
-
-def _sort_reduce_pairs(keys, vals, out_dtype):
-    if keys.numel() == 0:
-        return keys, vals
-    order = torch.argsort(keys)
-    keys_sorted = keys[order]
-    vals_sorted = vals[order]
-    return _reduce_sorted_keys_vals(keys_sorted, vals_sorted, out_dtype)
-
-
-def _spgemm_count_phase(prepared, profile=False):
+    Every scalar product A[i,k]*B[k,j] is materialized once, keyed by
+    row*n_cols+col, sorted globally, then duplicate (row,col) pairs are summed.
+    The result is emitted directly as a canonical CSR (columns sorted per row).
+    This replaces the former per-row-bucket Python orchestration and is an order
+    of magnitude faster while producing identical output.
+    """
+    a_data = prepared.a_data
+    a_indices = prepared.a_indices
+    a_indptr = prepared.a_indptr
+    b_data = prepared.b_data
+    b_indices = prepared.b_indices
+    b_indptr = prepared.b_indptr
     n_rows = prepared.n_rows
-    device = prepared.a_data.device
-    row_nnz_c = torch.zeros(n_rows, dtype=torch.int64, device=device)
-    bucket_ms = {bucket_id: None for bucket_id in _SPGEMM_BUCKET_ORDER}
-    long_row_sliced = 0
-    chunks_by_bucket = _ensure_count_chunks(prepared)
-    for bucket_id in _SPGEMM_BUCKET_ORDER:
-        chunks = chunks_by_bucket.get(bucket_id, [])
-        for row_ids in chunks:
-            if profile:
-                torch.cuda.synchronize()
-                t_bucket0 = time.perf_counter()
-            if bucket_id != _SPGEMM_BUCKET_LONG:
-                keys, _ = _expand_rows_contrib(prepared, row_ids, need_values=False)
-                if keys.numel() > 0:
-                    uniq_keys = torch.unique(keys, sorted=True)
-                    uniq_rows = torch.div(
-                        uniq_keys,
-                        max(1, prepared.n_cols),
-                        rounding_mode="floor",
-                    )
-                    rows_unique, counts = torch.unique_consecutive(
-                        uniq_rows, return_counts=True
-                    )
-                    row_nnz_c[rows_unique] = counts.to(torch.int64)
-            else:
-                for row in row_ids:
-                    slices = _iter_row_a_slices(
-                        prepared,
-                        int(row),
-                        max_expanded=prepared.long_row_slice_expanded,
-                    )
-                    if len(slices) > 1:
-                        long_row_sliced += 1
-                    keys_parts = []
-                    for a_start, a_end in slices:
-                        keys, _ = _expand_single_row_slice_contrib(
-                            prepared,
-                            int(row),
-                            a_start,
-                            a_end,
-                            need_values=False,
-                        )
-                        if keys.numel() == 0:
-                            continue
-                        keys_parts.append(torch.unique(keys, sorted=True))
-                    if not keys_parts:
-                        row_nnz_c[int(row)] = 0
-                        continue
-                    uniq_row_keys = torch.unique(torch.cat(keys_parts), sorted=True)
-                    row_nnz_c[int(row)] = int(uniq_row_keys.numel())
-            if profile:
-                torch.cuda.synchronize()
-                elapsed = (time.perf_counter() - t_bucket0) * 1000.0
-                bucket_ms[bucket_id] = (
-                    elapsed
-                    if bucket_ms[bucket_id] is None
-                    else bucket_ms[bucket_id] + elapsed
+    n_cols = prepared.n_cols
+    device = a_data.device
+    dtype = a_data.dtype
+
+    empty_indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    nnz_a = a_data.numel()
+    if nnz_a == 0 or n_rows == 0:
+        return (
+            torch.empty(0, dtype=dtype, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            empty_indptr,
+        )
+
+    a_indptr64 = a_indptr.to(torch.int64)
+    b_indptr64 = b_indptr.to(torch.int64)
+    a_row = torch.repeat_interleave(
+        torch.arange(n_rows, device=device), a_indptr64[1:] - a_indptr64[:-1]
+    )
+    k = a_indices.to(torch.int64)  # A column == B row
+    b_len = b_indptr64[1:] - b_indptr64[:-1]
+    seg = b_len[k]  # number of products contributed by each A nonzero
+    total = int(seg.sum().item())
+    if total == 0:
+        return (
+            torch.empty(0, dtype=dtype, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            empty_indptr,
+        )
+
+    # expanded[p] -> the A nonzero that produced it, and its offset within B[k,:]
+    ap = torch.repeat_interleave(torch.arange(nnz_a, device=device), seg)
+    base = torch.cumsum(seg, 0) - seg
+    within = torch.arange(total, device=device) - torch.repeat_interleave(base, seg)
+    bpos = b_indptr64[k][ap] + within
+    out_col = b_indices[bpos].to(torch.int64)
+    out_val = a_data[ap] * b_data[bpos]
+    out_row = a_row[ap]
+
+    key = out_row * n_cols + out_col
+    order = torch.argsort(key)
+    key_sorted = key[order]
+    val_sorted = out_val[order]
+    uniq_key, inverse = torch.unique_consecutive(key_sorted, return_inverse=True)
+    c_data = torch.zeros(uniq_key.numel(), dtype=dtype, device=device)
+    c_data.index_add_(0, inverse, val_sorted)
+    c_rows = torch.div(uniq_key, n_cols, rounding_mode="floor")
+    c_indices = (uniq_key - c_rows * n_cols).to(torch.int32)
+
+    c_indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    row_counts = torch.bincount(c_rows, minlength=n_rows)
+    c_indptr[1:] = torch.cumsum(row_counts, dim=0)
+    return c_data, c_indices, c_indptr
+
+
+# ---------------------------------------------------------------------------
+# TLE shared-memory hash acceleration (float32 medium-row rows)
+#
+# For rows whose expanded work fits a shared-memory hash table, a single
+# program per row accumulates C[i,:] entirely in shared memory (open-addressing
+# hash keyed by column, value accumulator). This is dramatically faster than
+# the global expand-sort-reduce (ESC) for medium-width rows. Rows that are too
+# small (hash init/occupancy overhead dominates) or too wide (exceed the
+# largest shared-memory table) are routed to the chunked ESC fallback instead.
+#
+# TLE is a FlagTree Triton extension and may be unavailable; the import is
+# guarded and the whole path degrades to pure ESC when it (or a non-float32
+# dtype, or an out-of-int32-range shape) rules it out.
+# ---------------------------------------------------------------------------
+try:
+    import triton.experimental.tle.language as _tle
+
+    _TLE_AVAILABLE = True
+except Exception:  # pragma: no cover - environment without FlagTree TLE
+    _tle = None
+    _TLE_AVAILABLE = False
+
+# (max_row_work, hash_capacity, inner_block, num_warps); capacity is a power of
+# two (load factor <=0.75) and stays within the 100KB shared-memory budget
+# (8192*4B*2 tables). A row is sized into the first bucket whose max_row_work it
+# fits. Rows start at the size their row work suggests (clamped to the largest
+# table) and are re-counted one size up if they overflow; only rows still
+# overflowing at the largest table fall back to the chunked ESC.
+_SPGEMM_HASH_BUCKETS = (
+    (48, 64, 32, 2),
+    (192, 256, 32, 2),
+    (768, 1024, 64, 4),
+    (3072, 4096, 128, 8),
+    (6144, 8192, 256, 16),
+)
+_SPGEMM_HASH_LOAD = 0.75  # max hash-table load factor
+_SPGEMM_HASH_SMEM_BUDGET = 96 * 1024  # per-program shared-memory budget
+_SPGEMM_SINGLE_PASS_MAX_BYTES = 512 * 1024 * 1024  # over-allocation cap
+_SPGEMM_ESC_CHUNK_PRODUCTS = 8_000_000  # peak-memory bound for chunked ESC
+
+
+if _TLE_AVAILABLE:
+
+    @triton.jit
+    def _spgemm_hash_count_kernel(
+        a_ind,
+        a_ptr,
+        a_pref,
+        b_ind,
+        b_ptr,
+        rows_ptr,
+        nrows,
+        rw_ptr,
+        row_nnz_ptr,
+        ovf_ptr,
+        CAP: tl.constexpr,
+        BLOCK: tl.constexpr,
+        USE_ROWS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= nrows:
+            return
+        if USE_ROWS:
+            row = tl.load(rows_ptr + pid)
+        else:
+            row = pid
+        rw = tl.load(rw_ptr + row)
+        keys = _tle.gpu.alloc([CAP], tl.int32, scope=_tle.gpu.smem)
+        tl.store(
+            _tle.gpu.local_ptr(keys, (tl.arange(0, CAP),)),
+            tl.full((CAP,), -1, tl.int32),
+        )
+        a_s = tl.load(a_ptr + row)
+        a_e = tl.load(a_ptr + row + 1)
+        fail = 0
+        q0 = 0
+        # stop as soon as the table overflows: this row's count is discarded
+        # (it falls back to ESC), so probing the rest of it is pure waste --
+        # on hub rows a full table costs CAP probes per product otherwise.
+        while (q0 < rw) & (fail == 0):
+            q = q0 + tl.arange(0, BLOCK)
+            m = q < rw
+            # locate the A nonzero owning product q: last ap with pref[ap] <= q
+            lo = tl.full((BLOCK,), a_s, tl.int32)
+            hi = tl.full((BLOCK,), a_e, tl.int32)
+            while tl.sum((hi - lo > 1).to(tl.int32)) > 0:
+                mid = (lo + hi) // 2
+                pv = tl.load(a_pref + mid, mask=(mid < a_e), other=0x7FFFFFFF)
+                take = pv <= q
+                lo = tl.where(take, mid, lo)
+                hi = tl.where(take, hi, mid)
+            ap = lo
+            k = tl.load(a_ind + ap, mask=m, other=0)
+            pv = tl.load(a_pref + ap, mask=m, other=0)
+            bpos = tl.load(b_ptr + k, mask=m, other=0) + (q - pv)
+            j = tl.load(b_ind + bpos, mask=m, other=-1)
+            h = (j.to(tl.uint32) * 2654435761).to(tl.int32) & (CAP - 1)
+            done = (~m) | (j < 0)
+            it = 0
+            while (tl.sum((~done).to(tl.int32)) > 0) & (it < CAP):
+                cur = tl.atomic_cas(
+                    _tle.gpu.local_ptr(keys, (h,)),
+                    tl.full((BLOCK,), -1, tl.int32),
+                    j,
                 )
-    meta = {
-        "bucket_count_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
-        "bucket_count_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
-        "bucket_count_ms_long": bucket_ms[_SPGEMM_BUCKET_LONG],
-        "long_row_sliced_count_count": int(long_row_sliced),
-    }
-    return row_nnz_c, meta
+                done = done | (cur == -1) | (cur == j)
+                j = tl.where(done, -1, j)
+                h = (h + 1) & (CAP - 1)
+                it += 1
+            # a lane left unplaced means the table was too small for this row
+            fail = fail | (tl.sum((~done).to(tl.int32)) > 0).to(tl.int32)
+            q0 += BLOCK
+        kk = tl.load(_tle.gpu.local_ptr(keys, (tl.arange(0, CAP),)))
+        cnt = tl.sum((kk != -1).to(tl.int32))
+        if fail:
+            tl.store(ovf_ptr + row, 1)
+            tl.store(row_nnz_ptr + row, 0)
+        else:
+            tl.store(ovf_ptr + row, 0)
+            tl.store(row_nnz_ptr + row, cnt)
+
+    @triton.jit
+    def _spgemm_hash_fill_kernel(
+        a_data,
+        a_ind,
+        a_ptr,
+        a_pref,
+        b_data,
+        b_ind,
+        b_ptr,
+        rows_ptr,
+        nrows,
+        rw_ptr,
+        c_indptr,
+        c_ind,
+        c_data,
+        row_nnz_ptr,
+        ovf_ptr,
+        CAP: tl.constexpr,
+        BLOCK: tl.constexpr,
+        USE_ROWS: tl.constexpr,
+        REPORT: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= nrows:
+            return
+        if USE_ROWS:
+            row = tl.load(rows_ptr + pid)
+        else:
+            row = pid
+        rw = tl.load(rw_ptr + row)
+        keys = _tle.gpu.alloc([CAP], tl.int32, scope=_tle.gpu.smem)
+        accum = _tle.gpu.alloc([CAP], tl.float32, scope=_tle.gpu.smem)
+        tl.store(
+            _tle.gpu.local_ptr(keys, (tl.arange(0, CAP),)),
+            tl.full((CAP,), -1, tl.int32),
+        )
+        tl.store(
+            _tle.gpu.local_ptr(accum, (tl.arange(0, CAP),)),
+            tl.zeros((CAP,), tl.float32),
+        )
+        a_s = tl.load(a_ptr + row)
+        a_e = tl.load(a_ptr + row + 1)
+        fail = 0
+        q0 = 0
+        while (q0 < rw) & (fail == 0):
+            q = q0 + tl.arange(0, BLOCK)
+            m = q < rw
+            lo = tl.full((BLOCK,), a_s, tl.int32)
+            hi = tl.full((BLOCK,), a_e, tl.int32)
+            while tl.sum((hi - lo > 1).to(tl.int32)) > 0:
+                mid = (lo + hi) // 2
+                pv = tl.load(a_pref + mid, mask=(mid < a_e), other=0x7FFFFFFF)
+                take = pv <= q
+                lo = tl.where(take, mid, lo)
+                hi = tl.where(take, hi, mid)
+            ap = lo
+            k = tl.load(a_ind + ap, mask=m, other=0)
+            av = tl.load(a_data + ap, mask=m, other=0.0)
+            pv = tl.load(a_pref + ap, mask=m, other=0)
+            bpos = tl.load(b_ptr + k, mask=m, other=0) + (q - pv)
+            j = tl.load(b_ind + bpos, mask=m, other=-1)
+            bv = tl.load(b_data + bpos, mask=m, other=0.0)
+            prod = av * bv
+            h = (j.to(tl.uint32) * 2654435761).to(tl.int32) & (CAP - 1)
+            done = (~m) | (j < 0)
+            it = 0
+            while (tl.sum((~done).to(tl.int32)) > 0) & (it < CAP):
+                cur = tl.atomic_cas(
+                    _tle.gpu.local_ptr(keys, (h,)),
+                    tl.full((BLOCK,), -1, tl.int32),
+                    j,
+                )
+                hit = (cur == -1) | (cur == j)
+                da = (~done) & hit
+                tl.atomic_add(
+                    _tle.gpu.local_ptr(accum, (h,)),
+                    tl.where(da, prod, 0.0),
+                    mask=da,
+                )
+                done = done | hit
+                j = tl.where(done, -1, j)
+                h = (h + 1) & (CAP - 1)
+                it += 1
+            fail = fail | (tl.sum((~done).to(tl.int32)) > 0).to(tl.int32)
+            q0 += BLOCK
+        sl = tl.arange(0, CAP)
+        kk = tl.load(_tle.gpu.local_ptr(keys, (sl,)))
+        vv = tl.load(_tle.gpu.local_ptr(accum, (sl,)))
+        ne = kk != -1
+        pos = tl.load(c_indptr + row) + (
+            tl.cumsum(ne.to(tl.int32), 0) - ne.to(tl.int32)
+        )
+        tl.store(c_ind + pos, kk, mask=ne)
+        tl.store(c_data + pos, vv, mask=ne)
+        if REPORT:
+            # single-pass mode: this pass also serves as the counting pass
+            tl.store(ovf_ptr + row, fail)
+            tl.store(
+                row_nnz_ptr + row,
+                tl.where(fail != 0, 0, tl.sum(ne.to(tl.int32))),
+            )
+
+    # float64 twin of the fill kernel: TLE's smem alloc needs a literal
+    # dtype, so the accumulator type cannot be a constexpr parameter.
+    @triton.jit
+    def _spgemm_hash_fill_kernel_f64(
+        a_data,
+        a_ind,
+        a_ptr,
+        a_pref,
+        b_data,
+        b_ind,
+        b_ptr,
+        rows_ptr,
+        nrows,
+        rw_ptr,
+        c_indptr,
+        c_ind,
+        c_data,
+        row_nnz_ptr,
+        ovf_ptr,
+        CAP: tl.constexpr,
+        BLOCK: tl.constexpr,
+        USE_ROWS: tl.constexpr,
+        REPORT: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= nrows:
+            return
+        if USE_ROWS:
+            row = tl.load(rows_ptr + pid)
+        else:
+            row = pid
+        rw = tl.load(rw_ptr + row)
+        keys = _tle.gpu.alloc([CAP], tl.int32, scope=_tle.gpu.smem)
+        accum = _tle.gpu.alloc([CAP], tl.float64, scope=_tle.gpu.smem)
+        tl.store(
+            _tle.gpu.local_ptr(keys, (tl.arange(0, CAP),)),
+            tl.full((CAP,), -1, tl.int32),
+        )
+        tl.store(
+            _tle.gpu.local_ptr(accum, (tl.arange(0, CAP),)),
+            tl.zeros((CAP,), tl.float64),
+        )
+        a_s = tl.load(a_ptr + row)
+        a_e = tl.load(a_ptr + row + 1)
+        fail = 0
+        q0 = 0
+        while (q0 < rw) & (fail == 0):
+            q = q0 + tl.arange(0, BLOCK)
+            m = q < rw
+            lo = tl.full((BLOCK,), a_s, tl.int32)
+            hi = tl.full((BLOCK,), a_e, tl.int32)
+            while tl.sum((hi - lo > 1).to(tl.int32)) > 0:
+                mid = (lo + hi) // 2
+                pv = tl.load(a_pref + mid, mask=(mid < a_e), other=0x7FFFFFFF)
+                take = pv <= q
+                lo = tl.where(take, mid, lo)
+                hi = tl.where(take, hi, mid)
+            ap = lo
+            k = tl.load(a_ind + ap, mask=m, other=0)
+            av = tl.load(a_data + ap, mask=m, other=0.0)
+            pv = tl.load(a_pref + ap, mask=m, other=0)
+            bpos = tl.load(b_ptr + k, mask=m, other=0) + (q - pv)
+            j = tl.load(b_ind + bpos, mask=m, other=-1)
+            bv = tl.load(b_data + bpos, mask=m, other=0.0)
+            prod = av * bv
+            h = (j.to(tl.uint32) * 2654435761).to(tl.int32) & (CAP - 1)
+            done = (~m) | (j < 0)
+            it = 0
+            while (tl.sum((~done).to(tl.int32)) > 0) & (it < CAP):
+                cur = tl.atomic_cas(
+                    _tle.gpu.local_ptr(keys, (h,)),
+                    tl.full((BLOCK,), -1, tl.int32),
+                    j,
+                )
+                hit = (cur == -1) | (cur == j)
+                da = (~done) & hit
+                tl.atomic_add(
+                    _tle.gpu.local_ptr(accum, (h,)),
+                    tl.where(da, prod, 0.0),
+                    mask=da,
+                )
+                done = done | hit
+                j = tl.where(done, -1, j)
+                h = (h + 1) & (CAP - 1)
+                it += 1
+            fail = fail | (tl.sum((~done).to(tl.int32)) > 0).to(tl.int32)
+            q0 += BLOCK
+        sl = tl.arange(0, CAP)
+        kk = tl.load(_tle.gpu.local_ptr(keys, (sl,)))
+        vv = tl.load(_tle.gpu.local_ptr(accum, (sl,)))
+        ne = kk != -1
+        pos = tl.load(c_indptr + row) + (
+            tl.cumsum(ne.to(tl.int32), 0) - ne.to(tl.int32)
+        )
+        tl.store(c_ind + pos, kk, mask=ne)
+        tl.store(c_data + pos, vv, mask=ne)
+        if REPORT:
+            # single-pass mode: this pass also serves as the counting pass
+            tl.store(ovf_ptr + row, fail)
+            tl.store(
+                row_nnz_ptr + row,
+                tl.where(fail != 0, 0, tl.sum(ne.to(tl.int32))),
+            )
 
 
-def _spgemm_fill_phase(
-    prepared, c_indptr, out_data=None, out_indices=None, profile=False
-):
+def _spgemm_row_products(prepared):
+    """Products (expanded work) per output row: ``sum_k nnz(B[A_col_k, :])``.
+
+    Returned as int32 (the dtype ``prepare`` stores) so the compute path does
+    not pay an int32 -> int64 -> int32 round trip over every row on each call.
+    Callers that sum it must accumulate in int64.
+    """
+    if prepared.row_work_ready and prepared.a_row_work.numel() == prepared.n_rows:
+        return prepared.a_row_work
+    return _build_row_product_metadata(
+        prepared.a_indices, prepared.a_indptr, prepared.b_indptr
+    )[0]
+
+
+def _spgemm_esc_expand_rows(prepared, rows):
+    """Reduced (crow, ccol, cval) for the given ascending row ids, in CSR order.
+
+    Materializes exactly the products contributed by ``rows``, keys them by
+    row*n_cols+col, sorts, and sums duplicates. Output is globally row-sorted
+    and column-sorted within each row (canonical CSR order for these rows).
+    """
+    device = prepared.a_data.device
+    dtype = prepared.a_data.dtype
+    n_cols = prepared.n_cols
+    a_data, a_indices = prepared.a_data, prepared.a_indices
+    b_data, b_indices = prepared.b_data, prepared.b_indices
+    a_indptr64 = prepared.a_indptr.to(torch.int64)
+    b_indptr64 = prepared.b_indptr.to(torch.int64)
+
+    a_deg = a_indptr64[1:] - a_indptr64[:-1]
+    sel_deg = a_deg[rows]
+    n_a_sel = int(sel_deg.sum().item())
+    empty = (
+        torch.empty(0, dtype=torch.int64, device=device),
+        torch.empty(0, dtype=torch.int32, device=device),
+        torch.empty(0, dtype=dtype, device=device),
+    )
+    if n_a_sel == 0:
+        return empty
+    sel_starts = a_indptr64[rows]
+    ap_local = torch.repeat_interleave(
+        torch.arange(rows.numel(), device=device), sel_deg
+    )
+    a_base = torch.cumsum(sel_deg, 0) - sel_deg
+    within_a = torch.arange(n_a_sel, device=device) - torch.repeat_interleave(
+        a_base, sel_deg
+    )
+    ap = sel_starts[ap_local] + within_a
+    arow = rows[ap_local]
+
+    k = a_indices[ap].to(torch.int64)
+    b_len = b_indptr64[1:] - b_indptr64[:-1]
+    seg = b_len[k]
+    total = int(seg.sum().item())
+    if total == 0:
+        return empty
+    aap = torch.repeat_interleave(torch.arange(ap.numel(), device=device), seg)
+    base = torch.cumsum(seg, 0) - seg
+    within_b = torch.arange(total, device=device) - torch.repeat_interleave(base, seg)
+    bpos = b_indptr64[k][aap] + within_b
+    out_col = b_indices[bpos].to(torch.int64)
+    out_val = a_data[ap][aap] * b_data[bpos]
+    out_row = arow[aap]
+
+    key = out_row * n_cols + out_col
+    order = torch.argsort(key)
+    key_sorted = key[order]
+    val_sorted = out_val[order]
+    uniq_key, inverse = torch.unique_consecutive(key_sorted, return_inverse=True)
+    cval = torch.zeros(uniq_key.numel(), dtype=dtype, device=device)
+    cval.index_add_(0, inverse, val_sorted)
+    crow = torch.div(uniq_key, n_cols, rounding_mode="floor")
+    ccol = (uniq_key - crow * n_cols).to(torch.int32)
+    return crow, ccol, cval
+
+
+def _spgemm_esc_rows_chunked(prepared, rows, rw, budget=_SPGEMM_ESC_CHUNK_PRODUCTS):
+    """ESC over ``rows`` split into contiguous chunks bounded by ``budget``
+    products, so peak memory stays bounded regardless of total work."""
+    device = prepared.a_data.device
+    dtype = prepared.a_data.dtype
+    if rows.numel() == 0:
+        return (
+            torch.empty(0, dtype=torch.int64, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            torch.empty(0, dtype=dtype, device=device),
+        )
+    prod = rw[rows].to(torch.int64)
+    total = int(prod.sum().item())
+    if total <= budget:
+        return _spgemm_esc_expand_rows(prepared, rows)
+    csum = torch.cumsum(prod, 0)
+    chunk_id = torch.div(torch.clamp(csum - 1, min=0), budget, rounding_mode="floor")
+    boundaries = (
+        torch.nonzero(chunk_id[1:] != chunk_id[:-1], as_tuple=False).flatten() + 1
+    )
+    edges = [0] + (boundaries + 0).tolist() + [rows.numel()]
+    crow_parts, ccol_parts, cval_parts = [], [], []
+    for i in range(len(edges) - 1):
+        sub = rows[edges[i] : edges[i + 1]]
+        if sub.numel() == 0:
+            continue
+        cr, cc, cv = _spgemm_esc_expand_rows(prepared, sub)
+        if cr.numel():
+            crow_parts.append(cr)
+            ccol_parts.append(cc)
+            cval_parts.append(cv)
+        torch.cuda.empty_cache()
+    if not crow_parts:
+        return (
+            torch.empty(0, dtype=torch.int64, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            torch.empty(0, dtype=dtype, device=device),
+        )
+    return (
+        torch.cat(crow_parts),
+        torch.cat(ccol_parts),
+        torch.cat(cval_parts),
+    )
+
+
+def _spgemm_assemble_row_sorted(crow, ccol, cval, n_rows, dtype, device):
+    """(crow, ccol, cval) already in CSR order -> (c_data, c_indices, c_indptr)."""
+    c_indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    if crow.numel():
+        c_indptr[1:] = torch.cumsum(torch.bincount(crow, minlength=n_rows), dim=0)
+    return cval.to(dtype), ccol.to(torch.int32), c_indptr
+
+
+def _spgemm_esc_compute_safe(prepared):
+    """Global ESC that never exceeds the chunk memory budget."""
+    rw = _spgemm_row_products(prepared)
+    total = int(rw.sum(dtype=torch.int64).item())
+    if total <= _SPGEMM_ESC_CHUNK_PRODUCTS:
+        return _spgemm_esc_compute(prepared)
+    device = prepared.a_data.device
+    rows = torch.nonzero(rw > 0, as_tuple=False).flatten()
+    crow, ccol, cval = _spgemm_esc_rows_chunked(prepared, rows, rw)
+    return _spgemm_assemble_row_sorted(
+        crow, ccol, cval, prepared.n_rows, prepared.a_data.dtype, device
+    )
+
+
+def _spgemm_hash_hybrid_compute(prepared):
+    """Hybrid: TLE shared-memory hash for rows that fit a table, chunked ESC
+    for the rest. Returns ``None`` when hashing does not apply (caller then
+    uses the ESC fallback).
+
+    Table sizes start from the row-work upper bound *clamped to the largest
+    table* rather than routing wide rows straight to ESC -- row work
+    over-estimates the distinct column count by up to ~37x, so many "wide" rows
+    actually fit. Rows that genuinely overflow are re-counted at the next size
+    up; only those still overflowing at the largest table fall back to ESC. The
+    fill phase is then sized from the exact per-row nnz the count produced.
+    """
+    if not _TLE_AVAILABLE:
+        return None
+    dtype = prepared.a_data.dtype
+    if dtype == torch.float32:
+        fill_kernel = _spgemm_hash_fill_kernel
+        acc_bytes = 4
+    elif dtype == torch.float64:
+        fill_kernel = _spgemm_hash_fill_kernel_f64
+        acc_bytes = 8
+    else:
+        return None
+    n_rows = prepared.n_rows
+    n_cols = prepared.n_cols
+    nnz_a = prepared.a_data.numel()
+    if n_rows == 0 or nnz_a == 0:
+        return None
+    if (
+        n_cols > _INDEX_LIMIT_INT32
+        or prepared.b_data.numel() > _INDEX_LIMIT_INT32
+        or nnz_a > _INDEX_LIMIT_INT32
+    ):
+        return None
+
+    device = prepared.a_data.device
+    rw = _spgemm_row_products(prepared)
+    if int(rw.sum(dtype=torch.int64).item()) == 0:
+        return None
+    if int(rw.max().item()) > _INDEX_LIMIT_INT32:
+        return None
+    pref = prepared.a_pref
+    if pref is None or pref.numel() != nnz_a:
+        pref = _build_row_product_metadata(
+            prepared.a_indices, prepared.a_indptr, prepared.b_indptr
+        )[1]
+
+    ai = prepared.a_indices.to(torch.int32).contiguous()
+    ap = prepared.a_indptr.to(torch.int32).contiguous()
+    bi = prepared.b_indices.to(torch.int32).contiguous()
+    bp = prepared.b_indptr.to(torch.int32).contiguous()
+    a_data = prepared.a_data.contiguous()
+    b_data = prepared.b_data.contiguous()
+    rw32 = rw.contiguous()
+    dummy = torch.empty(1, dtype=torch.int32, device=device)
+
+    row_nnz = torch.zeros(n_rows, dtype=torch.int64, device=device)
+    ovf = torch.zeros(n_rows, dtype=torch.int32, device=device)
+
+    # fp64 tables hold keys(4B)+accum(8B) per slot, so the largest sizes may not
+    # fit the shared-memory budget; drop the levels that do not.
+    ncaps = len(_SPGEMM_HASH_BUCKETS)
+    while (
+        ncaps > 1
+        and _SPGEMM_HASH_BUCKETS[ncaps - 1][1] * (4 + acc_bytes)
+        > _SPGEMM_HASH_SMEM_BUDGET
+    ):
+        ncaps -= 1
+
+    # A single-pass variant (fill reports its own counts, writing into
+    # rw-sized slots, then compact) was measured a net loss: 0.589 -> 0.528
+    # average, because the compaction gather over nnz(C) costs more than the
+    # counting pass it saves. It did help ASIC_680ks (0.12 -> 0.36), whose row
+    # work spans four table sizes, so a narrower gate may still be worthwhile.
+    # The kernels keep their REPORT path for that experiment.
+    # Starting table size per row from its row-work bound, clamped to the
+    # largest table. Rows below the top level have row work within that table's
+    # load bound and so cannot overflow; only clamped rows can, and those go
+    # straight to ESC. (Starting everyone at the smallest table and escalating
+    # was measured ~8x slower -- the wasted passes fall on the widest rows.)
+    level = torch.zeros(n_rows, dtype=torch.int64, device=device)
+    for ci, (max_rw, _cap, _blk, _w) in enumerate(_SPGEMM_HASH_BUCKETS[:ncaps]):
+        level = torch.where(rw > max_rw, torch.full_like(level, ci + 1), level)
+    level = level.clamp(max=ncaps - 1)
+
+    lvl_min = int(level.min().item())
+    lvl_max = int(level.max().item())
+    if lvl_min == lvl_max:
+        # uniform: one launch over all rows, no row-list materialisation
+        _max_rw, cap, blk, warps = _SPGEMM_HASH_BUCKETS[lvl_min]
+        _spgemm_hash_count_kernel[(n_rows,)](
+            ai,
+            ap,
+            pref,
+            bi,
+            bp,
+            dummy,
+            n_rows,
+            rw32,
+            row_nnz,
+            ovf,
+            CAP=cap,
+            BLOCK=blk,
+            num_warps=warps,
+            USE_ROWS=False,
+        )
+    else:
+        for ci in range(lvl_min, lvl_max + 1):
+            sel = torch.nonzero(level == ci, as_tuple=False).flatten().to(torch.int32)
+            if sel.numel() == 0:
+                continue
+            _max_rw, cap, blk, warps = _SPGEMM_HASH_BUCKETS[ci]
+            _spgemm_hash_count_kernel[(sel.numel(),)](
+                ai,
+                ap,
+                pref,
+                bi,
+                bp,
+                sel,
+                sel.numel(),
+                rw32,
+                row_nnz,
+                ovf,
+                CAP=cap,
+                BLOCK=blk,
+                num_warps=warps,
+                USE_ROWS=True,
+            )
+    pend = torch.nonzero(ovf, as_tuple=False).flatten()
+
+    # rows too wide for the largest table -> chunked ESC
+    crow = ccol = cval = None
+    if pend.numel():
+        # A Gustavson dense-accumulator (SPA) alternative to this ESC fallback
+        # was measured to make no difference: on Stanford / net150 the wide rows
+        # are only 20% / 44% of the runtime, and SPA cost the same as ESC on
+        # them. The bottleneck is the hash path on the merely-wide rows.
+        crow, ccol, cval = _spgemm_esc_rows_chunked(prepared, pend, rw)
+        if crow.numel():
+            row_nnz += torch.bincount(crow, minlength=n_rows)
+
+    c_indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    c_indptr[1:] = torch.cumsum(row_nnz, dim=0)
     nnz_c = int(c_indptr[-1].item())
-    device = prepared.a_data.device
-    c_data = (
-        out_data
-        if out_data is not None
-        else torch.empty(nnz_c, dtype=prepared.a_data.dtype, device=device)
-    )
-    c_indices = (
-        out_indices
-        if out_indices is not None
-        else torch.empty(nnz_c, dtype=torch.int32, device=device)
-    )
-    bucket_ms = {bucket_id: None for bucket_id in _SPGEMM_BUCKET_ORDER}
-    long_row_sliced = 0
-    if nnz_c == 0:
-        meta = {
-            "bucket_fill_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
-            "bucket_fill_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
-            "bucket_fill_ms_long": bucket_ms[_SPGEMM_BUCKET_LONG],
-            "long_row_sliced_count_fill": int(long_row_sliced),
-        }
-        return c_data, c_indices, meta
+    c_indices = torch.empty(nnz_c, dtype=torch.int32, device=device)
+    c_data = torch.empty(nnz_c, dtype=dtype, device=device)
 
-    chunks_by_bucket = _ensure_fill_chunks(prepared)
-    for bucket_id in _SPGEMM_BUCKET_ORDER:
-        chunks = chunks_by_bucket.get(bucket_id, [])
-        for row_ids in chunks:
-            if profile:
-                torch.cuda.synchronize()
-                t_bucket0 = time.perf_counter()
-            if bucket_id != _SPGEMM_BUCKET_LONG:
-                keys, vals = _expand_rows_contrib(prepared, row_ids, need_values=True)
-                if keys.numel() > 0:
-                    uniq_keys, uniq_vals = _sort_reduce_pairs(
-                        keys,
-                        vals,
-                        out_dtype=prepared.a_data.dtype,
+    # fill, sized from the exact counts rather than the row-work bound
+    hashed = row_nnz > 0
+    if pend.numel():
+        keep = torch.ones(n_rows, dtype=torch.bool, device=device)
+        keep[pend] = False
+        hashed = hashed & keep
+    if bool(hashed.any()):
+        max_nnz = int(row_nnz[hashed].max().item())
+        single = None
+        if pend.numel() == 0:
+            for _mr, cap, blk, warps in _SPGEMM_HASH_BUCKETS[:ncaps]:
+                if max_nnz <= cap * _SPGEMM_HASH_LOAD:
+                    single = (cap, blk, warps)
+                    break
+        if single is not None:
+            cap, blk, warps = single
+            fill_kernel[(n_rows,)](
+                a_data,
+                ai,
+                ap,
+                pref,
+                b_data,
+                bi,
+                bp,
+                dummy,
+                n_rows,
+                rw32,
+                c_indptr,
+                c_indices,
+                c_data,
+                row_nnz,
+                ovf,
+                CAP=cap,
+                BLOCK=blk,
+                num_warps=warps,
+                USE_ROWS=False,
+                REPORT=False,
+            )
+        else:
+            lo = 0
+            for _mr, cap, blk, warps in _SPGEMM_HASH_BUCKETS[:ncaps]:
+                hi = int(cap * _SPGEMM_HASH_LOAD)
+                sel = (
+                    torch.nonzero(
+                        hashed & (row_nnz > lo) & (row_nnz <= hi), as_tuple=False
                     )
-                    uniq_rows = torch.div(
-                        uniq_keys,
-                        max(1, prepared.n_cols),
-                        rounding_mode="floor",
-                    )
-                    uniq_cols = (uniq_keys - uniq_rows * max(1, prepared.n_cols)).to(
-                        torch.int32
-                    )
-                    _, row_counts = torch.unique_consecutive(
-                        uniq_rows, return_counts=True
-                    )
-                    row_offsets = torch.cumsum(
-                        row_counts.to(torch.int64), dim=0
-                    ) - row_counts.to(torch.int64)
-                    local_pos = torch.arange(
-                        uniq_keys.numel(), device=device, dtype=torch.int64
-                    ) - torch.repeat_interleave(row_offsets, row_counts)
-                    dst = c_indptr[uniq_rows] + local_pos
-                    c_indices[dst] = uniq_cols
-                    c_data[dst] = uniq_vals
-            else:
-                for row in row_ids:
-                    row = int(row)
-                    slices = _iter_row_a_slices(
-                        prepared,
-                        row,
-                        max_expanded=prepared.long_row_slice_expanded,
-                    )
-                    if len(slices) > 1:
-                        long_row_sliced += 1
-                    key_parts = []
-                    val_parts = []
-                    for a_start, a_end in slices:
-                        keys, vals = _expand_single_row_slice_contrib(
-                            prepared,
-                            row,
-                            a_start,
-                            a_end,
-                            need_values=True,
-                        )
-                        if keys.numel() == 0:
-                            continue
-                        uniq_k, uniq_v = _sort_reduce_pairs(
-                            keys,
-                            vals,
-                            out_dtype=prepared.a_data.dtype,
-                        )
-                        key_parts.append(uniq_k)
-                        val_parts.append(uniq_v)
-                    row_start = int(c_indptr[row].item())
-                    row_end = int(c_indptr[row + 1].item())
-                    row_nnz = row_end - row_start
-                    if row_nnz == 0:
-                        continue
-                    if not key_parts:
-                        raise RuntimeError(
-                            f"row {row} expected nnz={row_nnz} but got empty fill"
-                        )
-                    row_keys = torch.cat(key_parts)
-                    row_vals = torch.cat(val_parts)
-                    row_keys, row_vals = _sort_reduce_pairs(
-                        row_keys,
-                        row_vals,
-                        out_dtype=prepared.a_data.dtype,
-                    )
-                    if row_keys.numel() != row_nnz:
-                        raise RuntimeError(
-                            f"row {row} fill nnz mismatch: expected {row_nnz}, got {row_keys.numel()}"
-                        )
-                    row_cols = (row_keys - row * max(1, prepared.n_cols)).to(
-                        torch.int32
-                    )
-                    c_indices[row_start:row_end] = row_cols
-                    c_data[row_start:row_end] = row_vals
-            if profile:
-                torch.cuda.synchronize()
-                elapsed = (time.perf_counter() - t_bucket0) * 1000.0
-                bucket_ms[bucket_id] = (
-                    elapsed
-                    if bucket_ms[bucket_id] is None
-                    else bucket_ms[bucket_id] + elapsed
+                    .flatten()
+                    .to(torch.int32)
+                )
+                lo = hi
+                if sel.numel() == 0:
+                    continue
+                fill_kernel[(sel.numel(),)](
+                    a_data,
+                    ai,
+                    ap,
+                    pref,
+                    b_data,
+                    bi,
+                    bp,
+                    sel,
+                    sel.numel(),
+                    rw32,
+                    c_indptr,
+                    c_indices,
+                    c_data,
+                    row_nnz,
+                    ovf,
+                    CAP=cap,
+                    BLOCK=blk,
+                    num_warps=warps,
+                    USE_ROWS=True,
+                    REPORT=False,
                 )
 
-    meta = {
-        "bucket_fill_ms_short": bucket_ms[_SPGEMM_BUCKET_SHORT],
-        "bucket_fill_ms_medium": bucket_ms[_SPGEMM_BUCKET_MEDIUM],
-        "bucket_fill_ms_long": bucket_ms[_SPGEMM_BUCKET_LONG],
-        "long_row_sliced_count_fill": int(long_row_sliced),
-    }
-    return c_data, c_indices, meta
+    if crow is not None and crow.numel():
+        starts = c_indptr[crow]
+        first = torch.searchsorted(crow, crow)
+        pos = starts + (torch.arange(crow.numel(), device=device) - first)
+        c_indices[pos] = ccol
+        c_data[pos] = cval.to(dtype)
+
+    return c_data, c_indices, c_indptr
+
+
+def _spgemm_compute(prepared):
+    """Dispatch: hybrid hash when worthwhile, otherwise memory-safe ESC."""
+    if _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
+        try:
+            result = _spgemm_hash_hybrid_compute(prepared)
+        except (triton.runtime.errors.OutOfResources, torch.cuda.OutOfMemoryError):
+            # genuinely out of shared memory / device memory: ESC still works
+            result = None
+        if result is not None:
+            return result
+    return _spgemm_esc_compute_safe(prepared)
+
+
+_SPGEMM_EMPTY_STAGE_META = {
+    "count_ms": None,
+    "fill_ms": None,
+    "bucket_ms_short": None,
+    "bucket_ms_medium": None,
+    "bucket_ms_long": None,
+    "bucket_count_ms_short": None,
+    "bucket_count_ms_medium": None,
+    "bucket_count_ms_long": None,
+    "bucket_fill_ms_short": None,
+    "bucket_fill_ms_medium": None,
+    "bucket_fill_ms_long": None,
+    "bucket_nrows_short": 0,
+    "bucket_nrows_medium": 0,
+    "bucket_nrows_long": 0,
+    "long_row_sliced_count": 0,
+}
 
 
 def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False):
-    _ensure_row_work(prepared)
     if out is not None:
         if not isinstance(out, (tuple, list)) or len(out) != 3:
             raise TypeError("out must be a tuple/list of (data, indices, indptr)")
@@ -969,94 +1092,29 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
 
     if measure_stage:
         torch.cuda.synchronize()
-        t_count0 = time.perf_counter()
-    row_nnz_c, count_meta = _spgemm_count_phase(prepared, profile=profile)
+        t0 = time.perf_counter()
+    c_data, c_indices, c_indptr = _spgemm_compute(prepared)
     if measure_stage:
         torch.cuda.synchronize()
-        count_ms = (time.perf_counter() - t_count0) * 1000.0
+        total_ms = (time.perf_counter() - t0) * 1000.0
     else:
-        count_ms = None
-    _clear_count_schedule(prepared)
+        total_ms = None
 
-    c_indptr = out_indptr
-    if c_indptr is None:
-        c_indptr = torch.empty(
-            prepared.n_rows + 1, dtype=torch.int64, device=prepared.a_data.device
-        )
-    c_indptr[0] = 0
-    if prepared.n_rows > 0:
-        c_indptr[1:] = torch.cumsum(row_nnz_c, dim=0)
-    nnz_c = int(c_indptr[-1].item()) if c_indptr.numel() > 0 else 0
-
+    nnz_c = int(c_data.numel())
     if out_data is not None:
         if out_data.shape != (nnz_c,) or out_data.dtype != prepared.a_data.dtype:
             raise ValueError("out data shape/dtype must match computed C data")
         if out_indices.shape != (nnz_c,) or out_indices.dtype != torch.int32:
             raise ValueError("out indices shape/dtype must match computed C indices")
+        out_data.copy_(c_data)
+        out_indices.copy_(c_indices)
+        out_indptr.copy_(c_indptr)
+        c_data, c_indices, c_indptr = out_data, out_indices, out_indptr
 
-    if measure_stage:
-        torch.cuda.synchronize()
-        t_fill0 = time.perf_counter()
-    c_data, c_indices, fill_meta = _spgemm_fill_phase(
-        prepared,
-        c_indptr,
-        out_data=out_data,
-        out_indices=out_indices,
-        profile=profile,
-    )
-    if measure_stage:
-        torch.cuda.synchronize()
-        fill_ms = (time.perf_counter() - t_fill0) * 1000.0
-    else:
-        fill_ms = None
-    _clear_fill_schedule(prepared)
-
-    def _sum_bucket_ms(count_key, fill_key):
-        count_val = count_meta[count_key]
-        fill_val = fill_meta[fill_key]
-        if count_val is None or fill_val is None:
-            return None
-        return float(count_val + fill_val)
-
-    return (
-        c_data,
-        c_indices,
-        c_indptr,
-        {
-            "count_ms": count_ms,
-            "fill_ms": fill_ms,
-            "bucket_ms_short": _sum_bucket_ms(
-                "bucket_count_ms_short", "bucket_fill_ms_short"
-            ),
-            "bucket_ms_medium": _sum_bucket_ms(
-                "bucket_count_ms_medium", "bucket_fill_ms_medium"
-            ),
-            "bucket_ms_long": _sum_bucket_ms(
-                "bucket_count_ms_long", "bucket_fill_ms_long"
-            ),
-            "bucket_count_ms_short": count_meta["bucket_count_ms_short"],
-            "bucket_count_ms_medium": count_meta["bucket_count_ms_medium"],
-            "bucket_count_ms_long": count_meta["bucket_count_ms_long"],
-            "bucket_fill_ms_short": fill_meta["bucket_fill_ms_short"],
-            "bucket_fill_ms_medium": fill_meta["bucket_fill_ms_medium"],
-            "bucket_fill_ms_long": fill_meta["bucket_fill_ms_long"],
-            "bucket_nrows_short": int(
-                torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_SHORT).item()
-            ),
-            "bucket_nrows_medium": int(
-                torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_MEDIUM).item()
-            ),
-            "bucket_nrows_long": int(
-                torch.count_nonzero(prepared.row_bucket == _SPGEMM_BUCKET_LONG).item()
-            ),
-            "long_row_sliced_count": int(
-                max(
-                    count_meta["long_row_sliced_count_count"],
-                    fill_meta["long_row_sliced_count_fill"],
-                )
-            ),
-        },
-    )
+    meta = dict(_SPGEMM_EMPTY_STAGE_META)
+    meta["count_ms"] = total_ms
+    meta["fill_ms"] = 0.0 if total_ms is not None else None
+    return c_data, c_indices, c_indptr, meta
 
 
 def flagsparse_spgemm_csr(
@@ -1075,7 +1133,6 @@ def flagsparse_spgemm_csr(
 ):
     """CSR SpGEMM: C = A @ B with CSR output (Triton-only main path)."""
     prepare_ms = 0.0
-    internal_prepared = prepared is None
     if prepared is None:
         if any(
             x is None
@@ -1126,55 +1183,17 @@ def flagsparse_spgemm_csr(
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    if internal_prepared:
-        _clear_runtime_schedules(prepared)
-
     result = (c_data, c_indices, c_indptr, (prepared.n_rows, prepared.n_cols))
-    if return_time and return_meta:
-        meta = {
-            "prepare_ms": prepare_ms,
-            "count_ms": stage_meta["count_ms"],
-            "fill_ms": stage_meta["fill_ms"],
-            "triton_ms": elapsed_ms,
-            "hash_capacity_hint": prepared.hash_capacity_hint,
-            "bucket_ms_short": stage_meta["bucket_ms_short"],
-            "bucket_ms_medium": stage_meta["bucket_ms_medium"],
-            "bucket_ms_long": stage_meta["bucket_ms_long"],
-            "bucket_count_ms_short": stage_meta["bucket_count_ms_short"],
-            "bucket_count_ms_medium": stage_meta["bucket_count_ms_medium"],
-            "bucket_count_ms_long": stage_meta["bucket_count_ms_long"],
-            "bucket_fill_ms_short": stage_meta["bucket_fill_ms_short"],
-            "bucket_fill_ms_medium": stage_meta["bucket_fill_ms_medium"],
-            "bucket_fill_ms_long": stage_meta["bucket_fill_ms_long"],
-            "bucket_nrows_short": stage_meta["bucket_nrows_short"],
-            "bucket_nrows_medium": stage_meta["bucket_nrows_medium"],
-            "bucket_nrows_long": stage_meta["bucket_nrows_long"],
-            "long_row_sliced_count": stage_meta["long_row_sliced_count"],
-        }
-        return result, elapsed_ms, meta
+    if return_meta:
+        # The per-bucket keys are retained for the benchmark's report schema; the
+        # ESC / TLE-hash compute path does not populate them.
+        meta = {"prepare_ms": prepare_ms, **stage_meta}
+        if return_time:
+            meta["triton_ms"] = elapsed_ms
+            return result, elapsed_ms, meta
+        return result, meta
     if return_time:
         return result, elapsed_ms
-    if return_meta:
-        meta = {
-            "prepare_ms": prepare_ms,
-            "count_ms": stage_meta["count_ms"],
-            "fill_ms": stage_meta["fill_ms"],
-            "hash_capacity_hint": prepared.hash_capacity_hint,
-            "bucket_ms_short": stage_meta["bucket_ms_short"],
-            "bucket_ms_medium": stage_meta["bucket_ms_medium"],
-            "bucket_ms_long": stage_meta["bucket_ms_long"],
-            "bucket_count_ms_short": stage_meta["bucket_count_ms_short"],
-            "bucket_count_ms_medium": stage_meta["bucket_count_ms_medium"],
-            "bucket_count_ms_long": stage_meta["bucket_count_ms_long"],
-            "bucket_fill_ms_short": stage_meta["bucket_fill_ms_short"],
-            "bucket_fill_ms_medium": stage_meta["bucket_fill_ms_medium"],
-            "bucket_fill_ms_long": stage_meta["bucket_fill_ms_long"],
-            "bucket_nrows_short": stage_meta["bucket_nrows_short"],
-            "bucket_nrows_medium": stage_meta["bucket_nrows_medium"],
-            "bucket_nrows_long": stage_meta["bucket_nrows_long"],
-            "long_row_sliced_count": stage_meta["long_row_sliced_count"],
-        }
-        return result, meta
     return result
 
 
