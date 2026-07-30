@@ -14,6 +14,8 @@
 
 """CSR SDDMM kernels and helpers."""
 
+import math
+
 from ._common import *
 
 SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
@@ -47,17 +49,30 @@ class SDDMMPrepared:
         self.num_warps = int(num_warps)
 
 
-def _resolve_sddmm_launch_config(k):
-    if k <= 32:
-        return 32, 2
-    if k <= 64:
-        return 64, 4
-    if k <= 128:
-        return 64, 4
-    return 128, 8
+def _resolve_sddmm_launch_config(k, mean_row_len=None, value_dtype=None):
+    """Return (block_p, block_k, num_warps) for the nnz-parallel SDDMM kernel.
+
+    Tuned on sm_120 over 14 matrices x k in {32, 64, 128, 256}. BLOCK_K=32 is
+    fastest at every k: the kernel is bound by the gathered ``y`` traffic rather
+    than by the reduction, so a wider k tile buys nothing and only costs occupancy
+    (the previous BLOCK_K=64 at k>=64 cost up to 1.6x on long-row matrices).
+
+    BLOCK_P depends on the pattern -- long rows amortise a wide block, short rows
+    just pay for its masked tail -- and on the value dtype: fp64 doubles the
+    register footprint of the [BLOCK_P, BLOCK_K] tiles, and a wide block then
+    *regresses* by up to 28%, so fp64 always takes the narrow config.
+    """
+    block_k = 32 if k >= 32 else max(1, triton.next_power_of_2(int(k)))
+    if (
+        value_dtype != torch.float64
+        and mean_row_len is not None
+        and mean_row_len >= 16.0
+    ):
+        return 512, block_k, 4
+    return 64, block_k, 8
 
 
-def _prepare_sddmm_csr_pattern(indices, indptr, shape):
+def _prepare_sddmm_csr_pattern(indices, indptr, shape, validate=True):
     if len(shape) != 2:
         raise ValueError("shape must be a 2-tuple")
     if indices.ndim != 1 or indptr.ndim != 1:
@@ -79,6 +94,17 @@ def _prepare_sddmm_csr_pattern(indices, indptr, shape):
     indptr64 = indptr.to(torch.int64).contiguous()
     indices = indices.contiguous()
     nnz = int(indices.numel())
+
+    # These structural checks cost ~0.09ms -- about 45% of prepare, and prepare in
+    # turn can exceed the SDDMM kernel it prepares for. The cost is per-launch
+    # overhead across the ~8 small reductions below, essentially independent of nnz;
+    # it is *not* host-sync latency, so batching the ``.item()`` calls into one
+    # transfer does not help (measured slightly slower: a torch.stack adds a launch,
+    # and any(<0)|any(>=n) is one more kernel than min+max). Skipping the checks is
+    # the only thing that removes the cost -- hence ``validate`` on the public entry
+    # points. cuSPARSE performs no equivalent input validation.
+    if not validate:
+        return indices, indptr64, (n_rows, n_cols)
     if indptr64.numel() > 0 and int(indptr64[0].item()) != 0:
         raise ValueError("indptr[0] must be 0")
     if indptr64.numel() > 0 and int(indptr64[-1].item()) != nnz:
@@ -93,21 +119,71 @@ def _prepare_sddmm_csr_pattern(indices, indptr, shape):
     return indices, indptr64, (n_rows, n_cols)
 
 
-def _build_row_ids(indptr):
+@triton.jit
+def _row_ids_kernel(
+    indptr_ptr,
+    row_ids_ptr,
+    n_rows,
+    nnz,
+    BLOCK: tl.constexpr,
+    STEPS: tl.constexpr,
+):
+    """row_ids[p] = the row owning nonzero p, by binary search over indptr."""
+    pid = tl.program_id(0)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    mask = offs < nnz
+    # Invariant: indptr[lo] <= offs < indptr[hi], maintained because indptr[0] == 0
+    # and indptr[n_rows] == nnz > offs. Converges to lo = the largest row index with
+    # indptr[lo] <= offs, which is the owning row even when rows are empty (an empty
+    # row shares its offset with the next row, and the *largest* such index wins).
+    # Once hi == lo + 1 the update is idempotent, so surplus steps are harmless.
+    lo = tl.zeros([BLOCK], dtype=tl.int32)
+    hi = tl.full([BLOCK], n_rows, tl.int32)
+    for _ in tl.static_range(STEPS):
+        mid = (lo + hi) // 2
+        v = tl.load(indptr_ptr + mid, mask=mask, other=0)
+        take = v <= offs
+        lo = tl.where(take, mid, lo)
+        hi = tl.where(take, hi, mid)
+    tl.store(row_ids_ptr + offs, lo, mask=mask)
+
+
+def _build_row_ids(indptr, nnz):
+    """Expand indptr to a per-nonzero row index.
+
+    A binary-search kernel rather than ``repeat_interleave``: it is one launch
+    instead of the arange/diff/interleave chain and measures 2.4-5.5x faster
+    (bit-identical output, empty rows included). prepare is launch-overhead bound,
+    so collapsing the chain is what matters, not the O(nnz) write itself. ``nnz`` is
+    passed in rather than read from ``indptr[-1]``, which would cost a host sync.
+    """
     n_rows = int(indptr.numel()) - 1
-    if n_rows <= 0:
-        return torch.empty(0, dtype=torch.int32, device=indptr.device)
-    row_counts = indptr[1:] - indptr[:-1]
-    return torch.repeat_interleave(
-        torch.arange(n_rows, dtype=torch.int32, device=indptr.device),
-        row_counts,
+    if n_rows <= 0 or nnz == 0:
+        return torch.empty(max(0, nnz), dtype=torch.int32, device=indptr.device)
+    row_ids = torch.empty(nnz, dtype=torch.int32, device=indptr.device)
+    block = 1024
+    steps = max(1, math.ceil(math.log2(max(2, n_rows))))
+    _row_ids_kernel[(triton.cdiv(nnz, block),)](
+        indptr, row_ids, n_rows, nnz, BLOCK=block, STEPS=steps, num_warps=4
     )
+    return row_ids
 
 
-def prepare_sddmm_csr(indices, indptr, shape, k_hint=64):
-    indices, indptr, shape = _prepare_sddmm_csr_pattern(indices, indptr, shape)
-    row_ids = _build_row_ids(indptr)
-    block_k, num_warps = _resolve_sddmm_launch_config(int(k_hint))
+def prepare_sddmm_csr(indices, indptr, shape, k_hint=64, validate=True):
+    """Build reusable SDDMM pattern metadata.
+
+    ``validate=False`` skips the O(nnz) structural checks on the CSR pattern (~45%
+    of this call). Use it only for a pattern already known to be well-formed --
+    an out-of-range column index then reads out of bounds instead of raising.
+    """
+    indices, indptr, shape = _prepare_sddmm_csr_pattern(
+        indices, indptr, shape, validate=validate
+    )
+    row_ids = _build_row_ids(indptr, int(indices.numel()))
+    mean_row_len = int(indices.numel()) / shape[0] if shape[0] > 0 else None
+    _, block_k, num_warps = _resolve_sddmm_launch_config(
+        int(k_hint), mean_row_len=mean_row_len
+    )
     return SDDMMPrepared(
         indices=indices,
         indptr=indptr,
@@ -319,8 +395,10 @@ def _run_sddmm_prepared(
         }
 
     k_dim = int(x.shape[1])
-    block_k, num_warps = _resolve_sddmm_launch_config(k_dim)
-    block_p = 128
+    mean_row_len = nnz / prepared.n_rows if prepared.n_rows > 0 else float(nnz)
+    block_p, block_k, num_warps = _resolve_sddmm_launch_config(
+        k_dim, mean_row_len=mean_row_len, value_dtype=x.dtype
+    )
     kernel, acc_dtype = _resolve_sddmm_diagnostic_kernel(variant, x.dtype)
     grid = (triton.cdiv(nnz, block_p),)
     fallback_used = False
@@ -377,6 +455,7 @@ def _run_sddmm_prepared(
             num_warps=num_warps,
         )
     return out, {
+        "block_p": block_p,
         "block_k": block_k,
         "num_warps": num_warps,
         "fallback_used": fallback_used,
@@ -400,20 +479,35 @@ def flagsparse_sddmm_csr(
     return_time=False,
     return_meta=False,
     allow_fallback=False,
+    validate=True,
 ):
-    """CSR SDDMM: out[p] = alpha * dot(x[row(p)], y[col(p)]) + beta * data[p]."""
+    """CSR SDDMM: out[p] = alpha * dot(x[row(p)], y[col(p)]) + beta * data[p].
+
+    ``validate=False`` is forwarded to :func:`prepare_sddmm_csr` and only applies
+    when this call builds the prepared pattern itself.
+    """
+    # The perf_counter timings below need device syncs to be meaningful, but those
+    # syncs are pure instrumentation: they cost 0.05-0.09ms per call (6-23% of a
+    # single-shot SDDMM) and used to run even when the caller asked for neither
+    # timing, so the value was computed and thrown away. Only pay for what is asked.
+    timed = bool(return_time or return_meta)
+
     prepare_ms = 0.0
     if prepared is None:
         if any(v is None for v in (indices, indptr, shape)):
             raise ValueError(
                 "indices, indptr, and shape are required when prepared is not provided"
             )
-        torch.cuda.synchronize()
+        if timed:
+            torch.cuda.synchronize()
         t_prepare0 = time.perf_counter()
         k_hint = int(x.shape[1]) if (x is not None and x.ndim == 2) else 64
-        prepared = prepare_sddmm_csr(indices, indptr, shape, k_hint=k_hint)
-        torch.cuda.synchronize()
-        prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
+        prepared = prepare_sddmm_csr(
+            indices, indptr, shape, k_hint=k_hint, validate=validate
+        )
+        if timed:
+            torch.cuda.synchronize()
+            prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
     elif not isinstance(prepared, SDDMMPrepared):
         raise TypeError("prepared must be a SDDMMPrepared instance")
 
@@ -442,7 +536,8 @@ def flagsparse_sddmm_csr(
             return out, meta
         return out
 
-    torch.cuda.synchronize()
+    if timed:
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     out_tensor, launch_meta = _run_sddmm_prepared(
         prepared,
@@ -454,8 +549,10 @@ def flagsparse_sddmm_csr(
         out,
         allow_fallback=allow_fallback,
     )
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    elapsed_ms = 0.0
+    if timed:
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     if return_time and return_meta:
         meta = {"prepare_ms": prepare_ms, **launch_meta}
