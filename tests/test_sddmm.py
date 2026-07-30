@@ -15,7 +15,7 @@
 """
 SDDMM tests: load SuiteSparse .mtx as CSR pattern and benchmark
 out = alpha * dot(X[row], Y[col]) + beta * in.
-CuPy baseline uses sampled-dot on CSR pattern (not dense X@Y^T).
+cuSPARSE baseline is cusparseSDDMM via torch.sparse.sampled_addmm.
 
 acc_mode notes:
 - acc_mode=f32 keeps the native float32 accumulate path for float32 inputs.
@@ -119,43 +119,44 @@ def _is_resource_error(message):
     return any(token in text for token in resource_tokens)
 
 
-def _cupy_sampled_dot_chunked(x_cp, y_cp, row_ids_cp, col_ids_cp, chunk_nnz):
-    nnz = int(row_ids_cp.size)
-    out_cp = ast_ops.cp.empty((nnz,), dtype=x_cp.dtype)
-    for start in range(0, nnz, chunk_nnz):
-        end = min(nnz, start + chunk_nnz)
-        rows = row_ids_cp[start:end]
-        cols = col_ids_cp[start:end]
-        out_cp[start:end] = ast_ops.cp.sum(x_cp[rows] * y_cp[cols], axis=1)
-    return out_cp
-
-
-def _benchmark_cupy_sampled_reference(
-    indices, indptr, x, y, data_in, alpha, beta, warmup, iters
+def _benchmark_cusparse_sddmm(
+    indices, indptr, shape, x, y, data_in, alpha, beta, warmup, iters
 ):
-    n_rows = int(indptr.numel()) - 1
-    row_ids = torch.repeat_interleave(
-        torch.arange(n_rows, dtype=torch.int64, device=x.device),
-        indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+    """Real cuSPARSE SDDMM (``cusparseSDDMM``) under the scenario-B contract.
+
+    Scenario B means single-shot with validation on both sides, so the timed window
+    holds everything a caller must pay for one SDDMM: descriptor construction with
+    ``check_invariants=True`` (PyTorch's equivalent of FlagSparse's ``validate=True``,
+    checking the same CSR invariants) plus the op itself. cuSPARSE redoes its
+    descriptor/bufferSize/preprocess work on every call and PyTorch exposes no way to
+    reuse it, so nothing here can be hoisted out even in principle.
+
+    This replaced a CuPy ``sum(x[rows] * y[cols], axis=1)`` gather that was reported in
+    the ``cusparse_ms`` column while not being cuSPARSE at all -- it materialises
+    nnz x k temporaries and was 3-15x slower than the real thing, inflating the
+    reported speedup to 12-38x.
+    """
+    indptr64 = indptr.to(torch.int64).contiguous()
+    indices64 = indices.to(torch.int64).contiguous()
+    # sampled_addmm computes beta*input + alpha*(x @ y.T) masked to input's pattern,
+    # which matches out = alpha*dot(x[row], y[col]) + beta*data when the descriptor
+    # carries data_in as its values.
+    vals = (
+        data_in
+        if (beta != 0.0 and data_in is not None)
+        else torch.zeros(int(indices.numel()), dtype=x.dtype, device=x.device)
     )
-    x_cp = ast_ops._cupy_from_torch(x)
-    y_cp = ast_ops._cupy_from_torch(y)
-    row_ids_cp = ast_ops._cupy_from_torch(row_ids)
-    col_ids_cp = ast_ops._cupy_from_torch(indices.to(torch.int64))
-    nnz = max(1, int(indices.numel()))
-    chunk_nnz = min(262144, nnz)
-    sampled_cp, cupy_ms = ast_ops._benchmark_cuda_op(
-        lambda: _cupy_sampled_dot_chunked(
-            x_cp, y_cp, row_ids_cp, col_ids_cp, chunk_nnz
-        ),
-        warmup=warmup,
-        iters=iters,
-    )
-    sampled = ast_ops._torch_from_cupy(sampled_cp)
-    sampled = sampled * alpha
-    if beta != 0.0:
-        sampled = sampled + beta * data_in
-    return sampled, cupy_ms
+    y_t = y.t()
+
+    def op():
+        sp = torch.sparse_csr_tensor(
+            indptr64, indices64, vals, size=shape, check_invariants=True
+        )
+        return torch.sparse.sampled_addmm(
+            sp, x, y_t, beta=float(beta), alpha=float(alpha)
+        ).values()
+
+    return ast_ops._benchmark_cuda_op(op, warmup=warmup, iters=iters)
 
 
 def _normalize_csv_path(csv_path):
@@ -265,8 +266,10 @@ def _benchmark_triton_sddmm(
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
 
     if x.dtype == torch.float32 and acc_mode == "f64":
+        # Scenario B: prepare inside the timed window here too, so the acc64 diagnostic
+        # is measured on the same contract as the default path.
         op = lambda: ast_ops._run_sddmm_prepared(
-            prepared,
+            ast.prepare_sddmm_csr(indices, indptr, shape, k_hint=int(x.shape[1])),
             x.contiguous(),
             y.contiguous(),
             data.contiguous() if data is not None else None,
@@ -291,9 +294,20 @@ def _benchmark_triton_sddmm(
             variant="acc64",
         )
     else:
+        # Scenario B: prepare is inside the timed window (raw CSR args, not prepared=),
+        # with validate=True, so this measures the whole cost of one SDDMM against a
+        # cuSPARSE call that likewise cannot amortise its own setup. prepare_ms is
+        # still reported separately below. Matches the SpGEMM decision.
         triton_values, triton_ms = ast_ops._benchmark_cuda_op(
             lambda: ast.flagsparse_sddmm_csr(
-                data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared
+                data=data,
+                indices=indices,
+                indptr=indptr,
+                shape=shape,
+                x=x,
+                y=y,
+                alpha=alpha,
+                beta=beta,
             ),
             warmup=warmup,
             iters=iters,
@@ -347,7 +361,6 @@ def run_one_mtx(
         "triton_first_call_ms": None,
         "prepare_ms": None,
         "pytorch_ms": None,
-        "cupy_ms": None,
         "cusparse_ms": None,
         "err_pt": None,
         "err_cu": None,
@@ -405,34 +418,42 @@ def run_one_mtx(
         result["triton_ok_pt"] = False
 
     if run_cusparse:
-        if ast_ops.cp is None:
-            result["cu_status"] = "PERF_ONLY"
-            result["cu_reason"] = "CuPy is not available"
-        else:
-            try:
-                result["cu_started"] = True
-                _cu_vals, cupy_ms = _benchmark_cupy_sampled_reference(
-                    indices=indices,
-                    indptr=indptr,
-                    x=x,
-                    y=y,
-                    data_in=data_in,
-                    alpha=alpha,
-                    beta=beta,
-                    warmup=warmup,
-                    iters=iters,
+        try:
+            result["cu_started"] = True
+            cu_vals, cusparse_ms = _benchmark_cusparse_sddmm(
+                indices=indices,
+                indptr=indptr,
+                shape=shape,
+                x=x,
+                y=y,
+                data_in=data_in,
+                alpha=alpha,
+                beta=beta,
+                warmup=warmup,
+                iters=iters,
+            )
+            result["cusparse_ms"] = cusparse_ms
+            # cuSPARSE is now a real implementation of the same op, so it is a
+            # correctness check as well as the performance baseline.
+            if triton_values is not None and cu_vals is not None:
+                atol, rtol = _resolve_tolerance(value_dtype, acc_mode)
+                result["triton_ok_cu"] = bool(
+                    torch.allclose(triton_values, cu_vals, atol=atol, rtol=rtol)
                 )
-                result["cupy_ms"] = cupy_ms
-                result["cusparse_ms"] = cupy_ms
+                result["err_cu"] = _scaled_allclose_error(
+                    triton_values, cu_vals, atol, rtol
+                )
+                result["cu_status"] = "PASS" if result["triton_ok_cu"] else "FAIL"
+            else:
                 result["cu_status"] = "PERF_ONLY"
-            except Exception as exc:
-                result["cu_status"] = (
-                    "PERF_RESOURCE" if _is_resource_error(exc) else "PERF_UNAVAILABLE"
-                )
-                result["cu_reason"] = str(exc)
+        except Exception as exc:
+            result["cu_status"] = (
+                "PERF_RESOURCE" if _is_resource_error(exc) else "PERF_UNAVAILABLE"
+            )
+            result["cu_reason"] = str(exc)
     else:
         result["cu_status"] = "PERF_ONLY"
-        result["cu_reason"] = "CuPy reference is disabled by CLI"
+        result["cu_reason"] = "cuSPARSE baseline is disabled by CLI"
 
     result["cusparse_reason"] = result["cu_reason"]
     result["status"] = "PASS" if result["triton_ok_pt"] else "FAIL"
@@ -477,8 +498,14 @@ def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mo
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
     print(
-        "Formats: FlagSparse=CSR SDDMM, CuPy sampled-dot performance baseline (not cuSPARSE API), "
-        "PyTorch correctness reference."
+        "Formats: FlagSparse=CSR SDDMM vs cuSPARSE SDDMM (cusparseSDDMM via "
+        "torch.sparse.sampled_addmm). PyTorch = correctness reference only, not a "
+        "performance baseline."
+    )
+    print(
+        "Metric: scenario B -- single-shot, validation on both sides. Both timings "
+        "include their own setup (FlagSparse prepare+validate; cuSPARSE "
+        "descriptor+check_invariants+preprocess), neither is amortised."
     )
     print(
         f"Equation: out = alpha*dot(x[row], y[col]) + beta*in  |  K={k_dim}  alpha={alpha}  beta={beta}  acc_mode={acc_mode}"
@@ -486,8 +513,8 @@ def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mo
     print("-" * 196)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'K':>6} "
-        f"{'FlagSparse(ms)':>14} {'CuPy(ms)':>11} {'PyTorch(ms)':>11} "
-        f"{'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU_Status':>12} {'Err(PT)':>10} {'Err(CU)':>10} {'Prep(ms)':>9}"
+        f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
+        f"{'FS/CU':>7} {'PT':>6} {'CU_Status':>12} {'Err(PT)':>10} {'Err(CU)':>10} {'Prep(ms)':>9}"
     )
     print("-" * 196)
 
@@ -495,13 +522,11 @@ def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mo
 def _print_sddmm_mtx_row(entry):
     name = os.path.basename(entry["path"])[:27]
     n_rows, n_cols = entry["shape"]
-    cupy_ms = entry.get("cupy_ms")
-    if cupy_ms is None:
-        cupy_ms = entry.get("cusparse_ms")
+    cusparse_ms = entry.get("cusparse_ms")
     print(
         f"{name:<28} {n_rows:>7} {n_cols:>7} {entry['nnz_pattern']:>10} {entry['k']:>6} "
-        f"{_fmt_ms(entry.get('triton_ms')):>14} {_fmt_ms(cupy_ms):>11} {_fmt_ms(entry.get('pytorch_ms')):>11} "
-        f"{_fmt_speedup(cupy_ms, entry.get('triton_ms')):>7} {_fmt_speedup(entry.get('pytorch_ms'), entry.get('triton_ms')):>7} "
+        f"{_fmt_ms(entry.get('triton_ms')):>14} {_fmt_ms(cusparse_ms):>13} {_fmt_ms(entry.get('pytorch_ms')):>11} "
+        f"{_fmt_speedup(cusparse_ms, entry.get('triton_ms')):>7} "
         f"{_fmt_check(entry.get('triton_ok_pt')):>6} {_status_label(entry.get('cu_status')):>12} "
         f"{_fmt_err(entry.get('err_pt')):>10} {_fmt_err(entry.get('err_cu')):>10} {_fmt_ms(entry.get('prepare_ms')):>9}"
     )
@@ -567,7 +592,6 @@ def run_all_dtypes_export_csv(
                 print("-" * 196)
                 for entry in results:
                     n_rows, n_cols = entry["shape"]
-                    cupy_ms = entry.get("cupy_ms")
                     cusparse_ms = entry.get("cusparse_ms")
                     pytorch_ms = entry.get("pytorch_ms")
                     triton_ms = entry.get("triton_ms")
@@ -579,18 +603,19 @@ def run_all_dtypes_export_csv(
                             "n_rows": n_rows,
                             "n_cols": n_cols,
                             "nnz": entry["nnz"],
-                            "cupy_ms": cupy_ms,
                             "triton_ms": triton_ms,
                             "cusparse_ms": cusparse_ms,
                             "pytorch_ms": pytorch_ms,
-                            "triton_speedup_vs_cupy": _speedup_ratio(
-                                cupy_ms, triton_ms
-                            ),
+                            # Scenario B is the single performance metric. There is
+                            # deliberately no speedup-vs-pytorch column: the PyTorch
+                            # path is a correctness reference that materialises
+                            # nnz x k temporaries, so its latency is not a baseline.
+                            # run_flagsparse_pytest.py resolves the reported metric by
+                            # first non-empty match in PERFORMANCE_SPEEDUP_SCHEMAS,
+                            # where vs_pytorch precedes vs_cusparse -- emitting it
+                            # would silently override this metric.
                             "triton_speedup_vs_cusparse": _speedup_ratio(
                                 cusparse_ms, triton_ms
-                            ),
-                            "triton_speedup_vs_pytorch": _speedup_ratio(
-                                pytorch_ms, triton_ms
                             ),
                             "pt_status": _status_label(entry.get("triton_ok_pt")),
                             "cu_status": _status_label(entry.get("cu_status")),
@@ -617,12 +642,9 @@ def run_all_dtypes_export_csv(
         "n_cols",
         "nnz",
         "triton_ms",
-        "cupy_ms",
         "cusparse_ms",
         "pytorch_ms",
-        "triton_speedup_vs_cupy",
         "triton_speedup_vs_cusparse",
-        "triton_speedup_vs_pytorch",
         "pt_status",
         "cu_status",
         "status",
@@ -795,14 +817,14 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument(
-        "--no-cupy-ref",
+        "--no-cusparse-ref",
         action="store_true",
-        help="Skip CuPy sampled-dot performance baseline",
+        help="Skip the cuSPARSE SDDMM performance baseline",
     )
     parser.add_argument(
         "--no-cusparse",
         action="store_true",
-        help="Deprecated alias of --no-cupy-ref",
+        help="Alias of --no-cusparse-ref",
     )
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument("--skip-api-checks", action="store_true")
@@ -836,7 +858,7 @@ def main():
         failed = run_api_validation_checks()
         if failed > 0:
             raise SystemExit(1)
-    run_cupy_ref = not (args.no_cupy_ref or args.no_cusparse)
+    run_cusparse_ref = not (args.no_cusparse_ref or args.no_cusparse)
 
     paths = _expand_mtx_paths(args.mtx)
     if not paths and not args.csv:
@@ -871,7 +893,7 @@ def main():
             k_dims=k_dims,
             alpha=args.alpha,
             beta=args.beta,
-            run_cusparse=run_cupy_ref,
+            run_cusparse=run_cusparse_ref,
             acc_mode=args.acc_mode,
         )
         return
@@ -898,7 +920,7 @@ def main():
                     k_dim=k_dim,
                     alpha=args.alpha,
                     beta=args.beta,
-                    run_cusparse=run_cupy_ref,
+                    run_cusparse=run_cusparse_ref,
                     acc_mode=args.acc_mode,
                 )
                 print_mtx_results(
