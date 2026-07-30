@@ -439,32 +439,53 @@ def _cuda_event_benchmark(op, warmup, iters):
     return out, start.elapsed_time(end) / count
 
 
+def _pad_dense_for_bsr_run(B, padded_rows):
+    if B.shape[0] == padded_rows:
+        return B
+    if B.stride(0) == 1 and B.shape[0] > 1:
+        padded = torch.empty_strided(
+            (padded_rows, B.shape[1]),
+            (1, max(1, int(padded_rows))),
+            dtype=B.dtype,
+            device=B.device,
+        )
+        padded.zero_()
+    else:
+        padded = torch.zeros((padded_rows, B.shape[1]), dtype=B.dtype, device=B.device)
+    padded[: B.shape[0], :].copy_(B)
+    return padded
+
+
 def _time_flagsparse_bsr(data, indices, indptr, B, shape, block_dim, alg, warmup, iters, timing=False):
     prepared = fs.prepare_spmm_bsr_route(data, indices, indptr, shape, block_dim=block_dim, alg=alg)
+    B_for_bsr = _pad_dense_for_bsr_run(B, prepared.padded_n_cols)
     out, gpu_ms = _cuda_event_benchmark(
-        lambda: fs.flagsparse_spmm_bsr_run(prepared, B, alg=alg),
+        lambda: fs.flagsparse_spmm_bsr_run(prepared, B_for_bsr, alg=alg),
         warmup,
         iters,
     )
-    process_gpu_ms = 0.0
-    compute_ms = gpu_ms
+    _meta_out, meta = fs.flagsparse_spmm_bsr_run(
+        prepared,
+        B_for_bsr,
+        alg=alg,
+        return_meta=True,
+        timing=bool(timing),
+    )
+    process_cpu_ms = float(meta.get("process_cpu_ms", 0.0) or 0.0)
+    process_gpu_ms = meta.get("process_gpu_ms") if timing else None
+    compute_ms = meta.get("compute_ms") if timing else None
     if timing:
-        _timed_out, meta = fs.flagsparse_spmm_bsr_run(
-            prepared,
-            B,
-            alg=alg,
-            return_meta=True,
-            timing=True,
-        )
-        process_gpu_ms = meta.get("process_gpu_ms") or 0.0
-        compute_ms = meta.get("compute_ms") or gpu_ms
+        if process_gpu_ms is None:
+            process_gpu_ms = 0.0
+        if compute_ms is None:
+            compute_ms = gpu_ms
     return {
         "out": out,
-        "ms": gpu_ms,
+        "ms": process_cpu_ms + gpu_ms,
         "gpu_ms": gpu_ms,
-        "process_cpu_ms": 0.0,
-        "process_gpu_ms": process_gpu_ms if timing else None,
-        "compute_ms": compute_ms if timing else None,
+        "process_cpu_ms": process_cpu_ms,
+        "process_gpu_ms": process_gpu_ms,
+        "compute_ms": compute_ms,
     }
 
 
@@ -504,10 +525,12 @@ def _time_cusparse_bsr(data, indices, indptr, B, shape, block_dim, warmup, iters
     reason = _cupy_bsr_unavailable_reason()
     if reason:
         return None, reason, None
+    if indices.dtype != torch.int32 or indptr.dtype != torch.int32:
+        return None, "CuPy BSR baseline requires int32 indices/indptr; no implicit index fallback", None
     padded_shape = _padded_shape(shape, block_dim)
     data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int32)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr.to(torch.int32)))
+    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices))
+    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
     B_use = B
     if B.shape[0] != padded_shape[1]:
         B_use = torch.zeros((padded_shape[1], B.shape[1]), dtype=B.dtype, device=B.device)
