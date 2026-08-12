@@ -136,7 +136,8 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 
 **test_spsv.py** - SpSV (triangular solve; **square** matrices only). CSR and COO share this script; there is **no** `test_spsv_coo.py`.
 
-**test_spsv_sell.py** - lower, real, native column-major SELL SpSV. Its CSV and
+**test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native
+column-major SELL SpSV. Its CSV and
 terminal fields follow the CSR SpSV output. `FlagSparse_ms` and `cuSPARSE_ms`
 both cover every per-call preparation/analysis plus solve; static descriptors
 and SELL conversion are outside the timed interval. The direct
@@ -149,8 +150,11 @@ python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <dir/> --csv-csr spsv.csv
 python tests/test_spsv.py <dir/> --csv-coo out.csv      # same CSV columns as CSR
 pytest -q -s tests/test_spsv_sell.py
-python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell.csv --slice-size 32
+python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_alg1.csv --slice-size 32 --alg_num 1
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
+python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_unit.csv --unit-diagonal
+python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_complex.csv --dtype complex
+# Optional ALG2 tuning: append --alg2-workers 32|64|128|256|512
 ```
 
 **test_spsm.py** - SpSM (triangular matrix-matrix solve; **square** matrices only):

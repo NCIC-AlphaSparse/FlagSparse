@@ -483,10 +483,10 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             "spsv",
             "SELL",
             "triton",
-            values=("float32", "float64"),
-            indices=("int32", "int64"),
+            value_const="SUPPORTED_SPSV_SELL_VALUE_DTYPES",
+            index_const="SUPPORTED_SPSV_SELL_INDEX_DTYPES",
             ops=("NON_TRANS",),
-            notes="direct API plus explicit flagsparse_spsv_analysis_sell + flagsparse_spsv_solve_sell lifecycle; lower triangular; cuSPARSE-compatible column-major SELL storage; ALG1 original persistent-row and ALG2 slice-cooperative Triton kernels",
+            notes="direct API plus explicit flagsparse_spsv_analysis_sell + flagsparse_spsv_solve_sell lifecycle; lower triangular UNIT/NON_UNIT; cuSPARSE-compatible column-major SELL storage; ALG1 original persistent-row and ALG2 slice-cooperative Triton kernels; complex kernels use interleaved real/imaginary components",
         ),
         ApiSpec(
             "spsm",

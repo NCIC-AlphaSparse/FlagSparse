@@ -142,7 +142,7 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 
 **test_spsv.py** - SpSV（三角求解；**仅方阵**）。CSR 与 COO 共用本脚本；**不存在** `test_spsv_coo.py`。
 
-**test_spsv_sell.py** - 下三角、实数、原生列主序 SELL SpSV。CSV 和终端字段
+**test_spsv_sell.py** - 下三角、UNIT/NON_UNIT、实数/复数、原生列主序 SELL SpSV。CSV 和终端字段
 遵循 CSR SpSV 输出；`FlagSparse_ms` 和 `cuSPARSE_ms` 都覆盖每次调用的准备/
 分析加求解，静态 descriptor 与 SELL 转换不计时。直接
 `flagsparse_spsv_sell` API 默认使用 ALG1；使用 `--alg_num 2` 或显式
@@ -154,8 +154,11 @@ python tests/test_spsv.py --synthetic
 python tests/test_spsv.py <目录/> --csv-csr spsv.csv
 python tests/test_spsv.py <目录/> --csv-coo out.csv     # 列与 CSR 相同
 pytest -q -s tests/test_spsv_sell.py
-python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell.csv --slice-size 32
+python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg1.csv --slice-size 32 --alg_num 1
 python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
+python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_unit.csv --unit-diagonal
+python tests/test_spsv_sell.py <目录或文件.mtx> --csv sell_complex.csv --dtype complex
+# 可选 ALG2 调优：追加 --alg2-workers 32|64|128|256|512
 ```
 
 **test_spsm.py** - SpSM（三角矩阵-稠密矩阵求解；**仅方阵**）：

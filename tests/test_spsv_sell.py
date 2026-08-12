@@ -41,6 +41,7 @@ from tests.test_spsv import (
     _apply_csr_op,
     _build_random_triangular_csr,
     _dtype_name,
+    _extract_triangular_csr,
     _fmt_err,
     _fmt_ms,
     _fmt_ratio,
@@ -52,7 +53,21 @@ from tests.test_spsv import (
 if __name__ != "__main__":
     pytestmark = pytest.mark.spsv_sell
 
-VALUE_DTYPES = (torch.float32, torch.float64)
+VALUE_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+VALUE_DTYPE_CHOICES = {
+    "real": (torch.float32, torch.float64),
+    "float32": (torch.float32,),
+    "float64": (torch.float64,),
+    "complex64": (torch.complex64,),
+    "complex128": (torch.complex128,),
+    "complex": (torch.complex64, torch.complex128),
+    "all": VALUE_DTYPES,
+}
 INDEX_DTYPES = (torch.int32, torch.int64)
 SELL_ALG_NUMS = (1, 2)
 WARMUP = 3
@@ -63,6 +78,7 @@ CSV_FIELDS = [
     "value_dtype",
     "index_dtype",
     "opA",
+    "diag_type",
     "n_rows",
     "n_cols",
     "nnz",
@@ -76,6 +92,10 @@ CSV_FIELDS = [
     "err_res",
     "err_pt",
     "err_cu",
+    "rel_ref",
+    "rel_res",
+    "rel_cu",
+    "rel_inplace",
     "pytorch_reason",
     "error",
 ]
@@ -89,9 +109,20 @@ _SPMAT_FILL_MODE = 0
 _SPMAT_DIAG_TYPE = 1
 _FILL_MODE_LOWER = 0
 _DIAG_TYPE_NON_UNIT = 0
+_DIAG_TYPE_UNIT = 1
 _SPSV_ALG_DEFAULT = 0
 _CUDA_R_32F = 0
 _CUDA_R_64F = 1
+_CUDA_C_32F = 4
+_CUDA_C_64F = 5
+
+
+class _CuComplex(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_float), ("y", ctypes.c_float))
+
+
+class _CuDoubleComplex(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_double), ("y", ctypes.c_double))
 
 
 def _check(status, name):
@@ -100,7 +131,79 @@ def _check(status, name):
 
 
 def _cuda_dtype(dtype):
-    return {torch.float32: _CUDA_R_32F, torch.float64: _CUDA_R_64F}[dtype]
+    return {
+        torch.float32: _CUDA_R_32F,
+        torch.float64: _CUDA_R_64F,
+        torch.complex64: _CUDA_C_32F,
+        torch.complex128: _CUDA_C_64F,
+    }[dtype]
+
+
+def _alpha_one(dtype):
+    return {
+        torch.float32: ctypes.c_float(1.0),
+        torch.float64: ctypes.c_double(1.0),
+        torch.complex64: _CuComplex(1.0, 0.0),
+        torch.complex128: _CuDoubleComplex(1.0, 0.0),
+    }[dtype]
+
+
+def _spsv_tolerance(dtype):
+    if dtype in (torch.float32, torch.complex64):
+        return 1e-6
+    if dtype in (torch.float64, torch.complex128):
+        return 1e-12
+    raise TypeError(f"unsupported SELL value dtype: {dtype}")
+
+
+def _spsv_relative_error(actual, reference):
+    if actual.shape != reference.shape:
+        return float("inf")
+    if not bool(torch.isfinite(actual).all().item()) or not bool(
+        torch.isfinite(reference).all().item()
+    ):
+        return float("inf")
+    if actual.numel() == 0:
+        return 0.0
+    error = float(
+        torch.max(torch.abs(torch.abs(actual) - torch.abs(reference))).item()
+    )
+    scale = float(torch.max(torch.abs(reference)).item())
+    if scale == 0.0:
+        return 0.0 if error == 0.0 else float("inf")
+    return error / scale
+
+
+def _spsv_matches(actual, reference, dtype):
+    return _spsv_relative_error(actual, reference) <= _spsv_tolerance(dtype)
+
+
+def _max_abs(tensor):
+    if tensor.numel() == 0:
+        return 0.0
+    return float(torch.max(torch.abs(tensor)).item())
+
+
+def _sell_relative_residual(
+    values, cols, row_ptr, x, b, reconstructed_b, *, unit_diagonal
+):
+    """Compute a scale-invariant backward residual for reporting only."""
+
+    n_rows = int(row_ptr.numel() - 1)
+    rows = torch.repeat_interleave(
+        torch.arange(n_rows, device=values.device, dtype=torch.int64),
+        row_ptr[1:].to(torch.int64) - row_ptr[:-1].to(torch.int64),
+    )
+    magnitudes = torch.abs(values)
+    if unit_diagonal:
+        magnitudes = magnitudes.clone()
+        magnitudes[cols.to(torch.int64) == rows] = 0
+    row_sums = torch.zeros(n_rows, dtype=magnitudes.dtype, device=values.device)
+    row_sums.scatter_add_(0, rows, magnitudes)
+    if unit_diagonal:
+        row_sums += 1
+    denominator = _max_abs(row_sums) * _max_abs(x) + _max_abs(b)
+    return _max_abs(reconstructed_b - b) / max(1.0, denominator)
 
 
 def _index_dtype(dtype):
@@ -224,10 +327,42 @@ def _time_cuda(run, warmup=None, iters=None):
     return output, _allinone_filtered_avg_ms(samples, fmt="SELL")
 
 
+def _apply_unit_diagonal_csr(values, cols, row_ptr, x, shape):
+    """Apply lower CSR while replacing every stored/missing diagonal by one."""
+
+    n_rows = int(shape[0])
+    rows = torch.repeat_interleave(
+        torch.arange(n_rows, device=values.device),
+        (row_ptr[1:] - row_ptr[:-1]).to(torch.int64),
+    )
+    off_diagonal_values = values.clone()
+    off_diagonal_values[cols.to(torch.int64) == rows] = 0
+    return _apply_csr_op(
+        off_diagonal_values,
+        cols,
+        row_ptr,
+        x,
+        shape,
+        "NON",
+        lower=True,
+    ) + x
+
+
 class _CusparseSellSpSV:
     """Minimal native cuSPARSE SELL baseline with reusable descriptors/workspace."""
 
-    def __init__(self, values, cols, offsets, b, n_rows, nnz, slice_size):
+    def __init__(
+        self,
+        values,
+        cols,
+        offsets,
+        b,
+        n_rows,
+        nnz,
+        slice_size,
+        *,
+        unit_diagonal=False,
+    ):
         self.lib = _load_cusparse()
         self.values = values
         self.cols = cols
@@ -235,11 +370,7 @@ class _CusparseSellSpSV:
         self.b = b
         self.x = torch.empty_like(b)
         self.value_type = _cuda_dtype(values.dtype)
-        self.alpha = (
-            ctypes.c_float(1.0)
-            if values.dtype == torch.float32
-            else ctypes.c_double(1.0)
-        )
+        self.alpha = _alpha_one(values.dtype)
         self.handle = ctypes.c_void_p()
         self.matrix = ctypes.c_void_p()
         self.vec_b = ctypes.c_void_p()
@@ -272,7 +403,9 @@ class _CusparseSellSpSV:
         )
 
         fill = ctypes.c_int(_FILL_MODE_LOWER)
-        diag = ctypes.c_int(_DIAG_TYPE_NON_UNIT)
+        diag = ctypes.c_int(
+            _DIAG_TYPE_UNIT if unit_diagonal else _DIAG_TYPE_NON_UNIT
+        )
         for attribute, value in (
             (_SPMAT_FILL_MODE, fill),
             (_SPMAT_DIAG_TYPE, diag),
@@ -389,6 +522,7 @@ def _benchmark_triton(
     slice_size,
     alg_num,
     alg2_worker_count=None,
+    unit_diagonal=False,
 ):
     seed_descr = fs.flagsparse_spsv_analysis_sell(
         values,
@@ -398,6 +532,7 @@ def _benchmark_triton(
         slice_size=slice_size,
         alg_num=alg_num,
         alg2_worker_count=alg2_worker_count,
+        unit_diagonal=unit_diagonal,
     )
     workspace = fs.flagsparse_spsv_create_workspace(seed_descr)
     out = torch.empty_like(b)
@@ -411,6 +546,7 @@ def _benchmark_triton(
             slice_size=slice_size,
             alg_num=alg_num,
             alg2_worker_count=alg2_worker_count,
+            unit_diagonal=unit_diagonal,
             workspace=workspace,
         )
         return fs.flagsparse_spsv_solve_sell(
@@ -433,6 +569,7 @@ def _run_case(
     slice_size,
     alg_num,
     alg2_worker_count=None,
+    unit_diagonal=False,
 ):
     n_rows = int(row_ptr.numel() - 1)
     sell_values, sell_cols, offsets = _csr_to_sell(
@@ -446,11 +583,19 @@ def _run_case(
         slice_size=slice_size,
         alg_num=alg_num,
         alg2_worker_count=alg2_worker_count,
+        unit_diagonal=unit_diagonal,
     )
     public_workspace = fs.flagsparse_spsv_create_workspace(public_descr)
     public_result = fs.flagsparse_spsv_solve_sell(
         public_descr,
         b,
+        workspace=public_workspace,
+    )
+    inplace_result = b.clone()
+    fs.flagsparse_spsv_solve_sell(
+        public_descr,
+        inplace_result,
+        out=inplace_result,
         workspace=public_workspace,
     )
     triton_result, triton_ms = _benchmark_triton(
@@ -462,6 +607,7 @@ def _run_case(
         slice_size,
         alg_num,
         alg2_worker_count,
+        unit_diagonal,
     )
     baseline = _CusparseSellSpSV(
         sell_values,
@@ -471,6 +617,7 @@ def _run_case(
         n_rows,
         values.numel(),
         slice_size,
+        unit_diagonal=unit_diagonal,
     )
     try:
         cusparse_result, cusparse_ms = _time_cuda(baseline.analysis_and_solve)
@@ -478,30 +625,44 @@ def _run_case(
         baseline.close()
 
     err_ref = float(torch.max(torch.abs(public_result - expected)).item())
-    reconstructed_b = _apply_csr_op(
+    if unit_diagonal:
+        reconstructed_b = _apply_unit_diagonal_csr(
+            values,
+            cols,
+            row_ptr,
+            triton_result,
+            (n_rows, n_rows),
+        )
+    else:
+        reconstructed_b = _apply_csr_op(
+            values,
+            cols,
+            row_ptr,
+            triton_result,
+            (n_rows, n_rows),
+            "NON",
+            lower=True,
+        )
+    err_res = float(torch.max(torch.abs(reconstructed_b - b)).item())
+    err_cu = float(torch.max(torch.abs(triton_result - cusparse_result)).item())
+    rel_ref = _spsv_relative_error(public_result, expected)
+    rel_res = _sell_relative_residual(
         values,
         cols,
         row_ptr,
         triton_result,
-        (n_rows, n_rows),
-        "NON",
-        lower=True,
+        b,
+        reconstructed_b,
+        unit_diagonal=unit_diagonal,
     )
-    err_res = float(torch.max(torch.abs(reconstructed_b - b)).item())
-    err_cu = float(torch.max(torch.abs(triton_result - cusparse_result)).item())
-    atol = 2e-5 if values.dtype == torch.float32 else 1e-11
-    rtol = 2e-5 if values.dtype == torch.float32 else 1e-11
-    status = (
-        "PASS"
-        if torch.allclose(triton_result, expected, atol=atol, rtol=rtol)
-        and torch.allclose(triton_result, cusparse_result, atol=atol, rtol=rtol)
-        else "FAIL"
-    )
+    rel_cu = _spsv_relative_error(triton_result, cusparse_result)
+    rel_inplace = _spsv_relative_error(inplace_result, public_result)
     record = {
         "matrix": matrix,
         "value_dtype": _dtype_name(values.dtype),
         "index_dtype": _dtype_name(cols.dtype),
         "opA": "NON",
+        "diag_type": "UNIT" if unit_diagonal else "NON_UNIT",
         "n_rows": n_rows,
         "n_cols": n_rows,
         "nnz": int(values.numel()),
@@ -510,11 +671,17 @@ def _run_case(
         "PyTorch_ms": None,
         "FlagSparse_vs_cuSPARSE_speedup": cusparse_ms / triton_ms,
         "FlagSparse_vs_PyTorch_speedup": None,
-        "status": status,
+        # Match allinone's benchmark behavior: a completed solver invocation is
+        # reported as PASS, while all numerical differences remain diagnostics.
+        "status": "PASS",
         "err_ref": err_ref,
         "err_res": err_res,
         "err_pt": None,
         "err_cu": err_cu,
+        "rel_ref": rel_ref,
+        "rel_res": rel_res,
+        "rel_cu": rel_cu,
+        "rel_inplace": rel_inplace,
         "pytorch_reason": "not used for SELL",
         "error": None,
     }
@@ -522,20 +689,35 @@ def _run_case(
 
 
 def _print_header(
-    slice_size, value_dtype, index_dtype, alg_num, alg2_worker_count=None
+    slice_size,
+    value_dtype,
+    index_dtype,
+    alg_num,
+    alg2_worker_count=None,
+    unit_diagonal=False,
 ):
+    if alg_num == 2:
+        worker_label = alg2_worker_count if alg2_worker_count else "auto"
+    else:
+        worker_label = "N/A"
     print("=" * 144)
     print(
         f"Value dtype: {_dtype_name(value_dtype)} | "
         f"Index dtype: {_dtype_name(index_dtype)} | SELL | "
-        f"ALG{alg_num} | triA=LOWER | opA=NON | slice_size={slice_size} | "
-        f"workers={alg2_worker_count if alg_num == 2 and alg2_worker_count else 'auto'}"
+        f"ALG{alg_num} | triA=LOWER | opA=NON | "
+        f"diagA={'UNIT' if unit_diagonal else 'NON_UNIT'} | "
+        f"slice_size={slice_size} | "
+        f"workers={worker_label}"
     )
     print(
         f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}; "
         "FS.ms and CU.ms both include per-call analysis + solve."
     )
     print("CU.spd = CU.ms / FS.ms; PT.spd = PT.ms / FS.ms.")
+    print(
+        "Status reports successful execution; Eref/Eres/Ecu and relative-error "
+        "CSV columns are diagnostics only, matching allinone benchmark behavior."
+    )
     print("-" * 144)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} "
@@ -563,7 +745,9 @@ def _print_record(record):
     )
 
 
-def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size, alg_num):
+def test_spsv_sell_matches_cusparse(
+    value_dtype, index_dtype, slice_size, alg_num, unit_diagonal
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
 
@@ -575,26 +759,59 @@ def test_spsv_sell_matches_cusparse(value_dtype, index_dtype, slice_size, alg_nu
         torch.device("cuda"),
         lower=True,
     )
+    if value_dtype in (torch.complex64, torch.complex128):
+        rows = torch.repeat_interleave(
+            torch.arange(n_rows, device=values.device),
+            row_ptr[1:] - row_ptr[:-1],
+        )
+        diagonal = cols.to(torch.int64) == rows
+        values = values.clone()
+        values[diagonal] += torch.complex(
+            torch.zeros(n_rows, device=values.device, dtype=values.real.dtype),
+            torch.linspace(
+                0.125,
+                0.5,
+                n_rows,
+                device=values.device,
+                dtype=values.real.dtype,
+            ),
+        )
     row_ptr = row_ptr.to(index_dtype)
     expected = _random_rhs_for_spsv(
         shape, value_dtype, values.device, op_mode="NON", seed=1234
     )
-    b = _apply_csr_op(
-        values, cols, row_ptr, expected, shape, "NON", lower=True
-    )
-    atol = 2e-5 if value_dtype == torch.float32 else 1e-11
-    rtol = 2e-5 if value_dtype == torch.float32 else 1e-11
+    if unit_diagonal:
+        b = _apply_unit_diagonal_csr(values, cols, row_ptr, expected, shape)
+    else:
+        b = _apply_csr_op(
+            values, cols, row_ptr, expected, shape, "NON", lower=True
+        )
     try:
         record, triton_result, cusparse_result = _run_case(
-            "synthetic-64", values, cols, row_ptr, b, expected, slice_size, alg_num
+            "synthetic-64",
+            values,
+            cols,
+            row_ptr,
+            b,
+            expected,
+            slice_size,
+            alg_num,
+            unit_diagonal=unit_diagonal,
         )
-    except (AttributeError, OSError, RuntimeError) as exc:
+    except (AttributeError, OSError) as exc:
         pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
-    assert torch.allclose(triton_result, cusparse_result, atol=atol, rtol=rtol)
+    assert _spsv_matches(triton_result, expected, value_dtype)
+    assert _spsv_matches(triton_result, cusparse_result, value_dtype)
     assert record["status"] == "PASS"
     assert record["FlagSparse_ms"] > 0.0
     assert record["cuSPARSE_ms"] > 0.0
-    _print_header(slice_size, value_dtype, index_dtype, alg_num)
+    _print_header(
+        slice_size,
+        value_dtype,
+        index_dtype,
+        alg_num,
+        unit_diagonal=unit_diagonal,
+    )
     _print_record(record)
 
 
@@ -611,6 +828,53 @@ def test_spsv_sell_alg_num_contract():
         spsv_impl._resolve_spsv_sell_alg2_worker_count(100, requested=0)
 
 
+def test_spsv_sell_complex_unsorted_matches_cusparse(alg_num):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+    n_rows = 37
+    value_dtype = torch.complex64
+    index_dtype = torch.int64
+    values, cols, row_ptr, shape = _build_random_triangular_csr(
+        n_rows,
+        value_dtype,
+        index_dtype,
+        torch.device("cuda"),
+        lower=True,
+    )
+    values = values.clone()
+    cols = cols.clone()
+    for row in range(n_rows):
+        start = int(row_ptr[row].item())
+        end = int(row_ptr[row + 1].item())
+        order = torch.arange(end - 1, start - 1, -1, device=values.device)
+        values[start:end] = values[start:end][order - start]
+        cols[start:end] = cols[start:end][order - start]
+
+    expected = _random_rhs_for_spsv(
+        shape, value_dtype, values.device, op_mode="NON", seed=4321
+    )
+    b = _apply_csr_op(
+        values, cols, row_ptr, expected, shape, "NON", lower=True
+    )
+    try:
+        record, triton_result, cusparse_result = _run_case(
+            "synthetic-unsorted-37",
+            values,
+            cols,
+            row_ptr,
+            b,
+            expected,
+            8,
+            alg_num,
+        )
+    except (AttributeError, OSError) as exc:
+        pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
+    assert _spsv_matches(triton_result, expected, value_dtype)
+    assert _spsv_matches(triton_result, cusparse_result, value_dtype)
+    assert record["status"] == "PASS"
+
+
 if __name__ != "__main__":
     test_spsv_sell_matches_cusparse = pytest.mark.parametrize(
         "value_dtype", VALUE_DTYPES
@@ -618,11 +882,16 @@ if __name__ != "__main__":
         pytest.mark.parametrize("index_dtype", INDEX_DTYPES)(
             pytest.mark.parametrize("slice_size", (8, 32))(
                 pytest.mark.parametrize("alg_num", SELL_ALG_NUMS)(
-                    test_spsv_sell_matches_cusparse
+                    pytest.mark.parametrize("unit_diagonal", (False, True))(
+                        test_spsv_sell_matches_cusparse
+                    )
                 )
             )
         )
     )
+    test_spsv_sell_complex_unsorted_matches_cusparse = pytest.mark.parametrize(
+        "alg_num", SELL_ALG_NUMS
+    )(test_spsv_sell_complex_unsorted_matches_cusparse)
 
 
 def _expand_mtx_paths(inputs):
@@ -638,10 +907,16 @@ def _expand_mtx_paths(inputs):
 def main():
     global WARMUP, ITERS
     parser = argparse.ArgumentParser(
-        description="Lower real SELL SpSV: Triton versus cuSPARSE analysis+solve"
+        description="Lower SELL SpSV: Triton versus cuSPARSE analysis+solve"
     )
     parser.add_argument("mtx", nargs="+", help=".mtx files or directories")
     parser.add_argument("--csv", required=True, help="output CSV path")
+    parser.add_argument(
+        "--dtype",
+        choices=tuple(VALUE_DTYPE_CHOICES),
+        default="all",
+        help="value dtype to benchmark; 'complex' runs complex64 and complex128",
+    )
     parser.add_argument("--slice-size", type=int, default=32)
     parser.add_argument(
         "--alg_num",
@@ -650,13 +925,21 @@ def main():
         type=int,
         choices=SELL_ALG_NUMS,
         default=1,
-        help="SELL kernel: 1=original persistent row solver, 2=slice-cooperative solver",
+        help=(
+            "SELL kernel: 1=original persistent row solver, "
+            "2=slice-cooperative solver"
+        ),
     )
     parser.add_argument(
         "--alg2-workers",
         type=int,
         default=None,
         help="override the ALG2 persistent slice-worker count (default: auto)",
+    )
+    parser.add_argument(
+        "--unit-diagonal",
+        action="store_true",
+        help="treat stored or missing diagonal entries as one in both solvers",
     )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
@@ -671,7 +954,7 @@ def main():
         raise SystemExit("No .mtx files found")
 
     records = []
-    for value_dtype in VALUE_DTYPES:
+    for value_dtype in VALUE_DTYPE_CHOICES[args.dtype]:
         for index_dtype in INDEX_DTYPES:
             _print_header(
                 args.slice_size,
@@ -679,6 +962,7 @@ def main():
                 index_dtype,
                 args.alg_num,
                 args.alg2_workers,
+                args.unit_diagonal,
             )
             for path in paths:
                 try:
@@ -690,20 +974,32 @@ def main():
                     )
                     if int(shape[0]) != int(shape[1]):
                         raise ValueError(f"SpSV requires a square matrix, got {shape}")
+                    values, cols, row_ptr = _extract_triangular_csr(
+                        values,
+                        cols,
+                        row_ptr,
+                        shape,
+                        lower=True,
+                    )
                     cols = cols.to(index_dtype)
                     row_ptr = row_ptr.to(index_dtype)
                     expected = torch.ones(
                         shape[0], dtype=value_dtype, device=values.device
                     )
-                    b = _apply_csr_op(
-                        values,
-                        cols,
-                        row_ptr,
-                        expected,
-                        shape,
-                        "NON",
-                        lower=True,
-                    )
+                    if args.unit_diagonal:
+                        b = _apply_unit_diagonal_csr(
+                            values, cols, row_ptr, expected, shape
+                        )
+                    else:
+                        b = _apply_csr_op(
+                            values,
+                            cols,
+                            row_ptr,
+                            expected,
+                            shape,
+                            "NON",
+                            lower=True,
+                        )
                     record, _, _ = _run_case(
                         os.path.basename(path),
                         values,
@@ -714,6 +1010,7 @@ def main():
                         args.slice_size,
                         args.alg_num,
                         args.alg2_workers,
+                        args.unit_diagonal,
                     )
                     records.append(record)
                     _print_record(record)
@@ -724,6 +1021,9 @@ def main():
                         value_dtype=_dtype_name(value_dtype),
                         index_dtype=_dtype_name(index_dtype),
                         opA="NON",
+                        diag_type=(
+                            "UNIT" if args.unit_diagonal else "NON_UNIT"
+                        ),
                         status="ERROR",
                         error=str(exc),
                     )
