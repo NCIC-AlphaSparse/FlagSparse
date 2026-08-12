@@ -31,6 +31,13 @@ SUPPORTED_SPSV_VALUE_DTYPES = (
     torch.complex128,
 )
 SUPPORTED_SPSV_INDEX_DTYPES = (torch.int32, torch.int64)
+SUPPORTED_SPSV_SELL_VALUE_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+SUPPORTED_SPSV_SELL_INDEX_DTYPES = (torch.int32, torch.int64)
 SPSV_NON_TRANS_SUPPORTED_COMBOS = (
     (torch.float32, torch.int32),
     (torch.float64, torch.int32),
@@ -75,11 +82,9 @@ def _resolve_spsv_sell_alg2_worker_count(n_slices, requested=None):
             raise ValueError("SELL SpSV ALG2 worker count must be positive")
         return min(requested, n_slices)
 
-    # A SELL worker already exposes up to slice_size rows.  The full-matrix
-    # results show no consistent benefit from raising the grid to 128 workers,
-    # while deep dependency chains pay substantially more ready-flag polling
-    # contention.  Keep a conservative upper bound; callers can still override
-    # it explicitly for architecture-specific experiments.
+    # A SELL worker already exposes up to slice_size rows.  Keep the automatic
+    # grid conservative to limit ready-flag polling contention; callers can
+    # still override it explicitly for architecture-specific experiments.
     target = 64
     return _snap_cw_worker_count(min(target, n_slices), n_slices)
 
@@ -249,6 +254,10 @@ def _clear_spsv_csr_preprocess_cache():
 def _as_strided_contiguous(tensor):
     if tensor is None:
         return None
+    if tensor.is_conj():
+        tensor = tensor.resolve_conj()
+    if tensor.is_neg():
+        tensor = tensor.resolve_neg()
     if tensor.layout != torch.strided:
         out = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
         out.copy_(tensor)
@@ -373,6 +382,8 @@ def _prepare_spsv_sell_matrix_inputs(
     slice_offsets,
     shape,
     slice_size,
+    *,
+    unit_diagonal=False,
 ):
     """Validate the reusable sparse-matrix part of a SELL SpSV problem."""
 
@@ -395,10 +406,12 @@ def _prepare_spsv_sell_matrix_inputs(
         raise ValueError("invalid slice_offsets length")
     if values.numel() != col_indices.numel():
         raise ValueError("invalid SELL values or columns length")
-    if values.dtype not in (torch.float32, torch.float64):
-        raise TypeError("SELL values must be float32 or float64")
+    if values.dtype not in SUPPORTED_SPSV_SELL_VALUE_DTYPES:
+        raise TypeError(
+            "SELL values must be float32, float64, complex64, or complex128"
+        )
     if (
-        col_indices.dtype not in (torch.int32, torch.int64)
+        col_indices.dtype not in SUPPORTED_SPSV_SELL_INDEX_DTYPES
         or slice_offsets.dtype != col_indices.dtype
     ):
         raise TypeError("SELL columns and offsets must share int32 or int64 dtype")
@@ -417,36 +430,90 @@ def _prepare_spsv_sell_matrix_inputs(
             raise IndexError("SELL padding must use column index -1")
         if bool(torch.any(cols >= n_cols).item()):
             raise IndexError("SELL column index is out of range")
-
-    return values.contiguous(), cols, offsets, n_rows, slice_size
-
-
-def _prepare_spsv_sell_inputs(
-    values,
-    col_indices,
-    slice_offsets,
-    b,
-    shape,
-    slice_size,
-):
-    """Validate a complete cuSPARSE-compatible SELL SpSV call."""
-
-    values, cols, offsets, n_rows, slice_size = (
-        _prepare_spsv_sell_matrix_inputs(
-            values, col_indices, slice_offsets, shape, slice_size
-        )
+    _validate_spsv_sell_structure(
+        cols,
+        offsets,
+        n_rows,
+        slice_size,
+        unit_diagonal=bool(unit_diagonal),
     )
-    if not torch.is_tensor(b):
-        raise TypeError("SELL SpSV right-hand side must be a torch.Tensor")
-    if not b.is_cuda or b.ndim != 1:
-        raise ValueError("SELL SpSV right-hand side must be a 1D CUDA tensor")
-    if b.device != values.device:
-        raise ValueError("SELL SpSV inputs must use one CUDA device")
-    if b.numel() != n_rows:
-        raise ValueError("invalid SELL right-hand-side length")
-    if b.dtype != values.dtype:
-        raise TypeError("b dtype must match SELL values")
-    return values, cols, offsets, b.contiguous(), n_rows, slice_size
+
+    return _as_strided_contiguous(values), cols, offsets, n_rows, slice_size
+
+
+def _validate_spsv_sell_structure(
+    cols,
+    offsets,
+    n_rows,
+    slice_size,
+    *,
+    unit_diagonal,
+):
+    """Reject malformed lower SELL data before a dependency kernel runs."""
+
+    if n_rows == 0:
+        return
+
+    slice_lengths = (offsets[1:] - offsets[:-1]).to(torch.int64)
+    n_entries = int(cols.numel())
+    slice_ids = torch.repeat_interleave(
+        torch.arange(offsets.numel() - 1, device=cols.device, dtype=torch.int64),
+        slice_lengths,
+        output_size=n_entries,
+    )
+    slice_starts = torch.repeat_interleave(
+        offsets[:-1].to(torch.int64),
+        slice_lengths,
+        output_size=n_entries,
+    )
+    entry_offsets = torch.arange(
+        n_entries, device=cols.device, dtype=torch.int64
+    )
+    local_offsets = entry_offsets - slice_starts
+    rows = slice_ids * slice_size + local_offsets.remainder(slice_size)
+    slots = local_offsets // slice_size
+    row_mask = rows < n_rows
+    rows = rows[row_mask]
+    slots = slots[row_mask]
+    row_cols = cols.to(torch.int64)[row_mask]
+
+    # ALG2 completes a row at its first padding entry.  Enforcing trailing
+    # padding keeps that behavior identical to ALG1 for every accepted matrix.
+    padding = row_cols == -1
+    sentinel = n_entries + 1
+    first_padding = torch.full(
+        (n_rows,), sentinel, dtype=torch.int64, device=cols.device
+    )
+    first_padding.scatter_reduce_(
+        0,
+        rows,
+        torch.where(padding, slots, torch.full_like(slots, sentinel)),
+        reduce="amin",
+        include_self=True,
+    )
+    last_value = torch.full(
+        (n_rows,), -1, dtype=torch.int64, device=cols.device
+    )
+    last_value.scatter_reduce_(
+        0,
+        rows,
+        torch.where(~padding, slots, torch.full_like(slots, -1)),
+        reduce="amax",
+        include_self=True,
+    )
+    if bool(torch.any(last_value > first_padding).item()):
+        raise ValueError("SELL padding (-1) must be trailing within each row")
+
+    if not unit_diagonal:
+        diagonal = row_cols == rows
+        diagonal_count = torch.zeros(
+            n_rows, dtype=torch.int32, device=cols.device
+        )
+        diagonal_count.scatter_add_(0, rows, diagonal.to(torch.int32))
+        if bool(torch.any(diagonal_count != 1).item()):
+            raise ValueError(
+                "NON_UNIT SELL SpSV requires exactly one diagonal entry per row"
+            )
 
 
 def _spsv_diag_eps_for_dtype(value_dtype):
@@ -2128,6 +2195,7 @@ def _spsv_sell_cw_kernel_alg1(
     row_counter_ptr,
     n_rows,
     SLICE_SIZE: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
 ):
     """ALG1: original persistent scalar-row dependency solver."""
@@ -2148,6 +2216,8 @@ def _spsv_sell_cw_kernel_alg1(
             rhs = tl.load(b_ptr + row).to(tl.float32)
             tmp_sum = tl.zeros((), dtype=tl.float32)
             diag = tl.zeros((), dtype=tl.float32)
+        if UNIT_DIAG:
+            diag += 1.0
         slot = 0
         while slot < width:
             offset = slice_start + slot * SLICE_SIZE + row_in_slice
@@ -2155,10 +2225,11 @@ def _spsv_sell_cw_kernel_alg1(
             valid = (col >= 0) & (col < n_rows)
             if valid:
                 if col == row:
-                    if USE_FP64_ACC:
-                        diag = tl.load(values_ptr + offset).to(tl.float64)
-                    else:
-                        diag = tl.load(values_ptr + offset).to(tl.float32)
+                    if not UNIT_DIAG:
+                        if USE_FP64_ACC:
+                            diag = tl.load(values_ptr + offset).to(tl.float64)
+                        else:
+                            diag = tl.load(values_ptr + offset).to(tl.float32)
                 else:
                     is_dependency = col < row
                     if is_dependency:
@@ -2180,6 +2251,99 @@ def _spsv_sell_cw_kernel_alg1(
 
 
 @triton.jit
+def _spsv_sell_cw_kernel_alg1_complex(
+    values_ri_ptr,
+    col_indices_ptr,
+    slice_offsets_ptr,
+    b_ri_ptr,
+    x_ri_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    SLICE_SIZE: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+):
+    """Complex ALG1 using the interleaved real/imaginary storage convention."""
+
+    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    while logical_row < n_rows:
+        row = logical_row
+        slice_id = row // SLICE_SIZE
+        row_in_slice = row - slice_id * SLICE_SIZE
+        slice_start = tl.load(slice_offsets_ptr + slice_id)
+        slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
+        width = (slice_end - slice_start) // SLICE_SIZE
+        rhs_re = tl.load(b_ri_ptr + row * 2)
+        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        if USE_FP64_ACC:
+            rhs_re = rhs_re.to(tl.float64)
+            rhs_im = rhs_im.to(tl.float64)
+            tmp_sum_re = tl.zeros((), dtype=tl.float64)
+            tmp_sum_im = tl.zeros((), dtype=tl.float64)
+            diag_re = tl.zeros((), dtype=tl.float64)
+            diag_im = tl.zeros((), dtype=tl.float64)
+        else:
+            rhs_re = rhs_re.to(tl.float32)
+            rhs_im = rhs_im.to(tl.float32)
+            tmp_sum_re = tl.zeros((), dtype=tl.float32)
+            tmp_sum_im = tl.zeros((), dtype=tl.float32)
+            diag_re = tl.zeros((), dtype=tl.float32)
+            diag_im = tl.zeros((), dtype=tl.float32)
+        if UNIT_DIAG:
+            diag_re += 1.0
+        slot = 0
+        while slot < width:
+            offset = slice_start + slot * SLICE_SIZE + row_in_slice
+            col = tl.load(col_indices_ptr + offset)
+            valid = (col >= 0) & (col < n_rows)
+            if valid:
+                if col == row:
+                    if not UNIT_DIAG:
+                        diag_re = tl.load(values_ri_ptr + offset * 2)
+                        diag_im = tl.load(values_ri_ptr + offset * 2 + 1)
+                        if USE_FP64_ACC:
+                            diag_re = diag_re.to(tl.float64)
+                            diag_im = diag_im.to(tl.float64)
+                        else:
+                            diag_re = diag_re.to(tl.float32)
+                            diag_im = diag_im.to(tl.float32)
+                else:
+                    is_dependency = col < row
+                    if is_dependency:
+                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        while dep_ready != 1:
+                            dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                        a_re = tl.load(values_ri_ptr + offset * 2)
+                        a_im = tl.load(values_ri_ptr + offset * 2 + 1)
+                        x_re = tl.load(x_ri_ptr + col * 2)
+                        x_im = tl.load(x_ri_ptr + col * 2 + 1)
+                        if USE_FP64_ACC:
+                            a_re = a_re.to(tl.float64)
+                            a_im = a_im.to(tl.float64)
+                            x_re = x_re.to(tl.float64)
+                            x_im = x_im.to(tl.float64)
+                        else:
+                            a_re = a_re.to(tl.float32)
+                            a_im = a_im.to(tl.float32)
+                            x_re = x_re.to(tl.float32)
+                            x_im = x_im.to(tl.float32)
+                        tmp_sum_re += a_re * x_re - a_im * x_im
+                        tmp_sum_im += a_re * x_im + a_im * x_re
+            slot += 1
+
+        num_re = rhs_re - tmp_sum_re
+        num_im = rhs_im - tmp_sum_im
+        den = diag_re * diag_re + diag_im * diag_im
+        out_re = (num_re * diag_re + num_im * diag_im) / den
+        out_im = (num_im * diag_re - num_re * diag_im) / den
+        tl.store(x_ri_ptr + row * 2, out_re)
+        tl.store(x_ri_ptr + row * 2 + 1, out_im)
+        _publish_ready_flag_i32(ready_ptr, row)
+        logical_row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
 def _spsv_sell_slice_kernel_alg2(
     values_ptr,
     col_indices_ptr,
@@ -2192,8 +2356,8 @@ def _spsv_sell_slice_kernel_alg2(
     n_slices,
     SLICE_SIZE: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-    DIAG_EPS: tl.constexpr,
 ):
     """ALG2: persistent slice-cooperative SELL dependency solver.
 
@@ -2226,7 +2390,8 @@ def _spsv_sell_slice_kernel_alg2(
             diag = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
 
         slot = zero_i32
-        has_diag = ~valid_row
+        if UNIT_DIAG:
+            diag += 1.0
         done = ~valid_row
         while tl.sum((~done).to(tl.int32), axis=0) != 0:
             in_bounds = slot < width
@@ -2273,13 +2438,15 @@ def _spsv_sell_slice_kernel_alg2(
             tmp_sum += tl.where(consume, value * x_dep, 0.0)
 
             diagonal = active & (col == row)
-            diag_value = tl.load(values_ptr + offset, mask=diagonal, other=0.0)
-            if USE_FP64_ACC:
-                diag_value = diag_value.to(tl.float64)
-            else:
-                diag_value = diag_value.to(tl.float32)
-            diag = tl.where(diagonal, diag_value, diag)
-            has_diag = has_diag | diagonal
+            if not UNIT_DIAG:
+                diag_value = tl.load(
+                    values_ptr + offset, mask=diagonal, other=0.0
+                )
+                if USE_FP64_ACC:
+                    diag_value = diag_value.to(tl.float64)
+                else:
+                    diag_value = diag_value.to(tl.float32)
+                diag = tl.where(diagonal, diag_value, diag)
 
             # Padding marks the end of this row even when another row in the
             # same slice is much longer.  Finish immediately instead of
@@ -2288,10 +2455,7 @@ def _spsv_sell_slice_kernel_alg2(
             skip = active & ((col < 0) | (col > row))
             slot = slot + (consume | diagonal | skip).to(tl.int32)
             finished = (~done) & (padding | (slot >= width))
-            diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
-            x_row = (rhs - tmp_sum) / diag_safe
-            x_row = tl.where(has_diag, x_row, 0.0)
-            x_row = tl.where(x_row == x_row, x_row, 0.0)
+            x_row = (rhs - tmp_sum) / diag
             tl.store(
                 x_ptr + row,
                 x_row,
@@ -2300,6 +2464,156 @@ def _spsv_sell_slice_kernel_alg2(
             )
             # Release publication follows the x store; dependent lanes use an
             # acquire atomic before reading x.
+            tl.atomic_add(ready_ptr + row, 1, mask=finished, sem="release")
+            done = done | finished
+
+        logical_slice = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+
+
+@triton.jit
+def _spsv_sell_slice_kernel_alg2_complex(
+    values_ri_ptr,
+    col_indices_ptr,
+    slice_offsets_ptr,
+    b_ri_ptr,
+    x_ri_ptr,
+    ready_ptr,
+    row_counter_ptr,
+    n_rows,
+    n_slices,
+    SLICE_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+):
+    """Complex slice-cooperative SELL solver with coalesced component loads."""
+
+    lanes = tl.arange(0, BLOCK_ROWS)
+    zero_i32 = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
+    logical_slice = tl.atomic_add(row_counter_ptr, 1, sem="relaxed")
+    while logical_slice < n_slices:
+        slice_id = logical_slice
+        slice_start = tl.load(slice_offsets_ptr + slice_id)
+        slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
+        width = (slice_end - slice_start) // SLICE_SIZE
+        row = slice_id * SLICE_SIZE + lanes
+        valid_row = (lanes < SLICE_SIZE) & (row < n_rows)
+        rhs_re = tl.load(b_ri_ptr + row * 2, mask=valid_row, other=0.0)
+        rhs_im = tl.load(b_ri_ptr + row * 2 + 1, mask=valid_row, other=0.0)
+        if USE_FP64_ACC:
+            rhs_re = rhs_re.to(tl.float64)
+            rhs_im = rhs_im.to(tl.float64)
+            tmp_sum_re = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
+            tmp_sum_im = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
+            diag_re = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
+            diag_im = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
+        else:
+            rhs_re = rhs_re.to(tl.float32)
+            rhs_im = rhs_im.to(tl.float32)
+            tmp_sum_re = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+            tmp_sum_im = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+            diag_re = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+            diag_im = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+        slot = zero_i32
+        if UNIT_DIAG:
+            diag_re += 1.0
+        done = ~valid_row
+        while tl.sum((~done).to(tl.int32), axis=0) != 0:
+            in_bounds = slot < width
+            active = (~done) & in_bounds
+            offset = slice_start + slot * SLICE_SIZE + lanes
+            col = tl.load(col_indices_ptr + offset, mask=active, other=-1)
+
+            dependency = active & (col >= 0) & (col < row)
+            ready_hint = tl.load(
+                ready_ptr + col,
+                mask=dependency,
+                other=0,
+                cache_modifier=".cv",
+                volatile=True,
+            )
+            acquire_mask = dependency & (ready_hint != 0)
+            dep_ready = tl.atomic_add(
+                ready_ptr + col,
+                zero_i32,
+                mask=acquire_mask,
+                sem="acquire",
+            )
+            consume = acquire_mask & (dep_ready != 0)
+            value_re = tl.load(
+                values_ri_ptr + offset * 2, mask=consume, other=0.0
+            )
+            value_im = tl.load(
+                values_ri_ptr + offset * 2 + 1, mask=consume, other=0.0
+            )
+            x_re = tl.load(
+                x_ri_ptr + col * 2,
+                mask=consume,
+                other=0.0,
+                cache_modifier=".cv",
+            )
+            x_im = tl.load(
+                x_ri_ptr + col * 2 + 1,
+                mask=consume,
+                other=0.0,
+                cache_modifier=".cv",
+            )
+            if USE_FP64_ACC:
+                value_re = value_re.to(tl.float64)
+                value_im = value_im.to(tl.float64)
+                x_re = x_re.to(tl.float64)
+                x_im = x_im.to(tl.float64)
+            else:
+                value_re = value_re.to(tl.float32)
+                value_im = value_im.to(tl.float32)
+                x_re = x_re.to(tl.float32)
+                x_im = x_im.to(tl.float32)
+            product_re = value_re * x_re - value_im * x_im
+            product_im = value_re * x_im + value_im * x_re
+            tmp_sum_re += tl.where(consume, product_re, 0.0)
+            tmp_sum_im += tl.where(consume, product_im, 0.0)
+
+            diagonal = active & (col == row)
+            if not UNIT_DIAG:
+                diag_value_re = tl.load(
+                    values_ri_ptr + offset * 2, mask=diagonal, other=0.0
+                )
+                diag_value_im = tl.load(
+                    values_ri_ptr + offset * 2 + 1,
+                    mask=diagonal,
+                    other=0.0,
+                )
+                if USE_FP64_ACC:
+                    diag_value_re = diag_value_re.to(tl.float64)
+                    diag_value_im = diag_value_im.to(tl.float64)
+                else:
+                    diag_value_re = diag_value_re.to(tl.float32)
+                    diag_value_im = diag_value_im.to(tl.float32)
+                diag_re = tl.where(diagonal, diag_value_re, diag_re)
+                diag_im = tl.where(diagonal, diag_value_im, diag_im)
+
+            padding = active & (col < 0)
+            skip = active & ((col < 0) | (col > row))
+            slot = slot + (consume | diagonal | skip).to(tl.int32)
+            finished = (~done) & (padding | (slot >= width))
+            num_re = rhs_re - tmp_sum_re
+            num_im = rhs_im - tmp_sum_im
+            den = diag_re * diag_re + diag_im * diag_im
+            out_re = (num_re * diag_re + num_im * diag_im) / den
+            out_im = (num_im * diag_re - num_re * diag_im) / den
+            tl.store(
+                x_ri_ptr + row * 2,
+                out_re,
+                mask=finished,
+                cache_modifier=".wt",
+            )
+            tl.store(
+                x_ri_ptr + row * 2 + 1,
+                out_im,
+                mask=finished,
+                cache_modifier=".wt",
+            )
             tl.atomic_add(ready_ptr + row, 1, mask=finished, sem="release")
             done = done | finished
 
@@ -3286,30 +3600,60 @@ def _launch_spsv_sell(
     *,
     slice_size,
     out,
-    ready,
-    row_counter,
+    ready=None,
+    row_counter=None,
     alg_num=1,
     alg2_worker_count=None,
+    unit_diagonal=False,
+    values_ri_in=None,
 ):
     alg_num = _normalize_spsv_sell_alg_num(alg_num)
+    if ready is None or row_counter is None:
+        raise ValueError("SELL SpSV ALG1/ALG2 require ready/counter workspace")
     ready.zero_()
     row_counter.zero_()
     if n_rows == 0:
         return out
+    is_complex = torch.is_complex(values)
+    use_fp64_acc = values.dtype in (torch.float64, torch.complex128)
+    if is_complex:
+        values_ri = (
+            values_ri_in
+            if values_ri_in is not None
+            else _complex_interleaved_view(values)
+        )
+        b_ri = torch.view_as_real(_as_strided_contiguous(b_vec)).reshape(-1)
+        out_ri = torch.view_as_real(out).reshape(-1)
     if alg_num == SPSV_SELL_ALG1:
         worker_count = _snap_cw_worker_count(min(n_rows, 32), n_rows)
-        _spsv_sell_cw_kernel_alg1[(int(worker_count),)](
-            values,
-            col_indices,
-            slice_offsets,
-            b_vec,
-            out,
-            ready,
-            row_counter,
-            n_rows,
-            SLICE_SIZE=int(slice_size),
-            USE_FP64_ACC=values.dtype == torch.float64,
-        )
+        if is_complex:
+            _spsv_sell_cw_kernel_alg1_complex[(int(worker_count),)](
+                values_ri,
+                col_indices,
+                slice_offsets,
+                b_ri,
+                out_ri,
+                ready,
+                row_counter,
+                n_rows,
+                SLICE_SIZE=int(slice_size),
+                UNIT_DIAG=bool(unit_diagonal),
+                USE_FP64_ACC=use_fp64_acc,
+            )
+        else:
+            _spsv_sell_cw_kernel_alg1[(int(worker_count),)](
+                values,
+                col_indices,
+                slice_offsets,
+                b_vec,
+                out,
+                ready,
+                row_counter,
+                n_rows,
+                SLICE_SIZE=int(slice_size),
+                UNIT_DIAG=bool(unit_diagonal),
+                USE_FP64_ACC=use_fp64_acc,
+            )
         return out
 
     n_slices = (int(n_rows) + int(slice_size) - 1) // int(slice_size)
@@ -3320,22 +3664,40 @@ def _launch_spsv_sell(
     worker_count = _resolve_spsv_sell_alg2_worker_count(
         n_slices, requested=alg2_worker_count
     )
-    _spsv_sell_slice_kernel_alg2[(int(worker_count),)](
-        values,
-        col_indices,
-        slice_offsets,
-        b_vec,
-        out,
-        ready,
-        row_counter,
-        n_rows,
-        n_slices,
-        SLICE_SIZE=int(slice_size),
-        BLOCK_ROWS=int(block_rows),
-        USE_FP64_ACC=values.dtype == torch.float64,
-        DIAG_EPS=_spsv_diag_eps_for_dtype(values.dtype),
-        num_warps=1,
-    )
+    if is_complex:
+        _spsv_sell_slice_kernel_alg2_complex[(int(worker_count),)](
+            values_ri,
+            col_indices,
+            slice_offsets,
+            b_ri,
+            out_ri,
+            ready,
+            row_counter,
+            n_rows,
+            n_slices,
+            SLICE_SIZE=int(slice_size),
+            BLOCK_ROWS=int(block_rows),
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=use_fp64_acc,
+            num_warps=1,
+        )
+    else:
+        _spsv_sell_slice_kernel_alg2[(int(worker_count),)](
+            values,
+            col_indices,
+            slice_offsets,
+            b_vec,
+            out,
+            ready,
+            row_counter,
+            n_rows,
+            n_slices,
+            SLICE_SIZE=int(slice_size),
+            BLOCK_ROWS=int(block_rows),
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=use_fp64_acc,
+            num_warps=1,
+        )
     return out
 
 
@@ -4919,24 +5281,37 @@ def flagsparse_spsv_analysis_sell(
     slice_size,
     alg_num=1,
     alg2_worker_count=None,
+    unit_diagonal=False,
     workspace=None,
 ):
-    """Analyze a lower real SELL SpSV problem and return a reusable descriptor."""
+    """Analyze a lower NON_TRANS SELL SpSV problem and return a descriptor.
 
+    When ``unit_diagonal`` is true, stored diagonal entries are ignored and
+    missing diagonal entries are interpreted as one, matching SpSV descriptor
+    semantics used by cuSPARSE.
+    """
+
+    unit_diagonal = bool(unit_diagonal)
     values, cols, offsets, n_rows, slice_size = (
         _prepare_spsv_sell_matrix_inputs(
-            values, col_indices, slice_offsets, shape, slice_size
+            values,
+            col_indices,
+            slice_offsets,
+            shape,
+            slice_size,
+            unit_diagonal=unit_diagonal,
         )
     )
     alg_num = _normalize_spsv_sell_alg_num(alg_num)
     n_slices = (n_rows + slice_size - 1) // slice_size
-    resolved_workers = (
-        None
-        if alg_num == SPSV_SELL_ALG1
-        else _resolve_spsv_sell_alg2_worker_count(
+    if alg_num == SPSV_SELL_ALG1:
+        if alg2_worker_count is not None:
+            raise ValueError("alg2_worker_count is only valid for SELL SpSV ALG2")
+        resolved_workers = None
+    else:
+        resolved_workers = _resolve_spsv_sell_alg2_worker_count(
             n_slices, requested=alg2_worker_count
         )
-    )
     solve_kind = f"sell_alg{alg_num}"
     layout = _build_spsv_workspace_layout(
         n_rows, solve_kind, value_dtype=values.dtype
@@ -4945,19 +5320,20 @@ def flagsparse_spsv_analysis_sell(
         _resolve_spsv_workspace(workspace, layout, values.device)
     solve_plan = {
         "solve_kind": solve_kind,
+        "kernel_data": values,
         "slice_size": int(slice_size),
         "alg_num": int(alg_num),
         "alg2_worker_count": resolved_workers,
-        "n_slices": int(n_slices),
     }
+    _attach_spsv_complex_plan_views(solve_plan)
     return FlagSparseSpSVDescr(
         format="sell",
         canonical_format="sell",
         shape=(n_rows, n_rows),
         lower=True,
-        unit_diagonal=False,
+        unit_diagonal=unit_diagonal,
         fill_mode="lower",
-        diag_type="non_unit",
+        diag_type="unit" if unit_diagonal else "non_unit",
         matrix_type="triangular",
         index_base=0,
         transpose_mode="N",
@@ -4983,7 +5359,7 @@ def flagsparse_spsv_solve_sell(
     out=None,
     workspace=None,
 ):
-    """Solve a previously analyzed lower real SELL SpSV problem."""
+    """Solve a previously analyzed lower NON_TRANS SELL SpSV problem."""
 
     if not isinstance(descr, FlagSparseSpSVDescr):
         raise TypeError("descr must be a FlagSparseSpSVDescr")
@@ -5012,6 +5388,8 @@ def flagsparse_spsv_solve_sell(
         or int(out.numel()) != n_rows
     ):
         raise ValueError("out must be a matching contiguous 1D CUDA tensor")
+    if out.is_conj() or out.is_neg():
+        raise ValueError("out must not be an unresolved conjugate/negative view")
     buffers = _resolve_spsv_workspace(
         workspace, descr.workspace_layout, descr.data.device
     )
@@ -5020,14 +5398,16 @@ def flagsparse_spsv_solve_sell(
         descr.data,
         descr.indices,
         descr.indptr,
-        b.contiguous(),
+        _as_strided_contiguous(b),
         n_rows,
         slice_size=int(plan["slice_size"]),
         out=out,
-        ready=buffers["ready"],
-        row_counter=buffers["row_counter"],
+        ready=buffers.get("ready"),
+        row_counter=buffers.get("row_counter"),
         alg_num=int(plan["alg_num"]),
         alg2_worker_count=plan.get("alg2_worker_count"),
+        unit_diagonal=bool(descr.unit_diagonal),
+        values_ri_in=plan.get("kernel_data_ri"),
     )
 
 
@@ -5041,10 +5421,11 @@ def flagsparse_spsv_sell(
     slice_size,
     alg_num=1,
     alg2_worker_count=None,
+    unit_diagonal=False,
     out=None,
     workspace=None,
 ):
-    """Solve a real non-unit lower triangle in column-major SELL format."""
+    """Analyze and solve a lower NON_TRANS SELL SpSV problem."""
 
     descr = flagsparse_spsv_analysis_sell(
         values,
@@ -5054,14 +5435,10 @@ def flagsparse_spsv_sell(
         slice_size=slice_size,
         alg_num=alg_num,
         alg2_worker_count=alg2_worker_count,
+        unit_diagonal=unit_diagonal,
         workspace=workspace,
     )
-    return flagsparse_spsv_solve_sell(
-        descr,
-        b,
-        out=out,
-        workspace=workspace,
-    )
+    return flagsparse_spsv_solve_sell(descr, b, out=out, workspace=workspace)
 
 
 def flagsparse_spsv_csr(

@@ -247,6 +247,20 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+    "spmm_bsr": (
+        "tests/test_spmm_bsr.py",
+        "{input}",
+        "--csv-bsr",
+        "{csv}",
+        "--ops",
+        "non",
+        "--block-dims",
+        "2",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "spmm_csr_opt": (
         "tests/test_spmm_opt.py",
         "{input}",
@@ -372,6 +386,7 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     ),
     "spmm_csr": OperatorTestConfig("spmm_csr", PERFORMANCE_COMMANDS["spmm_csr"]),
     "spmm_coo": OperatorTestConfig("spmm_coo", PERFORMANCE_COMMANDS["spmm_coo"]),
+    "spmm_bsr": OperatorTestConfig("spmm_bsr", PERFORMANCE_COMMANDS["spmm_bsr"]),
     "spmm_csr_opt": OperatorTestConfig(
         "spmm_csr_opt", PERFORMANCE_COMMANDS["spmm_csr_opt"]
     ),

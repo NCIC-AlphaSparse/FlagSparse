@@ -27,6 +27,8 @@ EXPECTED_TOP_LEVEL = {
     "prepare_spmv_bsr",
     "flagsparse_spmm_csr",
     "flagsparse_spmm_coo",
+    "flagsparse_spmm_bsr",
+    "prepare_spmm_bsr_route",
     "flagsparse_spgemm_csr",
     "flagsparse_sddmm_csr",
     "flagsparse_spsv_csr",
