@@ -295,6 +295,11 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
         if "spmm_bsr" in modules
         else ("non",)
     )
+    spmm_csc_ops = (
+        op_names(modules["spmm_csc"], "SPMM_CSC_SUPPORTED_OP_NAMES")
+        if "spmm_csc" in modules
+        else ("non",)
+    )
     return (
         ApiSpec(
             "gather",
@@ -433,7 +438,18 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             value_const="SUPPORTED_SPMM_BSR_VALUE_DTYPES",
             index_const="SUPPORTED_INDEX_DTYPES",
             ops=spmm_bsr_ops,
-            notes="spmm_bsr_base uses native BSR arrays and padded block-grid output; v1 supports non only",
+            notes="spmm_bsr_base uses native BSR arrays and padded block-grid output; supports non/trans/conj",
+        ),
+        ApiSpec(
+            "spmm",
+            "flagsparse_spmm_csc",
+            "spmm_csc",
+            "CSC",
+            "triton_csc_base",
+            value_const="SUPPORTED_SPMM_CSC_VALUE_DTYPES",
+            index_const="SUPPORTED_INDEX_DTYPES",
+            ops=spmm_csc_ops,
+            notes="spmm_csc_base uses native CSC arrays; trans/conj are reserved but unsupported in v1",
         ),
         ApiSpec(
             "spgemm",

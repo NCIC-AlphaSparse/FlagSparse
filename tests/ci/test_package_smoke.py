@@ -27,8 +27,10 @@ def test_public_exports_are_listed():
     assert "flagsparse_spmv_csc" in exported
     assert "flagsparse_spmv_bsr" in exported
     assert "flagsparse_spmm_bsr" in exported
+    assert "flagsparse_spmm_csc" in exported
     assert "prepare_spmv_csc" in exported
     assert "prepare_spmv_bsr" in exported
     assert "prepare_spmm_bsr_route" in exported
+    assert "prepare_spmm_csc_route" in exported
     assert "create_csr_matrix" in exported
     assert "read_mtx_file" in exported

@@ -181,6 +181,24 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spmm_csc
+    description: |
+      Computes sparse matrix-dense matrix multiplication for a CSC matrix.
+    for:
+      - flagsparse_spmm_csc
+      - flagsparse_spmm_csc_run
+      - prepare_spmm_csc_route
+    labels:
+      - flagsparse
+      - sparse
+      - csc
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
   - id: spmm_csr_opt
     description: |
       Computes optimized CSR sparse matrix-dense matrix multiplication.
