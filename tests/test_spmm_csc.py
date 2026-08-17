@@ -23,6 +23,13 @@ from pathlib import Path
 
 import torch
 
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx_sparse
+except ImportError:
+    cp = None
+    cpx_sparse = None
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -58,9 +65,13 @@ PERF_FIELDS = [
     "ms",
     "gpu_ms",
     "process_cpu_ms",
+    "cusparse_ms",
+    "cusparse_vs_alg_speedup",
     "err_vs_ref",
+    "err_vs_cusparse",
     "status",
     "reason",
+    "cusparse_reason",
 ]
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
@@ -83,6 +94,12 @@ def _fmt(value, digits=4):
     if isinstance(value, float):
         return f"{value:.{digits}f}"
     return str(value)
+
+
+def _ratio(numerator, denominator):
+    if numerator is None or denominator in (None, 0):
+        return None
+    return float(numerator) / float(denominator)
 
 
 def _reference_dtype(dtype):
@@ -373,7 +390,55 @@ def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters
     }
 
 
-def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, dense_cols, layout, alg, op, warmup, iters, timing):
+def _cupy_csc_unavailable_reason():
+    if cp is None or cpx_sparse is None:
+        return "CuPy cupyx.scipy.sparse is not available"
+    if not hasattr(cpx_sparse, "csc_matrix"):
+        return "CuPy cupyx.scipy.sparse has no csc_matrix baseline"
+    return None
+
+
+def _time_cusparse_csc(data, indices, indptr, B, shape, warmup, iters):
+    reason = _cupy_csc_unavailable_reason()
+    if reason:
+        return None, reason, None
+    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
+    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices))
+    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
+    B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
+    A = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    for _ in range(max(0, int(warmup))):
+        out_cp = A @ B_cp
+    cp.cuda.runtime.deviceSynchronize()
+    start = cp.cuda.Event()
+    end = cp.cuda.Event()
+    count = max(1, int(iters))
+    start.record()
+    for _ in range(count):
+        out_cp = A @ B_cp
+    end.record()
+    end.synchronize()
+    out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
+    return cp.cuda.get_elapsed_time(start, end) / count, None, out
+
+
+def _run_case(
+    matrix_name,
+    data,
+    indices,
+    indptr,
+    shape,
+    dtype,
+    index_dtype,
+    dense_cols,
+    layout,
+    alg,
+    op,
+    warmup,
+    iters,
+    timing,
+    run_cusparse,
+):
     B = _materialize_dense_layout(
         _random_values((int(shape[1]), int(dense_cols)), dtype, data.device) * 0.125,
         layout,
@@ -397,9 +462,13 @@ def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, den
         "ms": None,
         "gpu_ms": None,
         "process_cpu_ms": 0.0,
+        "cusparse_ms": None,
+        "cusparse_vs_alg_speedup": None,
         "err_vs_ref": None,
+        "err_vs_cusparse": None,
         "status": "ERROR",
         "reason": "",
+        "cusparse_reason": "",
         "process_gpu_ms": None,
         "compute_ms": None,
     }
@@ -423,6 +492,18 @@ def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, den
             row["reason"] = "correctness check failed"
     except Exception as exc:
         row["reason"] = str(exc)
+    if row["status"] != "ERROR" and run_cusparse:
+        try:
+            cu_ms, cu_reason, cu_out = _time_cusparse_csc(
+                data, indices, indptr, B, shape, warmup, iters
+            )
+            row["cusparse_ms"] = cu_ms
+            row["cusparse_reason"] = cu_reason or ""
+            if cu_out is not None:
+                row["err_vs_cusparse"] = _error_ratio(cu_out, ref, dtype)
+        except Exception as exc:
+            row["cusparse_reason"] = str(exc)
+    row["cusparse_vs_alg_speedup"] = _ratio(row["cusparse_ms"], row["ms"])
     return row
 
 
@@ -436,9 +517,18 @@ def _resolve_input_paths(input_paths):
     return paths
 
 
-def _print_notes():
+def _print_notes(run_cusparse):
     print("FlagSparse CSC SpMM v1 supports native op=non only; trans/conj are reserved and reported as SKIP.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same CSC arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
+    print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
+    if run_cusparse:
+        reason = _cupy_csc_unavailable_reason()
+        if reason:
+            print(f"CuPy CSC baseline: unavailable ({reason}); CU(ms)=N/A.")
+        else:
+            print("CuPy CSC baseline: CU(ms) uses cupyx.scipy.sparse.csc_matrix @ dense with construction outside timing.")
+    else:
+        print("CuPy CSC baseline disabled by --no-cusparse; CU(ms)=N/A.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; CSC SpMM v1 has no process phase.")
 
 
@@ -447,7 +537,8 @@ def _print_row(row, timing=False):
         f"{row['matrix']:<28} {row['dtype']:<10} {row['index_dtype']:<5} {row['op']:<5} {row['layout']:<4} {row['alg']:<14} "
         f"{row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>9} {row['dense_cols']:>5} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
-        f"{_fmt(row['err_vs_ref'], 2):>10} {row['status']:>6}"
+        f"{_fmt(row['cusparse_ms']):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>8} "
+        f"{_fmt(row['err_vs_ref'], 2):>10} {_fmt(row['err_vs_cusparse'], 2):>10} {row['status']:>6}"
         + (
             f" {_fmt(row.get('process_gpu_ms')):>9} {_fmt(row.get('compute_ms')):>9}"
             if timing
@@ -474,7 +565,6 @@ def main():
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
-    del args.no_cusparse
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for native CSC SpMM benchmark")
     dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
@@ -482,7 +572,8 @@ def main():
     ops = _parse_ops(args.ops)
     algs = _parse_algs(args.alg)
     layouts = _layout_names(args.layout)
-    _print_notes()
+    run_cusparse = not args.no_cusparse
+    _print_notes(run_cusparse)
 
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
@@ -500,7 +591,8 @@ def main():
         print(
             f"{'Matrix':<28} {'DType':<10} {'Index':<5} {'Op':<5} {'Lay':<4} {'Alg':<14} "
             f"{'Rows':>7} {'Cols':>7} {'NNZ':>9} {'DCols':>5} "
-            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'Err':>10} {'Status':>6}"
+            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'CU':>9} {'CU/Alg':>8} "
+            f"{'Err':>10} {'CUErr':>10} {'Status':>6}"
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )
         print("-" * 150)
@@ -544,6 +636,7 @@ def main():
                                     "nnz": int(data.numel()),
                                     "dense_cols": int(dense_cols),
                                     "process_cpu_ms": 0.0,
+                                    "cusparse_reason": "",
                                     "status": "SKIP",
                                     "reason": "spmm_csc trans/conj are reserved but not implemented in v1",
                                 }
@@ -571,6 +664,7 @@ def main():
                                     args.warmup,
                                     args.iters,
                                     args.timing,
+                                    run_cusparse,
                                 )
                                 rows.append(row)
                                 _print_row(row, timing=args.timing)
