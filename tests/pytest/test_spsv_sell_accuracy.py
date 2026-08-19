@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Accuracy coverage for lower NON_TRANS SELL SpSV."""
+"""Accuracy coverage for lower SELL SpSV in NON/TRANS/CONJ modes."""
 
 import pytest
 import torch
@@ -117,7 +117,7 @@ def _lower_triangular_sell(
     return sell_values, sell_columns, offsets, dense.to(device)
 
 
-def _reference_solve(dense, b, dtype):
+def _reference_solve(dense, b, dtype, *, upper=False):
     if dtype == torch.float32:
         reference_dtype = torch.float64
     elif dtype == torch.complex64:
@@ -127,7 +127,7 @@ def _reference_solve(dense, b, dtype):
     return torch.linalg.solve_triangular(
         dense.to(reference_dtype),
         b.to(reference_dtype).unsqueeze(1),
-        upper=False,
+        upper=upper,
     ).squeeze(1).to(dtype)
 
 
@@ -175,6 +175,96 @@ def test_spsv_sell_matches_dense_and_supports_inplace(
 
     assert _sell_matches(result, expected, dtype)
     assert _sell_matches(inplace, expected, dtype)
+
+
+@pytest.mark.parametrize("n", SPSV_N)
+@pytest.mark.parametrize("dtype", CORE_DTYPES, ids=CORE_DTYPE_IDS)
+@pytest.mark.parametrize(
+    "index_dtype", (torch.int32, torch.int64), ids=("int32", "int64")
+)
+@pytest.mark.parametrize("slice_size", (8, 32), ids=("slice8", "slice32"))
+@pytest.mark.parametrize(
+    "unit_diagonal", (False, True), ids=("non_unit", "unit")
+)
+def test_spsv_sell_trans_matches_dense_and_supports_inplace(
+    n, dtype, index_dtype, slice_size, unit_diagonal
+):
+    """TRANS uses the SELL layout and solves A^T x=b accurately."""
+
+    device = torch.device("cuda")
+    values, columns, offsets, dense = _lower_triangular_sell(
+        n,
+        dtype,
+        index_dtype,
+        slice_size,
+        device,
+        unit_diagonal=unit_diagonal,
+    )
+    if dtype in (torch.complex64, torch.complex128):
+        real_dtype = values.real.dtype
+        b = torch.complex(
+            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=device),
+            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=device),
+        )
+    else:
+        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=device)
+    expected = _reference_solve(dense.transpose(0, 1), b, dtype, upper=True)
+
+    descr = flagsparse_spsv_analysis_sell(
+        values,
+        columns,
+        offsets,
+        (n, n),
+        slice_size=slice_size,
+        unit_diagonal=unit_diagonal,
+        transpose=True,
+    )
+    assert descr.transpose_mode == "T"
+    assert descr.solve_kind == "sell_trans"
+    workspace = flagsparse_spsv_create_workspace(descr)
+    result = flagsparse_spsv_solve_sell(descr, b, workspace=workspace)
+    inplace = b.clone()
+    flagsparse_spsv_solve_sell(
+        descr,
+        inplace,
+        out=inplace,
+        workspace=workspace,
+    )
+
+    assert _sell_matches(result, expected, dtype)
+    assert _sell_matches(inplace, expected, dtype)
+
+
+@pytest.mark.parametrize("dtype", (torch.complex64, torch.complex128))
+@pytest.mark.parametrize("transpose", ("T", "C"), ids=("trans", "conj"))
+def test_spsv_sell_conj_trans_complex(dtype, transpose):
+    device = torch.device("cuda")
+    values, columns, offsets, dense = _lower_triangular_sell(
+        37, dtype, torch.int64, 8, device
+    )
+    real_dtype = values.real.dtype
+    b = torch.complex(
+        torch.linspace(0.25, 1.25, 37, dtype=real_dtype, device=device),
+        torch.linspace(-0.5, 0.5, 37, dtype=real_dtype, device=device),
+    )
+    matrix = dense.transpose(0, 1)
+    if transpose == "C":
+        matrix = matrix.conj()
+    expected = _reference_solve(matrix, b, dtype, upper=True)
+    descr = flagsparse_spsv_analysis_sell(
+        values,
+        columns,
+        offsets,
+        (37, 37),
+        slice_size=8,
+        transpose=transpose,
+    )
+    result = flagsparse_spsv_solve_sell(
+        descr,
+        b,
+        workspace=flagsparse_spsv_create_workspace(descr),
+    )
+    assert _sell_matches(result, expected, dtype)
 
 
 @pytest.mark.parametrize("n", SPSV_N)
