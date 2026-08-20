@@ -16,6 +16,43 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
+## Backends (CUDA / DCU)
+
+FlagSparse dispatches its **vendor reference and baseline** paths on the detected
+runtime; the Triton kernels themselves are unchanged across backends.
+
+| Runtime | Detected by | Vendor sparse library | Python binding |
+| --- | --- | --- | --- |
+| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy (`cupy-cuda12x`) |
+| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+
+On a DCU/ROCm host, install the hip-python bindings matching your ROCm release:
+
+```bash
+pip install hip-python
+```
+
+Both bindings are optional. When neither is importable the benchmarks fall back to the
+portable `torch.sparse` reference and report the reason in the `*_reason` /
+`backend_status` fields rather than failing.
+
+Selection happens in `_*_sparse_ref_backend()` helpers, which return
+`("hipsparse" | "cupy_cusparse" | None, reason)`:
+
+- `flagsparse.sparse_operations._common` - SpMV CSR/COO
+- `.spmm_csr` / `.spmm_coo` / `.spgemm_csr` / `.gather_scatter` - the remaining operators
+
+To check the DCU path phase by phase (useful when a benchmark stalls instead of failing):
+
+```bash
+python tests/diagnose_hipsparse_ref.py --op env      # environment probe first
+python tests/diagnose_hipsparse_ref.py --op spmv-csr # then one operation at a time
+```
+
+For the full DCU bring-up procedure — environment checks, the stale-install trap, how to
+confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
+[docs/DCU_TESTING.md](docs/DCU_TESTING.md).
+
 ## Layout
 
 - `src/flagsparse/` - core package (`sparse_operations/` is emitted as several `.py` modules from string literals in `flagsparse.py`)
@@ -136,14 +173,15 @@ python tests/test_spgemm.py <dir/> --csv results.csv     # optional: --dtype flo
 
 **test_spsv.py** - SpSV (triangular solve; **square** matrices only). CSR and COO share this script; there is **no** `test_spsv_coo.py`.
 
-**test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native
-column-major SELL SpSV. Its CSV and
+**test_spsv_sell.py** - lower, UNIT/NON_UNIT, real/complex, native column-major
+SELL SpSV with NON/TRANS/CONJ operation modes. Its CSV and
 terminal fields follow the CSR SpSV output. `FlagSparse_ms` and `cuSPARSE_ms`
 both cover every per-call preparation/analysis plus solve; static descriptors
 and SELL conversion are outside the timed interval. The direct
 `flagsparse_spsv_sell` API defaults to ALG1; use `--alg_num 2` or the explicit
 `flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` lifecycle for
-the slice-cooperative ALG2 path.
+the slice-cooperative ALG2 path. TRANS/CONJ use a dedicated reverse-dependency
+kernel and do not accept `--alg_num` or `--alg2-workers`.
 
 ```bash
 python tests/test_spsv.py --synthetic
@@ -153,6 +191,8 @@ pytest -q -s tests/test_spsv_sell.py
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_alg1.csv --slice-size 32 --alg_num 1
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_alg2.csv --slice-size 32 --alg_num 2
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_unit.csv --unit-diagonal
+python tests/test_spsv_sell.py --csv sell_trans.csv --dtype float32 --slice-size 32 --ops TRANS <dir_or_file.mtx>
+python tests/test_spsv_sell.py --csv sell_conj.csv --dtype complex64 --slice-size 32 --ops CONJ <dir_or_file.mtx>
 python tests/test_spsv_sell.py <dir_or_file.mtx> --csv sell_complex.csv --dtype complex
 # Optional ALG2 tuning: append --alg2-workers 32|64|128|256|512
 ```

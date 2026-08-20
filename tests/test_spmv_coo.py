@@ -22,15 +22,17 @@ import os
 import time
 
 import torch
-import flagsparse as fs
-import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
+import sys
+from pathlib import Path
 
-try:
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx_sparse
-except Exception:
-    cp = None
-    cpx_sparse = None
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+import flagsparse as fs
+import flagsparse.sparse_operations._common as fs_common
+import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
 
 VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 INDEX_DTYPES = [torch.int32, torch.int64]
@@ -202,18 +204,6 @@ def _apply_cupy_sparse_op(matrix, x, op):
     return _cupy_sparse_op_matrix(matrix, op) @ x
 
 
-def _apply_cupy_coo_op(data, row, col, shape, op):
-    if op == "non":
-        return data, row, col, shape
-    n_rows, n_cols = shape
-    data_op = data
-    if op == "conj":
-        data_op = data.conj() if hasattr(data, "conj") else data.conjugate()
-    elif op != "trans":
-        raise ValueError(f"unsupported op: {op}")
-    return data_op, col, row, (n_cols, n_rows)
-
-
 def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
     ref_dtype = _reference_dtype(out_dtype)
@@ -227,21 +217,6 @@ def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     ).coalesce()
     y_ref = torch.sparse.mm(coo_ref, x_ref.unsqueeze(1)).squeeze(1)
     return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
-
-
-def _cupy_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
-    data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
-    ref_dtype = _reference_dtype(out_dtype)
-    data_ref = data.to(ref_dtype)
-    x_ref = x.to(ref_dtype)
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data_ref))
-    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
-    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x_ref))
-    A_cp_ref = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-    y_ref = A_cp_ref @ x_cp
-    y_ref_t = torch.utils.dlpack.from_dlpack(y_ref.toDlpack())
-    return y_ref_t.to(out_dtype) if ref_dtype != out_dtype else y_ref_t
 
 
 def _dense_to_coo(A):
@@ -593,10 +568,14 @@ def _run_one_coo_case(
     err_pt = _allclose_error_ratio(y_opt, y_pt, atol, rtol)
     cu_ms = None
     triton_ok_cu = False
-    if cp is not None and cpx_sparse is not None:
+    # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
+    sparse_ref = fs_common._benchmark_spmv_coo_sparse_ref(
+        data, row, col, x, shape, warmup=warmup, iters=iters, op=op
+    )
+    if sparse_ref["backend"] is not None:
         try:
-            cu_ms = _time_cupy_coo(data, row, col, x, shape, op, warmup, iters)
-            y_cu = _cupy_coo_reference(data, row, col, x, shape, dtype, op=op)
+            cu_ms = sparse_ref["ms"]
+            y_cu = sparse_ref["values"]
             err_cu = _allclose_error_ratio(y_opt, y_cu, atol, rtol)
             triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
         except Exception:
@@ -685,10 +664,13 @@ def _run_one_tocsr_case(
     cu_ms = None
     err_cu = None
     triton_ok_cu = False
-    if cp is not None and cpx_sparse is not None:
+    sparse_ref = fs_common._benchmark_spmv_coo_sparse_ref(
+        data, row, col, x, shape, warmup=warmup, iters=iters, op="non"
+    )
+    if sparse_ref["backend"] is not None:
         try:
-            cu_ms = _time_cupy_coo(data, row, col, x, shape, "non", warmup, iters)
-            y_cu = _cupy_coo_reference(data, row, col, x, shape, dtype, op="non")
+            cu_ms = sparse_ref["ms"]
+            y_cu = sparse_ref["values"]
             err_cu = _allclose_error_ratio(y_prepared, y_cu, atol, rtol)
             triton_ok_cu = (not math.isnan(err_cu)) and err_cu <= 1.0
         except Exception:
@@ -777,42 +759,6 @@ def _run_torch_runtime_op(data, row, col, x_2d, shape, op):
     data_op, row_op, col_op, shape_op = _apply_coo_op(data, row, col, shape, op)
     coo = _build_torch_sparse_coo(data_op, row_op, col_op, shape_op)
     return torch.sparse.mm(coo, x_2d).squeeze(1)
-
-
-def _time_cupy_coo(data, row, col, x, shape, op, warmup, iters):
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    row_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(row.to(torch.int64)))
-    col_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(col.to(torch.int64)))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-    if op == "non":
-        A_cp = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-        spmv_op = lambda: A_cp @ x_cp
-    else:
-        spmv_op = lambda: _run_cupy_runtime_op(
-            data_cp,
-            row_cp,
-            col_cp,
-            x_cp,
-            shape,
-            op,
-        )
-    for _ in range(warmup):
-        _ = spmv_op()
-    cp.cuda.runtime.deviceSynchronize()
-    c0 = cp.cuda.Event()
-    c1 = cp.cuda.Event()
-    c0.record()
-    for _ in range(iters):
-        _ = spmv_op()
-    c1.record()
-    c1.synchronize()
-    return cp.cuda.get_elapsed_time(c0, c1) / iters
-
-
-def _run_cupy_runtime_op(data, row, col, x, shape, op):
-    data_op, row_op, col_op, shape_op = _apply_cupy_coo_op(data, row, col, shape, op)
-    A_cp = cpx_sparse.coo_matrix((data_op, (row_op, col_op)), shape=shape_op)
-    return A_cp @ x
 
 
 def _print_coo_result(row, timing=False):

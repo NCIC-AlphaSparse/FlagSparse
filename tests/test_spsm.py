@@ -763,6 +763,21 @@ class _PreparedCusparseNativeSpSM:
 
 
 def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
+    # Vendor triangular-solve baseline per backend: hipSPARSE csrsm2 on DCU/ROCm,
+    # native cuSPARSE SpSM on CUDA.
+    if fs_spsm_impl._is_rocm_runtime() and indptr is not None:
+        sparse_ref = fs_spsm_impl._benchmark_spsm_csr_sparse_ref(
+            data,
+            col if fmt == "csr" else row,
+            indptr,
+            B,
+            shape,
+            warmup=warmup,
+            iters=iters,
+        )
+        if sparse_ref["backend"] is None:
+            return None, None, sparse_ref["reason"]
+        return sparse_ref["values"], sparse_ref["ms"], None
     plan = None
     try:
         plan = _PreparedCusparseNativeSpSM(data, row, col, indptr, B, shape, fmt)

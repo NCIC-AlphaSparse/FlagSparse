@@ -121,6 +121,39 @@ def _padded_cols(K, block_dim):
     return ((int(K) + int(block_dim) - 1) // int(block_dim)) * int(block_dim)
 
 
+def _op_transposes(op):
+    return op in ("trans", "conj")
+
+
+def _logical_b_rows(M, K, op):
+    return int(M) if _op_transposes(op) else int(K)
+
+
+def _logical_out_rows(M, K, op):
+    return int(K) if _op_transposes(op) else int(M)
+
+
+def _padded_b_rows(M, K, block_dim, op):
+    return _padded_rows(M, block_dim) if _op_transposes(op) else _padded_cols(K, block_dim)
+
+
+def _padded_out_rows(M, K, block_dim, op):
+    return _padded_cols(K, block_dim) if _op_transposes(op) else _padded_rows(M, block_dim)
+
+
+def _dense_reference(dense, B, dtype, op):
+    ref_dtype = _reference_dtype(dtype)
+    dense_ref = dense.to(ref_dtype)
+    B_ref = B.to(ref_dtype)
+    if op == "non":
+        return (dense_ref @ B_ref).to(dtype)
+    if op == "trans":
+        return (dense_ref.T @ B_ref).to(dtype)
+    if op == "conj":
+        return (dense_ref.conj().T @ B_ref).to(dtype)
+    raise ValueError(f"unsupported op: {op}")
+
+
 def _assert_close(actual, expected, dtype):
     rtol, atol = close_tolerances(dtype)
     ref_dtype = _reference_dtype(dtype)
@@ -136,15 +169,15 @@ def _assert_close(actual, expected, dtype):
 )
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
 @pytest.mark.parametrize("block_dim", [2, 4], ids=["block2", "block4"])
-def test_spmm_bsr_matches_dense_reference(M, K, N, name, dtype, index_dtype, block_dim):
+@pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
+def test_spmm_bsr_matches_dense_reference(M, K, N, name, dtype, index_dtype, block_dim, op):
     del name
     device = torch.device("cuda")
     data, indices, indptr, dense = _random_bsr_mk(
         M, K, dtype, index_dtype, block_dim, device
     )
-    B = _random_values((K, N), dtype, device)
-    ref_dtype = _reference_dtype(dtype)
-    ref = (dense.to(ref_dtype) @ B.to(ref_dtype)).to(dtype)
+    B = _random_values((_logical_b_rows(M, K, op), N), dtype, device)
+    ref = _dense_reference(dense, B, dtype, op)
     out = flagsparse_spmm_bsr(
         data,
         indices,
@@ -152,10 +185,11 @@ def test_spmm_bsr_matches_dense_reference(M, K, N, name, dtype, index_dtype, blo
         B,
         shape=(M, K),
         block_dim=block_dim,
+        op=op,
         index_fallback_policy="auto",
     )
-    assert out.shape == (_padded_rows(M, block_dim), N)
-    _assert_close(out[:M, :], ref, dtype)
+    assert out.shape == (_padded_out_rows(M, K, block_dim, op), N)
+    _assert_close(out[: _logical_out_rows(M, K, op), :], ref, dtype)
 
 
 @pytest.mark.spmm_bsr
@@ -167,28 +201,31 @@ def test_spmm_bsr_prepared_path_and_meta():
     data, indices, indptr, dense = _random_bsr_mk(
         M, K, dtype, torch.int32, block_dim, device
     )
-    prepared = prepare_spmm_bsr_route(data, indices, indptr, (M, K), block_dim=block_dim)
-    B = _random_values((K, N), dtype, device)
-    ref = (dense.to(torch.complex128) @ B.to(torch.complex128)).to(dtype)
+    op = "conj"
+    prepared = prepare_spmm_bsr_route(data, indices, indptr, (M, K), block_dim=block_dim, op=op)
+    B = _random_values((M, N), dtype, device)
+    ref = _dense_reference(dense, B, dtype, op)
     out, meta = spmm_bsr_mod.flagsparse_spmm_bsr_run(
         prepared,
         B,
+        op=op,
         return_meta=True,
         timing=True,
     )
-    assert out.shape == (_padded_rows(M, block_dim), N)
+    assert out.shape == (_padded_cols(K, block_dim), N)
     assert meta["alg"] == "spmm_bsr_base"
-    assert meta["op"] == "non"
+    assert meta["op"] == op
     assert meta["logical_shape"] == (M, K)
     assert meta["padded_shape"] == (_padded_rows(M, block_dim), _padded_cols(K, block_dim))
     assert meta["process_cpu_ms"] == 0.0
     assert meta["process_gpu_ms"] == 0.0
     assert meta["compute_ms"] >= 0.0
-    _assert_close(out[:M, :], ref, dtype)
+    _assert_close(out[:K, :], ref, dtype)
 
 
 @pytest.mark.spmm_bsr
-def test_spmm_bsr_accepts_padded_B():
+@pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
+def test_spmm_bsr_accepts_padded_B(op):
     device = torch.device("cuda")
     M, K, N = 7, 5, 4
     block_dim = 4
@@ -196,40 +233,32 @@ def test_spmm_bsr_accepts_padded_B():
     data, indices, indptr, dense = _random_bsr_mk(
         M, K, dtype, torch.int32, block_dim, device
     )
-    B = torch.zeros((_padded_cols(K, block_dim), N), dtype=dtype, device=device)
-    B[:K, :] = _random_values((K, N), dtype, device)
-    ref = (dense.double() @ B[:K, :].double()).float()
-    out = flagsparse_spmm_bsr(data, indices, indptr, B, shape=(M, K), block_dim=block_dim)
-    assert out.shape == (_padded_rows(M, block_dim), N)
-    _assert_close(out[:M, :], ref, dtype)
+    logical_b_rows = _logical_b_rows(M, K, op)
+    B = torch.zeros((_padded_b_rows(M, K, block_dim, op), N), dtype=dtype, device=device)
+    B[:logical_b_rows, :] = _random_values((logical_b_rows, N), dtype, device)
+    ref = _dense_reference(dense, B[:logical_b_rows, :], dtype, op)
+    out = flagsparse_spmm_bsr(data, indices, indptr, B, shape=(M, K), block_dim=block_dim, op=op)
+    assert out.shape == (_padded_out_rows(M, K, block_dim, op), N)
+    _assert_close(out[: _logical_out_rows(M, K, op), :], ref, dtype)
 
 
 @pytest.mark.spmm_bsr
-def test_spmm_bsr_B_length_mismatch_rejected():
+@pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
+def test_spmm_bsr_B_length_mismatch_rejected(op):
     device = torch.device("cuda")
     M, K, N = 8, 12, 4
     data, indices, indptr, _dense = _random_bsr_mk(
         M, K, torch.float32, torch.int32, 2, device
     )
-    B = torch.randn((K - 1, N), dtype=torch.float32, device=device)
+    good_rows = _logical_b_rows(M, K, op)
+    B = torch.randn((good_rows - 1, N), dtype=torch.float32, device=device)
     with pytest.raises(ValueError, match="B.shape\\[0\\] must be"):
-        flagsparse_spmm_bsr(data, indices, indptr, B, shape=(M, K), block_dim=2)
-
-
-@pytest.mark.spmm_bsr
-@pytest.mark.parametrize("op", ["trans", "conj"], ids=["trans", "conj"])
-def test_spmm_bsr_transpose_family_is_unsupported(op):
-    device = torch.device("cuda")
-    data, indices, indptr, _dense = _random_bsr_mk(
-        8, 12, torch.float32, torch.int32, 2, device
-    )
-    B = torch.randn((8, 4), dtype=torch.float32, device=device)
-    with pytest.raises(ValueError, match="only supports op='non'"):
         flagsparse_spmm_bsr(data, indices, indptr, B, shape=(8, 12), block_dim=2, op=op)
 
 
 @pytest.mark.spmm_bsr
-def test_spmm_bsr_int64_auto_fallback_to_int32(monkeypatch):
+@pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
+def test_spmm_bsr_int64_auto_fallback_to_int32(monkeypatch, op):
     device = torch.device("cuda")
     M, K, N = 7, 5, 4
     dtype = torch.float32
@@ -237,16 +266,16 @@ def test_spmm_bsr_int64_auto_fallback_to_int32(monkeypatch):
     data, indices, indptr, dense = _random_bsr_mk(
         M, K, dtype, torch.int64, block_dim, device
     )
-    B = _random_values((K, N), dtype, device)
-    ref = (dense.double() @ B.double()).float()
+    B = _random_values((_logical_b_rows(M, K, op), N), dtype, device)
+    ref = _dense_reference(dense, B, dtype, op)
     state = {"forced_once": False}
     original = spmm_bsr_mod._triton_spmm_bsr_base_kernel
 
-    def fail_int64_once(prepared, B_in):
+    def fail_int64_once(prepared, B_in, op_code=None):
         if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
             state["forced_once"] = True
             raise RuntimeError("forced int64 launch failure")
-        return original(prepared, B_in)
+        return original(prepared, B_in, op_code)
 
     monkeypatch.setattr(spmm_bsr_mod, "_triton_spmm_bsr_base_kernel", fail_int64_once)
     out = flagsparse_spmm_bsr(
@@ -256,7 +285,8 @@ def test_spmm_bsr_int64_auto_fallback_to_int32(monkeypatch):
         B,
         shape=(M, K),
         block_dim=block_dim,
+        op=op,
         index_fallback_policy="auto",
     )
     assert state["forced_once"] is True
-    _assert_close(out[:M, :], ref, dtype)
+    _assert_close(out[: _logical_out_rows(M, K, op), :], ref, dtype)

@@ -14,7 +14,12 @@
 
 """CSR SpGEMM (A@B) with two-phase structure/value build."""
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
+
+HipPointer = _common_mod.HipPointer
 
 SUPPORTED_SPGEMM_VALUE_DTYPES = (torch.float32, torch.float64)
 
@@ -1301,6 +1306,687 @@ def _torch_sparse_to_csr(tensor):
     raise TypeError(f"Unsupported sparse layout: {tensor.layout}")
 
 
+def _hipsparse_spgemm_algorithm():
+    return _hipsparse_lookup(
+        "hipsparseSpGEMMAlg_t",
+        ("HIPSPARSE_SPGEMM_DEFAULT", "HIPSPARSE_SPGEMM_ALG_DEFAULT"),
+    )
+
+
+def _hipsparse_spgemm_csr_skip_reason(
+    value_dtype,
+    a_indices_dtype,
+    a_indptr_dtype,
+    b_indices_dtype=None,
+    b_indptr_dtype=None,
+):
+    b_indices_dtype = a_indices_dtype if b_indices_dtype is None else b_indices_dtype
+    b_indptr_dtype = a_indptr_dtype if b_indptr_dtype is None else b_indptr_dtype
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpGEMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseDestroySpMat",
+        "hipsparseSpGEMM_createDescr",
+        "hipsparseSpGEMM_destroyDescr",
+        "hipsparseSpGEMM_workEstimation",
+        "hipsparseSpGEMM_compute",
+        "hipsparseSpGEMM_copy",
+        "hipsparseSpMatGetSize",
+        "hipsparseCsrSetPointers",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE CSR SpGEMM direct API is unavailable: missing {symbol}"
+    if value_dtype not in SUPPORTED_SPGEMM_VALUE_DTYPES:
+        return f"hipSPARSE CSR SpGEMM has no supported value dtype mapping for {value_dtype}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(
+            a_indptr_dtype, "hipSPARSE CSR SpGEMM A row offsets"
+        )
+        _ = _hipsparse_index_type(
+            a_indices_dtype, "hipSPARSE CSR SpGEMM A column indices"
+        )
+        _ = _hipsparse_index_type(
+            b_indptr_dtype, "hipSPARSE CSR SpGEMM B row offsets"
+        )
+        _ = _hipsparse_index_type(
+            b_indices_dtype, "hipSPARSE CSR SpGEMM B column indices"
+        )
+        _ = _hipsparse_lookup(
+            "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+        )
+        _ = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        _ = _hipsparse_spgemm_algorithm()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _hipsparse_spgemm_create_descr():
+    result = hipsparse.hipsparseSpGEMM_createDescr()
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            "hipsparseSpGEMM_createDescr wrapper returned an unexpected result"
+        )
+    status, descr = result
+    _hip_check_result(status, "hipsparseSpGEMM_createDescr")
+    return descr
+
+
+def _hipsparse_create_csr_descriptor(
+    spmat_ref,
+    n_rows,
+    n_cols,
+    nnz,
+    indptr,
+    indices,
+    data,
+    row_index_type,
+    col_index_type,
+    index_base,
+    value_type,
+):
+    _hip_check_result(
+        hipsparse.hipsparseCreateCsr(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            nnz,
+            HipPointer.fromObj(indptr.data_ptr()),
+            HipPointer.fromObj(indices.data_ptr()),
+            HipPointer.fromObj(data.data_ptr()),
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+        ),
+        "hipsparseCreateCsr",
+    )
+
+
+def _hipsparse_spgemm_work_estimation(
+    handle,
+    op_enum,
+    alpha,
+    mat_a,
+    mat_b,
+    beta,
+    mat_c,
+    value_type,
+    alg,
+    descr,
+    workspace,
+):
+    size_out = ctypes.c_size_t()
+    _hip_check_result(
+        hipsparse.hipsparseSpGEMM_workEstimation(
+            handle,
+            op_enum,
+            op_enum,
+            alpha,
+            mat_a,
+            mat_b,
+            beta,
+            mat_c,
+            value_type,
+            alg,
+            descr,
+            size_out,
+            workspace,
+        ),
+        "hipsparseSpGEMM_workEstimation",
+    )
+    return int(size_out.value)
+
+
+def _hipsparse_spgemm_compute(
+    handle,
+    op_enum,
+    alpha,
+    mat_a,
+    mat_b,
+    beta,
+    mat_c,
+    value_type,
+    alg,
+    descr,
+    workspace,
+):
+    size_out = ctypes.c_size_t()
+    _hip_check_result(
+        hipsparse.hipsparseSpGEMM_compute(
+            handle,
+            op_enum,
+            op_enum,
+            alpha,
+            mat_a,
+            mat_b,
+            beta,
+            mat_c,
+            value_type,
+            alg,
+            descr,
+            size_out,
+            workspace,
+        ),
+        "hipsparseSpGEMM_compute",
+    )
+    return int(size_out.value)
+
+
+def _prepare_spgemm_csr_ref_hipsparse(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+):
+    skip_reason = _hipsparse_spgemm_csr_skip_reason(
+        a_data.dtype,
+        a_indices.dtype,
+        a_indptr.dtype,
+        b_indices.dtype,
+        b_indptr.dtype,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(
+        torch.is_tensor(t)
+        for t in (a_data, a_indices, a_indptr, b_data, b_indices, b_indptr)
+    ):
+        raise TypeError("all CSR inputs must be torch.Tensor")
+    if not all(t.is_cuda for t in (a_data, a_indices, a_indptr, b_data, b_indices, b_indptr)):
+        raise ValueError("all CSR inputs must be CUDA tensors")
+    if not all(
+        t.device == a_data.device
+        for t in (a_indices, a_indptr, b_data, b_indices, b_indptr)
+    ):
+        raise ValueError("all CSR inputs must be on the same CUDA device")
+    if a_data.dtype != b_data.dtype:
+        raise TypeError("A and B value dtypes must match for direct hipSPARSE SpGEMM")
+    if a_data.ndim != 1 or a_indices.ndim != 1 or a_indptr.ndim != 1:
+        raise ValueError("A CSR tensors must be 1D")
+    if b_data.ndim != 1 or b_indices.ndim != 1 or b_indptr.ndim != 1:
+        raise ValueError("B CSR tensors must be 1D")
+    if a_data.numel() != a_indices.numel():
+        raise ValueError("A data and indices must have the same length")
+    if b_data.numel() != b_indices.numel():
+        raise ValueError("B data and indices must have the same length")
+
+    m, k_a = int(a_shape[0]), int(a_shape[1])
+    k_b, n = int(b_shape[0]), int(b_shape[1])
+    if k_a != k_b:
+        raise ValueError(f"inner dimensions must match, got {k_a} and {k_b}")
+    if a_indptr.numel() != m + 1:
+        raise ValueError(f"A indptr length must be n_rows+1={m + 1}")
+    if b_indptr.numel() != k_b + 1:
+        raise ValueError(f"B indptr length must be n_rows+1={k_b + 1}")
+
+    a_data = a_data.contiguous()
+    a_indices = a_indices.contiguous()
+    a_indptr = a_indptr.contiguous()
+    b_data = b_data.contiguous()
+    b_indices = b_indices.contiguous()
+    b_indptr = b_indptr.contiguous()
+
+    c_indptr = torch.zeros(m + 1, dtype=a_indptr.dtype, device=a_data.device)
+    # Some hip-python wrappers still validate pointer objects even when nnz == 0.
+    c_indices_placeholder = torch.empty(1, dtype=a_indices.dtype, device=a_data.device)
+    c_data_placeholder = torch.empty(1, dtype=a_data.dtype, device=a_data.device)
+
+    value_type = _hipsparse_value_type(a_data.dtype)
+    alpha = _hipsparse_scalar(a_data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(a_data.dtype, 0.0, 0.0)
+    a_row_index_type = _hipsparse_index_type(
+        a_indptr.dtype, "hipSPARSE CSR SpGEMM A row offsets"
+    )
+    a_col_index_type = _hipsparse_index_type(
+        a_indices.dtype, "hipSPARSE CSR SpGEMM A column indices"
+    )
+    b_row_index_type = _hipsparse_index_type(
+        b_indptr.dtype, "hipSPARSE CSR SpGEMM B row offsets"
+    )
+    b_col_index_type = _hipsparse_index_type(
+        b_indices.dtype, "hipSPARSE CSR SpGEMM B column indices"
+    )
+    c_col_index_type = _hipsparse_index_type(
+        a_indices.dtype, "hipSPARSE CSR SpGEMM C column indices"
+    )
+    op_enum = _hipsparse_lookup(
+        "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+    )
+    index_base = _hipsparse_lookup(
+        "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+    )
+    alg = _hipsparse_spgemm_algorithm()
+
+    handle = None
+    mat_a = None
+    mat_b = None
+    mat_c = None
+    descr = None
+    buffer1 = 0
+    buffer2 = 0
+    buffer1_allocated = False
+    buffer2_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        mat_a = ptr_type()
+        mat_b = ptr_type()
+        mat_c = ptr_type()
+        _hipsparse_create_csr_descriptor(
+            mat_a.createRef(),
+            m,
+            k_a,
+            int(a_data.numel()),
+            a_indptr,
+            a_indices,
+            a_data,
+            a_row_index_type,
+            a_col_index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_csr_descriptor(
+            mat_b.createRef(),
+            k_b,
+            n,
+            int(b_data.numel()),
+            b_indptr,
+            b_indices,
+            b_data,
+            b_row_index_type,
+            b_col_index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_csr_descriptor(
+            mat_c.createRef(),
+            m,
+            n,
+            0,
+            c_indptr,
+            c_indices_placeholder,
+            c_data_placeholder,
+            a_row_index_type,
+            c_col_index_type,
+            index_base,
+            value_type,
+        )
+        descr = _hipsparse_spgemm_create_descr()
+
+        buffer1_size = _hipsparse_spgemm_work_estimation(
+            handle,
+            op_enum,
+            alpha,
+            mat_a,
+            mat_b,
+            beta,
+            mat_c,
+            value_type,
+            alg,
+            descr,
+            0,
+        )
+        if buffer1_size > 0:
+            buffer1 = _hip_check_result(hip.hipMalloc(buffer1_size), "hipMalloc")
+            buffer1_allocated = True
+        _ = _hipsparse_spgemm_work_estimation(
+            handle,
+            op_enum,
+            alpha,
+            mat_a,
+            mat_b,
+            beta,
+            mat_c,
+            value_type,
+            alg,
+            descr,
+            buffer1,
+        )
+
+        buffer2_size = _hipsparse_spgemm_compute(
+            handle,
+            op_enum,
+            alpha,
+            mat_a,
+            mat_b,
+            beta,
+            mat_c,
+            value_type,
+            alg,
+            descr,
+            0,
+        )
+        if buffer2_size > 0:
+            buffer2 = _hip_check_result(hip.hipMalloc(buffer2_size), "hipMalloc")
+            buffer2_allocated = True
+        _ = _hipsparse_spgemm_compute(
+            handle,
+            op_enum,
+            alpha,
+            mat_a,
+            mat_b,
+            beta,
+            mat_c,
+            value_type,
+            alg,
+            descr,
+            buffer2,
+        )
+
+        rows_out = ctypes.c_int64()
+        cols_out = ctypes.c_int64()
+        nnz_out = ctypes.c_int64()
+        _hip_check_result(
+            hipsparse.hipsparseSpMatGetSize(mat_c, rows_out, cols_out, nnz_out),
+            "hipsparseSpMatGetSize",
+        )
+        nnz_c = int(nnz_out.value)
+        c_indices = torch.empty(nnz_c, dtype=a_indices.dtype, device=a_data.device)
+        c_data = torch.empty(nnz_c, dtype=a_data.dtype, device=a_data.device)
+        _hip_check_result(
+            hipsparse.hipsparseCsrSetPointers(
+                mat_c,
+                HipPointer.fromObj(c_indptr.data_ptr()),
+                HipPointer.fromObj(c_indices.data_ptr()),
+                HipPointer.fromObj(c_data.data_ptr()),
+            ),
+            "hipsparseCsrSetPointers",
+        )
+        return {
+            "backend": "hipsparse",
+            "buffer1_size": buffer1_size,
+            "buffer2_size": buffer2_size,
+            "compute_size_out": ctypes.c_size_t(buffer2_size),
+            "handle": handle,
+            "mat_a": mat_a,
+            "mat_b": mat_b,
+            "mat_c": mat_c,
+            "descr": descr,
+            "buffer1": buffer1,
+            "buffer2": buffer2,
+            "buffer1_allocated": buffer1_allocated,
+            "buffer2_allocated": buffer2_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "result": (c_data, c_indices, c_indptr, (m, n)),
+        }
+    finally:
+        if handle is None and descr is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseSpGEMM_destroyDescr(descr),
+                    "hipsparseSpGEMM_destroyDescr",
+                )
+            except Exception:
+                pass
+        for name, mat in (
+            ("hipsparseDestroySpMat(C)", mat_c),
+            ("hipsparseDestroySpMat(B)", mat_b),
+            ("hipsparseDestroySpMat(A)", mat_a),
+        ):
+            if handle is None and mat is not None:
+                try:
+                    _hip_check_result(hipsparse.hipsparseDestroySpMat(mat), name)
+                except Exception:
+                    pass
+        if handle is None and buffer2_allocated:
+            try:
+                _hip_check_result(hip.hipFree(buffer2), "hipFree(buffer2)")
+            except Exception:
+                pass
+        if handle is None and buffer1_allocated:
+            try:
+                _hip_check_result(hip.hipFree(buffer1), "hipFree(buffer1)")
+            except Exception:
+                pass
+ 
+
+def _run_spgemm_csr_ref_hipsparse_prepared(state):
+    _hip_check_result(
+        hipsparse.hipsparseSpGEMM_compute(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["mat_a"],
+            state["mat_b"],
+            state["beta"],
+            state["mat_c"],
+            state["value_type"],
+            state["alg"],
+            state["descr"],
+            state["compute_size_out"],
+            state["buffer2"],
+        ),
+        "hipsparseSpGEMM_compute",
+    )
+    _hip_check_result(
+        hipsparse.hipsparseSpGEMM_copy(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["mat_a"],
+            state["mat_b"],
+            state["beta"],
+            state["mat_c"],
+            state["value_type"],
+            state["alg"],
+            state["descr"],
+        ),
+        "hipsparseSpGEMM_copy",
+    )
+    return state["result"]
+
+
+def _destroy_spgemm_csr_ref_hipsparse_prepared(state):
+    descr = state.get("descr")
+    mat_c = state.get("mat_c")
+    mat_b = state.get("mat_b")
+    mat_a = state.get("mat_a")
+    buffer2_allocated = bool(state.get("buffer2_allocated"))
+    buffer1_allocated = bool(state.get("buffer1_allocated"))
+    buffer2 = state.get("buffer2", 0)
+    buffer1 = state.get("buffer1", 0)
+    handle = state.get("handle")
+    if descr is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseSpGEMM_destroyDescr(descr),
+                "hipsparseSpGEMM_destroyDescr",
+            )
+        except Exception:
+            pass
+    for name, mat in (
+        ("hipsparseDestroySpMat(C)", mat_c),
+        ("hipsparseDestroySpMat(B)", mat_b),
+        ("hipsparseDestroySpMat(A)", mat_a),
+    ):
+        if mat is not None:
+            try:
+                _hip_check_result(hipsparse.hipsparseDestroySpMat(mat), name)
+            except Exception:
+                pass
+    if buffer2_allocated:
+        try:
+            _hip_check_result(hip.hipFree(buffer2), "hipFree(buffer2)")
+        except Exception:
+            pass
+    if buffer1_allocated:
+        try:
+            _hip_check_result(hip.hipFree(buffer1), "hipFree(buffer1)")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spgemm_csr_ref_hipsparse(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+    return_metadata=False,
+):
+    state = _prepare_spgemm_csr_ref_hipsparse(
+        a_data,
+        a_indices,
+        a_indptr,
+        a_shape,
+        b_data,
+        b_indices,
+        b_indptr,
+        b_shape,
+    )
+    try:
+        result = _run_spgemm_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer1_size": int(state.get("buffer1_size", 0)),
+            "buffer2_size": int(state.get("buffer2_size", 0)),
+        }
+        if return_metadata:
+            return result, metadata
+        return result
+    finally:
+        _destroy_spgemm_csr_ref_hipsparse_prepared(state)
+
+
+def _spgemm_csr_sparse_ref_backend(
+    value_dtype=None,
+    a_indices_dtype=None,
+    a_indptr_dtype=None,
+    b_indices_dtype=None,
+    b_indptr_dtype=None,
+):
+    if _is_rocm_runtime():
+        reason = _hipsparse_spgemm_csr_skip_reason(
+            value_dtype,
+            a_indices_dtype,
+            a_indptr_dtype,
+            b_indices_dtype,
+            b_indptr_dtype,
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    return "cupy_cusparse", None
+
+
+def _benchmark_spgemm_csr_sparse_ref(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+    warmup,
+    iters,
+    value_dtype,
+):
+    backend, reason = _spgemm_csr_sparse_ref_backend(
+        a_data.dtype,
+        a_indices.dtype,
+        a_indptr.dtype,
+        b_indices.dtype,
+        b_indptr.dtype,
+    )
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spgemm_csr_ref_hipsparse(
+                a_data,
+                a_indices,
+                a_indptr,
+                a_shape,
+                b_data,
+                b_indices,
+                b_indptr,
+                b_shape,
+            ),
+            _run_spgemm_csr_ref_hipsparse_prepared,
+            _destroy_spgemm_csr_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    a_cp = cpx_sparse.csr_matrix(
+        (
+            _cupy_from_torch(a_data),
+            _cupy_from_torch(a_indices.to(torch.int64)),
+            _cupy_from_torch(a_indptr.to(torch.int64)),
+        ),
+        shape=a_shape,
+    )
+    b_cp = cpx_sparse.csr_matrix(
+        (
+            _cupy_from_torch(b_data),
+            _cupy_from_torch(b_indices.to(torch.int64)),
+            _cupy_from_torch(b_indptr.to(torch.int64)),
+        ),
+        shape=b_shape,
+    )
+    c_cp, ms = _benchmark_cuda_op(lambda: a_cp @ b_cp, warmup=warmup, iters=iters)
+    c_coo = c_cp.tocoo()
+    rows = _torch_from_cupy(c_coo.row).to(torch.int64)
+    cols = _torch_from_cupy(c_coo.col).to(torch.int64)
+    vals = _torch_from_cupy(c_coo.data).to(value_dtype)
+    c_t = torch.sparse_coo_tensor(
+        torch.stack([rows, cols]),
+        vals,
+        (int(a_shape[0]), int(b_shape[1])),
+        device=a_data.device,
+    ).coalesce()
+    result["values"] = _torch_sparse_to_csr(c_t)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
+
+
 def benchmark_spgemm_case(
     n_rows=1024,
     n_inner=1024,
@@ -1365,9 +2051,36 @@ def benchmark_spgemm_case(
     cusparse_ms = None
     cusparse_reason = None
     cusparse_match = None
-    if run_cusparse:
+    sparse_ref_backend, sparse_ref_reason = _spgemm_csr_sparse_ref_backend(
+        value_dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
+    )
+    if run_cusparse and sparse_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE SpGEMM stands in for the cuSPARSE baseline.
+        try:
+            c_ref, cusparse_ms = _benchmark_prepared_cuda_op(
+                lambda: _prepare_spgemm_csr_ref_hipsparse(
+                    a_data,
+                    a_indices,
+                    a_indptr,
+                    (n_rows, n_inner),
+                    b_data,
+                    b_indices,
+                    b_indptr,
+                    (n_inner, n_cols),
+                ),
+                _run_spgemm_csr_ref_hipsparse_prepared,
+                _destroy_spgemm_csr_ref_hipsparse_prepared,
+                warmup=warmup,
+                iters=iters,
+            )
+            cusparse_match = _spgemm_pairwise_summary(
+                triton_result, c_ref, value_dtype
+            )["match"]
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif run_cusparse:
         if cp is None or cpx_sparse is None:
-            cusparse_reason = "CuPy/cuSPARSE is not available"
+            cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"
         else:
             try:
                 a_cp = cpx_sparse.csr_matrix(

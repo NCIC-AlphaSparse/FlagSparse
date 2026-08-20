@@ -38,6 +38,7 @@ SCRIPTS = [
     "tests/test_spmv_bsr.py",
     "tests/test_spmv_bsr_scipy.py",
     "tests/test_spmm.py",
+    "tests/test_spmm_csc.py",
     "tests/test_spmm_bsr.py",
     "tests/test_spgemm.py",
     "tests/test_spsv.py",

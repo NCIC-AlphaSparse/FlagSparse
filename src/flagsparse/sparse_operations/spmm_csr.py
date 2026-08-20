@@ -14,11 +14,20 @@
 
 """CSR SpMM kernels, helpers, and benchmark entry points."""
 
+import ctypes
 import math
 
+from . import _common as _common_mod
 from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
+
+HipPointer = _common_mod.HipPointer
+
+
+def _hipsparse_spmm_alg_default():
+    return _hipsparse_spmm_algorithm("csr")
+
 
 SUPPORTED_SPMM_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 
@@ -534,17 +543,63 @@ def _normalize_spmm_base_device_props(device):
         getattr(props, "max_threads_per_multi_processor", 2048) or 2048
     )
     return {
+        "is_hip": getattr(torch.version, "hip", None) is not None,
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
     }
 
 
+def _spmm_is_hip_device(device_props):
+    return bool(device_props and device_props.get("is_hip"))
+
+
+def _spmm_thread_cap(device_props):
+    cap = int(device_props.get("max_threads_per_block", 1024) or 1024)
+    return min(cap, 512) if _spmm_is_hip_device(device_props) else cap
+
+
+def _spmm_hip_base_launch_overrides(
+    n_dense_cols, max_row_nnz, block_n, block_nnz, num_warps, num_stages
+):
+    """DCU/ROCm launch shape for the base CSR SpMM path.
+
+    Smaller tiles and fewer warps than the CUDA defaults; staged pipelining is
+    disabled because it does not pay off on the HIP backend.
+    """
+    n_dense_cols = int(n_dense_cols)
+    max_row_nnz = int(max_row_nnz)
+    if block_n is None:
+        if n_dense_cols <= 16:
+            block_n = 16
+        elif n_dense_cols <= 64:
+            block_n = 32
+        else:
+            block_n = 64
+    else:
+        block_n = min(int(block_n), 64)
+    if block_nnz is None:
+        block_nnz = 64 if max_row_nnz < 512 else 128
+    else:
+        block_nnz = min(int(block_nnz), 512)
+    if num_warps is None:
+        if n_dense_cols <= 16:
+            num_warps = 1
+        elif n_dense_cols <= 64:
+            num_warps = 2
+        else:
+            num_warps = 4
+    if num_stages is None:
+        num_stages = 1
+    return block_n, block_nnz, num_warps, num_stages
+
+
 def _clip_spmm_base_num_warps(desired, device_props):
     warp_size = int(device_props["warp_size"])
-    max_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_by_block = max(1, _spmm_thread_cap(device_props) // warp_size)
     max_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
-    max_supported = min(16, max_by_block, max_by_mp)
+    max_backend = 8 if _spmm_is_hip_device(device_props) else 16
+    max_supported = min(max_backend, max_by_block, max_by_mp)
     supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
     if not supported:
         return 1
@@ -562,8 +617,21 @@ def _resolve_spmm_base_triton_launch(
     block_n=None,
     block_nnz=None,
     max_segments=None,
+    num_warps=None,
+    num_stages=None,
     device_props=None,
 ):
+    # DCU/ROCm uses a distinct launch shape for the base path; CUDA keeps the
+    # heuristics below unchanged.
+    if device_props is not None and _spmm_is_hip_device(device_props):
+        block_n, block_nnz, num_warps, num_stages = _spmm_hip_base_launch_overrides(
+            n_dense_cols,
+            max_row_nnz,
+            block_n,
+            block_nnz,
+            num_warps,
+            num_stages,
+        )
     launch = _resolve_spmm_alg1_launch_config(
         n_dense_cols,
         max_row_nnz,
@@ -571,6 +639,12 @@ def _resolve_spmm_base_triton_launch(
         block_nnz=block_nnz,
         max_segments=max_segments,
     )
+    if device_props is not None and _spmm_is_hip_device(device_props):
+        return {
+            **launch,
+            "num_warps": int(num_warps),
+            "num_stages": int(num_stages),
+        }
     if device_props is None:
         return {
             **launch,
@@ -1388,6 +1462,9 @@ def _spmm_csr_alg1_run_bucket(plan, bucket, B, C_out, block_n, device_props):
         bucket.get("block_n_cap", block_n),
     )
     block_nnz = int(bucket["block_nnz"])
+    block_n, block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, block_nnz, device_props
+    )
     launch = _resolve_spmm_opt_launch(
         kind,
         block_n,
@@ -1446,6 +1523,9 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     if plan.long_part_rows.numel() == 0:
         return
     block_n = _select_spmm_opt_block_n_for_bucket(int(B.shape[1]), block_n)
+    block_n, split_block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, _SPMM_OPT_SPLIT_BLOCK_NNZ, device_props, split=True
+    )
     workspace = torch.empty(
         (plan.long_part_rows.numel(), B.shape[1]),
         dtype=B.dtype,
@@ -1464,7 +1544,7 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     split_launch = _resolve_spmm_opt_launch(
         "split_part",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -1472,7 +1552,7 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
     reduce_launch = _resolve_spmm_opt_launch(
         "split_reduce",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -1755,6 +1835,7 @@ def _normalize_spmm_csr_alg2_device_props(device):
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
         "device_name": str(getattr(props, "name", "cuda")),
+        "is_hip": getattr(torch.version, "hip", None) is not None,
         "warp_size": max(1, warp_size),
         "sm_count": max(0, sm_count),
         "max_threads_per_mp": max(32, max_threads_per_mp),
@@ -1813,9 +1894,11 @@ def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
     if max_threads_per_mp < 1536 and desired > 8:
         desired = 8
 
+    max_threads_per_block = _spmm_thread_cap(device_props)
     max_warps_by_block = max(1, max_threads_per_block // warp_size)
     max_warps_by_mp = max(1, max_threads_per_mp // warp_size)
-    max_supported = min(16, max_warps_by_block, max_warps_by_mp)
+    max_backend = 8 if _spmm_is_hip_device(device_props) else 16
+    max_supported = min(max_backend, max_warps_by_block, max_warps_by_mp)
     supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
     if not supported:
         return 1
@@ -1827,6 +1910,8 @@ def _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype):
 
 
 def _select_spmm_csr_alg2_num_stages(bucket, block_n, num_warps, device_props, dtype):
+    if _spmm_is_hip_device(device_props):
+        return 1
     kind = bucket["kind"]
     segments = int(bucket.get("segments", 1))
     shared_memory_per_block = int(device_props["shared_memory_per_block"])
@@ -1853,6 +1938,7 @@ def _select_spmm_csr_alg2_num_stages(bucket, block_n, num_warps, device_props, d
 
 def _resolve_spmm_csr_alg2_launch(bucket, n_dense_cols, dtype, device_props):
     block_n = _select_spmm_csr_alg2_block_n(n_dense_cols, bucket["block_n_cap"])
+    block_n = _adapt_spmm_csr_alg2_launch_for_device(block_n, bucket, device_props)
     num_warps = _select_spmm_csr_alg2_num_warps(bucket, block_n, device_props, dtype)
     num_stages = _select_spmm_csr_alg2_num_stages(
         bucket,
@@ -2865,6 +2951,7 @@ def _normalize_spmm_opt_device_props(device):
     )
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
+        "is_hip": getattr(torch.version, "hip", None) is not None,
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
@@ -2874,9 +2961,10 @@ def _normalize_spmm_opt_device_props(device):
 
 def _clip_spmm_opt_num_warps(desired, device_props):
     warp_size = int(device_props["warp_size"])
-    max_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_by_block = max(1, _spmm_thread_cap(device_props) // warp_size)
     max_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
-    max_supported = min(16, max_by_block, max_by_mp)
+    max_backend = 8 if _spmm_is_hip_device(device_props) else 16
+    max_supported = min(max_backend, max_by_block, max_by_mp)
     supported = [value for value in (1, 2, 4, 8, 16) if value <= max_supported]
     if not supported:
         return 1
@@ -2914,7 +3002,9 @@ def _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device
         desired_warps = min(desired_warps, 8)
     num_warps = _clip_spmm_opt_num_warps(desired_warps, device_props)
 
-    if dtype == torch.float64:
+    if _spmm_is_hip_device(device_props):
+        num_stages = 1
+    elif dtype == torch.float64:
         num_stages = 1 if kind.startswith("split") or block_n >= 64 else 2
     elif kind == "batched":
         num_stages = 2
@@ -2923,6 +3013,26 @@ def _resolve_spmm_opt_launch(kind, block_n, block_nnz, batch_rows, dtype, device
     else:
         num_stages = 1 if num_warps >= 8 else 2
     return {"num_warps": int(num_warps), "num_stages": int(num_stages)}
+
+
+def _adapt_spmm_csr_alg2_launch_for_device(block_n, bucket, device_props):
+    """Clamp the ALG2 tile width on DCU/ROCm; a no-op on CUDA."""
+    block_n = int(block_n)
+    if not _spmm_is_hip_device(device_props):
+        return block_n
+    return max(8, min(block_n, 64))
+
+
+def _adapt_spmm_opt_tile_for_device(block_n, block_nnz, device_props, *, split=False):
+    """Clamp the opt-path tile on DCU/ROCm; a no-op on CUDA."""
+    block_n = int(block_n)
+    block_nnz = int(block_nnz)
+    if not _spmm_is_hip_device(device_props):
+        return block_n, block_nnz
+    block_n = max(8, min(block_n, 64))
+    block_nnz_cap = 256 if split else 128
+    block_nnz = max(16, min(block_nnz, block_nnz_cap))
+    return block_n, block_nnz
 
 
 def _select_spmm_opt_block_n_for_bucket(n_dense_cols, block_n_cap):
@@ -3814,6 +3924,9 @@ def _run_spmm_opt_bucket(prepared, bucket, B, C_out, block_n, device_props):
         int(B.shape[1]), bucket.get("block_n_cap", block_n)
     )
     block_nnz = int(bucket["block_nnz"])
+    block_n, block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, block_nnz, device_props
+    )
     launch = _resolve_spmm_opt_launch(
         kind,
         block_n,
@@ -3872,6 +3985,9 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     if prepared.long_part_rows.numel() == 0:
         return False
     block_n = _select_spmm_opt_block_n_for_bucket(int(B.shape[1]), block_n)
+    block_n, split_block_nnz = _adapt_spmm_opt_tile_for_device(
+        block_n, _SPMM_OPT_SPLIT_BLOCK_NNZ, device_props, split=True
+    )
     workspace = torch.empty(
         (prepared.long_part_rows.numel(), B.shape[1]),
         dtype=B.dtype,
@@ -3890,7 +4006,7 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     split_launch = _resolve_spmm_opt_launch(
         "split_part",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -3898,7 +4014,7 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
     reduce_launch = _resolve_spmm_opt_launch(
         "split_reduce",
         block_n,
-        _SPMM_OPT_SPLIT_BLOCK_NNZ,
+        split_block_nnz,
         1,
         B.dtype,
         device_props,
@@ -4334,6 +4450,468 @@ def _spmm_opt_reference_error(candidate, reference, value_dtype):
     return float(torch.max(diff / denom).item())
 
 
+def _hipsparse_spmm_csr_skip_reason(value_dtype, indices_dtype, indptr_dtype):
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseCreateDnMat",
+        "hipsparseDestroyDnMat",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMM_bufferSize",
+        "hipsparseSpMM_preprocess",
+        "hipsparseSpMM",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE CSR SpMM direct API is unavailable: missing {symbol}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(
+            indptr_dtype, "hipSPARSE CSR SpMM row offsets"
+        )
+        _ = _hipsparse_index_type(
+            indices_dtype, "hipSPARSE CSR SpMM column indices"
+        )
+        _ = _hipsparse_spmm_order("row", "hipSPARSE CSR SpMM")
+        _ = _hipsparse_spmm_alg_default()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
+    if _is_rocm_runtime():
+        reason = _hipsparse_spmm_csr_skip_reason(
+            value_dtype,
+            index_dtype,
+            indptr_dtype,
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    skip_reason = _cusparse_baseline_skip_reason(value_dtype)
+    if skip_reason is not None:
+        return None, skip_reason
+    return "cupy_cusparse", None
+
+
+def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
+    skip_reason = _hipsparse_spmm_csr_skip_reason(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
+        raise TypeError("data, indices, indptr, B must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must all be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must be on the same CUDA device")
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
+        raise ValueError("data, indices, indptr must all be 1D tensors")
+    if B.ndim != 2:
+        raise ValueError("hipSPARSE CSR SpMM reference expects a 2D dense RHS")
+    if indices.numel() != data.numel():
+        raise ValueError("data and indices must have the same length")
+
+    n_rows = int(shape[0])
+    n_cols = int(shape[1])
+    if indptr.numel() != n_rows + 1:
+        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    if int(B.shape[0]) != n_cols:
+        raise ValueError(f"B.shape[0] must equal n_cols={n_cols}")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype for direct hipSPARSE SpMM")
+    if not B.is_contiguous():
+        raise ValueError("hipSPARSE CSR SpMM direct reference expects contiguous row-major B")
+
+    n_dense_cols = int(B.shape[1])
+    if n_dense_cols == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "csr",
+            "C": torch.empty((n_rows, 0), dtype=data.dtype, device=data.device),
+            "empty": True,
+        }
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    B = B.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    row_index_type = _hipsparse_index_type(
+        indptr.dtype, "hipSPARSE CSR SpMM row offsets"
+    )
+    col_index_type = _hipsparse_index_type(
+        indices.dtype, "hipSPARSE CSR SpMM column indices"
+    )
+    op_enum = _hipsparse_lookup(
+        "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+    )
+    order = _hipsparse_spmm_order("row", "hipSPARSE CSR SpMM")
+    alg = _hipsparse_spmm_alg_default()
+
+    C = out
+    if C is None:
+        C = torch.empty((n_rows, n_dense_cols), dtype=data.dtype, device=data.device)
+    else:
+        if not torch.is_tensor(C):
+            raise TypeError("out must be a torch.Tensor")
+        if not C.is_cuda or C.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if C.dtype != data.dtype or C.shape != (n_rows, n_dense_cols):
+            raise ValueError("out must match the result shape and dtype")
+        if not C.is_contiguous():
+            raise ValueError("out must be contiguous row-major")
+
+    handle = None
+    spmat = None
+    matb = None
+    matc = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        spmat = ptr_type()
+        matb = ptr_type()
+        matc = ptr_type()
+        spmat_ref = spmat.createRef()
+        matb_ref = matb.createRef()
+        matc_ref = matc.createRef()
+
+        row_ptr = HipPointer.fromObj(indptr.data_ptr())
+        col_ptr = HipPointer.fromObj(indices.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        b_ptr = HipPointer.fromObj(B.data_ptr())
+        c_ptr = HipPointer.fromObj(C.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+
+        _hip_check_result(
+            hipsparse.hipsparseCreateCsr(
+                spmat_ref,
+                n_rows,
+                n_cols,
+                int(data.numel()),
+                row_ptr,
+                col_ptr,
+                values_ptr,
+                row_index_type,
+                col_index_type,
+                index_base,
+                value_type,
+            ),
+            "hipsparseCreateCsr",
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matb_ref,
+            n_cols,
+            n_dense_cols,
+            int(B.stride(0)),
+            b_ptr,
+            value_type,
+            order,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matc_ref,
+            n_rows,
+            n_dense_cols,
+            int(C.stride(0)),
+            c_ptr,
+            value_type,
+            order,
+        )
+
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_bufferSize(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMM_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_preprocess(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSpMM_preprocess",
+        )
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "csr",
+            "handle": handle,
+            "spmat": spmat,
+            "matb": matb,
+            "matc": matc,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "C": C,
+            "empty": False,
+        }
+    finally:
+        if handle is None and matc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+                )
+            except Exception:
+                pass
+        if handle is None and matb is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+                )
+            except Exception:
+                pass
+        if handle is None and spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+                )
+            except Exception:
+                pass
+        if handle is None and workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+ 
+
+def _run_spmm_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["C"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMM(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["matb"],
+            state["beta"],
+            state["matc"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMM",
+    )
+    return state["C"]
+
+
+def _destroy_spmm_csr_ref_hipsparse_prepared(state):
+    matc = state.get("matc")
+    matb = state.get("matb")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if matc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+            )
+        except Exception:
+            pass
+    if matb is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_metadata=False):
+    state = _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=out)
+    try:
+        C = _run_spmm_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "csr",
+        }
+        if return_metadata:
+            return C, metadata
+        return C
+    finally:
+        _destroy_spmm_csr_ref_hipsparse_prepared(state)
+
+
+def _spmm_csr_reference(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    out_dtype=None,
+    reference_compute_dtype=True,
+    return_metadata=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    compute_dtype = (
+        _sparse_reference_compute_dtype(out_dtype)
+        if reference_compute_dtype
+        else out_dtype
+    )
+    device = data.device
+    data_ref = data.to(compute_dtype)
+    B_ref = B.to(compute_dtype)
+    indptr64 = indptr.to(torch.int64)
+    indices64 = indices.to(torch.int64)
+    fallback_reason = None
+    pytorch_format = "CSR"
+    try:
+        sparse_ref = torch.sparse_csr_tensor(
+            indptr64,
+            indices64,
+            data_ref,
+            size=shape,
+            device=device,
+        )
+        expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+    except Exception as exc:
+        pytorch_format = "COO"
+        fallback_reason = f"CSR fallback: {exc}"
+        row_indices = torch.repeat_interleave(
+            torch.arange(int(shape[0]), device=device, dtype=torch.int64),
+            indptr64[1:] - indptr64[:-1],
+        )
+        sparse_ref = torch.sparse_coo_tensor(
+            torch.stack([row_indices, indices64]),
+            data_ref,
+            shape,
+            device=device,
+        ).coalesce()
+        expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+    expected = _cast_sparse_reference_output(expected, out_dtype)
+    metadata = {
+        "backend": "torch",
+        "fallback_reason": fallback_reason,
+        "pytorch_sparse_format": pytorch_format,
+    }
+    if return_metadata:
+        return expected, metadata
+    return expected
+
+
+def _benchmark_spmm_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    warmup,
+    iters,
+):
+    backend, reason = _spmm_csr_sparse_ref_backend(
+        data.dtype, indices.dtype, indptr.dtype
+    )
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape),
+            _run_spmm_csr_ref_hipsparse_prepared,
+            _destroy_spmm_csr_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    indices_cp = _cupy_from_torch(indices.to(torch.int64))
+    indptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    B_cp = _cupy_from_torch(B)
+    A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: A_csr @ B_cp,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
+
+
 def benchmark_spmm_opt_case(
     n_rows=4096,
     n_cols=4096,
@@ -4407,16 +4985,12 @@ def benchmark_spmm_opt_case(
         pt_ms = None
 
     cu_ms = None
-    if run_cusparse and cp is not None and cpx_sparse is not None:
+    if run_cusparse:
+        # hipSPARSE on DCU/ROCm, cuSPARSE (via CuPy) on CUDA.
         try:
-            data_cp = _cupy_from_torch(data)
-            indices_cp = _cupy_from_torch(indices.to(torch.int64))
-            indptr_cp = _cupy_from_torch(indptr)
-            B_cp = _cupy_from_torch(B)
-            A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-            _, cu_ms = _benchmark_cuda_op(
-                lambda: A_csr @ B_cp, warmup=warmup, iters=iters
-            )
+            cu_ms = _benchmark_spmm_csr_sparse_ref(
+                data, indices, indptr, B, shape, warmup=warmup, iters=iters
+            )["ms"]
         except Exception:
             cu_ms = None
 
@@ -4688,9 +5262,35 @@ def benchmark_spmm_case(
         torch.complex64,
         torch.complex128,
     )
-    if run_cusparse:
+    sparse_ref_backend, sparse_ref_reason = _spmm_csr_sparse_ref_backend(
+        value_dtype, indices.dtype, indptr.dtype
+    )
+    if run_cusparse and sparse_ref_backend == "hipsparse":
+        # DCU/ROCm: the vendor reference is hipSPARSE. Its SpMM entry point is
+        # non-transpose only, so trans/conj stay unbenchmarked rather than being
+        # compared against a differently-shaped operation.
+        if op_code != SPMM_OP_NON:
+            cusparse_reason = (
+                "hipSPARSE CSR SpMM reference covers op=non only; trans/conj skipped"
+            )
+        else:
+            try:
+                cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
+                    lambda: _prepare_spmm_csr_ref_hipsparse(
+                        data, indices, indptr, B, shape
+                    ),
+                    _run_spmm_csr_ref_hipsparse_prepared,
+                    _destroy_spmm_csr_ref_hipsparse_prepared,
+                    warmup=warmup,
+                    iters=iters,
+                )
+                cusparse_metrics = _spmm_validation_metrics(cusparse_values, expected)
+                cusparse_match = cusparse_metrics["strict_allclose_match"]
+            except Exception as exc:
+                cusparse_reason = str(exc)
+    elif run_cusparse:
         if cp is None or cpx_sparse is None:
-            cusparse_reason = "CuPy/cuSPARSE is not available"
+            cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"
         elif value_dtype not in _cupy_supported_dtypes:
             cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
         else:

@@ -16,6 +16,7 @@
 
 from ._common import *
 
+import os
 import time
 import triton
 import triton.language as tl
@@ -173,6 +174,34 @@ _SPMV_OPT_BUCKET_CONFIGS_FP64 = (
     {"max_row_nnz": 8192, "block_size": 256, "num_warps": 8, "num_stages": 2},
     {"max_row_nnz": None, "block_size": 512, "num_warps": 16, "num_stages": 1},
 )
+# DCU/ROCm bucket tiers: smaller tiles and a num_warps ceiling of 8.
+_SPMV_OPT_BUCKET_CONFIGS_HIP = (
+    {
+        "max_row_nnz": 64,
+        "block_size": 32,
+        "num_warps": 1,
+        "num_stages": 2,
+        "batch_rows": 16,
+    },
+    {"max_row_nnz": 512, "block_size": 256, "num_warps": 8, "num_stages": 2},
+    {"max_row_nnz": 4096, "block_size": 512, "num_warps": 8, "num_stages": 1},
+    {"max_row_nnz": None, "block_size": 512, "num_warps": 8, "num_stages": 1},
+)
+_SPMV_OPT_BUCKET_CONFIGS_HIP_FP64 = (
+    {
+        "max_row_nnz": 64,
+        "block_size": 32,
+        "num_warps": 1,
+        "num_stages": 2,
+        "batch_rows": 4,
+    },
+    {"max_row_nnz": 256, "block_size": 64, "num_warps": 2, "num_stages": 2},
+    {"max_row_nnz": 2048, "block_size": 256, "num_warps": 4, "num_stages": 2},
+    {"max_row_nnz": 8192, "block_size": 512, "num_warps": 8, "num_stages": 1},
+    {"max_row_nnz": None, "block_size": 512, "num_warps": 8, "num_stages": 1},
+)
+
+
 _SPMV_OPT_ACC_MODES = ("fast", "mixed", "accurate")
 
 
@@ -180,6 +209,128 @@ _SPMV_OPT_ACC_MODES = ("fast", "mixed", "accurate")
 def _spmv_seg_add(row_a, val_a, row_b, val_b):
     """Associative combine for a segmented (per-row) inclusive sum."""
     return row_b, val_b + tl.where(row_a == row_b, val_a, val_b - val_b)
+
+
+def _normalize_spmv_opt_device_props(device):
+    props = torch.cuda.get_device_properties(device)
+    device_name = str(getattr(props, "name", "cuda"))
+    name_lower = device_name.lower()
+    is_hip = bool(getattr(torch.version, "hip", None)) or any(
+        token in name_lower for token in ("dcu", "hygon", "rocm", "amd")
+    )
+    warp_size = int(getattr(props, "warp_size", 64 if is_hip else 32) or 32)
+    max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
+    max_threads_per_mp = int(
+        getattr(props, "max_threads_per_multi_processor", max_threads_per_block)
+        or max_threads_per_block
+    )
+    return {
+        "backend": "hip" if is_hip else "cuda",
+        "device_name": device_name,
+        "warp_size": max(1, warp_size),
+        "max_threads_per_block": max(32, max_threads_per_block),
+        "max_threads_per_mp": max(32, max_threads_per_mp),
+    }
+
+
+def _spmv_opt_bucket_configs(dtype, device_props):
+    if device_props["backend"] == "hip":
+        return (
+            _SPMV_OPT_BUCKET_CONFIGS_HIP_FP64
+            if dtype == torch.float64
+            else _SPMV_OPT_BUCKET_CONFIGS_HIP
+        )
+    return (
+        _SPMV_OPT_BUCKET_CONFIGS_FP64
+        if dtype == torch.float64
+        else _SPMV_OPT_BUCKET_CONFIGS
+    )
+
+
+def _clip_spmv_opt_launch_spec(spec, device_props):
+    spec = dict(spec)
+    warp_size = max(1, int(device_props["warp_size"]))
+    max_warps_by_block = max(1, int(device_props["max_threads_per_block"]) // warp_size)
+    max_warps_by_mp = max(1, int(device_props["max_threads_per_mp"]) // warp_size)
+    max_supported = min(max_warps_by_block, max_warps_by_mp)
+    if device_props["backend"] == "hip":
+        max_supported = min(max_supported, 8)
+        spec["block_size"] = min(int(spec["block_size"]), 512)
+    spec["num_warps"] = max(1, min(int(spec["num_warps"]), max_supported))
+    spec["num_stages"] = max(1, int(spec["num_stages"]))
+    return spec
+
+
+# ── DCU/ROCm row-parallel SpMV ──────────────────────────────────────
+# One program per row with an in-row segment loop. This is the DCU branch's
+# kernel; CUDA keeps the nnz-partitioned segbin path below. Selected by
+# _spmv_csr_default_backend().
+
+@triton.jit
+def _spmv_csr_real_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    x_ptr,
+    y_ptr,
+    n_rows,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    acc = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
+    for seg in range(MAX_SEGMENTS):
+        idx = start + seg * BLOCK_NNZ
+        offsets = idx + tl.arange(0, BLOCK_NNZ)
+        mask = offsets < end
+        a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+        col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+        x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
+        part = tl.where(mask, a * x_vals, 0.0)
+        acc = acc + tl.sum(part)
+    tl.store(y_ptr + row, acc)
+
+
+@triton.jit
+def _spmv_csr_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    n_rows,
+    BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    acc_re = tl.load(data_ri_ptr + start * 2, mask=start < end, other=0.0) * 0
+    acc_im = tl.load(data_ri_ptr + start * 2 + 1, mask=start < end, other=0.0) * 0
+    for seg in range(MAX_SEGMENTS):
+        idx = start + seg * BLOCK_NNZ
+        offsets = idx + tl.arange(0, BLOCK_NNZ)
+        mask = offsets < end
+        a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+        a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+        col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+        x_re = tl.load(x_ri_ptr + col * 2, mask=mask, other=0.0)
+        x_im = tl.load(x_ri_ptr + col * 2 + 1, mask=mask, other=0.0)
+        prod_re = tl.where(mask, a_re * x_re - a_im * x_im, 0.0)
+        prod_im = tl.where(mask, a_re * x_im + a_im * x_re, 0.0)
+        acc_re = acc_re + tl.sum(prod_re)
+        acc_im = acc_im + tl.sum(prod_im)
+    tl.store(y_ri_ptr + row * 2, acc_re)
+    tl.store(y_ri_ptr + row * 2 + 1, acc_im)
+
+
+# ── Optimised SpMV (CSR-Vector, perf-oriented, no CuPy) ─────────────
 
 
 @triton.jit
@@ -419,11 +570,22 @@ def _build_spmv_opt_buckets(
     row_index_dtype,
     max_segments=None,
     fp64=False,
+    device_props=None,
 ):
     buckets = []
     lower_bound = 0
-    configs = _SPMV_OPT_BUCKET_CONFIGS_FP64 if fp64 else _SPMV_OPT_BUCKET_CONFIGS
+    # Bucket tiers and launch shape follow the runtime: HIP gets smaller tiles and
+    # a num_warps ceiling of 8. Falls back to the CUDA tiers when device_props is
+    # not supplied.
+    if device_props is None:
+        configs = _SPMV_OPT_BUCKET_CONFIGS_FP64 if fp64 else _SPMV_OPT_BUCKET_CONFIGS
+    else:
+        configs = _spmv_opt_bucket_configs(
+            torch.float64 if fp64 else torch.float32, device_props
+        )
     for spec in configs:
+        if device_props is not None:
+            spec = _clip_spmv_opt_launch_spec(spec, device_props)
         upper_bound = spec["max_row_nnz"]
         if upper_bound is None:
             mask = row_lengths > lower_bound
@@ -472,6 +634,7 @@ def _build_spmv_opt_runtime_buckets(prepared):
         row_index_dtype=row_index_dtype,
         max_segments=prepared.opt_max_segments,
         fp64=prepared.data.dtype == torch.float64,
+        device_props=_normalize_spmv_opt_device_props(prepared.data.device),
     )
 
 
@@ -744,12 +907,71 @@ def _get_spmv_baseline_data(prepared):
     return compute_dtype, prepared._baseline_data
 
 
+def _spmv_csr_default_backend():
+    """Pick the default (non-opt) CSR SpMV kernel family for this runtime.
+
+    DCU/ROCm uses the row-parallel kernel the DCU branch tuned for gfx936; CUDA
+    keeps the nnz-partitioned segbin path. Override with
+    FLAGSPARSE_SPMV_CSR_KERNEL=segbin|rowpar for A/B measurement.
+    """
+    override = os.environ.get("FLAGSPARSE_SPMV_CSR_KERNEL", "").strip().lower()
+    if override in ("segbin", "rowpar"):
+        return override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_SPMV_CSR_KERNEL must be 'segbin' or 'rowpar', "
+            f"got {override!r}"
+        )
+    return "rowpar" if _is_rocm_runtime() else "segbin"
+
+
+def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
+    """DCU/ROCm row-parallel SpMV: one program per row, in-row segment loop."""
+    device = prepared.data.device
+    dtype = prepared.data.dtype
+    y = torch.empty(prepared.n_rows, dtype=dtype, device=device)
+    _, data_in = _get_spmv_baseline_data(prepared)
+    x_in = x if compute_dtype == x.dtype else x.to(compute_dtype)
+    grid = (prepared.n_rows,)
+    if not _is_complex_dtype(compute_dtype):
+        y_out = torch.empty(prepared.n_rows, dtype=compute_dtype, device=device)
+        _spmv_csr_real_kernel[grid](
+            data_in,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            x_in,
+            y_out,
+            n_rows=prepared.n_rows,
+            BLOCK_NNZ=prepared.block_nnz,
+            MAX_SEGMENTS=prepared.max_segments,
+        )
+        y.copy_(y_out if dtype == compute_dtype else y_out.to(dtype))
+        return y
+    data_ri = torch.view_as_real(data_in).reshape(-1)
+    x_ri = torch.view_as_real(x_in).reshape(-1)
+    y_ri = torch.empty(prepared.n_rows * 2, dtype=data_ri.dtype, device=device)
+    _spmv_csr_complex_kernel[grid](
+        data_ri,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        x_ri,
+        y_ri,
+        n_rows=prepared.n_rows,
+        BLOCK_NNZ=prepared.block_nnz,
+        MAX_SEGMENTS=prepared.max_segments,
+    )
+    y.copy_(torch.view_as_complex(y_ri.reshape(prepared.n_rows, 2)))
+    return y
+
+
 def _triton_spmv_csr_impl_prepared(prepared, x):
     device = prepared.data.device
     dtype = prepared.data.dtype
     if prepared.n_rows == 0:
         return torch.empty(0, dtype=dtype, device=device)
     compute_dtype = prepared._baseline_compute_dtype
+    if _spmv_csr_default_backend() == "rowpar":
+        return _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype)
     # Fast path: preprocessing-free, load-balanced segmented nnz-split. Real dtype
     # only; native fp32/fp64 accumulation (fp16/bf16 accumulate in fp32). No
     # per-nonzero row-id or long-row metadata is needed — the row is found by an

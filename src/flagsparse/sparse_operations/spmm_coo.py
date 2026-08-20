@@ -14,8 +14,10 @@
 
 """Native COO SpMM kernels, route helpers, and internal benchmark entry points."""
 
+import ctypes
 from dataclasses import dataclass
 
+from . import _common as _common_mod
 from ._common import *
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
@@ -34,6 +36,8 @@ SPMM_COO_OP_NAMES = {
     SPMM_COO_OP_CONJ_TRANS: "conj",
 }
 _SPMM_COO_OP_NAME_TO_CODE = {name: code for code, name in SPMM_COO_OP_NAMES.items()}
+
+HipPointer = _common_mod.HipPointer
 
 
 def _normalize_spmm_coo_op(op=None, transpose=False):
@@ -288,6 +292,399 @@ def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape, dense_layout="r
         n_dense_cols,
         dense_layout=dense_layout,
     )
+
+
+def _spmm_coo_sparse_ref_backend(value_dtype, index_dtype):
+    if _is_rocm_runtime():
+        reason = _hipsparse_spmm_coo_skip_reason(value_dtype, index_dtype)
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    skip_reason = _cusparse_baseline_skip_reason(value_dtype)
+    if skip_reason is not None:
+        return None, skip_reason
+    return "cupy_cusparse", None
+
+
+def _hipsparse_spmm_coo_skip_reason(value_dtype, index_dtype):
+    if not _is_rocm_runtime():
+        return "hipSPARSE COO SpMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCoo",
+        "hipsparseCreateDnMat",
+        "hipsparseDestroyDnMat",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMM_bufferSize",
+        "hipsparseSpMM_preprocess",
+        "hipsparseSpMM",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE COO SpMM direct API is unavailable: missing {symbol}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(index_dtype, "hipSPARSE COO SpMM indices")
+        _ = _hipsparse_spmm_order("row", "hipSPARSE COO SpMM")
+        _ = _hipsparse_spmm_algorithm("coo")
+        _ = _hipsparse_lookup(
+            "hipsparseOperation_t",
+            ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
+        )
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _prepare_spmm_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    B,
+    shape,
+    out=None,
+):
+    skip_reason = _hipsparse_spmm_coo_skip_reason(data.dtype, row.dtype)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, row, col, B)):
+        raise TypeError("data, row, col, B must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, row, col, B)):
+        raise ValueError("data, row, col, B must all be CUDA tensors")
+    if not all(t.device == data.device for t in (row, col, B)):
+        raise ValueError("data, row, col, B must be on the same CUDA device")
+    if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
+        raise ValueError("data, row, col must all be 1D tensors")
+    if data.numel() != row.numel() or data.numel() != col.numel():
+        raise ValueError("data, row, col must have the same length")
+    if B.ndim != 2:
+        raise ValueError("hipSPARSE COO SpMM reference expects a 2D dense RHS")
+
+    n_rows = int(shape[0])
+    n_cols = int(shape[1])
+    if int(B.shape[0]) != n_cols:
+        raise ValueError(f"B.shape[0] must equal n_cols={n_cols}")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype for direct hipSPARSE COO SpMM")
+    if row.dtype != col.dtype:
+        raise TypeError("row and col must use the same index dtype for direct hipSPARSE COO SpMM")
+    if not B.is_contiguous():
+        raise ValueError("hipSPARSE COO SpMM direct reference expects contiguous row-major B")
+
+    n_dense_cols = int(B.shape[1])
+    if n_dense_cols == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "coo",
+            "C": torch.empty((n_rows, 0), dtype=data.dtype, device=data.device),
+            "empty": True,
+        }
+
+    data = data.contiguous()
+    row = row.contiguous()
+    col = col.contiguous()
+    B = B.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    index_type = _hipsparse_index_type(row.dtype, "hipSPARSE COO SpMM indices")
+    op_enum = _hipsparse_lookup(
+        "hipsparseOperation_t",
+        ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
+    )
+    order = _hipsparse_spmm_order("row", "hipSPARSE COO SpMM")
+    alg = _hipsparse_spmm_algorithm("coo")
+
+    C = out
+    if C is None:
+        C = torch.empty((n_rows, n_dense_cols), dtype=data.dtype, device=data.device)
+    else:
+        if not torch.is_tensor(C):
+            raise TypeError("out must be a torch.Tensor")
+        if not C.is_cuda or C.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if C.dtype != data.dtype or C.shape != (n_rows, n_dense_cols):
+            raise ValueError("out must match the result shape and dtype")
+        if not C.is_contiguous():
+            raise ValueError("out must be contiguous row-major")
+
+    handle = None
+    spmat = None
+    matb = None
+    matc = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        spmat = ptr_type()
+        matb = ptr_type()
+        matc = ptr_type()
+        spmat_ref = spmat.createRef()
+        matb_ref = matb.createRef()
+        matc_ref = matc.createRef()
+
+        row_ptr = HipPointer.fromObj(row.data_ptr())
+        col_ptr = HipPointer.fromObj(col.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        b_ptr = HipPointer.fromObj(B.data_ptr())
+        c_ptr = HipPointer.fromObj(C.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t",
+            ("HIPSPARSE_INDEX_BASE_ZERO",),
+        )
+
+        _hipsparse_create_coo_descriptor(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            int(data.numel()),
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matb_ref,
+            n_cols,
+            n_dense_cols,
+            int(B.stride(0)),
+            b_ptr,
+            value_type,
+            order,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matc_ref,
+            n_rows,
+            n_dense_cols,
+            int(C.stride(0)),
+            c_ptr,
+            value_type,
+            order,
+        )
+
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_bufferSize(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMM_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_preprocess(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSpMM_preprocess",
+        )
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "coo",
+            "handle": handle,
+            "spmat": spmat,
+            "matb": matb,
+            "matc": matc,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "C": C,
+            "empty": False,
+        }
+    finally:
+        if handle is None and matc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+                )
+            except Exception:
+                pass
+        if handle is None and matb is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+                )
+            except Exception:
+                pass
+        if handle is None and spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+                )
+            except Exception:
+                pass
+        if handle is None and workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+ 
+
+def _run_spmm_coo_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["C"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMM(
+            state["handle"],
+            state["op_enum"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["matb"],
+            state["beta"],
+            state["matc"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMM",
+    )
+    return state["C"]
+
+
+def _destroy_spmm_coo_ref_hipsparse_prepared(state):
+    matc = state.get("matc")
+    matb = state.get("matb")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if matc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+            )
+        except Exception:
+            pass
+    if matb is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spmm_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    B,
+    shape,
+    out=None,
+    return_metadata=False,
+):
+    state = _prepare_spmm_coo_ref_hipsparse(data, row, col, B, shape, out=out)
+    try:
+        C = _run_spmm_coo_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "coo",
+        }
+        if return_metadata:
+            return C, metadata
+        return C
+    finally:
+        _destroy_spmm_coo_ref_hipsparse_prepared(state)
+
+
+def _benchmark_spmm_coo_sparse_ref(data, row, col, B, shape, warmup, iters):
+    backend, reason = _spmm_coo_sparse_ref_backend(data.dtype, row.dtype)
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmm_coo_ref_hipsparse(data, row, col, B, shape),
+            _run_spmm_coo_ref_hipsparse_prepared,
+            _destroy_spmm_coo_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    row_cp = _cupy_from_torch(row.to(torch.int64))
+    col_cp = _cupy_from_torch(col.to(torch.int64))
+    B_cp = _cupy_from_torch(B)
+    A_coo = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: A_coo @ B_cp,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
 
 
 def _seg_starts_from_sorted_rows(row_i32, nnz, device):
@@ -2114,9 +2511,32 @@ def benchmark_spmm_coo_case(
         torch.complex64,
         torch.complex128,
     )
-    if run_cusparse:
+    sparse_ref_backend, sparse_ref_reason = _spmm_coo_sparse_ref_backend(
+        value_dtype, cusparse_row.dtype
+    )
+    if run_cusparse and sparse_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE COO SpMM stands in for the cuSPARSE baseline. The
+        # op has already been materialized into cusparse_row/col/data above, so the
+        # non-transpose hipSPARSE entry point covers every op here.
+        try:
+            cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
+                lambda: _prepare_spmm_coo_ref_hipsparse(
+                    cusparse_data, cusparse_row, cusparse_col, native_B, effective_shape
+                ),
+                _run_spmm_coo_ref_hipsparse_prepared,
+                _destroy_spmm_coo_ref_hipsparse_prepared,
+                warmup=warmup,
+                iters=iters,
+            )
+            cusparse_summary = _spmm_coo_pairwise_summary(
+                cusparse_values, expected, value_dtype
+            )
+            cusparse_match = cusparse_summary["match"]
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif run_cusparse:
         if cp is None or cpx_sparse is None:
-            cusparse_reason = "CuPy/cuSPARSE is not available"
+            cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"
         elif value_dtype not in _cupy_supported_dtypes:
             cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
         else:

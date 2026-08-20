@@ -14,7 +14,12 @@
 
 """Sparse triangular solve (SpSV) for CSR, COO, and SELL matrices."""
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
+
+HipPointer = _common_mod.HipPointer
 
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -31,13 +36,9 @@ SUPPORTED_SPSV_VALUE_DTYPES = (
     torch.complex128,
 )
 SUPPORTED_SPSV_INDEX_DTYPES = (torch.int32, torch.int64)
-SUPPORTED_SPSV_SELL_VALUE_DTYPES = (
-    torch.float32,
-    torch.float64,
-    torch.complex64,
-    torch.complex128,
-)
-SUPPORTED_SPSV_SELL_INDEX_DTYPES = (torch.int32, torch.int64)
+# Public support-matrix aliases for the standalone SELL lifecycle API.
+SUPPORTED_SPSV_SELL_VALUE_DTYPES = SUPPORTED_SPSV_VALUE_DTYPES
+SUPPORTED_SPSV_SELL_INDEX_DTYPES = SUPPORTED_SPSV_INDEX_DTYPES
 SPSV_NON_TRANS_SUPPORTED_COMBOS = (
     (torch.float32, torch.int32),
     (torch.float64, torch.int32),
@@ -93,6 +94,20 @@ def _spsv_env_flag(name, default="0"):
     return str(os.environ.get(name, default)).lower() in ("1", "true", "yes", "on")
 
 
+def _spsv_env_warp_size(name, default):
+    value = int(os.environ.get(name, default))
+    if value not in (32, 64):
+        raise ValueError(f"{name} must be 32 or 64, got {value}")
+    return value
+
+
+def _spsv_env_nonnegative_int(name, default):
+    value = int(os.environ.get(name, default))
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return value
+
+
 SPSV_PROMOTE_FP32_TO_FP64 = _spsv_env_flag("FLAGSPARSE_SPSV_PROMOTE_FP32_TO_FP64", "0")
 SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64", "0"
@@ -100,8 +115,295 @@ SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
 SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128", "0"
 )
+# SELL TRANS keeps the input/output dtype unchanged, but can use a wider
+# residual accumulator for high-fan-in columns.  This is deliberately a
+# separate switch from the full compute-dtype promotion flags above.
+SPSV_SELL_TRANS_FP64_RESIDUAL = _spsv_env_flag(
+    "FLAGSPARSE_SPSV_SELL_TRANS_FP64_RESIDUAL", "0"
+)
+# DCU/ROCm tuning switches. Defaults reflect what the DCU branch measured on
+# gfx936: the advanced AUTO routes are off (ALG1 is the predictable default),
+# and ALG3/ALG4 launch at the 64-wide wavefront instead of a 32-wide warp.
+SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
+    "FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "0"
+)
+SPSV_ROCM_ALG3_WARP_SIZE = _spsv_env_warp_size(
+    "FLAGSPARSE_SPSV_ROCM_ALG3_WARP_SIZE", "64"
+)
+SPSV_ROCM_ALG4_WARP_SIZE = _spsv_env_warp_size(
+    "FLAGSPARSE_SPSV_ROCM_ALG4_WARP_SIZE", "64"
+)
+SPSV_ROCM_ALG4_WORKER_COUNT = _spsv_env_nonnegative_int(
+    "FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT", "0"
+)
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
+_SPSV_SELL_TRANS_ANALYSIS_CACHE = OrderedDict()
+_SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE = 4
+
+
+def _spsv_alg4_worker_count(n_rows, device, is_rocm):
+    n_rows = int(n_rows)
+    if n_rows <= 0:
+        return 0
+    if not is_rocm:
+        return n_rows
+    if SPSV_ROCM_ALG4_WORKER_COUNT > 0:
+        return min(n_rows, SPSV_ROCM_ALG4_WORKER_COUNT)
+    # One persistent program per CU keeps the complete worker grid resident on
+    # gfx936 while exposing enough independent rows to hide ready-flag latency.
+    cu_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return min(n_rows, max(1, cu_count))
+
+
+def _try_set_hipsparse_current_stream(handle):
+    set_stream = getattr(hipsparse, "hipsparseSetStream", None)
+    if set_stream is None:
+        return "hipSPARSE binding does not expose hipsparseSetStream"
+
+    stream_ptr = _torch_current_stream_ptr()
+    if stream_ptr is None:
+        return "could not resolve torch current CUDA/HIP stream pointer"
+
+    stream_args = []
+    if HipPointer is not None:
+        try:
+            stream_args.append(HipPointer.fromObj(stream_ptr))
+        except Exception:
+            pass
+    stream_args.extend([stream_ptr, ctypes.c_void_p(stream_ptr)])
+
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(set_stream(handle, stream_arg), "hipsparseSetStream")
+            return None
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    return f"hipsparseSetStream failed for torch current stream: {last_error}"
+
+
+def _hipsparse_spsv_op(op):
+    return _hipsparse_spmv_operation(op, "hipSPARSE CSR SpSV")
+
+
+def _hipsparse_spsv_alg():
+    return _hipsparse_lookup(
+        "hipsparseSpSVAlg_t",
+        (
+            "HIPSPARSE_SPSV_ALG_DEFAULT",
+            "HIPSPARSE_SPSV_CSR_ALG1",
+        ),
+    )
+
+
+def _hipsparse_spmat_attribute(name):
+    mapping = {
+        "fill_mode": ("HIPSPARSE_SPMAT_FILL_MODE",),
+        "diag_type": ("HIPSPARSE_SPMAT_DIAG_TYPE",),
+    }
+    if name not in mapping:
+        raise RuntimeError(f"Unsupported hipSPARSE SpMat attribute: {name}")
+    return _hipsparse_lookup("hipsparseSpMatAttribute_t", mapping[name])
+
+
+def _hipsparse_fill_mode_enum(lower):
+    return _hipsparse_lookup(
+        "hipsparseFillMode_t",
+        ("HIPSPARSE_FILL_MODE_LOWER",)
+        if lower
+        else ("HIPSPARSE_FILL_MODE_UPPER",),
+    )
+
+
+def _hipsparse_diag_type_enum(unit_diagonal):
+    return _hipsparse_lookup(
+        "hipsparseDiagType_t",
+        ("HIPSPARSE_DIAG_TYPE_UNIT",)
+        if unit_diagonal
+        else ("HIPSPARSE_DIAG_TYPE_NON_UNIT",),
+    )
+
+
+def _hipsparse_call(attr_names, context):
+    for attr_name in attr_names:
+        fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if fn is not None:
+            return fn
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"{context} is unavailable: missing {names}")
+
+
+def _hipsparse_create_descriptor(attr_names, context, handle=None):
+    ptr_type = type(handle) if handle is not None else None
+    last_error = None
+    for attr_name in attr_names:
+        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if create_fn is None:
+            continue
+        try:
+            raw = create_fn()
+            if ptr_type is not None and isinstance(raw, ptr_type):
+                return raw
+            if hasattr(raw, "createRef"):
+                return raw
+            payload = _hip_check_result(raw, context)
+            if payload is not None:
+                return payload
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if ptr_type is None:
+            continue
+        descr = ptr_type()
+        attempts = []
+        if hasattr(descr, "createRef"):
+            attempts.append((descr.createRef(),))
+        attempts.append((descr,))
+        for args in attempts:
+            try:
+                payload = _hip_check_result(create_fn(*args), context)
+                return payload if payload is not None else descr
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+    raise RuntimeError(f"{context} failed: {last_error}") from last_error
+
+
+def _hipsparse_enum_storage(enum_value):
+    try:
+        raw_value = int(enum_value)
+    except Exception:
+        raw_value = getattr(enum_value, "value", enum_value)
+    return ctypes.c_int(int(raw_value))
+
+
+def _hipsparse_set_spmat_attribute(spmat, attr_name, enum_value):
+    setter = _hipsparse_call(
+        ("hipsparseSpMatSetAttribute",),
+        "hipsparseSpMatSetAttribute",
+    )
+    attr = _hipsparse_spmat_attribute(attr_name)
+    payload = _hipsparse_enum_storage(enum_value)
+    attempts = (
+        (spmat, attr, payload, ctypes.sizeof(payload)),
+        (spmat, attr, ctypes.byref(payload), ctypes.sizeof(payload)),
+        (spmat, attr, enum_value, ctypes.sizeof(payload)),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            _hip_check_result(setter(*args), "hipsparseSpMatSetAttribute")
+            return
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"hipsparseSpMatSetAttribute({attr_name}) failed: {last_error}"
+    ) from last_error
+
+
+def _hipsparse_create_spsv_descr(handle):
+    return _hipsparse_create_descriptor(
+        ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr"),
+        "hipsparseSpSV_createDescr",
+        handle=handle,
+    )
+
+
+def _hipsparse_destroy_spsv_descr(descr):
+    if descr is None:
+        return
+    destroy_fn = _hipsparse_call(
+        ("hipsparseSpSV_destroyDescr", "hipsparseDestroySpSVDescr"),
+        "hipsparseSpSV_destroyDescr",
+    )
+    _hip_check_result(destroy_fn(descr), "hipsparseSpSV_destroyDescr")
+
+
+def _hipsparse_spsv_skip_reason(
+    value_dtype,
+    index_dtype,
+    indptr_dtype=None,
+    *,
+    op="non",
+):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpSV reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseCreateDnVec",
+        "hipsparseDestroyDnVec",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMatSetAttribute",
+        "hipsparseSpSV_bufferSize",
+        "hipsparseSpSV_analysis",
+        "hipsparseSpSV_solve",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE CSR SpSV direct API is unavailable: missing {symbol}"
+    if not any(
+        hasattr(hipsparse, name)
+        for name in ("hipsparseSpSV_createDescr", "hipsparseCreateSpSVDescr")
+    ):
+        return "hipSPARSE CSR SpSV direct API is unavailable: missing descriptor create API"
+    if not any(
+        hasattr(hipsparse, name)
+        for name in ("hipsparseSpSV_destroyDescr", "hipsparseDestroySpSVDescr")
+    ):
+        return "hipSPARSE CSR SpSV direct API is unavailable: missing descriptor destroy API"
+    if value_dtype not in SUPPORTED_SPSV_VALUE_DTYPES:
+        return f"hipSPARSE CSR SpSV has no supported value dtype mapping for {value_dtype}"
+    if index_dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
+        return f"hipSPARSE CSR SpSV has no supported index dtype mapping for {index_dtype}"
+    if indptr_dtype not in SUPPORTED_SPSV_INDEX_DTYPES:
+        return f"hipSPARSE CSR SpSV has no supported row offset dtype mapping for {indptr_dtype}"
+    try:
+        _validate_spsv_non_trans_combo(value_dtype, index_dtype, "CSR")
+        _validate_spsv_trans_combo(value_dtype, index_dtype, "CSR")
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_index_type(index_dtype, "hipSPARSE CSR SpSV column indices")
+        _ = _hipsparse_index_type(indptr_dtype, "hipSPARSE CSR SpSV row offsets")
+        _ = _hipsparse_spsv_op(op)
+        _ = _hipsparse_spsv_alg()
+        _ = _hipsparse_fill_mode_enum(True)
+        _ = _hipsparse_fill_mode_enum(False)
+        _ = _hipsparse_diag_type_enum(False)
+        _ = _hipsparse_diag_type_enum(True)
+        _ = _hipsparse_spmat_attribute("fill_mode")
+        _ = _hipsparse_spmat_attribute("diag_type")
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op="non"):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
+    if _is_rocm_runtime():
+        reason = _hipsparse_spsv_skip_reason(
+            value_dtype,
+            index_dtype,
+            indptr_dtype,
+            op=op,
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    # CUDA 侧的 SpSV 基线是 CuPy 的 spsolve_triangular（见 tests/test_spsv.py），
+    # 不是本模块的 hipSPARSE 路径，因此这里只判定 hipSPARSE 可用性。
+    return None, "direct hipSPARSE CSR SpSV reference requires a ROCm runtime"
 
 
 @dataclass
@@ -315,6 +617,482 @@ def _normalize_spsv_transpose_mode(transpose):
     )
 
 
+def _prepare_spsv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    out=None,
+):
+    op_name = _normalize_sparse_reference_op(op)
+    skip_reason = _hipsparse_spsv_skip_reason(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+        op=op_name,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, rhs)):
+        raise TypeError("data, indices, indptr, rhs must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, indices, indptr, rhs)):
+        raise ValueError("data, indices, indptr, rhs must all be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr, rhs)):
+        raise ValueError("data, indices, indptr, rhs must be on the same CUDA device")
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or rhs.ndim != 1:
+        raise ValueError("data, indices, indptr, rhs must all be 1D tensors")
+    if indices.numel() != data.numel():
+        raise ValueError("data and indices must have the same length")
+
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows != n_cols:
+        raise ValueError(f"hipSPARSE CSR SpSV reference expects a square matrix, got {shape}")
+    if indptr.numel() != n_rows + 1:
+        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    rhs_size = n_rows if op_name == "non" else n_cols
+    if rhs.numel() != rhs_size:
+        raise ValueError(f"rhs length must be {rhs_size} for op={op_name}")
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    rhs = rhs.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    row_index_type = _hipsparse_index_type(
+        indptr.dtype, "hipSPARSE CSR SpSV row offsets"
+    )
+    col_index_type = _hipsparse_index_type(
+        indices.dtype, "hipSPARSE CSR SpSV column indices"
+    )
+    op_enum = _hipsparse_spsv_op(op_name)
+    alg = _hipsparse_spsv_alg()
+    fill_mode = _hipsparse_fill_mode_enum(lower)
+    diag_type = _hipsparse_diag_type_enum(unit_diagonal)
+
+    solution = out
+    if solution is None:
+        solution = torch.empty_like(rhs)
+    else:
+        if not torch.is_tensor(solution):
+            raise TypeError("out must be a torch.Tensor")
+        if not solution.is_cuda or solution.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if solution.dtype != data.dtype or solution.shape != rhs.shape:
+            raise ValueError("out must match the solution shape and dtype")
+        if not solution.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if rhs.numel() == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "csr",
+            "solution": solution,
+            "empty": True,
+        }
+
+    handle = None
+    spmat = None
+    rhs_desc = None
+    sol_desc = None
+    spsv_descr = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        stream_warning = _try_set_hipsparse_current_stream(handle)
+        ptr_type = type(handle)
+
+        spmat = ptr_type()
+        rhs_desc = ptr_type()
+        sol_desc = ptr_type()
+        spmat_ref = spmat.createRef()
+        rhs_desc_ref = rhs_desc.createRef()
+        sol_desc_ref = sol_desc.createRef()
+
+        row_ptr = HipPointer.fromObj(indptr.data_ptr())
+        col_ptr = HipPointer.fromObj(indices.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        rhs_ptr = HipPointer.fromObj(rhs.data_ptr())
+        sol_ptr = HipPointer.fromObj(solution.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t",
+            ("HIPSPARSE_INDEX_BASE_ZERO",),
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateCsr(
+                spmat_ref,
+                n_rows,
+                n_cols,
+                int(data.numel()),
+                row_ptr,
+                col_ptr,
+                values_ptr,
+                row_index_type,
+                col_index_type,
+                index_base,
+                value_type,
+            ),
+            "hipsparseCreateCsr",
+        )
+        _hipsparse_set_spmat_attribute(spmat, "fill_mode", fill_mode)
+        _hipsparse_set_spmat_attribute(spmat, "diag_type", diag_type)
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(rhs_desc_ref, rhs_size, rhs_ptr, value_type),
+            "hipsparseCreateDnVec(rhs)",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(sol_desc_ref, rhs_size, sol_ptr, value_type),
+            "hipsparseCreateDnVec(solution)",
+        )
+        spsv_descr = _hipsparse_create_spsv_descr(handle)
+
+        buffer_size_fn = _hipsparse_call(
+            ("hipsparseSpSV_bufferSize",),
+            "hipsparseSpSV_bufferSize",
+        )
+        analysis_fn = _hipsparse_call(
+            ("hipsparseSpSV_analysis",),
+            "hipsparseSpSV_analysis",
+        )
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            buffer_size_fn(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                rhs_desc,
+                sol_desc,
+                value_type,
+                alg,
+                spsv_descr,
+                size_out,
+            ),
+            "hipsparseSpSV_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        _hip_check_result(
+            analysis_fn(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                rhs_desc,
+                sol_desc,
+                value_type,
+                alg,
+                spsv_descr,
+                workspace,
+            ),
+            "hipsparseSpSV_analysis",
+        )
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "csr",
+            "handle": handle,
+            "spmat": spmat,
+            "rhs_desc": rhs_desc,
+            "sol_desc": sol_desc,
+            "spsv_descr": spsv_descr,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "value_type": value_type,
+            "alg": alg,
+            "solution": solution,
+            "stream_binding_warning": stream_warning,
+            "empty": False,
+        }
+    finally:
+        if handle is None and spsv_descr is not None:
+            try:
+                _hipsparse_destroy_spsv_descr(spsv_descr)
+            except Exception:
+                pass
+        if handle is None and sol_desc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(sol_desc),
+                    "hipsparseDestroyDnVec(solution)",
+                )
+            except Exception:
+                pass
+        if handle is None and rhs_desc is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(rhs_desc),
+                    "hipsparseDestroyDnVec(rhs)",
+                )
+            except Exception:
+                pass
+        if handle is None and spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat),
+                    "hipsparseDestroySpMat",
+                )
+            except Exception:
+                pass
+        if handle is None and workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+
+
+def _run_spsv_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["solution"]
+    solve_fn = _hipsparse_call(
+        ("hipsparseSpSV_solve",),
+        "hipsparseSpSV_solve",
+    )
+    solve_args = (
+        state["handle"],
+        state["op_enum"],
+        state["alpha"],
+        state["spmat"],
+        state["rhs_desc"],
+        state["sol_desc"],
+        state["value_type"],
+        state["alg"],
+        state["spsv_descr"],
+    )
+    # Some hip-python/hipSPARSE builds expose SpSV_solve without externalBuffer.
+    try:
+        result = solve_fn(*solve_args, state["workspace"])
+    except TypeError as exc:
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        result = solve_fn(*solve_args)
+    _hip_check_result(
+        result,
+        "hipsparseSpSV_solve",
+    )
+    return state["solution"]
+
+
+def _reanalyze_spsv_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return
+    analysis_fn = _hipsparse_call(
+        ("hipsparseSpSV_analysis",),
+        "hipsparseSpSV_analysis",
+    )
+    _hip_check_result(
+        analysis_fn(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["rhs_desc"],
+            state["sol_desc"],
+            state["value_type"],
+            state["alg"],
+            state["spsv_descr"],
+            state["workspace"],
+        ),
+        "hipsparseSpSV_analysis",
+    )
+
+
+def _destroy_spsv_csr_ref_hipsparse_prepared(state):
+    spsv_descr = state.get("spsv_descr")
+    sol_desc = state.get("sol_desc")
+    rhs_desc = state.get("rhs_desc")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if spsv_descr is not None:
+        try:
+            _hipsparse_destroy_spsv_descr(spsv_descr)
+        except Exception:
+            pass
+    if sol_desc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(sol_desc),
+                "hipsparseDestroyDnVec(solution)",
+            )
+        except Exception:
+            pass
+    if rhs_desc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(rhs_desc),
+                "hipsparseDestroyDnVec(rhs)",
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat),
+                "hipsparseDestroySpMat",
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _spsv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    out=None,
+    return_metadata=False,
+):
+    state = _prepare_spsv_csr_ref_hipsparse(
+        data,
+        indices,
+        indptr,
+        rhs,
+        shape,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+        op=op,
+        out=out,
+    )
+    try:
+        solution = _run_spsv_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "csr",
+        }
+        if return_metadata:
+            return solution, metadata
+        return solution
+    finally:
+        _destroy_spsv_csr_ref_hipsparse_prepared(state)
+
+
+def _benchmark_spsv_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    rhs,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    op="non",
+    warmup=0,
+    iters=1,
+    fresh_each_iter=False,
+):
+    backend, reason = _spsv_csr_sparse_ref_backend(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
+        op=op,
+    )
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    try:
+        if fresh_each_iter:
+            warmup = max(0, int(warmup))
+            iters = max(1, int(iters))
+            values = None
+            state = _prepare_spsv_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                rhs,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+                op=op,
+            )
+            try:
+                for _ in range(warmup):
+                    _reanalyze_spsv_csr_ref_hipsparse_prepared(state)
+                    values = _run_spsv_csr_ref_hipsparse_prepared(state)
+                    torch.cuda.synchronize()
+
+                times = []
+                for _ in range(iters):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    _reanalyze_spsv_csr_ref_hipsparse_prepared(state)
+                    values = _run_spsv_csr_ref_hipsparse_prepared(state)
+                    torch.cuda.synchronize()
+                    times.append((time.perf_counter() - t0) * 1000.0)
+            finally:
+                _destroy_spsv_csr_ref_hipsparse_prepared(state)
+            if times:
+                ordered = sorted(times)
+                median = ordered[len(ordered) // 2]
+                lo = median * 0.9
+                hi = median * 1.1
+                kept = [t for t in ordered if lo <= t <= hi]
+                ms = sum(kept) / len(kept) if kept else median
+            else:
+                ms = None
+        else:
+            values, ms = _benchmark_prepared_cuda_op(
+                lambda: _prepare_spsv_csr_ref_hipsparse(
+                    data,
+                    indices,
+                    indptr,
+                    rhs,
+                    shape,
+                    lower=lower,
+                    unit_diagonal=unit_diagonal,
+                    op=op,
+                ),
+                _run_spsv_csr_ref_hipsparse_prepared,
+                _destroy_spsv_csr_ref_hipsparse_prepared,
+                warmup=warmup,
+                iters=iters,
+            )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+    except Exception as exc:
+        result["values"] = None
+        result["ms"] = None
+        result["reason"] = str(exc)
+    return result
+
+
 def _prepare_spsv_inputs(data, indices, indptr, b, shape):
     """Validate and normalize inputs for sparse solve A x = b with CSR A."""
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, b)):
@@ -384,6 +1162,7 @@ def _prepare_spsv_sell_matrix_inputs(
     slice_size,
     *,
     unit_diagonal=False,
+    skip_validated_checks=False,
 ):
     """Validate the reusable sparse-matrix part of a SELL SpSV problem."""
 
@@ -406,17 +1185,20 @@ def _prepare_spsv_sell_matrix_inputs(
         raise ValueError("invalid slice_offsets length")
     if values.numel() != col_indices.numel():
         raise ValueError("invalid SELL values or columns length")
-    if values.dtype not in SUPPORTED_SPSV_SELL_VALUE_DTYPES:
+    if values.dtype not in SUPPORTED_SPSV_VALUE_DTYPES:
         raise TypeError(
             "SELL values must be float32, float64, complex64, or complex128"
         )
     if (
-        col_indices.dtype not in SUPPORTED_SPSV_SELL_INDEX_DTYPES
+        col_indices.dtype not in SUPPORTED_SPSV_INDEX_DTYPES
         or slice_offsets.dtype != col_indices.dtype
     ):
         raise TypeError("SELL columns and offsets must share int32 or int64 dtype")
     offsets = slice_offsets.contiguous()
     cols = col_indices.contiguous()
+    if skip_validated_checks:
+        return _as_strided_contiguous(values), cols, offsets, n_rows, slice_size
+
     slice_lengths = offsets[1:] - offsets[:-1]
     if (
         int(offsets[0].item()) != 0
@@ -535,6 +1317,29 @@ def _tensor_cache_token(tensor):
     )
 
 
+def _spsv_sell_trans_analysis_signature(
+    values,
+    col_indices,
+    slice_offsets,
+    shape,
+    slice_size,
+    unit_diagonal,
+):
+    if not all(torch.is_tensor(t) for t in (values, col_indices, slice_offsets)):
+        return None
+    return (
+        "sell_trans",
+        tuple(int(v) for v in shape),
+        int(slice_size),
+        bool(unit_diagonal),
+        str(values.device),
+        str(values.dtype),
+        int(values.numel()),
+        _tensor_cache_token(col_indices),
+        _tensor_cache_token(slice_offsets),
+    )
+
+
 def _spsv_cache_get(cache, key):
     value = cache.get(key)
     if value is not None:
@@ -639,11 +1444,35 @@ def _spsv_effective_compute_dtype(value_dtype, trans_mode, compute_dtype=None):
     return value_dtype
 
 
+def _spsv_sell_trans_residual_dtype(value_dtype):
+    """Return the internal residual dtype without changing user I/O dtype."""
+
+    if not SPSV_SELL_TRANS_FP64_RESIDUAL:
+        return value_dtype
+    if value_dtype == torch.float32:
+        return torch.float64
+    if value_dtype == torch.complex64:
+        return torch.complex128
+    return value_dtype
+
+
 def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
     n_rows = int(n_rows)
     if solve_kind in ("csr_cw", "sell_alg1", "sell_alg2"):
         return (
             _workspace_entry("ready", n_rows, torch.int32),
+            _workspace_entry("row_counter", 1, torch.int32),
+        )
+    if solve_kind == "sell_trans":
+        if value_dtype is None:
+            raise ValueError("value_dtype is required for SELL TRANS workspace sizing")
+        return (
+            _workspace_entry(
+                "residual",
+                n_rows,
+                _spsv_sell_trans_residual_dtype(value_dtype),
+            ),
+            _workspace_entry("indegree", n_rows, torch.int32),
             _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "csr_roc":
@@ -1145,6 +1974,11 @@ def _choose_spsv_nontrans_auto_route(
     is to keep default routing predictable while still steering obviously
     serialized systems and wide-frontier systems onto more suitable kernels.
     """
+    # DCU/ROCm: the advanced routes are opt-in. ALG1 (csr_cw) is the measured
+    # default there; set FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=1 to re-enable
+    # the heuristics below.
+    if _is_rocm_runtime() and not SPSV_ROCM_ENABLE_ADVANCED_AUTO:
+        return "csr_cw"
     if bool(unit_diagonal):
         return "csr_cw"
     n_rows = int(n_rows)
@@ -1474,7 +2308,9 @@ def _build_spsv_level_schedule_metadata(
     if n_rows == 0:
         return empty_meta
 
-    if lower and indices64.is_cuda:
+    # The GPU level-schedule builder is CUDA-only; DCU/ROCm falls back to the
+    # host path below.
+    if lower and indices64.is_cuda and not _is_rocm_runtime():
         return _build_spsv_level_schedule_metadata_lower_gpu(
             indices64,
             indptr64,
@@ -1611,8 +2447,18 @@ def _prepare_spsv_csr_system(
         nnz_meta = None
         auto_route = None
         auto_matrix_stats = base_stats
-        if requested_route is None and _supports_spsv_advanced_nontrans_routes(
-            "N", lower, unit_diagonal, data.dtype
+        if (
+            requested_route is None
+            and _is_rocm_runtime()
+            and not SPSV_ROCM_ENABLE_ADVANCED_AUTO
+        ):
+            auto_route = "csr_cw"
+        if (
+            requested_route is None
+            and auto_route is None
+            and _supports_spsv_advanced_nontrans_routes(
+                "N", lower, unit_diagonal, data.dtype
+            )
         ):
             auto_route = _choose_spsv_nontrans_auto_route(
                 n_rows,
@@ -2182,6 +3028,314 @@ def _spsv_csr_cw_kernel_complex(
                         ptr += 1
         _publish_ready_flag_i32(ready_ptr, row)
         logical_row = tl.atomic_add(row_counter_ptr, 1)
+
+
+@triton.jit
+def _spsv_sell_trans_analysis_kernel(
+    col_indices_ptr,
+    slice_offsets_ptr,
+    indegree_init_ptr,
+    diag_offsets_ptr,
+    row_widths_ptr,
+    n_rows,
+    SLICE_SIZE: tl.constexpr,
+):
+    """Build immutable transpose metadata from column-major SELL."""
+
+    row = tl.program_id(0)
+    row_i64 = row.to(tl.int64)
+    slice_id = row // SLICE_SIZE
+    row_in_slice = row_i64 - slice_id.to(tl.int64) * SLICE_SIZE
+    # Normalize analysis indexing to int64 for both supported SELL index
+    # dtypes.  This keeps every loop-carried index independent of pointer dtype.
+    slice_start = tl.load(slice_offsets_ptr + slice_id).to(tl.int64)
+    slice_end = tl.load(slice_offsets_ptr + slice_id + 1).to(tl.int64)
+    width = (slice_end - slice_start) // SLICE_SIZE
+    zero_i64 = tl.zeros((), dtype=tl.int64)
+    # NON_UNIT validation guarantees that the diagonal replaces this value;
+    # UNIT does not read the recorded diagonal offset.
+    diag_offset = zero_i64
+    row_width = width
+    slot = zero_i64
+    while slot < width:
+        offset = slice_start + slot * SLICE_SIZE + row_in_slice
+        col = tl.load(col_indices_ptr + offset)
+        diag_offset = tl.where(col.to(tl.int64) == row_i64, offset, diag_offset)
+        row_width = tl.where((col < 0) & (row_width == width), slot, row_width)
+        # For a lower A, row i of A^T depends on every A row j>i that
+        # contains column i.  Padding and the diagonal are not dependencies.
+        dependency = (col >= 0) & (col.to(tl.int64) < row_i64)
+        tl.atomic_add(indegree_init_ptr + col, 1, mask=dependency)
+        slot += 1
+    tl.store(diag_offsets_ptr + row, diag_offset)
+    tl.store(row_widths_ptr + row, row_width.to(tl.int32))
+
+
+@triton.jit
+def _spsv_sell_trans_init_kernel(
+    b_ptr,
+    residual_ptr,
+    indegree_init_ptr,
+    indegree_ptr,
+    n_rows,
+    BLOCK_SIZE: tl.constexpr,
+    VALUE_ELEMENTS_PER_ROW: tl.constexpr,
+    RESIDUAL_FP64: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    value_mask = offsets < n_rows * VALUE_ELEMENTS_PER_ROW
+    row_mask = offsets < n_rows
+    rhs = tl.load(b_ptr + offsets, mask=value_mask, other=0.0)
+    if RESIDUAL_FP64:
+        rhs = rhs.to(tl.float64)
+    tl.store(
+        residual_ptr + offsets,
+        rhs,
+        mask=value_mask,
+    )
+    tl.store(
+        indegree_ptr + offsets,
+        tl.load(indegree_init_ptr + offsets, mask=row_mask, other=0),
+        mask=row_mask,
+    )
+
+
+@triton.jit
+def _spsv_sell_trans_kernel(
+    values_ptr,
+    col_indices_ptr,
+    slice_offsets_ptr,
+    diag_offsets_ptr,
+    row_widths_ptr,
+    residual_ptr,
+    x_ptr,
+    indegree_ptr,
+    block_counter_ptr,
+    n_rows,
+    n_blocks,
+    SLICE_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+):
+    """Slice-cooperative transpose SELL solver."""
+
+    lanes = tl.arange(0, BLOCK_ROWS)
+    zero_i32 = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
+    logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
+    while logical_block < n_blocks:
+        first_row = n_rows - (logical_block + 1) * BLOCK_ROWS
+        raw_row = first_row + (BLOCK_ROWS - 1 - lanes)
+        valid_row = (raw_row >= 0) & (raw_row < n_rows)
+        row = tl.maximum(raw_row, 0)
+        slice_id = row // SLICE_SIZE
+        row_in_slice = row - slice_id * SLICE_SIZE
+        slice_start = tl.load(slice_offsets_ptr + slice_id, mask=valid_row, other=0)
+        row_width = tl.load(row_widths_ptr + row, mask=valid_row, other=0)
+        pending = valid_row
+
+        while tl.sum(pending.to(tl.int32), axis=0) != 0:
+            ready_hint = tl.load(
+                indegree_ptr + row,
+                mask=pending,
+                other=1,
+                cache_modifier=".cv",
+                volatile=True,
+            )
+            candidate = pending & (ready_hint == 0)
+            ready_value = tl.atomic_add(
+                indegree_ptr + row,
+                zero_i32,
+                mask=candidate,
+                sem="acquire",
+            )
+            ready = candidate & (ready_value == 0)
+            if USE_FP64_ACC:
+                rhs = tl.load(residual_ptr + row, mask=ready, other=0.0).to(tl.float64)
+            else:
+                rhs = tl.load(residual_ptr + row, mask=ready, other=0.0).to(tl.float32)
+            if UNIT_DIAG:
+                diag = rhs * 0.0 + 1.0
+            else:
+                diag_offset = tl.load(diag_offsets_ptr + row, mask=ready, other=0)
+                diag = tl.load(values_ptr + diag_offset, mask=ready, other=1.0)
+                if USE_FP64_ACC:
+                    diag = diag.to(tl.float64)
+                else:
+                    diag = diag.to(tl.float32)
+
+            x_row = rhs / diag
+            tl.store(x_ptr + row, x_row, mask=ready)
+
+            slot = zero_i32
+            while tl.sum((ready & (slot < row_width)).to(tl.int32), axis=0) != 0:
+                active = ready & (slot < row_width)
+                offset = slice_start + slot * SLICE_SIZE + row_in_slice
+                col = tl.load(col_indices_ptr + offset, mask=active, other=-1)
+                dependency = active & (col >= 0) & (col < row)
+                a = tl.load(values_ptr + offset, mask=dependency, other=0.0)
+                if USE_FP64_ACC:
+                    a = a.to(tl.float64)
+                    x_value = x_row.to(tl.float64)
+                else:
+                    a = a.to(tl.float32)
+                    x_value = x_row.to(tl.float32)
+                tl.atomic_add(
+                    residual_ptr + col,
+                    -a * x_value,
+                    mask=dependency,
+                )
+                tl.atomic_add(
+                    indegree_ptr + col,
+                    -1,
+                    mask=dependency,
+                    sem="release",
+                )
+                slot += 1
+            pending = pending & ~ready
+
+        logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
+
+
+@triton.jit
+def _spsv_sell_trans_kernel_complex(
+    values_ri_ptr,
+    col_indices_ptr,
+    slice_offsets_ptr,
+    diag_offsets_ptr,
+    row_widths_ptr,
+    residual_ri_ptr,
+    x_ri_ptr,
+    indegree_ptr,
+    block_counter_ptr,
+    n_rows,
+    n_blocks,
+    SLICE_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+    CONJ_TRANS: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+):
+    """Complex slice-cooperative transpose SELL solver."""
+
+    lanes = tl.arange(0, BLOCK_ROWS)
+    zero_i32 = tl.zeros((BLOCK_ROWS,), dtype=tl.int32)
+    logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
+    while logical_block < n_blocks:
+        first_row = n_rows - (logical_block + 1) * BLOCK_ROWS
+        raw_row = first_row + (BLOCK_ROWS - 1 - lanes)
+        valid_row = (raw_row >= 0) & (raw_row < n_rows)
+        row = tl.maximum(raw_row, 0)
+        slice_id = row // SLICE_SIZE
+        row_in_slice = row - slice_id * SLICE_SIZE
+        slice_start = tl.load(slice_offsets_ptr + slice_id, mask=valid_row, other=0)
+        row_width = tl.load(row_widths_ptr + row, mask=valid_row, other=0)
+        pending = valid_row
+
+        while tl.sum(pending.to(tl.int32), axis=0) != 0:
+            ready_hint = tl.load(
+                indegree_ptr + row,
+                mask=pending,
+                other=1,
+                cache_modifier=".cv",
+                volatile=True,
+            )
+            candidate = pending & (ready_hint == 0)
+            ready_value = tl.atomic_add(
+                indegree_ptr + row,
+                zero_i32,
+                mask=candidate,
+                sem="acquire",
+            )
+            ready = candidate & (ready_value == 0)
+            rhs_re = tl.load(residual_ri_ptr + row * 2, mask=ready, other=0.0)
+            rhs_im = tl.load(residual_ri_ptr + row * 2 + 1, mask=ready, other=0.0)
+            if USE_FP64_ACC:
+                rhs_re = rhs_re.to(tl.float64)
+                rhs_im = rhs_im.to(tl.float64)
+            else:
+                rhs_re = rhs_re.to(tl.float32)
+                rhs_im = rhs_im.to(tl.float32)
+            if UNIT_DIAG:
+                diag_re = rhs_re * 0.0 + 1.0
+                diag_im = rhs_im * 0.0
+            else:
+                diag_offset = tl.load(diag_offsets_ptr + row, mask=ready, other=0)
+                diag_re = tl.load(
+                    values_ri_ptr + diag_offset * 2,
+                    mask=ready,
+                    other=1.0,
+                )
+                diag_im = tl.load(
+                    values_ri_ptr + diag_offset * 2 + 1,
+                    mask=ready,
+                    other=0.0,
+                )
+                if CONJ_TRANS:
+                    diag_im = -diag_im
+                if USE_FP64_ACC:
+                    diag_re = diag_re.to(tl.float64)
+                    diag_im = diag_im.to(tl.float64)
+                else:
+                    diag_re = diag_re.to(tl.float32)
+                    diag_im = diag_im.to(tl.float32)
+
+            den = diag_re * diag_re + diag_im * diag_im
+            x_re = (rhs_re * diag_re + rhs_im * diag_im) / den
+            x_im = (rhs_im * diag_re - rhs_re * diag_im) / den
+            tl.store(x_ri_ptr + row * 2, x_re, mask=ready)
+            tl.store(x_ri_ptr + row * 2 + 1, x_im, mask=ready)
+
+            slot = zero_i32
+            while tl.sum((ready & (slot < row_width)).to(tl.int32), axis=0) != 0:
+                active = ready & (slot < row_width)
+                offset = slice_start + slot * SLICE_SIZE + row_in_slice
+                col = tl.load(col_indices_ptr + offset, mask=active, other=-1)
+                dependency = active & (col >= 0) & (col < row)
+                a_re = tl.load(
+                    values_ri_ptr + offset * 2,
+                    mask=dependency,
+                    other=0.0,
+                )
+                a_im = tl.load(
+                    values_ri_ptr + offset * 2 + 1,
+                    mask=dependency,
+                    other=0.0,
+                )
+                if CONJ_TRANS:
+                    a_im = -a_im
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                    x_re_acc = x_re.to(tl.float64)
+                    x_im_acc = x_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                    x_re_acc = x_re.to(tl.float32)
+                    x_im_acc = x_im.to(tl.float32)
+                delta_re = -(a_re * x_re_acc - a_im * x_im_acc)
+                delta_im = -(a_re * x_im_acc + a_im * x_re_acc)
+                tl.atomic_add(
+                    residual_ri_ptr + col * 2,
+                    delta_re,
+                    mask=dependency,
+                )
+                tl.atomic_add(
+                    residual_ri_ptr + col * 2 + 1,
+                    delta_im,
+                    mask=dependency,
+                )
+                tl.atomic_add(
+                    indegree_ptr + col,
+                    -1,
+                    mask=dependency,
+                    sem="release",
+                )
+                slot += 1
+            pending = pending & ~ready
+
+        logical_block = tl.atomic_add(block_counter_ptr, 1, sem="relaxed")
 
 
 @triton.jit
@@ -3701,6 +4855,118 @@ def _launch_spsv_sell(
     return out
 
 
+def _launch_spsv_sell_trans(
+    values,
+    col_indices,
+    slice_offsets,
+    indegree_init,
+    diag_offsets,
+    row_widths,
+    b_vec,
+    n_rows,
+    *,
+    slice_size,
+    out,
+    residual,
+    indegree,
+    row_counter,
+    unit_diagonal=False,
+    conj_trans=False,
+    values_ri_in=None,
+):
+    """Launch the dedicated SELL transpose dependency-propagation route."""
+
+    row_counter.zero_()
+    if n_rows == 0:
+        return out
+
+    is_complex = torch.is_complex(values)
+    if is_complex:
+        b_init = torch.view_as_real(b_vec).reshape(-1)
+        residual_init = torch.view_as_real(residual).reshape(-1)
+        value_elements_per_row = 2
+    else:
+        b_init = b_vec
+        residual_init = residual
+        value_elements_per_row = 1
+    init_block_size = 256
+    _spsv_sell_trans_init_kernel[
+        (
+            triton.cdiv(
+                int(n_rows) * value_elements_per_row,
+                init_block_size,
+            ),
+        )
+    ](
+        b_init,
+        residual_init,
+        indegree_init,
+        indegree,
+        n_rows,
+        BLOCK_SIZE=init_block_size,
+        VALUE_ELEMENTS_PER_ROW=value_elements_per_row,
+        RESIDUAL_FP64=bool(residual.dtype in (torch.float64, torch.complex128)),
+        num_warps=4,
+    )
+    # The residual buffer controls the accumulation dtype.  For float32 and
+    # complex64 input, only this internal buffer is widened; x remains in the
+    # original user-visible dtype.
+    use_fp64_acc = residual.dtype in (torch.float64, torch.complex128)
+    if is_complex:
+        values_ri = (
+            values_ri_in
+            if values_ri_in is not None
+            else _complex_interleaved_view(values)
+        )
+        residual_ri = torch.view_as_real(residual).reshape(-1)
+        out_ri = torch.view_as_real(out).reshape(-1)
+
+    block_rows = 1 << (int(slice_size) - 1).bit_length()
+    n_blocks = (int(n_rows) + block_rows - 1) // block_rows
+    worker_count = _snap_cw_worker_count(min(512, n_blocks), n_blocks)
+
+    if is_complex:
+        _spsv_sell_trans_kernel_complex[(int(worker_count),)](
+            values_ri,
+            col_indices,
+            slice_offsets,
+            diag_offsets,
+            row_widths,
+            residual_ri,
+            out_ri,
+            indegree,
+            row_counter,
+            n_rows,
+            int(n_blocks),
+            SLICE_SIZE=int(slice_size),
+            BLOCK_ROWS=int(block_rows),
+            UNIT_DIAG=bool(unit_diagonal),
+            CONJ_TRANS=bool(conj_trans),
+            USE_FP64_ACC=use_fp64_acc,
+            num_warps=1,
+        )
+    else:
+        _spsv_sell_trans_kernel[(int(worker_count),)](
+            values,
+            col_indices,
+            slice_offsets,
+            diag_offsets,
+            row_widths,
+            residual,
+            out,
+            indegree,
+            row_counter,
+            n_rows,
+            int(n_blocks),
+            SLICE_SIZE=int(slice_size),
+            BLOCK_ROWS=int(block_rows),
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=use_fp64_acc,
+            num_warps=1,
+        )
+    return out
+
+
 def _triton_spsv_csr_u_lo_cw_vector(*args, **kwargs):
     return _triton_spsv_csr_cw_vector(*args, lower=True, unit_diagonal=True, **kwargs)
 
@@ -3745,6 +5011,8 @@ def _triton_spsv_csr_n_lo_roc_vector(
     diag_eps=1e-12,
     ready_in=None,
 ):
+    # DCU/ROCm launches ALG3 at the 64-wide wavefront; CUDA keeps 32.
+    warp_size = SPSV_ROCM_ALG3_WARP_SIZE if _is_rocm_runtime() else 32
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -3765,7 +5033,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
         LOWER=lower,
         USE_FP64_ACC=use_fp64_acc,
         DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
+        WARP_SIZE=warp_size,
         num_warps=1,
     )
     return x
@@ -3784,6 +5052,8 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     data_ri_in=None,
     ready_in=None,
 ):
+    # DCU/ROCm launches ALG3 at the 64-wide wavefront; CUDA keeps 32.
+    warp_size = SPSV_ROCM_ALG3_WARP_SIZE if _is_rocm_runtime() else 32
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -3808,10 +5078,216 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
         LOWER=lower,
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
+        WARP_SIZE=warp_size,
         num_warps=1,
     )
     return x
+
+
+# ── DCU/ROCm persistent-worker SMBLK (ALG4) ─────────────────────────
+# The DCU branch's ALG4 kernel, kept alongside the CUDA one-program-per-row
+# kernel above. Three DCU-specific differences:
+#   * persistent workers (NUM_WORKERS) instead of one program per row;
+#   * the ready flag is read with sem="acquire", scope="gpu", pairing with the
+#     producer's release store;
+#   * the dependency value uses an ordinary tl.load instead of a float
+#     atomic-RMW, which the Triton 3.6 AMD lowering broadcasts inefficiently.
+# Selected by _spsv_smblk_use_persistent(); CUDA never reaches this kernel.
+
+@triton.jit
+def _spsv_csr_smblk_persistent_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    x_ptr,
+    ready_ptr,
+    n_rows,
+    LOWER: tl.constexpr,
+    REVERSE_ORDER: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+    WARP_SIZE: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
+):
+    lanes = tl.arange(0, WARP_SIZE)
+    worker_id = tl.program_id(0)
+    for logical_row in tl.range(worker_id, n_rows, NUM_WORKERS):
+        row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        ptr = start + lanes
+        if USE_FP64_ACC:
+            rhs = tl.load(b_ptr + row).to(tl.float64)
+            local_sum = tl.where(lanes == 0, rhs, 0.0).to(tl.float64)
+        else:
+            rhs = tl.load(b_ptr + row).to(tl.float32)
+            local_sum = tl.where(lanes == 0, rhs, 0.0).to(tl.float32)
+
+        loop_done = 0
+        while loop_done == 0:
+            active = ptr < end
+            col = tl.load(indices_ptr + ptr, mask=active, other=row)
+            dep_mask = active & (col < row if LOWER else col > row)
+            if tl.sum(dep_mask.to(tl.int32), axis=0) == 0:
+                loop_done = 1
+            else:
+                # Acquire pairs with the producer's release publication below.
+                # Once ready is observed, an ordinary load of x[col] is ordered
+                # after the producer's x store and avoids float atomic-RMW
+                # broadcasting in the Triton 3.6 AMD lowering.
+                dep_ready = tl.atomic_add(
+                    ready_ptr + col,
+                    tl.zeros((WARP_SIZE,), dtype=tl.int32),
+                    mask=dep_mask,
+                    sem="acquire",
+                    scope="gpu",
+                )
+                advance_mask = dep_mask & (dep_ready != 0)
+                a = tl.load(data_ptr + ptr, mask=advance_mask, other=0.0)
+                if USE_FP64_ACC:
+                    a = a.to(tl.float64)
+                    y_dep = tl.load(
+                        x_ptr + col, mask=advance_mask, other=0.0
+                    ).to(tl.float64)
+                else:
+                    a = a.to(tl.float32)
+                    y_dep = tl.load(
+                        x_ptr + col, mask=advance_mask, other=0.0
+                    ).to(tl.float32)
+                local_sum += tl.where(advance_mask, -a * y_dep, 0.0)
+                ptr = ptr + tl.where(advance_mask, WARP_SIZE, 0)
+
+        active = ptr < end
+        col = tl.load(indices_ptr + ptr, mask=active, other=row + 1)
+        diag_mask = active & (col == row)
+        diag = tl.load(data_ptr + ptr, mask=diag_mask, other=0.0)
+        if USE_FP64_ACC:
+            diag = diag.to(tl.float64)
+        else:
+            diag = diag.to(tl.float32)
+        diag_val = tl.sum(diag, axis=0)
+        diag_safe = tl.where(tl.abs(diag_val) < DIAG_EPS, 1.0, diag_val)
+        out = tl.sum(local_sum, axis=0) / diag_safe
+        out = tl.where(out == out, out, 0.0)
+        tl.store(x_ptr + row, out)
+        tl.atomic_add(ready_ptr + row, 1, sem="release", scope="gpu")
+
+
+@triton.jit
+def _spsv_csr_smblk_persistent_kernel_complex(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    x_ri_ptr,
+    ready_ptr,
+    n_rows,
+    LOWER: tl.constexpr,
+    REVERSE_ORDER: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
+    WARP_SIZE: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
+):
+    lanes = tl.arange(0, WARP_SIZE)
+    worker_id = tl.program_id(0)
+    for logical_row in tl.range(worker_id, n_rows, NUM_WORKERS):
+        row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
+        start = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        ptr = start + lanes
+
+        rhs_re = tl.load(b_ri_ptr + row * 2)
+        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        if USE_FP64_ACC:
+            rhs_re = rhs_re.to(tl.float64)
+            rhs_im = rhs_im.to(tl.float64)
+            local_sum_re = tl.where(lanes == 0, rhs_re, 0.0).to(tl.float64)
+            local_sum_im = tl.where(lanes == 0, rhs_im, 0.0).to(tl.float64)
+        else:
+            rhs_re = rhs_re.to(tl.float32)
+            rhs_im = rhs_im.to(tl.float32)
+            local_sum_re = tl.where(lanes == 0, rhs_re, 0.0).to(tl.float32)
+            local_sum_im = tl.where(lanes == 0, rhs_im, 0.0).to(tl.float32)
+
+        loop_done = 0
+        while loop_done == 0:
+            active = ptr < end
+            col = tl.load(indices_ptr + ptr, mask=active, other=row)
+            dep_mask = active & (col < row if LOWER else col > row)
+            if tl.sum(dep_mask.to(tl.int32), axis=0) == 0:
+                loop_done = 1
+            else:
+                dep_ready = tl.atomic_add(
+                    ready_ptr + col,
+                    tl.zeros((WARP_SIZE,), dtype=tl.int32),
+                    mask=dep_mask,
+                    sem="acquire",
+                    scope="gpu",
+                )
+                advance_mask = dep_mask & (dep_ready != 0)
+                a_re = tl.load(data_ri_ptr + ptr * 2, mask=advance_mask, other=0.0)
+                a_im = tl.load(data_ri_ptr + ptr * 2 + 1, mask=advance_mask, other=0.0)
+                x_re = tl.load(x_ri_ptr + col * 2, mask=advance_mask, other=0.0)
+                x_im = tl.load(x_ri_ptr + col * 2 + 1, mask=advance_mask, other=0.0)
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                    x_re = x_re.to(tl.float64)
+                    x_im = x_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                    x_re = x_re.to(tl.float32)
+                    x_im = x_im.to(tl.float32)
+                prod_re = a_re * x_re - a_im * x_im
+                prod_im = a_re * x_im + a_im * x_re
+                local_sum_re += tl.where(advance_mask, -prod_re, 0.0)
+                local_sum_im += tl.where(advance_mask, -prod_im, 0.0)
+                ptr = ptr + tl.where(advance_mask, WARP_SIZE, 0)
+
+        active = ptr < end
+        col = tl.load(indices_ptr + ptr, mask=active, other=row + 1)
+        diag_mask = active & (col == row)
+        diag_re = tl.load(data_ri_ptr + ptr * 2, mask=diag_mask, other=0.0)
+        diag_im = tl.load(data_ri_ptr + ptr * 2 + 1, mask=diag_mask, other=0.0)
+        if USE_FP64_ACC:
+            diag_re = diag_re.to(tl.float64)
+            diag_im = diag_im.to(tl.float64)
+        else:
+            diag_re = diag_re.to(tl.float32)
+            diag_im = diag_im.to(tl.float32)
+        diag_re = tl.sum(diag_re, axis=0)
+        diag_im = tl.sum(diag_im, axis=0)
+        sum_re = tl.sum(local_sum_re, axis=0)
+        sum_im = tl.sum(local_sum_im, axis=0)
+        den = diag_re * diag_re + diag_im * diag_im
+        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+        out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+        out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
+        out_re = tl.where(out_re == out_re, out_re, 0.0)
+        out_im = tl.where(out_im == out_im, out_im, 0.0)
+        tl.store(x_ri_ptr + row * 2, out_re)
+        tl.store(x_ri_ptr + row * 2 + 1, out_im)
+        tl.atomic_add(ready_ptr + row, 1, sem="release", scope="gpu")
+
+
+def _spsv_smblk_use_persistent():
+    """Whether ALG4 runs the DCU persistent-worker kernel.
+
+    DCU/ROCm defaults to it; CUDA keeps the one-program-per-row kernel.
+    Override with FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog|persistent for A/B.
+    """
+    override = os.environ.get("FLAGSPARSE_SPSV_SMBLK_KERNEL", "").strip().lower()
+    if override in ("rowprog", "persistent"):
+        return override == "persistent"
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_SPSV_SMBLK_KERNEL must be 'rowprog' or 'persistent', "
+            f"got {override!r}"
+        )
+    return _is_rocm_runtime()
 
 
 def _triton_spsv_csr_n_lo_smblk_vector(
@@ -3825,6 +5301,9 @@ def _triton_spsv_csr_n_lo_smblk_vector(
     diag_eps=1e-12,
     ready_in=None,
 ):
+    # DCU/ROCm launches ALG4 at the 64-wide wavefront; CUDA keeps 32.
+    is_rocm = _is_rocm_runtime()
+    warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -3833,6 +5312,25 @@ def _triton_spsv_csr_n_lo_smblk_vector(
     if n_rows == 0:
         return x
     use_fp64_acc = data.dtype == torch.float64
+    if _spsv_smblk_use_persistent():
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, is_rocm)
+        _spsv_csr_smblk_persistent_kernel[(worker_count,)](
+            data,
+            indices,
+            indptr,
+            b_vec,
+            x,
+            ready,
+            n_rows,
+            LOWER=lower,
+            REVERSE_ORDER=not lower,
+            USE_FP64_ACC=use_fp64_acc,
+            DIAG_EPS=diag_eps,
+            WARP_SIZE=warp_size,
+            NUM_WORKERS=worker_count,
+            num_warps=1,
+        )
+        return x
     _spsv_csr_smblk_kernel[(n_rows,)](
         data,
         indices,
@@ -3845,7 +5343,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64_acc,
         DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
+        WARP_SIZE=warp_size,
         num_warps=1,
     )
     return x
@@ -3863,6 +5361,9 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     data_ri_in=None,
     ready_in=None,
 ):
+    # DCU/ROCm launches ALG4 at the 64-wide wavefront; CUDA keeps 32.
+    is_rocm = _is_rocm_runtime()
+    warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -3875,6 +5376,25 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
+    if _spsv_smblk_use_persistent():
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, is_rocm)
+        _spsv_csr_smblk_persistent_kernel_complex[(worker_count,)](
+            data_ri,
+            indices,
+            indptr,
+            b_ri,
+            x_ri,
+            ready,
+            n_rows,
+            LOWER=lower,
+            REVERSE_ORDER=not lower,
+            USE_FP64_ACC=use_fp64,
+            DIAG_EPS=diag_eps,
+            WARP_SIZE=warp_size,
+            NUM_WORKERS=worker_count,
+            num_warps=1,
+        )
+        return x
     _spsv_csr_smblk_kernel_complex[(n_rows,)](
         data_ri,
         indices,
@@ -3887,7 +5407,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
-        WARP_SIZE=32,
+        WARP_SIZE=warp_size,
         num_warps=1,
     )
     return x
@@ -4703,6 +6223,10 @@ def _execute_spsv_csr_plan(
             1,
             cached_worker_count=cw_worker_count,
         )
+    # Keep ALG1 serial on ROCm/DCU because cross-program ready-flag polling does
+    # not make forward progress reliably on the current gfx936 Triton stack.
+    if solve_kind == "csr_cw" and _is_rocm_runtime():
+        worker_count_use = 1
     complex_kernel_data_ri = None
     if torch.is_complex(data_in):
         if compute_dtype == solve_plan["kernel_data"].dtype:
@@ -5279,19 +6803,38 @@ def flagsparse_spsv_analysis_sell(
     shape,
     *,
     slice_size,
-    alg_num=1,
+    alg_num=None,
     alg2_worker_count=None,
     unit_diagonal=False,
+    transpose=False,
     workspace=None,
 ):
-    """Analyze a lower NON_TRANS SELL SpSV problem and return a descriptor.
+    """Analyze a lower SELL SpSV problem and return a descriptor.
 
     When ``unit_diagonal`` is true, stored diagonal entries are ignored and
     missing diagonal entries are interpreted as one, matching SpSV descriptor
-    semantics used by cuSPARSE.
+    semantics used by cuSPARSE.  ``transpose`` accepts the same N/T/C forms as
+    the CSR API; T solves A^T x=b and C solves A^H x=b.
     """
 
     unit_diagonal = bool(unit_diagonal)
+    trans_mode = _normalize_spsv_transpose_mode(transpose)
+    trans_analysis_key = None
+    trans_analysis = None
+    if trans_mode != "N":
+        trans_analysis_key = _spsv_sell_trans_analysis_signature(
+            values,
+            col_indices,
+            slice_offsets,
+            shape,
+            slice_size,
+            unit_diagonal,
+        )
+        if trans_analysis_key is not None:
+            trans_analysis = _spsv_cache_get(
+                _SPSV_SELL_TRANS_ANALYSIS_CACHE,
+                trans_analysis_key,
+            )
     values, cols, offsets, n_rows, slice_size = (
         _prepare_spsv_sell_matrix_inputs(
             values,
@@ -5300,19 +6843,74 @@ def flagsparse_spsv_analysis_sell(
             shape,
             slice_size,
             unit_diagonal=unit_diagonal,
+            skip_validated_checks=trans_analysis is not None,
         )
     )
-    alg_num = _normalize_spsv_sell_alg_num(alg_num)
-    n_slices = (n_rows + slice_size - 1) // slice_size
-    if alg_num == SPSV_SELL_ALG1:
-        if alg2_worker_count is not None:
-            raise ValueError("alg2_worker_count is only valid for SELL SpSV ALG2")
-        resolved_workers = None
+    if trans_mode == "N":
+        _validate_spsv_non_trans_combo(values.dtype, cols.dtype, "SELL")
     else:
-        resolved_workers = _resolve_spsv_sell_alg2_worker_count(
-            n_slices, requested=alg2_worker_count
+        _validate_spsv_trans_combo(values.dtype, cols.dtype, "SELL")
+    if trans_mode == "N":
+        alg_num = (
+            SPSV_SELL_ALG1
+            if alg_num is None
+            else _normalize_spsv_sell_alg_num(alg_num)
         )
-    solve_kind = f"sell_alg{alg_num}"
+        n_slices = (n_rows + slice_size - 1) // slice_size
+        if alg_num == SPSV_SELL_ALG1:
+            if alg2_worker_count is not None:
+                raise ValueError("alg2_worker_count is only valid for SELL SpSV ALG2")
+            resolved_workers = None
+        else:
+            resolved_workers = _resolve_spsv_sell_alg2_worker_count(
+                n_slices, requested=alg2_worker_count
+            )
+        solve_kind = f"sell_alg{alg_num}"
+    else:
+        if alg_num is not None:
+            raise ValueError("SELL TRANS/CONJ do not accept alg_num")
+        if alg2_worker_count is not None:
+            raise ValueError("SELL TRANS/CONJ do not accept worker-count tuning")
+        if trans_analysis is None:
+            indegree_init = torch.zeros(
+                n_rows,
+                dtype=torch.int32,
+                device=values.device,
+            )
+            diag_offsets = torch.empty(
+                n_rows,
+                dtype=torch.int64,
+                device=values.device,
+            )
+            row_widths = torch.empty(
+                n_rows,
+                dtype=torch.int32,
+                device=values.device,
+            )
+            if n_rows > 0:
+                _spsv_sell_trans_analysis_kernel[(n_rows,)](
+                    cols,
+                    offsets,
+                    indegree_init,
+                    diag_offsets,
+                    row_widths,
+                    n_rows,
+                    SLICE_SIZE=int(slice_size),
+                    num_warps=1,
+                )
+            trans_analysis = {
+                "indegree_init": indegree_init,
+                "diag_offsets": diag_offsets,
+                "row_widths": row_widths,
+            }
+            if trans_analysis_key is not None:
+                _spsv_cache_put(
+                    _SPSV_SELL_TRANS_ANALYSIS_CACHE,
+                    trans_analysis_key,
+                    trans_analysis,
+                    _SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE,
+                )
+        solve_kind = "sell_trans"
     layout = _build_spsv_workspace_layout(
         n_rows, solve_kind, value_dtype=values.dtype
     )
@@ -5322,9 +6920,14 @@ def flagsparse_spsv_analysis_sell(
         "solve_kind": solve_kind,
         "kernel_data": values,
         "slice_size": int(slice_size),
-        "alg_num": int(alg_num),
-        "alg2_worker_count": resolved_workers,
     }
+    if trans_mode == "N":
+        solve_plan["alg_num"] = int(alg_num)
+        solve_plan["alg2_worker_count"] = resolved_workers
+    else:
+        solve_plan["indegree_init"] = trans_analysis["indegree_init"]
+        solve_plan["diag_offsets"] = trans_analysis["diag_offsets"]
+        solve_plan["row_widths"] = trans_analysis["row_widths"]
     _attach_spsv_complex_plan_views(solve_plan)
     return FlagSparseSpSVDescr(
         format="sell",
@@ -5336,7 +6939,7 @@ def flagsparse_spsv_analysis_sell(
         diag_type="unit" if unit_diagonal else "non_unit",
         matrix_type="triangular",
         index_base=0,
-        transpose_mode="N",
+        transpose_mode=trans_mode,
         value_dtype=values.dtype,
         compute_dtype=values.dtype,
         index_dtype=cols.dtype,
@@ -5359,7 +6962,7 @@ def flagsparse_spsv_solve_sell(
     out=None,
     workspace=None,
 ):
-    """Solve a previously analyzed lower NON_TRANS SELL SpSV problem."""
+    """Solve a previously analyzed lower SELL SpSV problem."""
 
     if not isinstance(descr, FlagSparseSpSVDescr):
         raise TypeError("descr must be a FlagSparseSpSVDescr")
@@ -5394,6 +6997,25 @@ def flagsparse_spsv_solve_sell(
         workspace, descr.workspace_layout, descr.data.device
     )
     plan = descr.solve_plan
+    if descr.transpose_mode in ("T", "C"):
+        return _launch_spsv_sell_trans(
+            descr.data,
+            descr.indices,
+            descr.indptr,
+            plan["indegree_init"],
+            plan["diag_offsets"],
+            plan["row_widths"],
+            _as_strided_contiguous(b),
+            n_rows,
+            slice_size=int(plan["slice_size"]),
+            out=out,
+            residual=buffers.get("residual"),
+            indegree=buffers.get("indegree"),
+            row_counter=buffers.get("row_counter"),
+            unit_diagonal=bool(descr.unit_diagonal),
+            conj_trans=descr.transpose_mode == "C",
+            values_ri_in=plan.get("kernel_data_ri"),
+        )
     return _launch_spsv_sell(
         descr.data,
         descr.indices,
@@ -5419,13 +7041,14 @@ def flagsparse_spsv_sell(
     shape,
     *,
     slice_size,
-    alg_num=1,
+    alg_num=None,
     alg2_worker_count=None,
     unit_diagonal=False,
+    transpose=False,
     out=None,
     workspace=None,
 ):
-    """Analyze and solve a lower NON_TRANS SELL SpSV problem."""
+    """Analyze and solve a lower SELL SpSV problem."""
 
     descr = flagsparse_spsv_analysis_sell(
         values,
@@ -5436,6 +7059,7 @@ def flagsparse_spsv_sell(
         alg_num=alg_num,
         alg2_worker_count=alg2_worker_count,
         unit_diagonal=unit_diagonal,
+        transpose=transpose,
         workspace=workspace,
     )
     return flagsparse_spsv_solve_sell(descr, b, out=out, workspace=workspace)

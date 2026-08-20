@@ -181,6 +181,24 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spmm_csc
+    description: |
+      Computes sparse matrix-dense matrix multiplication for a CSC matrix.
+    for:
+      - flagsparse_spmm_csc
+      - flagsparse_spmm_csc_run
+      - prepare_spmm_csc_route
+    labels:
+      - flagsparse
+      - sparse
+      - csc
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
   - id: spmm_csr_opt
     description: |
       Computes optimized CSR sparse matrix-dense matrix multiplication.
@@ -331,9 +349,11 @@ ops:
     description: |
       Solves sparse triangular systems represented in cuSPARSE-compatible
       column-major Sliced ELLPACK format using native Triton kernels.
-      NON_TRANS supports float32/float64/complex64/complex128 with int32/int64
-      indices and UNIT/NON_UNIT diagonals.
-      ALG1 is the original persistent row solver; ALG2 is slice-cooperative.
+      NON_TRANS and TRANS/CONJ support float32/float64/complex64/complex128
+      with int32/int64 indices and UNIT/NON_UNIT diagonals. ALG1 is the
+      original persistent row solver and ALG2 is slice-cooperative for
+      NON_TRANS, while TRANS/CONJ uses one dedicated slice-cooperative
+      reverse-dependency kernel.
     for:
       - flagsparse_spsv_sell
       - flagsparse_spsv_analysis_sell

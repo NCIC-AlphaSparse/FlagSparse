@@ -20,9 +20,12 @@ from .gather_scatter import (
     DEFAULT_GATHER_BLOCK_SIZE,
     _PreparedCusparseNativeGather,
     SUPPORTED_SCATTER_VALUE_DTYPES,
+    _gather_scatter_sparse_ref_backend,
     _scatter_dtype_error_message,
     _cusparse_native_gather_skip_reason,
     _cusparse_spmv,
+    benchmark_hipsparse_gather,
+    benchmark_hipsparse_scatter,
     _make_scatter_selector_matrix,
     _pytorch_scatter_impl,
     _set_cusparse_stream,
@@ -144,7 +147,27 @@ def benchmark_gather_case(
     cusparse_match = None
     cusparse_max_error = None
     cusparse_reason = None
-    if run_cusparse:
+    gather_ref_backend, _gather_ref_reason = _gather_scatter_sparse_ref_backend(
+        value_dtype, index_dtype, "gather"
+    )
+    if run_cusparse and gather_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE exposes a native SpVec gather, so the baseline is a
+        # direct gather rather than the CUDA-side selector-matrix SpMV.
+        try:
+            cusparse_values, cusparse_ms = benchmark_hipsparse_gather(
+                dense_vector, indices, warmup=warmup, iters=iters
+            )
+            cusparse_match = torch.allclose(
+                cusparse_values, expected, atol=atol, rtol=rtol
+            )
+            cusparse_max_error = (
+                float(torch.max(torch.abs(cusparse_values - expected)).item())
+                if nnz > 0
+                else 0.0
+            )
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif run_cusparse:
         skip_reason = _cusparse_native_gather_skip_reason(value_dtype)
         if skip_reason:
             cusparse_reason = skip_reason
@@ -330,10 +353,34 @@ def benchmark_scatter_case(
     cusparse_match = None
     cusparse_max_error = None
     cusparse_reason = None
-    if run_cusparse:
+    scatter_ref_backend, _scatter_ref_reason = _gather_scatter_sparse_ref_backend(
+        sparse_values.dtype, indices.dtype, "scatter"
+    )
+    if run_cusparse and scatter_ref_backend == "hipsparse" and reset_output:
+        # DCU/ROCm: hipSPARSE exposes a native SpVec scatter.
+        try:
+            cusparse_values, cusparse_ms = benchmark_hipsparse_scatter(
+                sparse_values,
+                indices,
+                dense_size=dense_size,
+                reset_output=reset_output,
+                warmup=warmup,
+                iters=iters,
+            )
+            cusparse_match = torch.allclose(
+                cusparse_values, expected, atol=atol, rtol=rtol
+            )
+            cusparse_max_error = (
+                float(torch.max(torch.abs(cusparse_values - expected)).item())
+                if dense_size > 0
+                else 0.0
+            )
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif run_cusparse:
         if not reset_output:
             skip_reason = (
-                "cuSPARSE scatter baseline only matches reset_output=True semantics"
+                "sparse scatter baseline only matches reset_output=True semantics"
             )
         else:
             skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
@@ -459,7 +506,13 @@ def benchmark_spmv_case(
         torch.complex64,
         torch.complex128,
     )
-    if (
+    spmv_ref_backend, _spmv_ref_reason = _spmv_csr_sparse_ref_backend(
+        value_dtype, indices.dtype, op=op_code
+    )
+    if spmv_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE is the vendor reference.
+        expected = spmv_csr_ref_hipsparse(data, indices, indptr, x, shape, op=op_code)
+    elif (
         cp is not None
         and cpx_sparse is not None
         and value_dtype in _cupy_supported_dtypes
@@ -501,7 +554,28 @@ def benchmark_spmv_case(
     cusparse_match = None
     cusparse_max_error = None
     cusparse_reason = None
-    if (
+    if run_cusparse and spmv_ref_backend == "hipsparse":
+        try:
+            cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
+                lambda: _prepare_spmv_csr_ref_hipsparse(
+                    data, indices, indptr, x, shape, op=op_code
+                ),
+                _run_spmv_csr_ref_hipsparse_prepared,
+                _destroy_spmv_csr_ref_hipsparse_prepared,
+                warmup=warmup,
+                iters=iters,
+            )
+            cusparse_match = torch.allclose(
+                cusparse_values, expected, atol=atol, rtol=rtol
+            )
+            cusparse_max_error = (
+                float(torch.max(torch.abs(cusparse_values - expected)).item())
+                if y_size > 0
+                else 0.0
+            )
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif (
         run_cusparse
         and cp is not None
         and cpx_sparse is not None

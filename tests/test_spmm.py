@@ -500,7 +500,44 @@ def run_one_mtx(
         torch.complex64,
         torch.complex128,
     )
-    if run_cusparse:
+    sparse_ref_backend, sparse_ref_reason = ast_ops._spmm_csr_sparse_ref_backend(
+        value_dtype, indices.dtype, indptr.dtype
+    )
+    if run_cusparse and sparse_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline. Its SpMM
+        # entry point is non-transpose only, so trans/conj are reported as skipped.
+        if op != "non":
+            result["cusparse_reason"] = (
+                "hipSPARSE CSR SpMM reference covers op=non only; trans/conj skipped"
+            )
+        else:
+            try:
+                cs_C_t, result["cusparse_ms"] = ast_ops._benchmark_prepared_cuda_op(
+                    lambda: ast_ops._prepare_spmm_csr_ref_hipsparse(
+                        data, indices, indptr, B, shape
+                    ),
+                    ast_ops._run_spmm_csr_ref_hipsparse_prepared,
+                    ast_ops._destroy_spmm_csr_ref_hipsparse_prepared,
+                    warmup=warmup,
+                    iters=iters,
+                )
+                cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
+                result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]
+                result["cusparse_relative_error_diag"] = cusparse_metrics[
+                    "max_relative_error"
+                ]
+                if triton_C is not None:
+                    result["err_cu"] = _scaled_allclose_error(
+                        triton_C, cs_C_t, value_dtype
+                    )
+                    result["triton_ok_cu"] = torch.allclose(
+                        triton_C, cs_C_t, atol=atol, rtol=rtol
+                    )
+            except Exception as exc:
+                result["cusparse_ms"] = None
+                result["err_cu"] = None
+                result["cusparse_reason"] = str(exc)
+    elif run_cusparse:
         if value_dtype not in _cupy_supported_dtypes:
             result["cusparse_reason"] = (
                 "float16/bfloat16 not supported by CuPy sparse; skipped"

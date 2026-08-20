@@ -20,6 +20,7 @@ import glob
 import math
 import os
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -39,11 +40,21 @@ except ImportError:
     cp = None
     cpx_sparse = None
 
+try:
+    import numpy as np
+    from scipy.sparse import bsr_matrix as scipy_bsr_matrix
+except ImportError as exc:
+    np = None
+    scipy_bsr_matrix = None
+    SCIPY_IMPORT_ERROR = str(exc)
+else:
+    SCIPY_IMPORT_ERROR = None
+
 
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = (torch.int32, torch.int64)
 OPS = ("non", "trans", "conj")
-SUPPORTED_OPS = ("non",)
+SUPPORTED_OPS = OPS
 ALGS = ("auto", "spmm_bsr_base", "base", "all")
 TEST_SIZES = ((64, 96, 16), (160, 1024, 32), (128, 256, 48))
 DEFAULT_BLOCK_DIMS = (2,)
@@ -75,15 +86,19 @@ PERF_FIELDS = [
     "process_cpu_ms",
     "torch_ms",
     "cusparse_ms",
+    "scipy_cpu_ms",
     "torch_vs_alg_speedup",
     "cusparse_vs_alg_speedup",
+    "scipy_vs_alg_speedup",
     "err_vs_ref",
     "err_vs_torch",
     "err_vs_cusparse",
+    "scipy_cpu_err",
     "status",
     "reason",
     "torch_reason",
     "cusparse_reason",
+    "scipy_reason",
 ]
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
@@ -277,6 +292,28 @@ def _padded_shape(shape, block_dim):
     )
 
 
+def _op_transposes(op):
+    return str(op).lower() in ("trans", "conj")
+
+
+def _logical_b_rows(shape, op):
+    return int(shape[0]) if _op_transposes(op) else int(shape[1])
+
+
+def _logical_out_rows(shape, op):
+    return int(shape[1]) if _op_transposes(op) else int(shape[0])
+
+
+def _padded_b_rows(shape, block_dim, op):
+    padded_rows, padded_cols = _padded_shape(shape, block_dim)
+    return padded_rows if _op_transposes(op) else padded_cols
+
+
+def _padded_out_rows(shape, block_dim, op):
+    padded_rows, padded_cols = _padded_shape(shape, block_dim)
+    return padded_cols if _op_transposes(op) else padded_rows
+
+
 def _entries_to_bsr(entries, shape, dtype, index_dtype, block_dim, device):
     n_rows, n_cols = int(shape[0]), int(shape[1])
     n_block_rows = (n_rows + block_dim - 1) // block_dim
@@ -411,7 +448,7 @@ def _bsr_to_torch_coo(data, indices, indptr, shape, block_dim):
     ).coalesce()
 
 
-def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, block_dim):
+def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, block_dim, op):
     ref_dtype = _reference_dtype(dtype)
     A = _bsr_to_torch_coo(
         data.to(ref_dtype),
@@ -420,7 +457,13 @@ def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, block_dim)
         shape,
         block_dim,
     )
-    return torch.sparse.mm(A, B[: int(shape[1]), :].to(ref_dtype)).to(dtype)
+    if op == "non":
+        return torch.sparse.mm(A, B[: int(shape[1]), :].to(ref_dtype)).to(dtype)
+    if op == "trans":
+        return torch.sparse.mm(A.transpose(0, 1), B[: int(shape[0]), :].to(ref_dtype)).to(dtype)
+    if op == "conj":
+        return torch.sparse.mm(A.conj().transpose(0, 1), B[: int(shape[0]), :].to(ref_dtype)).to(dtype)
+    raise ValueError(f"unsupported op: {op}")
 
 
 def _cuda_event_benchmark(op, warmup, iters):
@@ -456,11 +499,13 @@ def _pad_dense_for_bsr_run(B, padded_rows):
     return padded
 
 
-def _time_flagsparse_bsr(data, indices, indptr, B, shape, block_dim, alg, warmup, iters, timing=False):
-    prepared = fs.prepare_spmm_bsr_route(data, indices, indptr, shape, block_dim=block_dim, alg=alg)
-    B_for_bsr = _pad_dense_for_bsr_run(B, prepared.padded_n_cols)
+def _time_flagsparse_bsr(data, indices, indptr, B, shape, block_dim, alg, op, warmup, iters, timing=False):
+    prepared = fs.prepare_spmm_bsr_route(
+        data, indices, indptr, shape, block_dim=block_dim, alg=alg, op=op
+    )
+    B_for_bsr = _pad_dense_for_bsr_run(B, _padded_b_rows(shape, block_dim, op))
     out, gpu_ms = _cuda_event_benchmark(
-        lambda: fs.flagsparse_spmm_bsr_run(prepared, B_for_bsr, alg=alg),
+        lambda: fs.flagsparse_spmm_bsr_run(prepared, B_for_bsr, alg=alg, op=op),
         warmup,
         iters,
     )
@@ -468,6 +513,7 @@ def _time_flagsparse_bsr(data, indices, indptr, B, shape, block_dim, alg, warmup
         prepared,
         B_for_bsr,
         alg=alg,
+        op=op,
         return_meta=True,
         timing=bool(timing),
     )
@@ -489,7 +535,9 @@ def _time_flagsparse_bsr(data, indices, indptr, B, shape, block_dim, alg, warmup
     }
 
 
-def _time_pytorch_bsr(data, indices, indptr, B, shape, block_dim, warmup, iters):
+def _time_pytorch_bsr(data, indices, indptr, B, shape, block_dim, op, warmup, iters):
+    if op in ("trans", "conj"):
+        return None, "PyTorch CUDA BSR transpose-family SpMM baseline is unsupported; no fallback", None
     padded_shape = _padded_shape(shape, block_dim)
     padded_B = B
     if B.shape[0] != padded_shape[1]:
@@ -521,7 +569,7 @@ def _cupy_bsr_unavailable_reason():
     return None
 
 
-def _time_cusparse_bsr(data, indices, indptr, B, shape, block_dim, warmup, iters):
+def _time_cusparse_bsr(data, indices, indptr, B, shape, block_dim, op, warmup, iters):
     reason = _cupy_bsr_unavailable_reason()
     if reason:
         return None, reason, None
@@ -532,44 +580,85 @@ def _time_cusparse_bsr(data, indices, indptr, B, shape, block_dim, warmup, iters
     ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices))
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
     B_use = B
-    if B.shape[0] != padded_shape[1]:
-        B_use = torch.zeros((padded_shape[1], B.shape[1]), dtype=B.dtype, device=B.device)
+    padded_b_rows = _padded_b_rows(shape, block_dim, op)
+    if B.shape[0] != padded_b_rows:
+        B_use = torch.zeros((padded_b_rows, B.shape[1]), dtype=B.dtype, device=B.device)
         B_use[: B.shape[0], :].copy_(B)
     B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B_use))
     A = cpx_sparse.bsr_matrix((data_cp, ind_cp, ptr_cp), shape=padded_shape)
+    if op == "non":
+        fn = lambda: A @ B_cp
+    elif op == "trans":
+        fn = lambda: A.T @ B_cp
+    elif op == "conj":
+        fn = lambda: A.conj().T @ B_cp
+    else:
+        raise ValueError(f"unsupported op: {op}")
     for _ in range(max(0, int(warmup))):
-        _ = A @ B_cp
+        _ = fn()
     cp.cuda.runtime.deviceSynchronize()
     start = cp.cuda.Event()
     end = cp.cuda.Event()
     count = max(1, int(iters))
     start.record()
     for _ in range(count):
-        out_cp = A @ B_cp
+        out_cp = fn()
     end.record()
     end.synchronize()
     out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
     return cp.cuda.get_elapsed_time(start, end) / count, None, out
 
 
-def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, block_dim, dense_cols, layout, alg, warmup, iters, timing, run_cusparse):
+def _time_scipy_bsr_cpu(data, indices, indptr, B, shape, block_dim, op, warmup, iters):
+    if scipy_bsr_matrix is None or np is None:
+        return None, f"SciPy BSR baseline is not available: {SCIPY_IMPORT_ERROR}", None
+    padded_shape = _padded_shape(shape, block_dim)
+    data_np = data.detach().cpu().numpy()
+    indices_np = indices.detach().cpu().numpy()
+    indptr_np = indptr.detach().cpu().numpy()
+    B_use = _pad_dense_for_bsr_run(B, _padded_b_rows(shape, block_dim, op))
+    B_np = B_use.detach().cpu().numpy()
+    A = scipy_bsr_matrix((data_np, indices_np, indptr_np), shape=padded_shape)
+    if op == "non":
+        fn = lambda: A @ B_np
+    elif op == "trans":
+        fn = lambda: A.T @ B_np
+    elif op == "conj":
+        fn = lambda: A.conj().T @ B_np
+    else:
+        raise ValueError(f"unsupported op: {op}")
+    out_np = None
+    for _ in range(max(0, int(warmup))):
+        out_np = fn()
+    count = max(1, int(iters))
+    start = time.perf_counter()
+    for _ in range(count):
+        out_np = fn()
+    elapsed_ms = (time.perf_counter() - start) * 1000.0 / count
+    out = torch.as_tensor(out_np, dtype=data.dtype, device=data.device)
+    return elapsed_ms, None, out
+
+
+def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, block_dim, dense_cols, layout, alg, op, warmup, iters, timing, run_cusparse):
     B = _materialize_dense_layout(
-        _random_values((int(shape[1]), int(dense_cols)), dtype, data.device) * 0.125,
+        _random_values((_logical_b_rows(shape, op), int(dense_cols)), dtype, data.device) * 0.125,
         layout,
     )
-    ref = _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, block_dim)
+    ref = _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, block_dim, op)
+    logical_out_rows = _logical_out_rows(shape, op)
+    padded_out_rows = _padded_out_rows(shape, block_dim, op)
     row = {
         "matrix": matrix_name,
         "dtype": _dtype_name(dtype),
         "index_dtype": _dtype_name(index_dtype),
-        "op": "non",
+        "op": op,
         "layout": layout,
         "alg": alg,
         "block_dim": block_dim,
         "ref": "torch_spmm_coo",
-        "out_rows": int(shape[0]),
-        "padded_out_rows": _padded_shape(shape, block_dim)[0],
-        "pad_rows": _padded_shape(shape, block_dim)[0] - int(shape[0]),
+        "out_rows": logical_out_rows,
+        "padded_out_rows": padded_out_rows,
+        "pad_rows": padded_out_rows - logical_out_rows,
         "n_rows": int(shape[0]),
         "n_cols": int(shape[1]),
         "nnzb": int(data.shape[0]),
@@ -583,23 +672,27 @@ def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, blo
         "process_cpu_ms": 0.0,
         "torch_ms": None,
         "cusparse_ms": None,
+        "scipy_cpu_ms": None,
         "torch_vs_alg_speedup": None,
         "cusparse_vs_alg_speedup": None,
+        "scipy_vs_alg_speedup": None,
         "err_vs_ref": None,
         "err_vs_torch": None,
         "err_vs_cusparse": None,
+        "scipy_cpu_err": None,
         "status": "ERROR",
         "reason": "",
         "torch_reason": "",
         "cusparse_reason": "",
+        "scipy_reason": "",
         "process_gpu_ms": None,
         "compute_ms": None,
     }
     try:
         bsr = _time_flagsparse_bsr(
-            data, indices, indptr, B, shape, block_dim, alg, warmup, iters, timing=timing
+            data, indices, indptr, B, shape, block_dim, alg, op, warmup, iters, timing=timing
         )
-        out_logical = bsr["out"][: int(shape[0]), :]
+        out_logical = bsr["out"][:logical_out_rows, :]
         row.update(
             {
                 "ms": bsr["ms"],
@@ -619,27 +712,38 @@ def _run_case(matrix_name, data, indices, indptr, shape, dtype, index_dtype, blo
         return row
     try:
         torch_ms, torch_reason, torch_out = _time_pytorch_bsr(
-            data, indices, indptr, B, shape, block_dim, warmup, iters
+            data, indices, indptr, B, shape, block_dim, op, warmup, iters
         )
         row["torch_ms"] = torch_ms
         row["torch_reason"] = torch_reason or ""
         if torch_out is not None:
-            row["err_vs_torch"] = _error_ratio(torch_out[: int(shape[0]), :], ref, dtype)
+            row["err_vs_torch"] = _error_ratio(torch_out[:logical_out_rows, :], ref, dtype)
     except Exception as exc:
         row["torch_reason"] = str(exc)
     if run_cusparse:
         try:
             cu_ms, cu_reason, cu_out = _time_cusparse_bsr(
-                data, indices, indptr, B, shape, block_dim, warmup, iters
+                data, indices, indptr, B, shape, block_dim, op, warmup, iters
             )
             row["cusparse_ms"] = cu_ms
             row["cusparse_reason"] = cu_reason or ""
             if cu_out is not None:
-                row["err_vs_cusparse"] = _error_ratio(cu_out[: int(shape[0]), :], ref, dtype)
+                row["err_vs_cusparse"] = _error_ratio(cu_out[:logical_out_rows, :], ref, dtype)
         except Exception as exc:
             row["cusparse_reason"] = str(exc)
+    try:
+        scipy_ms, scipy_reason, scipy_out = _time_scipy_bsr_cpu(
+            data, indices, indptr, B, shape, block_dim, op, warmup, iters
+        )
+        row["scipy_cpu_ms"] = scipy_ms
+        row["scipy_reason"] = scipy_reason or ""
+        if scipy_out is not None:
+            row["scipy_cpu_err"] = _error_ratio(scipy_out[:logical_out_rows, :], ref, dtype)
+    except Exception as exc:
+        row["scipy_reason"] = str(exc)
     row["torch_vs_alg_speedup"] = _ratio(row["torch_ms"], row["ms"])
     row["cusparse_vs_alg_speedup"] = _ratio(row["cusparse_ms"], row["ms"])
+    row["scipy_vs_alg_speedup"] = _ratio(row["scipy_cpu_ms"], row["ms"])
     return row
 
 
@@ -654,9 +758,13 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
-    print("FlagSparse BSR SpMM follows padded block-grid semantics; native output is padded and correctness checks slice back to logical rows.")
+    print("FlagSparse BSR SpMM follows padded block-grid semantics; native output is padded and correctness checks slice back to logical rows/cols by op.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same BSR arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
-    print("PyTorch BSR baseline is attempted with the same BSR arrays and padded shape; unsupported cases are recorded as N/A.")
+    print("PyTorch BSR baseline is attempted only for same-format supported cases; CUDA BSR transpose-family is recorded as N/A with no fallback.")
+    if scipy_bsr_matrix is None:
+        print(f"SciPy CPU BSR baseline: unavailable ({SCIPY_IMPORT_ERROR}); SciPy(ms)=N/A.")
+    else:
+        print("SciPy CPU BSR baseline: same BSR arrays with padded shape; CPU-vs-GPU speedup is diagnostic only.")
     if run_cusparse:
         reason = _cupy_bsr_unavailable_reason()
         if reason:
@@ -668,8 +776,9 @@ def _print_row(row, timing=False):
         f"{row['matrix']:<28} {row['dtype']:<10} {row['index_dtype']:<5} {row['op']:<4} {row['layout']:<4} {row['alg']:<14} "
         f"{row['block_dim']:>4} {row['n_rows']:>7} {row['n_cols']:>7} {row['nnzb']:>8} {row['dense_cols']:>5} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
-        f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9} "
-        f"{_fmt(row['torch_vs_alg_speedup'], 2):>8} {_fmt(row['err_vs_ref'], 2):>10} {row['status']:>6}"
+        f"{_fmt(row['torch_ms']):>9} {_fmt(row['cusparse_ms']):>9} {_fmt(row['scipy_cpu_ms']):>9} "
+        f"{_fmt(row['torch_vs_alg_speedup'], 2):>8} {_fmt(row['scipy_vs_alg_speedup'], 2):>8} "
+        f"{_fmt(row['err_vs_ref'], 2):>10} {_fmt(row['scipy_cpu_err'], 2):>10} {row['status']:>6}"
         + (
             f" {_fmt(row.get('process_gpu_ms')):>9} {_fmt(row.get('compute_ms')):>9}"
             if timing
@@ -724,7 +833,8 @@ def main():
         print(
             f"{'Matrix':<28} {'DType':<10} {'Index':<5} {'Op':<4} {'Lay':<4} {'Alg':<14} "
             f"{'BDim':>4} {'Rows':>7} {'Cols':>7} {'NNZB':>8} {'DCols':>5} "
-            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'PT':>9} {'CU':>9} {'PT/Alg':>8} {'Err':>10} {'Status':>6}"
+            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'PT':>9} {'CU':>9} {'SciPy':>9} "
+            f"{'PT/Alg':>8} {'Sci/Alg':>8} {'Err':>10} {'SciErr':>10} {'Status':>6}"
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )
         print("-" * 160)
@@ -769,7 +879,7 @@ def main():
                                         "n_rows": int(shape[0]),
                                         "n_cols": int(shape[1]),
                                         "status": "SKIP",
-                                        "reason": "spmm_bsr v1 only supports op='non'",
+                                        "reason": f"spmm_bsr does not support op={op!r}",
                                     }
                                 )
                                 rows.append(row)
@@ -791,6 +901,7 @@ def main():
                                         dense_cols,
                                         layout,
                                         alg,
+                                        op,
                                         args.warmup,
                                         args.iters,
                                         args.timing,

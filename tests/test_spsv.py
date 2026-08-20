@@ -836,6 +836,27 @@ def _cupy_spsolve_lower_csr_or_coo(
 
 
 def _cupy_spsolve_csr_with_op(data, indices, indptr, shape, b, op_mode, lower):
+    # Vendor triangular-solve baseline, dispatched per backend: hipSPARSE SpSV on
+    # DCU/ROCm, CuPy's spsolve_triangular (cuSPARSE-backed) on CUDA.
+    if fs_spsv_impl._is_rocm_runtime():
+        warmup, iters = _spsv_benchmark_schedule(
+            int(data.numel()), op_mode, data.dtype, fmt="CSR"
+        )
+        sparse_ref = fs_spsv_impl._benchmark_spsv_csr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            b,
+            shape,
+            lower=lower,
+            unit_diagonal=False,
+            op=str(op_mode).lower(),
+            warmup=warmup,
+            iters=iters,
+        )
+        if sparse_ref["backend"] is None:
+            return None, None
+        return sparse_ref["ms"], sparse_ref["values"]
     if cp is None or cpx_sparse is None or cpx_spsolve_triangular is None:
         return None, None
     try:
