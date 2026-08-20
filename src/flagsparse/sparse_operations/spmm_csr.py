@@ -4726,7 +4726,7 @@ def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
                 _hip_check_result(hip.hipFree(workspace), "hipFree")
             except Exception:
                 pass
- 
+
 
 def _run_spmm_csr_ref_hipsparse_prepared(state):
     if state.get("empty"):

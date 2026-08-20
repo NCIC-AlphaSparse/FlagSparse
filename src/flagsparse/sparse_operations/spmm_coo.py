@@ -560,7 +560,7 @@ def _prepare_spmm_coo_ref_hipsparse(
                 _hip_check_result(hip.hipFree(workspace), "hipFree")
             except Exception:
                 pass
- 
+
 
 def _run_spmm_coo_ref_hipsparse_prepared(state):
     if state.get("empty"):

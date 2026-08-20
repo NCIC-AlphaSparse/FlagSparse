@@ -1760,7 +1760,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
                 _hip_check_result(hip.hipFree(buffer1), "hipFree(buffer1)")
             except Exception:
                 pass
- 
+
 
 def _run_spgemm_csr_ref_hipsparse_prepared(state):
     _hip_check_result(

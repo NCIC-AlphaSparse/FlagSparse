@@ -739,7 +739,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
                 _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
             except Exception:
                 pass
- 
+
 
 def _run_hipsparse_gather_prepared(state):
     _hip_check_result(
@@ -876,7 +876,7 @@ def _prepare_hipsparse_scatter(
                 _hip_check_result(hipsparse.hipsparseDestroySpVec(spvec), "hipsparseDestroySpVec")
             except Exception:
                 pass
- 
+
 
 def _run_hipsparse_scatter_prepared(state):
     _hip_check_result(
