@@ -542,6 +542,31 @@ def _build_cupy_spgemm_reference(
     return _op(), "CSR", _op
 
 
+def _build_hipsparse_spgemm_reference(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+):
+    """DCU/ROCm vendor SpGEMM reference, the hipSPARSE analogue of the CuPy path."""
+    reason = ast_ops._hipsparse_spgemm_csr_skip_reason(
+        a_data.dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
+    )
+    if reason is not None:
+        raise RuntimeError(reason)
+
+    def _op():
+        return ast_ops._spgemm_csr_ref_hipsparse(
+            a_data, a_indices, a_indptr, a_shape, b_data, b_indices, b_indptr, b_shape
+        )
+
+    return _op(), "CSR", _op
+
+
 def _build_cupy_spgemm_reference_blocked(
     a_data,
     a_indices,
@@ -682,16 +707,17 @@ def _run_reference_with_retries(
     input_mode,
     result_device="gpu",
 ):
-    run_direct = (
-        _build_torch_spgemm_reference
-        if backend == "torch"
-        else _build_cupy_spgemm_reference
-    )
-    run_blocked = (
-        _build_torch_spgemm_reference_blocked
-        if backend == "torch"
-        else _build_cupy_spgemm_reference_blocked
-    )
+    if backend == "torch":
+        run_direct = _build_torch_spgemm_reference
+        run_blocked = _build_torch_spgemm_reference_blocked
+    elif backend == "hipsparse":
+        run_direct = _build_hipsparse_spgemm_reference
+        # hipSPARSE has no blocked variant; the torch builder is the memory-relief
+        # retry on DCU just as it is when CuPy blocking is unavailable.
+        run_blocked = _build_torch_spgemm_reference_blocked
+    else:
+        run_direct = _build_cupy_spgemm_reference
+        run_blocked = _build_cupy_spgemm_reference_blocked
     attempted_modes = ["direct"]
 
     def _mark_mode(mode):
@@ -1088,8 +1114,12 @@ def run_one_mtx(
         _cleanup_reference_pools()
 
     if run_cusparse:
+        # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
+        vendor_backend, _vendor_reason = ast_ops._spgemm_csr_sparse_ref_backend(
+            value_dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
+        )
         cu_ref = _run_reference_with_retries(
-            backend="cupy",
+            backend="hipsparse" if vendor_backend == "hipsparse" else "cupy",
             a_data=a_data,
             a_indices=a_indices,
             a_indptr=a_indptr,

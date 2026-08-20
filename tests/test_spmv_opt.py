@@ -29,7 +29,16 @@ import os
 import time
 
 import torch
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
 import flagsparse as fs
+import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_csr as spmv_csr_mod
 
 VALUE_DTYPES = [torch.float32, torch.float64]
@@ -220,28 +229,13 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
 
 
 def _timed_cusparse(data, indices, indptr, x, shape, warmup, iters):
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-
-    data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-    x_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
-    A = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        _ = A @ x_cp
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
-    e0.record()
-    for _ in range(iters):
-        _ = A @ x_cp
-    e1.record()
-    torch.cuda.synchronize()
-    y_cp = A @ x_cp
-    y = torch.utils.dlpack.from_dlpack(y_cp.toDlpack())
-    return y, e0.elapsed_time(e1) / iters
+    """Vendor SpMV baseline: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA."""
+    sparse_ref = fs_common._benchmark_spmv_csr_sparse_ref(
+        data, indices, indptr, x, shape, warmup=warmup, iters=iters
+    )
+    if sparse_ref["backend"] is None:
+        raise RuntimeError(sparse_ref["reason"] or "no sparse backend reference")
+    return sparse_ref["values"], sparse_ref["ms"]
 
 
 def _fmt(v):

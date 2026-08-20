@@ -19,6 +19,7 @@ from ._common import *
 import math
 
 from .spmm_csr import (
+    _benchmark_spmm_csr_sparse_ref,
     _prepare_spmm_csr_matrix,
     _spmm_coo_reference_tolerance,
     _spmm_validation_metrics,
@@ -1320,23 +1321,18 @@ def benchmark_spmm_opt_alg2_case(
     sparse_ms = None
     sparse_reason = None
     if run_cusparse:
-        if cp is None or cpx_sparse is None:
-            sparse_reason = "CuPy/cuSPARSE is not available"
-        else:
-            try:
-                data_cp = _cupy_from_torch(data)
-                indices_cp = _cupy_from_torch(indices.to(torch.int64))
-                indptr_cp = _cupy_from_torch(indptr)
-                B_cp = _cupy_from_torch(B)
-                A_csr = cpx_sparse.csr_matrix(
-                    (data_cp, indices_cp, indptr_cp), shape=shape
-                )
-                sparse_backend, sparse_ms = _benchmark_cuda_op(
-                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
-                )
-                sparse_backend = _torch_from_cupy(sparse_backend)
-            except Exception as exc:
-                sparse_reason = str(exc)
+        # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
+        try:
+            sparse_ref = _benchmark_spmm_csr_sparse_ref(
+                data, indices, indptr, B, shape, warmup=warmup, iters=iters
+            )
+            if sparse_ref["backend"] is None:
+                sparse_reason = sparse_ref["reason"]
+            else:
+                sparse_backend = sparse_ref["values"]
+                sparse_ms = sparse_ref["ms"]
+        except Exception as exc:
+            sparse_reason = str(exc)
 
     return {
         "parameters": {

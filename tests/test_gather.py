@@ -26,6 +26,11 @@ if SRC_ROOT.is_dir():
 
 import torch
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
 import flagsparse as ast
 
 DEFAULT_CASES = [

@@ -32,6 +32,40 @@ pip install . --no-deps --no-build-isolation
 pip install torch triton cupy-cuda12x
 ```
 
+## 后端（CUDA / DCU）
+
+FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分发；Triton 内核本身在各后端保持不变。
+
+| 运行时 | 判定方式 | 厂商稀疏库 | Python 绑定 |
+| --- | --- | --- | --- |
+| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy（`cupy-cuda12x`） |
+| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+
+在 DCU/ROCm 机器上，安装与 ROCm 版本匹配的 hip-python：
+
+```bash
+pip install hip-python
+```
+
+两种绑定都是可选的。若都不可用，基准测试会回退到通用的 `torch.sparse` 参考实现，
+并在 `*_reason` / `backend_status` 字段中给出原因，而不是直接报错。
+
+分发逻辑位于各 `_*_sparse_ref_backend()` 辅助函数，返回
+`("hipsparse" | "cupy_cusparse" | None, reason)`：
+
+- `flagsparse.sparse_operations._common` —— SpMV CSR/COO
+- `.spmm_csr` / `.spmm_coo` / `.spgemm_csr` / `.gather_scatter` —— 其余算子
+
+逐阶段排查 DCU 路径（基准测试卡住而非报错时尤其有用）：
+
+```bash
+python tests/diagnose_hipsparse_ref.py --op env      # 先做环境探测
+python tests/diagnose_hipsparse_ref.py --op spmv-csr # 再逐个算子排查
+```
+
+DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
+已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。
+
 ## 目录说明
 
 - `src/flagsparse/` - 核心包（`sparse_operations/` 由 `flagsparse.py` 内嵌字符串生成多个 `.py`）

@@ -60,6 +60,13 @@ def _reference_dtype(dtype):
 
 
 def _tol(dtype):
+    # fp32 / fp16 / bf16 and complex64 accumulate in fp32-precision components and
+    # carry standard fp32 SpMV error (order-dependent), so they use a realistic
+    # fp32 tolerance rather than the fp64-then-cast accuracy of the former
+    # baseline. fp64 and complex128 accumulate in fp64 and keep the strict shared
+    # tolerance.
+    if dtype in (torch.float32, torch.float16, torch.bfloat16, torch.complex64):
+        return 1e-3, 1e-3
     return close_tolerances(dtype)
 
 

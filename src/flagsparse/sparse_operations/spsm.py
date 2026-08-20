@@ -16,7 +16,12 @@
 
 from collections import OrderedDict
 
+import ctypes
+
+from . import _common as _common_mod
 from ._common import *
+
+HipPointer = _common_mod.HipPointer
 
 SUPPORTED_SPSM_VALUE_DTYPES = (
     torch.float32,
@@ -38,6 +43,531 @@ SPSM_NON_TRANS_PRIMARY_COMBOS = (
 _SPSM_PREPROCESS_CACHE = OrderedDict()
 _SPSM_PREPROCESS_CACHE_SIZE = 8
 _SPSM_POLLING_RHS_TILE = 1024
+
+
+def _try_set_hipsparse_current_stream(handle):
+    set_stream = getattr(hipsparse, "hipsparseSetStream", None)
+    if set_stream is None:
+        return "hipSPARSE binding does not expose hipsparseSetStream"
+
+    stream_ptr = _torch_current_stream_ptr()
+    if stream_ptr is None:
+        return "could not resolve torch current CUDA/HIP stream pointer"
+
+    stream_args = []
+    if HipPointer is not None:
+        try:
+            stream_args.append(HipPointer.fromObj(stream_ptr))
+        except Exception:
+            pass
+    stream_args.extend([stream_ptr, ctypes.c_void_p(stream_ptr)])
+
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(set_stream(handle, stream_arg), "hipsparseSetStream")
+            return None
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    return f"hipsparseSetStream failed for torch current stream: {last_error}"
+
+
+def _hipsparse_csrsm2_functions(value_dtype):
+    prefix = {
+        torch.float32: "S",
+        torch.float64: "D",
+        torch.complex64: "C",
+        torch.complex128: "Z",
+    }.get(value_dtype)
+    if prefix is None:
+        raise TypeError(f"hipSPARSE csrsm2 does not support {value_dtype}")
+    return (
+        getattr(hipsparse, f"hipsparse{prefix}csrsm2_bufferSizeExt"),
+        getattr(hipsparse, f"hipsparse{prefix}csrsm2_analysis"),
+        getattr(hipsparse, f"hipsparse{prefix}csrsm2_solve"),
+    )
+
+
+def _hipsparse_create_descriptor(attr_names, context, handle=None):
+    ptr_type = type(handle) if handle is not None else None
+    last_error = None
+    for attr_name in attr_names:
+        create_fn = getattr(hipsparse, attr_name, None) if hipsparse is not None else None
+        if create_fn is None:
+            continue
+        try:
+            raw = create_fn()
+            if ptr_type is not None and isinstance(raw, ptr_type):
+                return raw
+            if hasattr(raw, "createRef"):
+                return raw
+            payload = _hip_check_result(raw, context)
+            if payload is not None:
+                return payload
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if ptr_type is None:
+            continue
+        descr = ptr_type()
+        attempts = []
+        if hasattr(descr, "createRef"):
+            attempts.append((descr.createRef(),))
+        attempts.append((descr,))
+        for args in attempts:
+            try:
+                payload = _hip_check_result(create_fn(*args), context)
+                return payload if payload is not None else descr
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+    raise RuntimeError(f"{context} failed: {last_error}") from last_error
+
+
+def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
+    indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
+    if not _is_rocm_runtime():
+        return "hipSPARSE csrsm2 requires a ROCm/DCU runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    if value_dtype not in SUPPORTED_SPSM_VALUE_DTYPES:
+        return f"hipSPARSE csrsm2 has no value dtype mapping for {value_dtype}"
+    if index_dtype != torch.int32 or indptr_dtype != torch.int32:
+        return "hipSPARSE csrsm2 requires int32 CSR indices and row offsets"
+    for symbol in ("hipMalloc", "hipFree"):
+        if hip is None or not hasattr(hip, symbol):
+            return f"hipSPARSE csrsm2 is unavailable: missing HIP runtime {symbol}"
+    required = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateMatDescr",
+        "hipsparseDestroyMatDescr",
+        "hipsparseSetMatType",
+        "hipsparseSetMatIndexBase",
+        "hipsparseSetMatFillMode",
+        "hipsparseSetMatDiagType",
+        "hipsparseCreateCsrsm2Info",
+        "hipsparseDestroyCsrsm2Info",
+    )
+    for symbol in required:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE csrsm2 is unavailable: missing {symbol}"
+    try:
+        _hipsparse_csrsm2_functions(value_dtype)
+        _hipsparse_lookup(
+            "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+        )
+        _hipsparse_lookup(
+            "hipsparseMatrixType_t", ("HIPSPARSE_MATRIX_TYPE_GENERAL",)
+        )
+        _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        _hipsparse_lookup("hipsparseFillMode_t", ("HIPSPARSE_FILL_MODE_LOWER",))
+        _hipsparse_lookup(
+            "hipsparseDiagType_t", ("HIPSPARSE_DIAG_TYPE_NON_UNIT",)
+        )
+        _hipsparse_lookup(
+            "hipsparseSolvePolicy_t",
+            (
+                "HIPSPARSE_SOLVE_POLICY_NO_LEVEL",
+                "HIPSPARSE_SOLVE_POLICY_USE_LEVEL",
+            ),
+        )
+        _hipsparse_scalar(value_dtype, 1.0, 0.0)
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spsm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
+    reason = _hipsparse_csrsm2_skip_reason(
+        value_dtype, index_dtype, indptr_dtype
+    )
+    if reason is None:
+        return "hipsparse_csrsm2", None
+    return None, reason
+
+
+def _destroy_spsm_csr_ref_hipsparse_prepared(state):
+    if not state:
+        return
+    if state.get("workspace_allocated"):
+        try:
+            _hip_check_result(hip.hipFree(state["workspace"]), "hipFree")
+        except Exception:
+            pass
+    info = state.get("info")
+    if info is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyCsrsm2Info(info),
+                "hipsparseDestroyCsrsm2Info",
+            )
+        except Exception:
+            pass
+    descr = state.get("descr")
+    if descr is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyMatDescr(descr),
+                "hipsparseDestroyMatDescr",
+            )
+        except Exception:
+            pass
+    handle = state.get("handle")
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _time_hipsparse_call_ms(call):
+    start_evt = None
+    stop_evt = None
+    if _hip_runtime_event_available():
+        try:
+            start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+            stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            _hip_check_result(hip.hipEventRecord(start_evt, 0), "hipEventRecord(start)")
+            call()
+            _hip_check_result(hip.hipEventRecord(stop_evt, 0), "hipEventRecord(stop)")
+            _hip_check_result(
+                hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)"
+            )
+            return _hip_event_elapsed_ms(start_evt, stop_evt)
+        finally:
+            _destroy_hip_event(stop_evt)
+            _destroy_hip_event(start_evt)
+
+    torch.cuda.synchronize()
+    start_evt_torch = torch.cuda.Event(enable_timing=True)
+    stop_evt_torch = torch.cuda.Event(enable_timing=True)
+    start_evt_torch.record()
+    call()
+    stop_evt_torch.record()
+    torch.cuda.synchronize()
+    return float(start_evt_torch.elapsed_time(stop_evt_torch))
+
+
+def _spsm_filtered_avg_ms(times):
+    if not times:
+        return None
+    times = [float(t) for t in times]
+    if len(times) == 1:
+        return times[0]
+    ordered = sorted(times)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    lo = median * 0.9
+    hi = median * 1.1
+    kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
+def _prepare_spsm_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+):
+    reason = _hipsparse_csrsm2_skip_reason(
+        data.dtype, indices.dtype, indptr.dtype
+    )
+    if reason is not None:
+        raise RuntimeError(reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
+        raise TypeError("data, indices, indptr, B must all be torch.Tensor")
+    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+        raise ValueError("hipSPARSE csrsm2 inputs must all be GPU tensors")
+    if not all(t.device == data.device for t in (indices, indptr, B)):
+        raise ValueError("hipSPARSE csrsm2 inputs must be on the same device")
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
+        raise ValueError("data, indices, and indptr must be 1D")
+    if B.ndim != 2:
+        raise ValueError("B must be a 2D dense matrix")
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows != n_cols:
+        raise ValueError("hipSPARSE csrsm2 requires a square sparse matrix")
+    if indptr.numel() != n_rows + 1:
+        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    if data.numel() != indices.numel():
+        raise ValueError("data and indices must contain the same number of entries")
+    if B.shape[0] != n_rows:
+        raise ValueError(f"B.shape[0] must equal n_rows={n_rows}")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype")
+
+    state = {
+        "backend": "hipsparse_csrsm2",
+        "handle": None,
+        "descr": None,
+        "info": None,
+        "workspace": 0,
+        "workspace_allocated": False,
+    }
+    try:
+        data = data.contiguous()
+        indices = indices.contiguous()
+        indptr = indptr.contiguous()
+        # csrsm2 uses column-major dense storage. B.T contiguous has that layout.
+        rhs_col_major = B.transpose(0, 1).contiguous()
+        solution_col_major = rhs_col_major.clone()
+        buffer_size_fn, analysis_fn, solve_fn = _hipsparse_csrsm2_functions(
+            data.dtype
+        )
+
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        state["handle"] = handle
+        state["stream_binding_warning"] = _try_set_hipsparse_current_stream(handle)
+        descr = _hipsparse_create_descriptor(
+            ("hipsparseCreateMatDescr",),
+            "hipsparseCreateMatDescr",
+            handle=handle,
+        )
+        state["descr"] = descr
+        _hip_check_result(
+            hipsparse.hipsparseSetMatType(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseMatrixType_t", ("HIPSPARSE_MATRIX_TYPE_GENERAL",)
+                ),
+            ),
+            "hipsparseSetMatType",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatIndexBase(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+                ),
+            ),
+            "hipsparseSetMatIndexBase",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatFillMode(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseFillMode_t",
+                    ("HIPSPARSE_FILL_MODE_LOWER",)
+                    if lower
+                    else ("HIPSPARSE_FILL_MODE_UPPER",),
+                ),
+            ),
+            "hipsparseSetMatFillMode",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatDiagType(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseDiagType_t",
+                    ("HIPSPARSE_DIAG_TYPE_UNIT",)
+                    if unit_diagonal
+                    else ("HIPSPARSE_DIAG_TYPE_NON_UNIT",),
+                ),
+            ),
+            "hipsparseSetMatDiagType",
+        )
+        info = _hipsparse_create_descriptor(
+            ("hipsparseCreateCsrsm2Info",),
+            "hipsparseCreateCsrsm2Info",
+            handle=handle,
+        )
+        state["info"] = info
+
+        alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+        op_n = _hipsparse_lookup(
+            "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+        )
+        policy = _hipsparse_lookup(
+            "hipsparseSolvePolicy_t",
+            (
+                "HIPSPARSE_SOLVE_POLICY_NO_LEVEL",
+                "HIPSPARSE_SOLVE_POLICY_USE_LEVEL",
+            ),
+        )
+        dense_ptr = HipPointer.fromObj(solution_col_major.data_ptr())
+        common_args = (
+            handle,
+            0,
+            op_n,
+            op_n,
+            n_rows,
+            int(B.shape[1]),
+            int(data.numel()),
+            alpha,
+            descr,
+            HipPointer.fromObj(data.data_ptr()),
+            HipPointer.fromObj(indptr.data_ptr()),
+            HipPointer.fromObj(indices.data_ptr()),
+            dense_ptr,
+            n_rows,
+            info,
+            policy,
+        )
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            buffer_size_fn(*common_args, size_out),
+            "hipsparseXcsrsm2_bufferSizeExt",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            state["workspace"] = _hip_check_result(
+                hip.hipMalloc(buffer_size), "hipMalloc(csrsm2 workspace)"
+            )
+            state["workspace_allocated"] = True
+        analysis_ms = _time_hipsparse_call_ms(
+            lambda: _hip_check_result(
+                analysis_fn(*common_args, state["workspace"]),
+                "hipsparseXcsrsm2_analysis",
+            )
+        )
+        state.update(
+            {
+                "analysis_ms": analysis_ms,
+                "buffer_size": buffer_size,
+                "data": data,
+                "indices": indices,
+                "indptr": indptr,
+                "rhs": rhs_col_major,
+                "solution_col_major": solution_col_major,
+                "solve_fn": solve_fn,
+                "solve_args": common_args,
+            }
+        )
+        return state
+    except Exception:
+        _destroy_spsm_csr_ref_hipsparse_prepared(state)
+        raise
+
+
+def _run_spsm_csr_ref_hipsparse_prepared(state):
+    state["solution_col_major"].copy_(state["rhs"])
+    _hip_check_result(
+        state["solve_fn"](*state["solve_args"], state["workspace"]),
+        "hipsparseXcsrsm2_solve",
+    )
+    return state["solution_col_major"].transpose(0, 1).contiguous()
+
+
+def _spsm_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    return_metadata=False,
+):
+    state = _prepare_spsm_csr_ref_hipsparse(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        lower=lower,
+        unit_diagonal=unit_diagonal,
+    )
+    try:
+        values = _run_spsm_csr_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse_csrsm2",
+            "analysis_ms": float(state.get("analysis_ms", 0.0)),
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "csr",
+        }
+        return (values, metadata) if return_metadata else values
+    finally:
+        _destroy_spsm_csr_ref_hipsparse_prepared(state)
+
+
+def _benchmark_spsm_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    *,
+    lower=True,
+    unit_diagonal=False,
+    warmup=0,
+    iters=1,
+):
+    backend, reason = _spsm_csr_sparse_ref_backend(
+        data.dtype, indices.dtype, indptr.dtype
+    )
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    state = None
+    try:
+        values = None
+        for _ in range(warmup):
+            state = _prepare_spsm_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+            )
+            try:
+                values = _run_spsm_csr_ref_hipsparse_prepared(state)
+            finally:
+                _destroy_spsm_csr_ref_hipsparse_prepared(state)
+                state = None
+            torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            state = _prepare_spsm_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+            )
+            try:
+                values = _run_spsm_csr_ref_hipsparse_prepared(state)
+                torch.cuda.synchronize()
+                times.append((time.perf_counter() - start_time) * 1000.0)
+            finally:
+                _destroy_spsm_csr_ref_hipsparse_prepared(state)
+                state = None
+        result["values"] = values
+        result["ms"] = _spsm_filtered_avg_ms(times)
+        result["reason"] = None
+    except Exception as exc:
+        result["reason"] = str(exc)
+    finally:
+        _destroy_spsm_csr_ref_hipsparse_prepared(state)
+    return result
 
 
 def _clear_spsm_preprocess_cache():

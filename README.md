@@ -16,6 +16,43 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
+## Backends (CUDA / DCU)
+
+FlagSparse dispatches its **vendor reference and baseline** paths on the detected
+runtime; the Triton kernels themselves are unchanged across backends.
+
+| Runtime | Detected by | Vendor sparse library | Python binding |
+| --- | --- | --- | --- |
+| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy (`cupy-cuda12x`) |
+| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+
+On a DCU/ROCm host, install the hip-python bindings matching your ROCm release:
+
+```bash
+pip install hip-python
+```
+
+Both bindings are optional. When neither is importable the benchmarks fall back to the
+portable `torch.sparse` reference and report the reason in the `*_reason` /
+`backend_status` fields rather than failing.
+
+Selection happens in `_*_sparse_ref_backend()` helpers, which return
+`("hipsparse" | "cupy_cusparse" | None, reason)`:
+
+- `flagsparse.sparse_operations._common` - SpMV CSR/COO
+- `.spmm_csr` / `.spmm_coo` / `.spgemm_csr` / `.gather_scatter` - the remaining operators
+
+To check the DCU path phase by phase (useful when a benchmark stalls instead of failing):
+
+```bash
+python tests/diagnose_hipsparse_ref.py --op env      # environment probe first
+python tests/diagnose_hipsparse_ref.py --op spmv-csr # then one operation at a time
+```
+
+For the full DCU bring-up procedure — environment checks, the stale-install trap, how to
+confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
+[docs/DCU_TESTING.md](docs/DCU_TESTING.md).
+
 ## Layout
 
 - `src/flagsparse/` - core package (`sparse_operations/` is emitted as several `.py` modules from string literals in `flagsparse.py`)
