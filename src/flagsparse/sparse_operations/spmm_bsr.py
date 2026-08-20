@@ -37,7 +37,7 @@ SPMM_BSR_OP_NAMES = {
     SPMM_BSR_OP_TRANS: "trans",
     SPMM_BSR_OP_CONJ_TRANS: "conj",
 }
-SPMM_BSR_SUPPORTED_OP_NAMES = ("non",)
+SPMM_BSR_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
 _SPMM_BSR_OP_NAME_TO_CODE = {name: code for code, name in SPMM_BSR_OP_NAMES.items()}
 
 SPMM_BSR_ALG_BASE = "spmm_bsr_base"
@@ -87,7 +87,8 @@ def _spmm_bsr_op_transposes(op):
 def _ensure_spmm_bsr_supported_op(op_code):
     op_name = _spmm_bsr_op_to_name(op_code)
     if op_name not in SPMM_BSR_SUPPORTED_OP_NAMES:
-        raise ValueError("spmm_bsr v1 only supports op='non'")
+        supported = ", ".join(SPMM_BSR_SUPPORTED_OP_NAMES)
+        raise ValueError(f"spmm_bsr supports ops: {supported}")
 
 
 def _normalize_spmm_bsr_alg(alg):
@@ -293,6 +294,125 @@ def _spmm_bsr_non_complex_kernel(
     )
 
 
+@triton.jit
+def _spmm_bsr_trans_real_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_block_rows,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_ck,
+    stride_cn,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+):
+    brow = tl.program_id(0)
+    inner_row = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    if brow >= n_block_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    row = brow * BLOCK_DIM + inner_row
+    b_vals = tl.load(
+        b_ptr + row * stride_bm + offs_n * stride_bn,
+        mask=mask_n,
+        other=0.0,
+    )
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_col in tl.static_range(0, BLOCK_DIM):
+        cols = bcols * BLOCK_DIM + inner_col
+        vals = tl.load(
+            data_ptr + offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col,
+            mask=mask,
+            other=0.0,
+        )
+        tl.atomic_add(
+            c_ptr + cols[:, None] * stride_ck + offs_n[None, :] * stride_cn,
+            vals[:, None] * b_vals[None, :],
+            mask=mask[:, None] & mask_n[None, :],
+        )
+
+
+@triton.jit
+def _spmm_bsr_trans_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    c_ri_ptr,
+    n_block_rows,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_br,
+    stride_ck,
+    stride_cn,
+    stride_cr,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+    CONJ: tl.constexpr,
+):
+    brow = tl.program_id(0)
+    inner_row = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    if brow >= n_block_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    row = brow * BLOCK_DIM + inner_row
+    b_re = tl.load(
+        b_ri_ptr + row * stride_bm + offs_n * stride_bn,
+        mask=mask_n,
+        other=0.0,
+    )
+    b_im = tl.load(
+        b_ri_ptr + row * stride_bm + offs_n * stride_bn + stride_br,
+        mask=mask_n,
+        other=0.0,
+    )
+    start = tl.load(indptr_ptr + brow)
+    end = tl.load(indptr_ptr + brow + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
+    for inner_col in tl.static_range(0, BLOCK_DIM):
+        cols = bcols * BLOCK_DIM + inner_col
+        elem = offs * BLOCK_DIM * BLOCK_DIM + inner_row * BLOCK_DIM + inner_col
+        a_re = tl.load(data_ri_ptr + elem * 2, mask=mask, other=0.0)
+        a_im_raw = tl.load(data_ri_ptr + elem * 2 + 1, mask=mask, other=0.0)
+        a_im = a_im_raw
+        if CONJ:
+            a_im = -a_im_raw
+        prod_re = a_re[:, None] * b_re[None, :] - a_im[:, None] * b_im[None, :]
+        prod_im = a_re[:, None] * b_im[None, :] + a_im[:, None] * b_re[None, :]
+        tl.atomic_add(
+            c_ri_ptr + cols[:, None] * stride_ck + offs_n[None, :] * stride_cn,
+            prod_re,
+            mask=mask[:, None] & mask_n[None, :],
+        )
+        tl.atomic_add(
+            c_ri_ptr
+            + cols[:, None] * stride_ck
+            + offs_n[None, :] * stride_cn
+            + stride_cr,
+            prod_im,
+            mask=mask[:, None] & mask_n[None, :],
+        )
+
+
 def _prepare_spmm_bsr_matrix(data, indices, indptr, shape, block_dim):
     if not torch.is_tensor(data) or not torch.is_tensor(indices) or not torch.is_tensor(indptr):
         raise TypeError("data, indices, and indptr must be torch.Tensor")
@@ -407,7 +527,7 @@ def prepare_spmm_bsr_route(
     )
 
 
-def _validate_spmm_bsr_B(B, prepared):
+def _validate_spmm_bsr_B(B, prepared, op_code):
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -418,23 +538,33 @@ def _validate_spmm_bsr_B(B, prepared):
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
-    if B.shape[0] not in (prepared.n_cols, prepared.padded_n_cols):
+    if _spmm_bsr_op_transposes(op_code):
+        logical_rows = prepared.n_rows
+        padded_rows = prepared.padded_n_rows
+        logical_name = "n_rows"
+        padded_name = "padded_n_rows"
+    else:
+        logical_rows = prepared.n_cols
+        padded_rows = prepared.padded_n_cols
+        logical_name = "n_cols"
+        padded_name = "padded_n_cols"
+    if B.shape[0] not in (logical_rows, padded_rows):
         raise ValueError(
-            f"B.shape[0] must be n_cols={prepared.n_cols} or padded_n_cols={prepared.padded_n_cols}, got {B.shape[0]}"
+            f"B.shape[0] must be {logical_name}={logical_rows} or {padded_name}={padded_rows}, got {B.shape[0]}"
         )
-    if B.shape[0] == prepared.padded_n_cols:
+    if B.shape[0] == padded_rows:
         return B
     if B.stride(0) == 1 and B.shape[0] > 1:
         padded = torch.empty_strided(
-            (prepared.padded_n_cols, B.shape[1]),
-            (1, max(1, prepared.padded_n_cols)),
+            (padded_rows, B.shape[1]),
+            (1, max(1, padded_rows)),
             dtype=B.dtype,
             device=B.device,
         )
         padded.zero_()
     else:
         padded = torch.zeros(
-            (prepared.padded_n_cols, B.shape[1]),
+            (padded_rows, B.shape[1]),
             dtype=B.dtype,
             device=B.device,
         )
@@ -448,11 +578,14 @@ def _select_block_n(n_dense_cols, dtype):
     return 32 if n_dense_cols >= 32 else 16
 
 
-def _triton_spmm_bsr_base_kernel(prepared, B):
+def _triton_spmm_bsr_base_kernel(prepared, B, op_code=None):
+    op_code = _normalize_spmm_bsr_op(prepared.op if op_code is None else op_code)
+    transposes = _spmm_bsr_op_transposes(op_code)
     dtype = prepared.data.dtype
     n_dense_cols = int(B.shape[1])
+    out_rows = prepared.padded_n_cols if transposes else prepared.padded_n_rows
     C = torch.zeros(
-        (prepared.padded_n_rows, n_dense_cols),
+        (out_rows, n_dense_cols),
         dtype=dtype,
         device=prepared.data.device,
     )
@@ -469,45 +602,86 @@ def _triton_spmm_bsr_base_kernel(prepared, B):
             data_ri = torch.view_as_real(prepared.data)
             B_ri = torch.view_as_real(B)
             C_ri = torch.view_as_real(C)
-            _spmm_bsr_non_complex_kernel[grid](
-                data_ri.reshape(-1),
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                B_ri,
-                C_ri,
-                prepared.n_block_rows,
-                n_dense_cols,
-                B_ri.stride(0),
-                B_ri.stride(1),
-                B_ri.stride(2),
-                C_ri.stride(0),
-                C_ri.stride(1),
-                C_ri.stride(2),
-                BLOCK_DIM=prepared.block_dim,
-                BLOCK_N=block_n,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-                ACC_DTYPE=tl.float64 if dtype == torch.complex128 else tl.float32,
-            )
+            if transposes:
+                _spmm_bsr_trans_complex_kernel[grid](
+                    data_ri.reshape(-1),
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B_ri,
+                    C_ri,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B_ri.stride(0),
+                    B_ri.stride(1),
+                    B_ri.stride(2),
+                    C_ri.stride(0),
+                    C_ri.stride(1),
+                    C_ri.stride(2),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    CONJ=op_code == SPMM_BSR_OP_CONJ_TRANS,
+                )
+            else:
+                _spmm_bsr_non_complex_kernel[grid](
+                    data_ri.reshape(-1),
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B_ri,
+                    C_ri,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B_ri.stride(0),
+                    B_ri.stride(1),
+                    B_ri.stride(2),
+                    C_ri.stride(0),
+                    C_ri.stride(1),
+                    C_ri.stride(2),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    ACC_DTYPE=tl.float64 if dtype == torch.complex128 else tl.float32,
+                )
         else:
-            _spmm_bsr_non_real_kernel[grid](
-                prepared.data,
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                B,
-                C,
-                prepared.n_block_rows,
-                n_dense_cols,
-                B.stride(0),
-                B.stride(1),
-                C.stride(0),
-                C.stride(1),
-                BLOCK_DIM=prepared.block_dim,
-                BLOCK_N=block_n,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-                ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
-            )
+            if transposes:
+                _spmm_bsr_trans_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B,
+                    C,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B.stride(0),
+                    B.stride(1),
+                    C.stride(0),
+                    C.stride(1),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
+            else:
+                _spmm_bsr_non_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B,
+                    C,
+                    prepared.n_block_rows,
+                    n_dense_cols,
+                    B.stride(0),
+                    B.stride(1),
+                    C.stride(0),
+                    C.stride(1),
+                    BLOCK_DIM=prepared.block_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
+                )
     return C
 
 
@@ -519,7 +693,7 @@ def _run_spmm_bsr_base_route(prepared, B, *, timing=False, diagnostics=False):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _triton_spmm_bsr_base_kernel(prepared, B)
+    C = _triton_spmm_bsr_base_kernel(prepared, B, _normalize_spmm_bsr_op(prepared.op))
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -535,7 +709,7 @@ SPMM_BSR_ALGORITHMS = {
     SPMM_BSR_ALG_BASE: SpmmBsrAlgorithm(
         name=SPMM_BSR_ALG_BASE,
         display_name="BSRBase",
-        supported_ops=("non",),
+        supported_ops=SPMM_BSR_SUPPORTED_OP_NAMES,
         supported_dtypes=SUPPORTED_SPMM_BSR_VALUE_DTYPES,
         run=_run_spmm_bsr_base_route,
     ),
@@ -647,9 +821,11 @@ def flagsparse_spmm_bsr_run(
         raise TypeError("prepared must be a PreparedBsrSpmm instance")
     op_name = prepared.op if op is None else _spmm_bsr_op_to_name(op)
     _ensure_spmm_bsr_supported_op(_normalize_spmm_bsr_op(op_name))
+    if op_name != prepared.op:
+        raise ValueError(f"op={op_name} does not match prepared.op={prepared.op}")
     alg_name = prepared.alg if alg is None else _normalize_spmm_bsr_alg(alg)
     algorithm = resolve_spmm_bsr_algorithm(alg_name, op_name, prepared.data.dtype)
-    B = _validate_spmm_bsr_B(B, prepared)
+    B = _validate_spmm_bsr_B(B, prepared, _normalize_spmm_bsr_op(op_name))
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
         torch.cuda.synchronize()
@@ -730,8 +906,9 @@ def flagsparse_spmm_bsr(
 ):
     """BSR SpMM using native Triton BSR kernels.
 
-    The native compute layer follows padded block-grid semantics and returns a
-    tensor with ``padded_rows`` rows for ``op='non'``.
+    The native compute layer follows padded block-grid semantics. It returns
+    ``padded_rows`` rows for ``op='non'`` and ``padded_cols`` rows for
+    ``op='trans'`` or ``op='conj'``.
     """
     op_explicit = op is not None
     op_code = _normalize_spmm_bsr_op(
@@ -765,6 +942,8 @@ def flagsparse_spmm_bsr(
     else:
         if op_explicit and _spmm_bsr_op_to_name(op_code) != prepared.op:
             raise ValueError(f"op={_spmm_bsr_op_to_name(op_code)} does not match prepared.op={prepared.op}")
+        if transpose is not None and bool(transpose) != _spmm_bsr_op_transposes(prepared.op):
+            raise ValueError(f"transpose={bool(transpose)} does not match prepared.op={prepared.op}")
         if not op_explicit:
             op_code = _normalize_spmm_bsr_op(prepared.op)
     C = flagsparse_spmm_bsr_run(
