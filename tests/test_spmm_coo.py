@@ -671,6 +671,29 @@ def _skip_alg_row(
 def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row"):
     if dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
+    sparse_ref_backend, _ = ast_ops._spmm_coo_sparse_ref_backend(
+        prepared_case["cusparse_data"].dtype, prepared_case["cusparse_row"].dtype
+    )
+    if sparse_ref_backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline. COO SpMM
+        # materialises the op before the call, so every op is covered. Without
+        # this branch the DCU run silently reports the baseline as unavailable.
+        try:
+            ref = ast_ops._benchmark_spmm_coo_sparse_ref(
+                prepared_case["cusparse_data"],
+                prepared_case["cusparse_row"],
+                prepared_case["cusparse_col"],
+                prepared_case["native_B"],
+                (prepared_case["n_rows"], prepared_case["n_cols"]),
+                warmup,
+                iters,
+            )
+        except Exception as exc:
+            return None, None, str(exc)
+        if ref["values"] is None:
+            return None, None, ref["reason"] or "hipSPARSE COO SpMM reference skipped"
+        del ref_C
+        return ref["values"], ref["ms"], ref["reason"] or ""
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx

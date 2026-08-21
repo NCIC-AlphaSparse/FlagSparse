@@ -56,12 +56,62 @@ pip install hip-python
 - `flagsparse.sparse_operations._common` —— SpMV CSR/COO
 - `.spmm_csr` / `.spmm_coo` / `.spgemm_csr` / `.gather_scatter` —— 其余算子
 
-逐阶段排查 DCU 路径（基准测试卡住而非报错时尤其有用）：
+### 在 DCU 上跑测试
+
+所有命令都要带 `PYTHONPATH=src`。开工先确认没跑到旧的已安装包 —— 这是 DCU 上最容易踩的坑：
 
 ```bash
-python tests/diagnose_hipsparse_ref.py --op env      # 先做环境探测
-python tests/diagnose_hipsparse_ref.py --op spmv-csr # 再逐个算子排查
+python -c "import flagsparse; print(flagsparse.__file__)"   # 必须指向 <仓库>/src/flagsparse/__init__.py
 ```
+
+**1. 先 diagnose，再跑基准。** hipSPARSE 用错时是挂住而不是报错，所以要逐级探，
+不要一上来就 `--op all`：
+
+```bash
+python tests/diagnose_hipsparse_ref.py --op env        # 先探环境，不碰任何算子
+python tests/diagnose_hipsparse_ref.py --timing-only   # HIP 事件计时链
+python tests/diagnose_hipsparse_ref.py --op spmv-csr   # 再一次一个算子
+python tests/diagnose_hipsparse_ref.py --op all        # 单点全部通过后才跑这个
+```
+
+**2. 正确性套件。**
+
+```bash
+PYTHONPATH=src python -m pytest tests/pytest -q
+```
+
+SpSV 和 SpSM 目前在 DCU 上会 GPU 内核死锁（见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)
+已知限制一节），需要排除掉才能跑完：
+
+```bash
+PYTHONPATH=src python -m pytest tests/pytest -q \
+  --ignore=tests/pytest/test_spsv_csr_accuracy.py \
+  --ignore=tests/pytest/test_spsv_coo_accuracy.py \
+  --ignore=tests/pytest/test_spsv_sell_accuracy.py \
+  --ignore=tests/pytest/test_spsm_accuracy.py
+```
+
+DCU 基准线：排除 851 个 SpSV/SpSM 用例后 `984 passed / 1 failed`，约 60 秒。
+那个失败是 `spmv_coo` / `spmv_csc` 的容差抖动 —— 每次失败的 dtype 参数都不一样，
+且单独跑就过；参数固定不变的失败才是真问题。CUDA 全量基准线：`1613 passed / 3 failed`。
+
+**3. 策略/契约类测试** —— 不需要 GPU，秒级：
+
+```bash
+python -m pytest tests/ci -q     # 期望 39 passed / 3 skipped
+```
+
+**4. 逐算子基准：**
+
+```bash
+M=matrix   # 任意 .mtx 目录
+python tests/test_spmv.py     $M --warmup 2 --iters 5
+python tests/test_spmm.py     $M --warmup 2 --iters 5
+python tests/test_spgemm.py   $M --warmup 2 --iters 5
+python tests/test_spmm_coo.py $M --warmup 2 --iters 5
+```
+
+看时间数据前先确认没有别的任务在争抢 GPU。
 
 DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
 已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。

@@ -4590,10 +4590,8 @@ def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
-        spmat = ptr_type()
         matb = ptr_type()
         matc = ptr_type()
-        spmat_ref = spmat.createRef()
         matb_ref = matb.createRef()
         matc_ref = matc.createRef()
 
@@ -4607,21 +4605,17 @@ def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
             "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
         )
 
-        _hip_check_result(
-            hipsparse.hipsparseCreateCsr(
-                spmat_ref,
-                n_rows,
-                n_cols,
-                int(data.numel()),
-                row_ptr,
-                col_ptr,
-                values_ptr,
-                row_index_type,
-                col_index_type,
-                index_base,
-                value_type,
-            ),
-            "hipsparseCreateCsr",
+        spmat = _hipsparse_create_csr_descriptor(
+            n_rows,
+            n_cols,
+            int(data.numel()),
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
         )
         _hipsparse_create_dnmat_descriptor(
             matb_ref,

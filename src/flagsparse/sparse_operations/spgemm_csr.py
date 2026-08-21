@@ -1384,8 +1384,7 @@ def _hipsparse_spgemm_create_descr():
     return descr
 
 
-def _hipsparse_create_csr_descriptor(
-    spmat_ref,
+def _hipsparse_create_csr_descriptor_from_tensors(
     n_rows,
     n_cols,
     nnz,
@@ -1397,21 +1396,17 @@ def _hipsparse_create_csr_descriptor(
     index_base,
     value_type,
 ):
-    _hip_check_result(
-        hipsparse.hipsparseCreateCsr(
-            spmat_ref,
-            n_rows,
-            n_cols,
-            nnz,
-            HipPointer.fromObj(indptr.data_ptr()),
-            HipPointer.fromObj(indices.data_ptr()),
-            HipPointer.fromObj(data.data_ptr()),
-            row_index_type,
-            col_index_type,
-            index_base,
-            value_type,
-        ),
-        "hipsparseCreateCsr",
+    return _hipsparse_create_csr_descriptor(
+        n_rows,
+        n_cols,
+        nnz,
+        HipPointer.fromObj(indptr.data_ptr()),
+        HipPointer.fromObj(indices.data_ptr()),
+        HipPointer.fromObj(data.data_ptr()),
+        row_index_type,
+        col_index_type,
+        index_base,
+        value_type,
     )
 
 
@@ -1587,11 +1582,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
-        mat_a = ptr_type()
-        mat_b = ptr_type()
-        mat_c = ptr_type()
-        _hipsparse_create_csr_descriptor(
-            mat_a.createRef(),
+        mat_a = _hipsparse_create_csr_descriptor_from_tensors(
             m,
             k_a,
             int(a_data.numel()),
@@ -1603,8 +1594,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
             index_base,
             value_type,
         )
-        _hipsparse_create_csr_descriptor(
-            mat_b.createRef(),
+        mat_b = _hipsparse_create_csr_descriptor_from_tensors(
             k_b,
             n,
             int(b_data.numel()),
@@ -1616,8 +1606,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
             index_base,
             value_type,
         )
-        _hipsparse_create_csr_descriptor(
-            mat_c.createRef(),
+        mat_c = _hipsparse_create_csr_descriptor_from_tensors(
             m,
             n,
             0,
