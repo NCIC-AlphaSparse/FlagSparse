@@ -342,6 +342,11 @@ def _validate_gather_value_dtype(dense_vector, op_name):
     return None
 
 
+def _validate_scatter_value_dtype(sparse_values):
+    if sparse_values.dtype not in SUPPORTED_SCATTER_VALUE_DTYPES:
+        raise TypeError(_scatter_dtype_error_message())
+
+
 _CUSPARSE_STATUS_SUCCESS = 0
 _CUSPARSE_INDEX_BASE_ZERO = 0
 _CUSPARSE_INDEX_32I = 2
