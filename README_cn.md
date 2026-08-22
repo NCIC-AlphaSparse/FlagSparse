@@ -36,10 +36,10 @@ pip install torch triton cupy-cuda12x
 
 FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分发；Triton 内核本身在各后端保持不变。
 
-| 运行时 | 判定方式 | 厂商稀疏库 | Python 绑定 |
-| --- | --- | --- | --- |
-| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy（`cupy-cuda12x`） |
-| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+| 运行时      | 判定方式                          | 厂商稀疏库 | Python 绑定              |
+| ----------- | --------------------------------- | ---------- | ------------------------ |
+| NVIDIA CUDA | `torch.version.hip is None`     | cuSPARSE   | CuPy（`cupy-cuda12x`） |
+| DCU / ROCm  | `torch.version.hip is not None` | hipSPARSE  | `hip-python`           |
 
 在 DCU/ROCm 机器上，安装与 ROCm 版本匹配的 hip-python：
 
@@ -123,6 +123,8 @@ python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matr
   --timeout 1800 \
   --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr
 ```
+
+matrix为指向矩阵文件 .mtx 目录
 
 这个算子清单就是 `--list-ops` 的全集去掉那五个求解器条目。`--timeout 1800` 只是兜底：
 真卡住的会记成 `TIMEOUT` 并继续往下跑，而不是整轮停摆。注意 `--gpus 0,1` 单独用没有用 ——
