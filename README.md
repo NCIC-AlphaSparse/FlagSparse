@@ -101,6 +101,22 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 
 Make sure no other job is competing for the GPU before trusting the timings.
 
+**5. Unified runner.** `run_flagsparse_pytest.py` has no backend awareness, and its default
+sweep includes `spsv_csr`, `spsv_coo`, `spsv_sell`, `spsm_csr`, and `spsm_coo` — all five
+deadlock on DCU. `--timeout` also defaults to `0` (disabled), so the run would hang forever
+rather than move on. Name the operators explicitly and set a timeout as a backstop:
+
+```bash
+python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
+  --timeout 1800 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr
+```
+
+That op list is the full `--list-ops` set minus the five solver entries. `--timeout 1800` is
+only a backstop: anything that does hang is recorded as `TIMEOUT` and the sweep continues
+instead of stalling. Note that `--gpus 0,1` does not help on its own — it splits the operators
+into two queues, and whichever queue holds SpSV/SpSM still blocks.
+
 For the full DCU bring-up procedure — environment checks, the stale-install trap, how to
 confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
 [docs/DCU_TESTING.md](docs/DCU_TESTING.md).

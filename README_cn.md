@@ -113,6 +113,21 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 
 看时间数据前先确认没有别的任务在争抢 GPU。
 
+**5. 统一运行器。** `run_flagsparse_pytest.py` 没有后端感知，默认算子清单包含
+`spsv_csr`、`spsv_coo`、`spsv_sell`、`spsm_csr`、`spsm_coo` —— 这五个在 DCU 上都会死锁。
+而且 `--timeout` 默认是 `0`（关闭），一旦卡住就是无限等待而不会跳过。
+所以在 DCU 上要显式指定算子，并加超时兜底：
+
+```bash
+python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
+  --timeout 1800 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr
+```
+
+这个算子清单就是 `--list-ops` 的全集去掉那五个求解器条目。`--timeout 1800` 只是兜底：
+真卡住的会记成 `TIMEOUT` 并继续往下跑，而不是整轮停摆。注意 `--gpus 0,1` 单独用没有用 ——
+它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样堵死。
+
 DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
 已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。
 
