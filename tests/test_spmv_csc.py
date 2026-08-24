@@ -30,6 +30,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as ast_ops
 
 try:
     import cupy as cp
@@ -246,6 +247,16 @@ def _time_pytorch(data, indices, indptr, x, shape, op, warmup, iters):
 
 
 def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
+    backend, _ = ast_ops._spmv_csc_sparse_ref_backend(data.dtype, indices.dtype, op=op)
+    if backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline, via
+        # hipsparseCreateCsc + the generic SpMV.  Without this branch the DCU
+        # run reports no vendor baseline at all and the CSC timings have
+        # nothing to be compared against.
+        ref = ast_ops._benchmark_spmv_csc_sparse_ref(
+            data, indices, indptr, x, shape, warmup, iters, op=op
+        )
+        return ref["ms"]
     if cp is None or cpx_sparse is None:
         return None
     if data.dtype not in (

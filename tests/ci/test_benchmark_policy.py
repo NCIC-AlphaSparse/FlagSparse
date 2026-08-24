@@ -63,3 +63,26 @@ def test_benchmark_pytest_json_record_plugin_exists():
         "benchmark_result.json",
     ]:
         assert snippet in text
+
+
+def test_spgemm_csv_is_written_incrementally():
+    # A rocSPARSE csrgemm page fault on DCU aborts the process with SIGABRT,
+    # which no Python handler can intercept.  SpGEMM used to buffer every row
+    # until the sweep ended, so the crash left an empty CSV and discarded the
+    # matrices that had already succeeded.  Rows must reach disk per matrix.
+    source = (PROJECT_ROOT / "tests" / "test_spgemm.py").read_text(encoding="utf-8")
+    export = source.split("def run_all_dtypes_export_csv(", 1)[1].split("\ndef ", 1)[0]
+    assert "on_entry=_emit" in export, "per-matrix CSV callback is not wired up"
+    assert "handle.flush()" in source and "os.fsync(handle.fileno())" in source
+    # the batch must not be buffered into a list that is only written at the end
+    assert "rows.append(" not in export
+
+
+def test_spgemm_records_the_item_in_flight_for_crash_attribution():
+    source = (PROJECT_ROOT / "tests" / "test_spgemm.py").read_text(encoding="utf-8")
+    assert "def _record_spgemm_inflight(" in source
+    assert "def _clear_spgemm_inflight(" in source
+    export = source.split("def run_all_dtypes_export_csv(", 1)[1].split("\ndef ", 1)[0]
+    # written before the work starts, cleared only after a clean finish
+    assert "_record_spgemm_inflight(" in export
+    assert "_clear_spgemm_inflight(csv_path)" in export

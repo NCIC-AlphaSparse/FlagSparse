@@ -36,6 +36,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import spmm_csr as spmm_ops
 
 
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -390,6 +391,10 @@ def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters
     }
 
 
+def _is_rocm_runtime_for_tests():
+    return getattr(torch.version, "hip", None) is not None
+
+
 def _cupy_csc_unavailable_reason():
     if cp is None or cpx_sparse is None:
         return "CuPy cupyx.scipy.sparse is not available"
@@ -399,6 +404,21 @@ def _cupy_csc_unavailable_reason():
 
 
 def _time_cusparse_csc(data, indices, indptr, B, shape, warmup, iters):
+    backend, backend_reason = spmm_ops._spmm_csc_sparse_ref_backend(
+        data.dtype, indices.dtype, indptr.dtype
+    )
+    if backend == "hipsparse":
+        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline, via
+        # hipsparseCreateCsc + the generic SpMM.  Without this branch the DCU
+        # run has no vendor column at all.
+        ref = spmm_ops._benchmark_spmm_csc_sparse_ref(
+            data, indices, indptr, B, shape, warmup, iters
+        )
+        if ref["values"] is None:
+            return None, ref["reason"] or "hipSPARSE CSC SpMM reference skipped", None
+        return ref["ms"], None, ref["values"]
+    if backend is None and _is_rocm_runtime_for_tests():
+        return None, backend_reason, None
     reason = _cupy_csc_unavailable_reason()
     if reason:
         return None, reason, None

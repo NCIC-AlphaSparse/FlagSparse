@@ -32,6 +32,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import spmm_bsr as bsr_ops
 
 try:
     import cupy as cp
@@ -570,6 +571,29 @@ def _cupy_bsr_unavailable_reason():
 
 
 def _time_cusparse_bsr(data, indices, indptr, B, shape, block_dim, op, warmup, iters):
+    backend, backend_reason = bsr_ops._spmm_bsr_sparse_ref_backend(
+        data.dtype, indices.dtype, op=op
+    )
+    if backend == "hipsparse":
+        # DCU/ROCm: the generic SpMM API has no BSR format, so the vendor
+        # baseline is the legacy hipsparseXbsrmm entry point.  Without this
+        # branch the DCU run has no vendor column at all.
+        padded = _padded_shape(shape, block_dim)
+        B_use = B
+        padded_b_rows = _padded_b_rows(shape, block_dim, op)
+        if B.shape[0] != padded_b_rows:
+            B_use = torch.zeros(
+                (padded_b_rows, B.shape[1]), dtype=B.dtype, device=B.device
+            )
+            B_use[: B.shape[0], :].copy_(B)
+        ref = bsr_ops._benchmark_spmm_bsr_sparse_ref(
+            data, indices, indptr, B_use, padded, block_dim, warmup, iters, op=op
+        )
+        if ref["values"] is None:
+            return None, ref["reason"] or "hipSPARSE BSR SpMM reference skipped", None
+        return ref["ms"], None, ref["values"]
+    if backend is None and getattr(torch.version, "hip", None) is not None:
+        return None, backend_reason, None
     reason = _cupy_bsr_unavailable_reason()
     if reason:
         return None, reason, None
