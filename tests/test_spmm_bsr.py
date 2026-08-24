@@ -910,6 +910,7 @@ def main():
                                 _print_row(row, timing=args.timing)
                                 if writer:
                                     writer.writerow({field: row.get(field) for field in fields})
+                                    fh.flush()
                                 continue
                             for layout in layouts:
                                 for alg in expanded_algs:
