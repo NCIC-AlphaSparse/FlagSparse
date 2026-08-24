@@ -36,10 +36,10 @@ pip install torch triton cupy-cuda12x
 
 FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分发；Triton 内核本身在各后端保持不变。
 
-| 运行时      | 判定方式                          | 厂商稀疏库 | Python 绑定              |
-| ----------- | --------------------------------- | ---------- | ------------------------ |
-| NVIDIA CUDA | `torch.version.hip is None`     | cuSPARSE   | CuPy（`cupy-cuda12x`） |
-| DCU / ROCm  | `torch.version.hip is not None` | hipSPARSE  | `hip-python`           |
+| 运行时 | 判定方式 | 厂商稀疏库 | Python 绑定 |
+| --- | --- | --- | --- |
+| NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy（`cupy-cuda12x`） |
+| DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
 
 在 DCU/ROCm 机器上，安装与 ROCm 版本匹配的 hip-python：
 
@@ -120,15 +120,16 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 
 ```bash
 python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
-  --timeout 1800 \
+  --timeout 3600 \
   --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr
 ```
 
-matrix为指向矩阵文件 .mtx 目录
+这个算子清单就是 `--list-ops` 的全集去掉那五个求解器条目。`--timeout 3600` 只是兜底：
+真卡住的会记成 `TIMEOUT` 并继续往下跑，而不是整轮停摆。DCU 实测 30 个矩阵跑完全程约 3.3 小时，
+其中 `spmv_bsr`、`spmm_coo`、`spmm_bsr`、`spmm_csc` 四个算子的矩阵 x dtype 网格单个就超过 1800 秒，
+所以预算给到 3600。
 
-这个算子清单就是 `--list-ops` 的全集去掉那五个求解器条目。`--timeout 1800` 只是兜底：
-真卡住的会记成 `TIMEOUT` 并继续往下跑，而不是整轮停摆。注意 `--gpus 0,1` 单独用没有用 ——
-它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样堵死。
+注意 `--gpus 0,1` 单独用没有用 —— 它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样堵死。
 
 DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
 已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。

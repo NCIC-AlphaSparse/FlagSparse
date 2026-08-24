@@ -395,6 +395,30 @@ python tests/test_spmv.py $M --no-cusparse --warmup 2 --iters 5
   两个后端上这一列都是 `N/A`，回落到 `torch.sparse` 参考。这在 CUDA 上就是如此。
 - **`test_spmm` 的 CU 列会在阈值附近 FAIL/PASS 乱跳**。CUDA 上改动前的误差跨度是
   0.84~2.07（判定阈值 1.0），这是既有的 fp32 与厂商库逐元素比较的容差问题，不是后端引入的。
+- **SpGEMM 在超大矩阵上会触发 rocSPARSE 的显存非法访问（VMFault）**。2026-08 实测，
+  `mip1.mtx`（66463×66463，nnz≈1035 万，A_EQUALS_B 自乘）跑到参考实现阶段时进程被
+  `SIGABRT` 打死（returncode `-6`）：
+  ```
+  Invalid address access: 0x7f341574d000, Error code: 3.
+  >>>>>>>> KERNEL VMFault !!!! <<<<<<
+  kernel name: _ZL23csrgemm_fill_wf_per_rowILj256ELj16ELj32ELj137EiiffE...
+  ```
+  故障内核 `csrgemm_fill_wf_per_row` 是 **rocSPARSE 内部的 SpGEMM 填充内核，不是
+  FlagSparse 的 Triton 内核**，所以不在本仓库的修复范围内，排查时不要往 Triton 侧找。
+  GPU 页错误是 `SIGABRT`，Python 的 `except BaseException` 拦不住，进程直接消失。
+  已做的规避：`tests/test_spgemm.py` 改成**逐矩阵 flush + fsync 写 CSV**，崩溃前已完成的
+  矩阵结果得以保留；同时写 `<csv>.inflight.json` 记录正在处理的项，正常跑完才删除，
+  崩溃后该文件的 `last_completed` 的**下一个**矩阵即为触发者。
+  配合 `run_flagsparse_pytest.py` 里状态不被部分产物覆盖的修复，这类崩溃现在表现为
+  「部分性能数据 + `Failed` 状态 + 指名凶手」，而不是「整轮数据全丢」。
+- **SpSV / SpSM 在 DCU 上 GPU 内核死锁**（2026-08 实测，gfx936）。Python 层正常返回，
+  hang 在 `torch.cuda.synchronize()`，16×16 的矩阵跑 15 分钟也不结束。根因是内核里
+  跨 program 的裸自旋等待（`while ready == 0: ready = tl.atomic_or(dep_flag_ptr, 0, sem="acquire")`）：
+  消费者 program 占住 CU，生产者排不进去，flag 永远不会被置位。
+  `spsv.py` 里 `solve_kind == "csr_cw" and _is_rocm_runtime()` → `worker_count_use = 1`
+  这个串行保护并没有真正规避掉它。这是内核层固有问题，与 hipSPARSE 参考层无关，
+  排查时不要往后端分发方向找。影响 `tests/pytest` 1836 个用例中的 851 个
+  （SpSV 341+219+219、SpSM 72），跑套件时需按第 5 节的方式 `--ignore` 掉这四个文件。
 
 ---
 

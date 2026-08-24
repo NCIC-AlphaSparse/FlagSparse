@@ -16,10 +16,15 @@
 
 from dataclasses import dataclass
 
+from . import _common as _common_mod
 from ._common import *
 
 import triton
 import triton.language as tl
+
+# `HipPointer` is a plain module attribute rather than an `__all__` export, so
+# the star import above does not bring it in.
+HipPointer = _common_mod.HipPointer
 
 
 SUPPORTED_SPMM_BSR_VALUE_DTYPES = (
@@ -972,3 +977,267 @@ def flagsparse_spmm_bsr(
     if return_meta:
         return out, C[1]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Vendor BSR SpMM reference
+#
+# The generic hipsparseSpMM API has no BSR format, so this rides the legacy
+# hipsparseXbsrmm entry point instead of the descriptor-based path the CSR/CSC
+# references use.  That brings two constraints worth stating up front: the
+# legacy API takes a hipsparseMatDescr_t rather than a sparse descriptor, and
+# its dense operands are column-major.
+# ---------------------------------------------------------------------------
+
+_HIPSPARSE_BSRMM_PREFIX = {
+    torch.float32: "S",
+    torch.float64: "D",
+    torch.complex64: "C",
+    torch.complex128: "Z",
+}
+
+
+def _hipsparse_bsrmm_function(value_dtype):
+    prefix = _HIPSPARSE_BSRMM_PREFIX.get(value_dtype)
+    if prefix is None:
+        raise TypeError(f"hipSPARSE bsrmm does not support {value_dtype}")
+    name = f"hipsparse{prefix}bsrmm"
+    fn = getattr(hipsparse, name, None)
+    if fn is None:
+        raise RuntimeError(f"hipSPARSE BSR SpMM is unavailable: missing {name}")
+    return fn
+
+
+def _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op="non"):
+    if not _is_rocm_runtime():
+        return "hipSPARSE BSR SpMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    for symbol in (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateMatDescr",
+        "hipsparseDestroyMatDescr",
+        "hipsparseSetMatIndexBase",
+        "hipsparseSetMatType",
+    ):
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE BSR SpMM direct API is unavailable: missing {symbol}"
+    if value_dtype not in _HIPSPARSE_BSRMM_PREFIX:
+        return f"hipSPARSE BSR SpMM has no value dtype mapping for {value_dtype}"
+    if index_dtype != torch.int32:
+        # The legacy entry point is int32-only; there is no int64 bsrmm to fall
+        # back to, and silently downcasting would misreport what was measured.
+        return "hipSPARSE BSR SpMM requires int32 block indices/offsets"
+    if op != "non":
+        # rocsparse_bsrmm fixes trans_A to none, so trans/conj would have to be
+        # materialised first -- which is a different measurement.
+        return f"hipSPARSE BSR SpMM covers op=non only; {op} skipped"
+    try:
+        _ = _hipsparse_bsrmm_function(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spmm_bsr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    """Pick the vendor sparse library for a BSR SpMM reference, per backend."""
+    if _is_rocm_runtime():
+        reason = _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op=op)
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if cp is None or cpx_sparse is None:
+        return None, "CuPy/cuSPARSE is not available"
+    if not hasattr(cpx_sparse, "bsr_matrix"):
+        return None, "CuPy cupyx.scipy.sparse has no bsr_matrix baseline"
+    return "cupy_cusparse", None
+
+
+def _prepare_spmm_bsr_ref_hipsparse(
+    data, indices, indptr, B, shape, block_dim, out=None, op="non"
+):
+    skip_reason = _hipsparse_spmm_bsr_skip_reason(data.dtype, indices.dtype, op=op)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if indptr.dtype != torch.int32:
+        raise RuntimeError("hipSPARSE BSR SpMM requires int32 block indices/offsets")
+    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+        raise ValueError("data, indices, indptr, B must all be CUDA tensors")
+    if B.ndim != 2:
+        raise ValueError("hipSPARSE BSR SpMM reference expects a 2D dense RHS")
+
+    block_dim = int(block_dim)
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if n_rows % block_dim or n_cols % block_dim:
+        raise ValueError("shape must already be padded to a block_dim multiple")
+    mb, kb = n_rows // block_dim, n_cols // block_dim
+    if indptr.numel() != mb + 1:
+        raise ValueError(f"indptr length must be mb+1={mb + 1}")
+    if int(B.shape[0]) != n_cols:
+        raise ValueError(f"B.shape[0] must equal n_cols={n_cols}")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype")
+
+    n_dense_cols = int(B.shape[1])
+    if n_dense_cols == 0 or mb == 0:
+        return {
+            "backend": "hipsparse",
+            "C": torch.zeros((n_rows, 0), dtype=data.dtype, device=data.device),
+            "empty": True,
+        }
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    B = B.contiguous()
+
+    # bsrmm is column-major.  Row-major B (n_cols x n_dense_cols) reads as a
+    # column-major (n_dense_cols x n_cols) matrix with ldb = n_dense_cols, so
+    # transB=TRANSPOSE recovers the operand we want without a copy.  The output
+    # has no such trick available -- it must be written column-major, so C is
+    # allocated transposed and viewed back afterwards.
+    C_colmajor = torch.zeros(
+        (n_dense_cols, n_rows), dtype=data.dtype, device=data.device
+    )
+
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    handle = None
+    descr = None
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        descr = ptr_type()
+        _hip_check_result(
+            hipsparse.hipsparseCreateMatDescr(descr.createRef()),
+            "hipsparseCreateMatDescr",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatIndexBase(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+                ),
+            ),
+            "hipsparseSetMatIndexBase",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseSetMatType(
+                descr,
+                _hipsparse_lookup(
+                    "hipsparseMatrixType_t", ("HIPSPARSE_MATRIX_TYPE_GENERAL",)
+                ),
+            ),
+            "hipsparseSetMatType",
+        )
+        return {
+            "backend": "hipsparse",
+            "empty": False,
+            "fn": _hipsparse_bsrmm_function(data.dtype),
+            "handle": handle,
+            "descr": descr,
+            # blocks are stored row-major inside each block
+            "dir_enum": _hipsparse_lookup(
+                "hipsparseDirection_t", ("HIPSPARSE_DIRECTION_ROW",)
+            ),
+            "op_none": _hipsparse_lookup(
+                "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
+            ),
+            "op_trans": _hipsparse_lookup(
+                "hipsparseOperation_t", ("HIPSPARSE_OPERATION_TRANSPOSE",)
+            ),
+            "mb": mb,
+            "kb": kb,
+            "n": n_dense_cols,
+            "nnzb": int(indices.numel()),
+            "block_dim": block_dim,
+            "alpha": alpha,
+            "beta": beta,
+            "val_ptr": HipPointer.fromObj(data.data_ptr()),
+            "row_ptr": HipPointer.fromObj(indptr.data_ptr()),
+            "col_ptr": HipPointer.fromObj(indices.data_ptr()),
+            "b_ptr": HipPointer.fromObj(B.data_ptr()),
+            "c_ptr": HipPointer.fromObj(C_colmajor.data_ptr()),
+            "ldb": n_dense_cols,
+            "ldc": n_rows,
+            "C_colmajor": C_colmajor,
+            "C": C_colmajor.t(),
+        }
+    except Exception:
+        _destroy_spmm_bsr_ref_hipsparse_prepared(
+            {"handle": handle, "descr": descr}
+        )
+        raise
+
+
+def _run_spmm_bsr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["C"]
+    _hip_check_result(
+        state["fn"](
+            state["handle"],
+            state["dir_enum"],
+            state["op_none"],
+            state["op_trans"],
+            state["mb"],
+            state["n"],
+            state["kb"],
+            state["nnzb"],
+            state["alpha"],
+            state["descr"],
+            state["val_ptr"],
+            state["row_ptr"],
+            state["col_ptr"],
+            state["block_dim"],
+            state["b_ptr"],
+            state["ldb"],
+            state["beta"],
+            state["c_ptr"],
+            state["ldc"],
+        ),
+        "hipsparseXbsrmm",
+    )
+    return state["C"]
+
+
+def _destroy_spmm_bsr_ref_hipsparse_prepared(state):
+    descr = state.get("descr")
+    handle = state.get("handle")
+    if descr is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyMatDescr(descr), "hipsparseDestroyMatDescr"
+            )
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _benchmark_spmm_bsr_sparse_ref(
+    data, indices, indptr, B, shape, block_dim, warmup, iters, op="non"
+):
+    """Vendor BSR SpMM baseline: hipSPARSE on ROCm, CuPy/cuSPARSE on CUDA."""
+    backend, reason = _spmm_bsr_sparse_ref_backend(data.dtype, indices.dtype, op=op)
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend != "hipsparse":
+        return result
+    values, ms = _benchmark_prepared_cuda_op(
+        lambda: _prepare_spmm_bsr_ref_hipsparse(
+            data, indices, indptr, B, shape, block_dim, op=op
+        ),
+        _run_spmm_bsr_ref_hipsparse_prepared,
+        _destroy_spmm_bsr_ref_hipsparse_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = values.contiguous()
+    result["ms"] = ms
+    result["reason"] = None
+    return result

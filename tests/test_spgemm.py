@@ -21,6 +21,7 @@ import argparse
 import csv
 import gc
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -1322,6 +1323,7 @@ def run_mtx_batch(
     ref_cleanup=True,
     compare_device=DEFAULT_COMPARE_DEVICE,
     on_result=None,
+    on_entry=None,
 ):
     results = []
     total = len(mtx_paths)
@@ -1379,6 +1381,11 @@ def run_mtx_batch(
         # the placeholder entry produced for a failed matrix
         if on_result is not None and entry.get("status") != "ERROR":
             on_result(entry)
+        # on_entry persists the row, so it must see the failures too -- and it
+        # runs per matrix rather than per batch because a vendor-library page
+        # fault aborts the process outright, taking any buffered rows with it.
+        if on_entry is not None:
+            on_entry(entry)
     return results
 
 
@@ -1471,110 +1478,7 @@ def print_mtx_results(results, value_dtype, index_dtype):
     print("-" * 320)
 
 
-def run_all_dtypes_export_csv(
-    paths,
-    csv_path,
-    warmup=WARMUP,
-    iters=ITERS,
-    run_cusparse=True,
-    input_mode=DEFAULT_INPUT_MODE,
-    adaptive_loops=False,
-    target_window_seconds=TARGET_TIMED_WINDOW_SECONDS,
-    ref_blocked_retry=True,
-    ref_block_rows=DEFAULT_REF_BLOCK_ROWS,
-    ref_isolated_retry=True,
-    ref_cleanup=True,
-    compare_device=DEFAULT_COMPARE_DEVICE,
-):
-    csv_path = _normalize_csv_path(csv_path)
-    rows = []
-    for value_dtype in CSV_VALUE_DTYPES:
-        for index_dtype in CSV_INDEX_DTYPES:
-            print("=" * 180)
-            _print_spgemm_mtx_header(value_dtype, index_dtype)
-            results = run_mtx_batch(
-                paths,
-                value_dtype=value_dtype,
-                index_dtype=index_dtype,
-                warmup=warmup,
-                iters=iters,
-                run_cusparse=run_cusparse,
-                input_mode=input_mode,
-                adaptive_loops=adaptive_loops,
-                target_window_seconds=target_window_seconds,
-                ref_blocked_retry=ref_blocked_retry,
-                ref_block_rows=ref_block_rows,
-                ref_isolated_retry=ref_isolated_retry,
-                ref_cleanup=ref_cleanup,
-                compare_device=compare_device,
-                on_result=_print_spgemm_mtx_row,
-            )
-            print("-" * 320)
-            for entry in results:
-                n_rows, n_cols = entry["shape"]
-                rows.append(
-                    {
-                        "matrix": os.path.basename(entry["path"]),
-                        "value_dtype": _dtype_name(value_dtype),
-                        "index_dtype": _dtype_name(index_dtype),
-                        "n_rows": n_rows,
-                        "n_cols": n_cols,
-                        "nnz": entry["nnz"],
-                        "triton_ms": entry.get("triton_ms"),
-                        "cusparse_ms": entry.get("cusparse_ms"),
-                        "pytorch_ms": entry.get("pytorch_ms"),
-                        "triton_speedup_vs_cusparse": _speedup_ratio(
-                            entry.get("cusparse_ms"), entry.get("triton_ms")
-                        ),
-                        "triton_speedup_vs_pytorch": _speedup_ratio(
-                            entry.get("pytorch_ms"), entry.get("triton_ms")
-                        ),
-                        "pt_status": _status_label(entry.get("triton_ok_pt")),
-                        "cu_status": _status_label(entry.get("triton_ok_cu")),
-                        "status": entry.get("status"),
-                        "ref_reason_code": entry.get("ref_reason_code"),
-                        "err_pt": entry.get("err_pt"),
-                        "err_cu": entry.get("err_cu"),
-                        "max_abs_err_pt": entry.get("max_abs_err_pt"),
-                        "max_rel_err_pt": entry.get("max_rel_err_pt"),
-                        "max_abs_err_cu": entry.get("max_abs_err_cu"),
-                        "max_rel_err_cu": entry.get("max_rel_err_cu"),
-                        "pytorch_reason": entry.get("pytorch_reason"),
-                        "cusparse_reason": entry.get("cusparse_reason"),
-                        "error": entry.get("error"),
-                        "pt_exec_mode": entry.get("pt_exec_mode"),
-                        "cu_exec_mode": entry.get("cu_exec_mode"),
-                        "attempted_modes_pt": entry.get("attempted_modes_pt"),
-                        "attempted_modes_cu": entry.get("attempted_modes_cu"),
-                        "compare_status": entry.get("compare_status"),
-                        "pt_retry_count": entry.get("pt_retry_count"),
-                        "cu_retry_count": entry.get("cu_retry_count"),
-                        "ref_peak_block_rows": entry.get("ref_peak_block_rows"),
-                        "ref_fail_stage": entry.get("ref_fail_stage"),
-                        "nnz_a": entry.get("nnz_a"),
-                        "nnz_b": entry.get("nnz_b"),
-                        "nnz_c": entry.get("nnz_c"),
-                        "input_mode": entry.get("input_mode"),
-                        "shape_a": str(entry.get("shape_a")),
-                        "shape_b": str(entry.get("shape_b")),
-                        "prepare_ms": entry.get("prepare_ms"),
-                        "count_ms": entry.get("count_ms"),
-                        "fill_ms": entry.get("fill_ms"),
-                        "bucket_nrows_short": entry.get("bucket_nrows_short"),
-                        "bucket_nrows_medium": entry.get("bucket_nrows_medium"),
-                        "bucket_nrows_long": entry.get("bucket_nrows_long"),
-                        "bucket_ms_short": entry.get("bucket_ms_short"),
-                        "bucket_ms_medium": entry.get("bucket_ms_medium"),
-                        "bucket_ms_long": entry.get("bucket_ms_long"),
-                        "long_row_sliced_count": entry.get("long_row_sliced_count"),
-                        "triton_started": entry.get("triton_started"),
-                        "ref_started": entry.get("ref_started"),
-                        "effective_warmup": entry.get("effective_warmup"),
-                        "effective_iters": entry.get("effective_iters"),
-                        "compare_device": entry.get("compare_device"),
-                    }
-                )
-    fieldnames = [
+SPGEMM_CSV_FIELDNAMES = [
         "matrix",
         "value_dtype",
         "index_dtype",
@@ -1629,15 +1533,193 @@ def run_all_dtypes_export_csv(
         "effective_warmup",
         "effective_iters",
         "compare_device",
-    ]
+]
+
+
+def _spgemm_csv_row(entry, value_dtype, index_dtype):
+    n_rows, n_cols = entry["shape"]
+    return (
+                {
+                    "matrix": os.path.basename(entry["path"]),
+                    "value_dtype": _dtype_name(value_dtype),
+                    "index_dtype": _dtype_name(index_dtype),
+                    "n_rows": n_rows,
+                    "n_cols": n_cols,
+                    "nnz": entry["nnz"],
+                    "triton_ms": entry.get("triton_ms"),
+                    "cusparse_ms": entry.get("cusparse_ms"),
+                    "pytorch_ms": entry.get("pytorch_ms"),
+                    "triton_speedup_vs_cusparse": _speedup_ratio(
+                        entry.get("cusparse_ms"), entry.get("triton_ms")
+                    ),
+                    "triton_speedup_vs_pytorch": _speedup_ratio(
+                        entry.get("pytorch_ms"), entry.get("triton_ms")
+                    ),
+                    "pt_status": _status_label(entry.get("triton_ok_pt")),
+                    "cu_status": _status_label(entry.get("triton_ok_cu")),
+                    "status": entry.get("status"),
+                    "ref_reason_code": entry.get("ref_reason_code"),
+                    "err_pt": entry.get("err_pt"),
+                    "err_cu": entry.get("err_cu"),
+                    "max_abs_err_pt": entry.get("max_abs_err_pt"),
+                    "max_rel_err_pt": entry.get("max_rel_err_pt"),
+                    "max_abs_err_cu": entry.get("max_abs_err_cu"),
+                    "max_rel_err_cu": entry.get("max_rel_err_cu"),
+                    "pytorch_reason": entry.get("pytorch_reason"),
+                    "cusparse_reason": entry.get("cusparse_reason"),
+                    "error": entry.get("error"),
+                    "pt_exec_mode": entry.get("pt_exec_mode"),
+                    "cu_exec_mode": entry.get("cu_exec_mode"),
+                    "attempted_modes_pt": entry.get("attempted_modes_pt"),
+                    "attempted_modes_cu": entry.get("attempted_modes_cu"),
+                    "compare_status": entry.get("compare_status"),
+                    "pt_retry_count": entry.get("pt_retry_count"),
+                    "cu_retry_count": entry.get("cu_retry_count"),
+                    "ref_peak_block_rows": entry.get("ref_peak_block_rows"),
+                    "ref_fail_stage": entry.get("ref_fail_stage"),
+                    "nnz_a": entry.get("nnz_a"),
+                    "nnz_b": entry.get("nnz_b"),
+                    "nnz_c": entry.get("nnz_c"),
+                    "input_mode": entry.get("input_mode"),
+                    "shape_a": str(entry.get("shape_a")),
+                    "shape_b": str(entry.get("shape_b")),
+                    "prepare_ms": entry.get("prepare_ms"),
+                    "count_ms": entry.get("count_ms"),
+                    "fill_ms": entry.get("fill_ms"),
+                    "bucket_nrows_short": entry.get("bucket_nrows_short"),
+                    "bucket_nrows_medium": entry.get("bucket_nrows_medium"),
+                    "bucket_nrows_long": entry.get("bucket_nrows_long"),
+                    "bucket_ms_short": entry.get("bucket_ms_short"),
+                    "bucket_ms_medium": entry.get("bucket_ms_medium"),
+                    "bucket_ms_long": entry.get("bucket_ms_long"),
+                    "long_row_sliced_count": entry.get("long_row_sliced_count"),
+                    "triton_started": entry.get("triton_started"),
+                    "ref_started": entry.get("ref_started"),
+                    "effective_warmup": entry.get("effective_warmup"),
+                    "effective_iters": entry.get("effective_iters"),
+                    "compare_device": entry.get("compare_device"),
+                }
+    )
+
+
+def _write_spgemm_csv_row(writer, handle, row):
+    """Append one row and push it to disk immediately.
+
+    SpGEMM buffered every row until the sweep ended, so a vendor-library
+    VMFault (rocSPARSE csrgemm on DCU) killed the process with an empty CSV and
+    the matrices that had already succeeded were lost.  Flushing per matrix
+    keeps those results.
+    """
+
+    writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _spgemm_crash_witness_path(csv_path):
+    return f"{os.path.splitext(csv_path)[0]}.inflight.json"
+
+
+def _record_spgemm_inflight(csv_path, entry):
+    """Name the item currently in flight so a hard abort leaves a culprit.
+
+    A GPU page fault raises SIGABRT, which no Python handler can intercept, so
+    the record has to be on disk *before* the work starts.  It is removed once
+    the sweep finishes cleanly.
+    """
+
+    try:
+        with open(_spgemm_crash_witness_path(csv_path), "w", encoding="utf-8") as fh:
+            json.dump(entry, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def _clear_spgemm_inflight(csv_path):
+    try:
+        os.remove(_spgemm_crash_witness_path(csv_path))
+    except OSError:
+        pass
+
+
+def run_all_dtypes_export_csv(
+    paths,
+    csv_path,
+    warmup=WARMUP,
+    iters=ITERS,
+    run_cusparse=True,
+    input_mode=DEFAULT_INPUT_MODE,
+    adaptive_loops=False,
+    target_window_seconds=TARGET_TIMED_WINDOW_SECONDS,
+    ref_blocked_retry=True,
+    ref_block_rows=DEFAULT_REF_BLOCK_ROWS,
+    ref_isolated_retry=True,
+    ref_cleanup=True,
+    compare_device=DEFAULT_COMPARE_DEVICE,
+):
+    csv_path = _normalize_csv_path(csv_path)
+    written = 0
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle, fieldnames=SPGEMM_CSV_FIELDNAMES, extrasaction="ignore"
+        )
         writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {key: ("" if value is None else value) for key, value in row.items()}
-            )
-    print(f"Wrote {len(rows)} rows to {csv_path}")
+        handle.flush()
+        for value_dtype in CSV_VALUE_DTYPES:
+            for index_dtype in CSV_INDEX_DTYPES:
+                print("=" * 180)
+                _print_spgemm_mtx_header(value_dtype, index_dtype)
+
+                def _emit(entry, value_dtype=value_dtype, index_dtype=index_dtype):
+                    nonlocal written
+                    _write_spgemm_csv_row(
+                        writer,
+                        handle,
+                        _spgemm_csv_row(entry, value_dtype, index_dtype),
+                    )
+                    written += 1
+                    _record_spgemm_inflight(
+                        csv_path,
+                        {
+                            "stage": "between-matrices",
+                            "last_completed": os.path.basename(entry.get("path") or ""),
+                            "value_dtype": _dtype_name(value_dtype),
+                            "index_dtype": _dtype_name(index_dtype),
+                        },
+                    )
+
+                _record_spgemm_inflight(
+                    csv_path,
+                    {
+                        "stage": "batch-start",
+                        "value_dtype": _dtype_name(value_dtype),
+                        "index_dtype": _dtype_name(index_dtype),
+                    },
+                )
+                run_mtx_batch(
+                    paths,
+                    value_dtype=value_dtype,
+                    index_dtype=index_dtype,
+                    warmup=warmup,
+                    iters=iters,
+                    run_cusparse=run_cusparse,
+                    input_mode=input_mode,
+                    adaptive_loops=adaptive_loops,
+                    target_window_seconds=target_window_seconds,
+                    ref_blocked_retry=ref_blocked_retry,
+                    ref_block_rows=ref_block_rows,
+                    ref_isolated_retry=ref_isolated_retry,
+                    ref_cleanup=ref_cleanup,
+                    compare_device=compare_device,
+                    on_result=_print_spgemm_mtx_row,
+                    on_entry=_emit,
+
+                )
+                print("-" * 320)
+    _clear_spgemm_inflight(csv_path)
+    print(f"Wrote {written} rows to {csv_path}")
 
 
 def run_api_validation_checks():

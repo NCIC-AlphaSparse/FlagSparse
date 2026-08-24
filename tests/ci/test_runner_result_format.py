@@ -424,3 +424,68 @@ def test_runner_treats_flaggems_failed_status_as_failure():
         [{"operator": "gather", "accuracy": {"phase": "accuracy", "status": "Failed"}}],
         strict=False,
     )
+
+
+def test_timeout_status_survives_a_partial_result_artifact():
+    # A run killed by --timeout can still have flushed a partial CSV/JSON, and
+    # the summary parsed from it only covers the rows that reached disk.
+    # Observed on DCU: spmm_bsr and spmm_csc were reported "Passed" with
+    # returncode -100 because parse_performance_json overwrote the status.
+    assert (
+        runner.resolve_status_with_parsed(
+            "TIMEOUT", "Passed", returncode=runner.TIMEOUT_RETURN_CODE, timed_out=True
+        )
+        == "TIMEOUT"
+    )
+
+
+def test_crash_status_survives_a_partial_result_artifact():
+    assert (
+        runner.resolve_status_with_parsed(
+            "FAIL", "Passed", returncode=-6, timed_out=False
+        )
+        == "FAIL"
+    )
+
+
+def test_parsed_status_still_refines_a_clean_run():
+    # The parsed artifact is more specific than the exit code on a clean run,
+    # so it must keep winning there -- e.g. a benchmark that ran to completion
+    # but reported its own failure.
+    assert (
+        runner.resolve_status_with_parsed(
+            "PASS", "Failed", returncode=0, timed_out=False
+        )
+        == "Failed"
+    )
+    assert (
+        runner.resolve_status_with_parsed("PASS", None, returncode=0, timed_out=False)
+        == "PASS"
+    )
+
+
+def test_missing_measurements_are_null_not_zero(tmp_path):
+    # A CSV with no speedup/latency columns carries no measurement at all.
+    # Reporting 0.0 made it look like a measured 0.00x speedup -- seen on DCU
+    # for spmv_csc / spmm_csc / spmm_bsr, none of which run a vendor baseline.
+    csv_path = tmp_path / "performance.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["matrix", "dtype", "ms"])
+        writer.writeheader()
+        writer.writerow({"matrix": "a.mtx", "dtype": "float32", "ms": "1.5"})
+
+    summary = runner.summarize_performance_csv(csv_path)
+    detail = next(iter(summary["data"]["float32"]["details"].values()))
+    assert detail["base"] is None
+    assert detail["gems"] is None
+    assert detail["speedup"] is None
+
+    out = tmp_path / "performance_result.json"
+    runner.write_benchmark_json_from_csv("spmv_csc", csv_path, out)
+    payload = json.loads(out.read_text(encoding="utf-8"))["spmv_csc"]
+    entry = payload["details"][0]["result"][0]
+    assert entry["latency_base"] is None
+    assert entry["latency"] is None
+    assert entry["speedup"] is None
+    # the raw column is still carried through, so nothing is lost
+    assert entry["ms"] == 1.5

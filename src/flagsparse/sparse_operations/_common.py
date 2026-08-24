@@ -108,6 +108,13 @@ __all__ = (
     "_prepare_spmv_csr_ref_hipsparse",
     "_run_spmv_csr_ref_hipsparse_prepared",
     "_destroy_spmv_csr_ref_hipsparse_prepared",
+    "_hipsparse_create_csc_descriptor",
+    "_hipsparse_spmv_csc_skip_reason",
+    "_prepare_spmv_csc_ref_hipsparse",
+    "_run_spmv_csc_ref_hipsparse_prepared",
+    "_destroy_spmv_csc_ref_hipsparse_prepared",
+    "_spmv_csc_sparse_ref_backend",
+    "_benchmark_spmv_csc_sparse_ref",
     "_normalize_spmv_reference_op",
     "_normalize_sparse_reference_op",
     "_spmv_reference_compute_dtype",
@@ -551,6 +558,37 @@ def _hipsparse_create_coo_descriptor(
     raise RuntimeError("hipsparseCreateCoo wrapper signature mismatch")
 
 
+def _hipsparse_create_csc_descriptor(
+    n_rows,
+    n_cols,
+    nnz,
+    col_ptr,
+    row_ptr,
+    values_ptr,
+    col_index_type,
+    row_index_type,
+    index_base,
+    value_type,
+):
+    # Same payload-style return as CreateCsr; the operand order is
+    # (colOffsets, rowInd) rather than (rowOffsets, colInd).
+    return _hip_check_result(
+        hipsparse.hipsparseCreateCsc(
+            n_rows,
+            n_cols,
+            nnz,
+            col_ptr,
+            row_ptr,
+            values_ptr,
+            col_index_type,
+            row_index_type,
+            index_base,
+            value_type,
+        ),
+        "hipsparseCreateCsc",
+    )
+
+
 def _hipsparse_create_csr_descriptor(
     n_rows,
     n_cols,
@@ -773,6 +811,16 @@ def _hipsparse_spmv_coo_direct_skip_reason(value_dtype, index_dtype, op="non"):
     return None
 
 
+def _hipsparse_spmv_csc_skip_reason(value_dtype, index_dtype, op="non"):
+    """CSC SpMV rides the same generic API as CSR, with a CSC descriptor."""
+    reason = _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op=op)
+    if reason is not None:
+        return reason.replace("CSR SpMV", "CSC SpMV")
+    if not hasattr(hipsparse, "hipsparseCreateCsc"):
+        return "hipSPARSE CSC SpMV direct API is unavailable: missing hipsparseCreateCsc"
+    return None
+
+
 def _cupy_cusparse_spmv_skip_reason(value_dtype):
     """Why the CuPy/cuSPARSE vendor baseline cannot serve this dtype."""
     if cp is None or cpx_sparse is None:
@@ -792,6 +840,22 @@ def _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
     op_name = _normalize_spmv_reference_op(op)
     if _is_rocm_runtime():
         skip_reason = _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op=op_name)
+        if skip_reason is None:
+            return "hipsparse", None
+        return None, skip_reason
+    skip_reason = _cupy_cusparse_spmv_skip_reason(value_dtype)
+    if skip_reason is None:
+        return "cupy_cusparse", None
+    return None, skip_reason
+
+
+def _spmv_csc_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    """Pick the vendor sparse library for a CSC SpMV reference, per backend."""
+    op_name = _normalize_spmv_reference_op(op)
+    if _is_rocm_runtime():
+        skip_reason = _hipsparse_spmv_csc_skip_reason(
+            value_dtype, index_dtype, op=op_name
+        )
         if skip_reason is None:
             return "hipsparse", None
         return None, skip_reason
@@ -1258,8 +1322,52 @@ def _prepare_spmv_csr_ref_hipsparse(
     out=None,
     op="non",
 ):
+    return _prepare_spmv_ref_hipsparse(
+        data, indices, indptr, x, shape, out=out, op=op, layout="csr"
+    )
+
+
+def _prepare_spmv_csc_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+):
+    return _prepare_spmv_ref_hipsparse(
+        data, indices, indptr, x, shape, out=out, op=op, layout="csc"
+    )
+
+
+def _prepare_spmv_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+    layout="csr",
+):
+    """Shared hipSPARSE generic-API SpMV setup for CSR and CSC.
+
+    The two formats differ only in the descriptor constructor and in which
+    dimension ``indptr`` indexes; the SpMV call, the dense vectors and the
+    workspace are identical, so they are not worth duplicating.
+    """
+
+    if layout not in ("csr", "csc"):
+        raise ValueError(f"layout must be 'csr' or 'csc', got {layout!r}")
+    fmt = layout.upper()
     op_name = _normalize_spmv_reference_op(op)
-    skip_reason = _hipsparse_spmv_csr_skip_reason(data.dtype, indices.dtype, op=op_name)
+    skip_fn = (
+        _hipsparse_spmv_csr_skip_reason
+        if layout == "csr"
+        else _hipsparse_spmv_csc_skip_reason
+    )
+    skip_reason = skip_fn(data.dtype, indices.dtype, op=op_name)
     if skip_reason is not None:
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, x)):
@@ -1274,8 +1382,11 @@ def _prepare_spmv_csr_ref_hipsparse(
     if indices.numel() != data.numel():
         raise ValueError("data and indices must have the same length")
     n_rows, n_cols = int(shape[0]), int(shape[1])
-    if indptr.numel() != n_rows + 1:
-        raise ValueError(f"indptr length must be n_rows+1={n_rows + 1}")
+    # CSC indexes columns, CSR indexes rows; the maths shape is the same either way.
+    n_slots = n_rows if layout == "csr" else n_cols
+    slot_name = "n_rows" if layout == "csr" else "n_cols"
+    if indptr.numel() != n_slots + 1:
+        raise ValueError(f"indptr length must be {slot_name}+1={n_slots + 1}")
     x_size = n_cols if op_name == "non" else n_rows
     y_size = n_rows if op_name == "non" else n_cols
     if x.numel() != x_size:
@@ -1288,13 +1399,13 @@ def _prepare_spmv_csr_ref_hipsparse(
     value_type = _hipsparse_value_type(data.dtype)
     alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
     beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
-    row_index_type = _hipsparse_index_type(
-        indptr.dtype, "hipSPARSE CSR SpMV row offsets"
+    offsets_index_type = _hipsparse_index_type(
+        indptr.dtype, f"hipSPARSE {fmt} SpMV offsets"
     )
-    col_index_type = _hipsparse_index_type(
-        indices.dtype, "hipSPARSE CSR SpMV column indices"
+    entries_index_type = _hipsparse_index_type(
+        indices.dtype, f"hipSPARSE {fmt} SpMV entry indices"
     )
-    op_enum = _hipsparse_spmv_operation(op_name, "hipSPARSE CSR SpMV")
+    op_enum = _hipsparse_spmv_operation(op_name, f"hipSPARSE {fmt} SpMV")
 
     y = out
     if y is None:
@@ -1334,9 +1445,9 @@ def _prepare_spmv_csr_ref_hipsparse(
         vecx_ref = vecx.createRef()
         vecy_ref = vecy.createRef()
 
-        # CSR pointers must wrap tensor.data_ptr(), not the tensor object itself.
-        row_ptr = HipPointer.fromObj(indptr.data_ptr())
-        col_ind = HipPointer.fromObj(indices.data_ptr())
+        # Pointers must wrap tensor.data_ptr(), not the tensor object itself.
+        offsets_ptr = HipPointer.fromObj(indptr.data_ptr())
+        entries_ptr = HipPointer.fromObj(indices.data_ptr())
         values_ptr = HipPointer.fromObj(data.data_ptr())
         x_ptr = HipPointer.fromObj(x.data_ptr())
         y_ptr = HipPointer.fromObj(y.data_ptr())
@@ -1349,15 +1460,20 @@ def _prepare_spmv_csr_ref_hipsparse(
             ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
         )
 
-        spmat = _hipsparse_create_csr_descriptor(
+        make_descriptor = (
+            _hipsparse_create_csr_descriptor
+            if layout == "csr"
+            else _hipsparse_create_csc_descriptor
+        )
+        spmat = make_descriptor(
             n_rows,
             n_cols,
             int(data.numel()),
-            row_ptr,
-            col_ind,
+            offsets_ptr,
+            entries_ptr,
             values_ptr,
-            row_index_type,
-            col_index_type,
+            offsets_index_type,
+            entries_index_type,
             index_base,
             value_type,
         )
@@ -1584,6 +1700,60 @@ def _spmv_csr_reference(
     metadata = {"backend": backend, "fallback_reason": fallback_reason}
     if return_metadata:
         return result, metadata
+    return result
+
+
+# The prepared state is format-agnostic, so CSC reuses the CSR run/destroy pair.
+_run_spmv_csc_ref_hipsparse_prepared = _run_spmv_csr_ref_hipsparse_prepared
+_destroy_spmv_csc_ref_hipsparse_prepared = _destroy_spmv_csr_ref_hipsparse_prepared
+
+
+def _benchmark_spmv_csc_sparse_ref(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    warmup,
+    iters,
+    op="non",
+):
+    """Vendor CSC SpMV baseline: hipSPARSE on ROCm, CuPy/cuSPARSE on CUDA."""
+    op_name = _normalize_spmv_reference_op(op)
+    backend, reason = _spmv_csc_sparse_ref_backend(
+        data.dtype, indices.dtype, op=op_name
+    )
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmv_csc_ref_hipsparse(
+                data, indices, indptr, x, shape, op=op_name
+            ),
+            _run_spmv_csc_ref_hipsparse_prepared,
+            _destroy_spmv_csc_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    ind_cp = _cupy_from_torch(indices.to(torch.int64))
+    ptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    matrix = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: _apply_cupy_spmv_op(matrix, x_cp, op_name),
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
     return result
 
 
