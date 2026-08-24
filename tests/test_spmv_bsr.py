@@ -988,89 +988,6 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
     ops = SUPPORTED_OPS if ops is None else ops
     algs = ["base"] if algs is None else algs
     rows = []
-    _print_baseline_notes(run_cusparse=run_cusparse)
-    for dtype in value_dtypes:
-        for index_dtype in index_dtypes:
-            for op in ops:
-                op_algs = _expand_algs(algs, op)
-                print(_sep(timing))
-                print(f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op} | alg: {','.join(op_algs)}")
-                print(_sep(timing))
-                print(_header(timing))
-                print(_sep(timing))
-                for path in mtx_paths:
-                    try:
-                        entries, shape = load_mtx_entries(path)
-                        resolved_block_dims = _resolve_block_dims(block_dims, entries, shape)
-                        for block_dim in resolved_block_dims:
-                            data, indices, indptr = _entries_to_bsr_torch(
-                                entries, shape, dtype, index_dtype, int(block_dim), device
-                            )
-                            for alg in op_algs:
-                                row = _run_one_case(
-                                    data,
-                                    indices,
-                                    indptr,
-                                    shape,
-                                    dtype,
-                                    index_dtype,
-                                    op,
-                                    alg,
-                                    os.path.basename(path),
-                                    int(block_dim),
-                                    warmup,
-                                    iters,
-                                    timing=timing,
-                                    run_cusparse=run_cusparse,
-                                    logical_nnz=len(entries),
-                                )
-                                if fail_fast and row.get("status") == "ERROR":
-                                    raise RuntimeError(row.get("error") or "BSR SpMV case failed")
-                                rows.append(row)
-                                _print_row(row, timing=timing)
-                    except Exception as exc:
-                        if fail_fast:
-                            raise
-                        row = {
-                            "matrix": os.path.basename(path),
-                            "value_dtype": _dtype_name(dtype),
-                            "index_dtype": _dtype_name(index_dtype),
-                            "op": op,
-                            "algorithm": "base",
-                            "reference": "spmv-coo",
-                            "block_dim": "ERR",
-                            "out_size": "ERR",
-                            "padded_out_size": "ERR",
-                            "pad_rows": "ERR",
-                            "n_rows": "ERR",
-                            "n_cols": "ERR",
-                            "nnzb": "ERR",
-                            "logical_nnz": "ERR",
-                            "stored_nnz": "ERR",
-                            "padding_ratio": "ERR",
-                            "bsr_ms": None,
-                            "bsr_gpu_ms": None,
-                            "process_cpu_ms": None,
-                            "process_gpu_ms": None,
-                            "compute_ms": None,
-                            "pytorch_ms": None,
-                            "pytorch_error": None,
-                            "pytorch_padded_ms": None,
-                            "pytorch_padded_error": None,
-                            "pytorch_padded_err": None,
-                            "pytorch_padded_mode": None,
-                            "bsr_vs_pytorch_err": None,
-                            "bsr_vs_pytorch_padded_err": None,
-                            "cusparse_ms": None,
-                            "cusparse_error": None,
-                            "bsr_err": None,
-                            "err": None,
-                            "status": "ERROR",
-                            "error": str(exc),
-                        }
-                        rows.append(row)
-                        _print_row(row, timing=timing)
-                print(_sep(timing))
     fieldnames = [
         "matrix",
         "value_dtype",
@@ -1123,11 +1040,109 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
     csv_parent = Path(csv_path).parent
     if str(csv_parent) not in ("", "."):
         csv_parent.mkdir(parents=True, exist_ok=True)
-    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+    # Stream each row to disk as it is produced.  The BSR sweeps are the ones
+    # that outrun --timeout, and a killed process used to leave an empty CSV
+    # because every row was buffered until the very end.
+    csv_handle = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = csv.DictWriter(
+        csv_handle, fieldnames=fieldnames, extrasaction="ignore"
+    )
+    csv_writer.writeheader()
+    csv_handle.flush()
+
+    def _emit(row):
+        rows.append(row)
+        csv_writer.writerow(
+            {key: ("" if value is None else value) for key, value in row.items()}
+        )
+        # flush is enough here: the failure mode is the process being killed,
+        # not the node going down, so the OS still owns the buffered bytes.
+        csv_handle.flush()
+
+    _print_baseline_notes(run_cusparse=run_cusparse)
+    for dtype in value_dtypes:
+        for index_dtype in index_dtypes:
+            for op in ops:
+                op_algs = _expand_algs(algs, op)
+                print(_sep(timing))
+                print(f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op} | alg: {','.join(op_algs)}")
+                print(_sep(timing))
+                print(_header(timing))
+                print(_sep(timing))
+                for path in mtx_paths:
+                    try:
+                        entries, shape = load_mtx_entries(path)
+                        resolved_block_dims = _resolve_block_dims(block_dims, entries, shape)
+                        for block_dim in resolved_block_dims:
+                            data, indices, indptr = _entries_to_bsr_torch(
+                                entries, shape, dtype, index_dtype, int(block_dim), device
+                            )
+                            for alg in op_algs:
+                                row = _run_one_case(
+                                    data,
+                                    indices,
+                                    indptr,
+                                    shape,
+                                    dtype,
+                                    index_dtype,
+                                    op,
+                                    alg,
+                                    os.path.basename(path),
+                                    int(block_dim),
+                                    warmup,
+                                    iters,
+                                    timing=timing,
+                                    run_cusparse=run_cusparse,
+                                    logical_nnz=len(entries),
+                                )
+                                if fail_fast and row.get("status") == "ERROR":
+                                    raise RuntimeError(row.get("error") or "BSR SpMV case failed")
+                                _emit(row)
+                                _print_row(row, timing=timing)
+                    except Exception as exc:
+                        if fail_fast:
+                            raise
+                        row = {
+                            "matrix": os.path.basename(path),
+                            "value_dtype": _dtype_name(dtype),
+                            "index_dtype": _dtype_name(index_dtype),
+                            "op": op,
+                            "algorithm": "base",
+                            "reference": "spmv-coo",
+                            "block_dim": "ERR",
+                            "out_size": "ERR",
+                            "padded_out_size": "ERR",
+                            "pad_rows": "ERR",
+                            "n_rows": "ERR",
+                            "n_cols": "ERR",
+                            "nnzb": "ERR",
+                            "logical_nnz": "ERR",
+                            "stored_nnz": "ERR",
+                            "padding_ratio": "ERR",
+                            "bsr_ms": None,
+                            "bsr_gpu_ms": None,
+                            "process_cpu_ms": None,
+                            "process_gpu_ms": None,
+                            "compute_ms": None,
+                            "pytorch_ms": None,
+                            "pytorch_error": None,
+                            "pytorch_padded_ms": None,
+                            "pytorch_padded_error": None,
+                            "pytorch_padded_err": None,
+                            "pytorch_padded_mode": None,
+                            "bsr_vs_pytorch_err": None,
+                            "bsr_vs_pytorch_padded_err": None,
+                            "cusparse_ms": None,
+                            "cusparse_error": None,
+                            "bsr_err": None,
+                            "err": None,
+                            "status": "ERROR",
+                            "error": str(exc),
+                        }
+                        _emit(row)
+                        _print_row(row, timing=timing)
+                print(_sep(timing))
+    csv_handle.close()
     print(f"Wrote {len(rows)} rows to {csv_path}")
 
 
