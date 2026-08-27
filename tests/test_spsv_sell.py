@@ -36,6 +36,7 @@ if __name__ != "__main__":
 
 import flagsparse as fs
 from flagsparse.sparse_operations import spsv as spsv_impl
+from mtx_fast import NonSquareMatrixError
 from tests.test_spsv import (
     _allinone_filtered_avg_ms,
     _apply_csr_op,
@@ -157,6 +158,187 @@ def _spsv_tolerance(dtype):
     raise TypeError(f"unsupported SELL value dtype: {dtype}")
 
 
+def _scipy_sell_reference(
+    values,
+    cols,
+    row_ptr,
+    b,
+    shape,
+    op_mode,
+    unit_diagonal=False,
+):
+    """Solve the exact post-load SELL source matrix with SciPy on the CPU."""
+
+    import numpy as np
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import spsolve_triangular
+
+    matrix = sp.csr_matrix(
+        (
+            values.detach().cpu().numpy(),
+            cols.detach().cpu().numpy().astype(np.int64, copy=False),
+            row_ptr.detach().cpu().numpy().astype(np.int64, copy=False),
+        ),
+        shape=shape,
+    )
+
+    op_mode = str(op_mode).upper()
+    if op_mode == "TRANS":
+        matrix_op = matrix.transpose().tocsr()
+    elif op_mode == "CONJ":
+        matrix_op = matrix.getH().tocsr()
+    else:
+        raise ValueError("SciPy SELL reference only supports TRANS or CONJ")
+    matrix_op.sum_duplicates()
+    matrix_op.sort_indices()
+
+    result = spsolve_triangular(
+        matrix_op,
+        b.detach().cpu().numpy(),
+        lower=False,
+        unit_diagonal=bool(unit_diagonal),
+    )
+    return torch.as_tensor(result, dtype=b.dtype)
+
+
+def _solution_comparison_stats(actual, reference, dtype):
+    actual = actual.detach().cpu()
+    reference = reference.detach().cpu()
+    if actual.shape != reference.shape:
+        raise ValueError(
+            f"solution shape mismatch: {tuple(actual.shape)} != "
+            f"{tuple(reference.shape)}"
+        )
+    if actual.numel() == 0:
+        return {
+            "allclose": True,
+            "bad_count": 0,
+            "total": 0,
+            "max_diff": 0.0,
+            "worst_index": None,
+            "actual": None,
+            "reference": None,
+            "tolerance": 0.0,
+        }
+
+    atol, rtol = _spsv_tolerance(dtype)
+    finite = torch.isfinite(actual) & torch.isfinite(reference)
+    diff = torch.abs(actual - reference)
+    tolerance = atol + rtol * torch.abs(reference)
+    bad = (~finite) | (diff > tolerance)
+    ranked_diff = torch.where(
+        finite, diff, torch.full_like(diff, float("inf"))
+    )
+    worst_index = int(torch.argmax(ranked_diff).item())
+    return {
+        "allclose": bool(
+            torch.allclose(actual, reference, atol=atol, rtol=rtol)
+        ),
+        "bad_count": int(bad.sum().item()),
+        "total": int(diff.numel()),
+        "max_diff": float(ranked_diff[worst_index].item()),
+        "worst_index": worst_index,
+        "actual": actual[worst_index].item(),
+        "reference": reference[worst_index].item(),
+        "tolerance": float(tolerance[worst_index].item()),
+    }
+
+
+def _run_mip1_scipy_diagnostic(
+    values,
+    cols,
+    row_ptr,
+    b,
+    shape,
+    expected,
+    flagsparse_result,
+    cusparse_result,
+    value_dtype,
+    index_dtype,
+    op_mode,
+    unit_diagonal,
+    output_dir,
+):
+    """Compare mip1 solutions outside benchmark timing and PASS/FAIL."""
+
+    scipy_result = _scipy_sell_reference(
+        values,
+        cols,
+        row_ptr,
+        b,
+        shape,
+        op_mode,
+        unit_diagonal,
+    )
+    solutions = {
+        "FlagSparse": flagsparse_result.detach().cpu(),
+        "cuSPARSE": cusparse_result.detach().cpu(),
+        "SciPy": scipy_result.detach().cpu(),
+        "Expected": expected.detach().cpu(),
+    }
+    comparisons = (
+        ("FS-ref", "FlagSparse", "Expected"),
+        ("CU-ref", "cuSPARSE", "Expected"),
+        ("SciPy-ref", "SciPy", "Expected"),
+        ("FS-CU", "FlagSparse", "cuSPARSE"),
+        ("FS-SciPy", "FlagSparse", "SciPy"),
+        ("CU-SciPy", "cuSPARSE", "SciPy"),
+    )
+    stats = {
+        label: _solution_comparison_stats(
+            solutions[actual_name], solutions[reference_name], value_dtype
+        )
+        for label, actual_name, reference_name in comparisons
+    }
+
+    print("-" * 144)
+    print(
+        "mip1 SciPy solution diagnostic "
+        "(excluded from timing and PASS/FAIL)"
+    )
+    print(
+        f"opA={op_mode} | value={_dtype_name(value_dtype)} | "
+        f"index={_dtype_name(index_dtype)} | "
+        f"diag={'UNIT' if unit_diagonal else 'NON_UNIT'}"
+    )
+    for label, _, _ in comparisons:
+        item = stats[label]
+        print(
+            f"{label:<10} allclose={str(item['allclose']):<5} "
+            f"bad={item['bad_count']}/{item['total']} "
+            f"max_diff={item['max_diff']:.6e} "
+            f"index={item['worst_index']} "
+            f"actual={item['actual']} reference={item['reference']} "
+            f"tol={item['tolerance']:.6e}"
+        )
+
+    diag_label = "unit" if unit_diagonal else "non_unit"
+    output_name = (
+        f"mip1_{str(op_mode).lower()}_{_dtype_name(value_dtype)}_"
+        f"{_dtype_name(index_dtype)}_{diag_label}_solutions.pt"
+    )
+    output_path = os.path.join(output_dir, output_name)
+    torch.save(
+        {
+            "matrix": "mip1.mtx",
+            "opA": str(op_mode),
+            "value_dtype": _dtype_name(value_dtype),
+            "index_dtype": _dtype_name(index_dtype),
+            "unit_diagonal": bool(unit_diagonal),
+            "b": b.detach().cpu(),
+            "expected": solutions["Expected"],
+            "flagsparse": solutions["FlagSparse"],
+            "cusparse": solutions["cuSPARSE"],
+            "scipy": solutions["SciPy"],
+            "comparisons": stats,
+        },
+        output_path,
+    )
+    print(f"Saved mip1 solutions to {output_path}")
+    print("-" * 144)
+    return output_path
+
+
 def _spsv_relative_error(actual, reference):
     if actual.shape != reference.shape:
         return float("inf")
@@ -259,51 +441,46 @@ def _csr_to_sell(values, cols, row_ptr, n_rows, slice_size):
 
     slice_size = int(slice_size)
     n_slices = (n_rows + slice_size - 1) // slice_size
-    widths = []
-    for slice_id in range(n_slices):
-        row0 = slice_id * slice_size
-        row1 = min(row0 + slice_size, n_rows)
-        widths.append(
-            max(
-                int(row_ptr[row + 1].item() - row_ptr[row].item())
-                for row in range(row0, row1)
-            )
-        )
-
-    offsets = torch.zeros(
-        n_slices + 1, dtype=row_ptr.dtype, device=row_ptr.device
+    row_ptr64 = row_ptr.to(torch.int64)
+    row_lengths64 = row_ptr64[1:] - row_ptr64[:-1]
+    padded_lengths64 = torch.zeros(
+        n_slices * slice_size, dtype=torch.int64, device=row_ptr.device
     )
-    if widths:
-        increments = torch.tensor(
-            [width * slice_size for width in widths],
-            dtype=row_ptr.dtype,
-            device=row_ptr.device,
+    if n_rows > 0:
+        padded_lengths64[:n_rows] = row_lengths64
+    slice_widths64 = padded_lengths64.reshape(
+        n_slices, slice_size
+    ).amax(dim=1)
+    offsets64 = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int64, device=row_ptr.device),
+            torch.cumsum(slice_widths64 * slice_size, dim=0),
         )
-        offsets[1:] = torch.cumsum(increments, dim=0)
-
-    padded_size = int(offsets[-1].item())
+    )
+    offsets = offsets64.to(row_ptr.dtype)
+    padded_size = int(offsets64[-1].item())
     sell_values = torch.zeros(
         padded_size, dtype=values.dtype, device=values.device
     )
     sell_cols = torch.full(
         (padded_size,), -1, dtype=cols.dtype, device=cols.device
     )
-    for slice_id in range(n_slices):
-        row0 = slice_id * slice_size
-        row1 = min(row0 + slice_size, n_rows)
-        base = int(offsets[slice_id].item())
-        for row in range(row0, row1):
-            start = int(row_ptr[row].item())
-            end = int(row_ptr[row + 1].item())
-            count = end - start
-            dst = (
-                base
-                + torch.arange(count, device=values.device) * slice_size
-                + row
-                - row0
-            )
-            sell_values[dst] = values[start:end]
-            sell_cols[dst] = cols[start:end]
+    if values.numel() > 0:
+        rows = torch.repeat_interleave(
+            torch.arange(n_rows, device=row_ptr.device, dtype=torch.int64),
+            row_lengths64,
+        )
+        row_entries = torch.arange(
+            int(values.numel()), device=values.device, dtype=torch.int64
+        ) - row_ptr64[rows]
+        slices = rows // slice_size
+        dst = (
+            offsets64[slices]
+            + row_entries * slice_size
+            + rows.remainder(slice_size)
+        )
+        sell_values[dst] = values
+        sell_cols[dst] = cols
     return sell_values, sell_cols, offsets
 
 
@@ -369,11 +546,14 @@ class _CusparseSellSpSV:
         self.cols = cols
         self.offsets = offsets
         self.b = b
+        baseline_op_mode = str(op_mode).upper()
+        if baseline_op_mode == "CONJ" and not torch.is_complex(values):
+            baseline_op_mode = "TRANS"
         self.operation = {
             "NON": _NON_TRANSPOSE,
             "TRANS": _TRANSPOSE,
             "CONJ": _CONJ_TRANSPOSE,
-        }[str(op_mode).upper()]
+        }[baseline_op_mode]
         self.x = torch.empty_like(b)
         self.value_type = _cuda_dtype(values.dtype)
         self.alpha = _alpha_one(values.dtype)
@@ -540,6 +720,33 @@ def _benchmark_triton(
         analysis_kwargs["alg_num"] = alg_num
         if alg2_worker_count is not None:
             analysis_kwargs["alg2_worker_count"] = alg2_worker_count
+    else:
+        spsv_impl._clear_spsv_sell_trans_analysis_cache()
+        descr, analysis_ms = _time_cuda(
+            lambda: fs.flagsparse_spsv_analysis_sell(
+                values,
+                cols,
+                offsets,
+                (n_rows, n_rows),
+                **analysis_kwargs,
+            ),
+            warmup=0,
+            iters=1,
+        )
+        workspace = fs.flagsparse_spsv_create_workspace(descr)
+        out = torch.empty_like(b)
+
+        def solve():
+            return fs.flagsparse_spsv_solve_sell(
+                descr,
+                b,
+                out=out,
+                workspace=workspace,
+            )
+
+        result, solve_ms = _time_cuda(solve)
+        return result, solve_ms + analysis_ms / ITERS
+
     seed_descr = fs.flagsparse_spsv_analysis_sell(
         values, cols, offsets, (n_rows, n_rows), **analysis_kwargs
     )
@@ -621,7 +828,18 @@ def _run_case(
         op_mode=op_mode,
     )
     try:
-        cusparse_result, cusparse_ms = _time_cuda(baseline.analysis_and_solve)
+        if op_mode == "NON":
+            cusparse_result, cusparse_ms = _time_cuda(
+                baseline.analysis_and_solve
+            )
+        else:
+            _, cusparse_analysis_ms = _time_cuda(
+                baseline.analysis,
+                warmup=0,
+                iters=1,
+            )
+            cusparse_result, cusparse_solve_ms = _time_cuda(baseline.solve)
+            cusparse_ms = cusparse_solve_ms + cusparse_analysis_ms / ITERS
     finally:
         baseline.close()
 
@@ -718,10 +936,16 @@ def _print_header(
         f"slice_size={slice_size} | "
         f"workers={worker_label}"
     )
-    print(
-        f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}; "
-        "FS.ms and CU.ms both include per-call analysis + solve."
-    )
+    if op_mode == "NON":
+        print(
+            f"Benchmark schedule: warmup={WARMUP}, iter={ITERS}; "
+            "FS.ms and CU.ms both include per-call analysis + solve."
+        )
+    else:
+        print(
+            f"Benchmark schedule: solve warmup={WARMUP}, iter={ITERS}; "
+            "FS.ms and CU.ms are (one analysis + iter solves) / iter."
+        )
     print("CU.spd = CU.ms / FS.ms; PT.spd = PT.ms / FS.ms.")
     print(
         "Status compares FlagSparse with cuSPARSE; Eref/Eres and residual "
@@ -825,7 +1049,7 @@ def test_spsv_sell_matches_cusparse(
 
 
 def test_spsv_sell_trans_matches_cusparse(
-    value_dtype, index_dtype, unit_diagonal
+    value_dtype, index_dtype, slice_size, unit_diagonal, op_mode
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -839,15 +1063,15 @@ def test_spsv_sell_trans_matches_cusparse(
         lower=True,
     )
     expected = _random_rhs_for_spsv(
-        shape, value_dtype, values.device, op_mode="TRANS", seed=9876
+        shape, value_dtype, values.device, op_mode=op_mode, seed=9876
     )
     if unit_diagonal:
         b = _apply_unit_diagonal_csr(
-            values, cols, row_ptr, expected, shape, "TRANS"
+            values, cols, row_ptr, expected, shape, op_mode
         )
     else:
         b = _apply_csr_op(
-            values, cols, row_ptr, expected, shape, "TRANS", lower=True
+            values, cols, row_ptr, expected, shape, op_mode, lower=True
         )
     try:
         record, triton_result, cusparse_result = _run_case(
@@ -857,9 +1081,9 @@ def test_spsv_sell_trans_matches_cusparse(
             row_ptr,
             b,
             expected,
-            8,
+            slice_size,
             unit_diagonal=unit_diagonal,
-            op_mode="TRANS",
+            op_mode=op_mode,
         )
     except (AttributeError, OSError) as exc:
         pytest.skip(f"native cuSPARSE SELL SpSV is unavailable: {exc}")
@@ -869,11 +1093,11 @@ def test_spsv_sell_trans_matches_cusparse(
     assert record["FlagSparse_ms"] > 0.0
     assert record["cuSPARSE_ms"] > 0.0
     _print_header(
-        8,
+        slice_size,
         value_dtype,
         index_dtype,
         unit_diagonal=unit_diagonal,
-        op_mode="TRANS",
+        op_mode=op_mode,
     )
     _print_record(record)
 
@@ -956,8 +1180,12 @@ if __name__ != "__main__":
         "value_dtype", (torch.float32, torch.complex64)
     )(
         pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))(
-            pytest.mark.parametrize("unit_diagonal", (False, True))(
-                test_spsv_sell_trans_matches_cusparse
+            pytest.mark.parametrize("slice_size", (8, 32))(
+                pytest.mark.parametrize("unit_diagonal", (False, True))(
+                    pytest.mark.parametrize("op_mode", ("TRANS", "CONJ"))(
+                        test_spsv_sell_trans_matches_cusparse
+                    )
+                )
             )
         )
     )
@@ -1020,6 +1248,14 @@ def main():
         action="store_true",
         help="treat stored or missing diagonal entries as one in both solvers",
     )
+    parser.add_argument(
+        "--scipy-check-mip1",
+        action="store_true",
+        help=(
+            "compare mip1 FlagSparse/cuSPARSE solutions with a SciPy CPU "
+            "reference outside timing and PASS/FAIL"
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
@@ -1028,6 +1264,8 @@ def main():
         parser.error("TRANS/CONJ do not accept --alg_num")
     if args.ops != "NON" and args.alg2_workers is not None:
         parser.error("TRANS/CONJ do not accept --alg2-workers")
+    if args.scipy_check_mip1 and args.ops == "NON":
+        parser.error("--scipy-check-mip1 only supports TRANS/CONJ")
     alg_num = 1 if args.alg_num is None else args.alg_num
     op_mode = args.ops
 
@@ -1040,6 +1278,8 @@ def main():
         raise SystemExit("No .mtx files found")
 
     records = []
+    scipy_check_count = 0
+    scipy_output_dir = os.path.dirname(os.path.abspath(args.csv))
     for value_dtype in VALUE_DTYPE_CHOICES[args.dtype]:
         for index_dtype in INDEX_DTYPES:
             _print_header(
@@ -1060,7 +1300,7 @@ def main():
                         lower=True,
                     )
                     if int(shape[0]) != int(shape[1]):
-                        raise ValueError(f"SpSV requires a square matrix, got {shape}")
+                        raise NonSquareMatrixError("SpSV", shape)
                     values, cols, row_ptr = _extract_triangular_csr(
                         values,
                         cols,
@@ -1092,7 +1332,7 @@ def main():
                             op_mode,
                             lower=True,
                         )
-                    record, _, _ = _run_case(
+                    record, triton_result, cusparse_result = _run_case(
                         os.path.basename(path),
                         values,
                         cols,
@@ -1105,8 +1345,50 @@ def main():
                         args.unit_diagonal,
                         op_mode,
                     )
+                    if (
+                        args.scipy_check_mip1
+                        and os.path.basename(path).lower() == "mip1.mtx"
+                    ):
+                        scipy_check_count += 1
+                        try:
+                            _run_mip1_scipy_diagnostic(
+                                values,
+                                cols,
+                                row_ptr,
+                                b,
+                                shape,
+                                expected,
+                                triton_result,
+                                cusparse_result,
+                                value_dtype,
+                                index_dtype,
+                                op_mode,
+                                args.unit_diagonal,
+                                scipy_output_dir,
+                            )
+                        except Exception as scipy_exc:
+                            print(
+                                f"mip1 SciPy diagnostic failed: {scipy_exc}"
+                            )
                     records.append(record)
                     _print_record(record)
+                except NonSquareMatrixError as exc:
+                    record = {key: None for key in CSV_FIELDS}
+                    record.update(
+                        matrix=os.path.basename(path),
+                        value_dtype=_dtype_name(value_dtype),
+                        index_dtype=_dtype_name(index_dtype),
+                        opA=op_mode,
+                        diag_type=(
+                            "UNIT" if args.unit_diagonal else "NON_UNIT"
+                        ),
+                        n_rows=exc.shape[0],
+                        n_cols=exc.shape[1],
+                        status="SKIP",
+                        error=str(exc),
+                    )
+                    records.append(record)
+                    print(f"{record['matrix']:<28} SKIP: {exc}")
                 except Exception as exc:
                     record = {key: None for key in CSV_FIELDS}
                     record.update(
@@ -1132,6 +1414,8 @@ def main():
             )
     print("-" * 144)
     print(f"Wrote {len(records)} rows to {args.csv}")
+    if args.scipy_check_mip1 and scipy_check_count == 0:
+        print("No mip1.mtx input found; SciPy diagnostic was not run.")
 
 
 if __name__ == "__main__":
