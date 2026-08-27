@@ -37,13 +37,11 @@ SPMM_CSC_OP_NAMES = {
     SPMM_CSC_OP_TRANS: "trans",
     SPMM_CSC_OP_CONJ_TRANS: "conj",
 }
-SPMM_CSC_SUPPORTED_OP_NAMES = ("non",)
+SPMM_CSC_SUPPORTED_OP_NAMES = ("non", "trans", "conj")
 _SPMM_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMM_CSC_OP_NAMES.items()}
 
 SPMM_CSC_ALG_BASE = "spmm_csc_base"
-_SPMM_CSC_RESERVED_OP_MESSAGE = (
-    "spmm_csc_base only supports op='non'; trans/conj are reserved"
-)
+_SPMM_CSC_RESERVED_OP_MESSAGE = "spmm_csc_base supports op='non', 'trans', and 'conj'"
 
 
 class SpmmCscAlgorithmUnavailable(RuntimeError):
@@ -273,7 +271,119 @@ def _spmm_csc_non_complex_kernel(
     )
 
 
-def _select_block_n(n_dense_cols, dtype):
+@triton.jit
+def _spmm_csc_trans_real_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_cols,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_ck,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+):
+    col = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if col >= n_cols:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + col)
+    end = tl.load(indptr_ptr + col + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+    vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
+    b_vals = tl.load(
+        b_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+        mask=mask[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    acc = tl.sum(vals[:, None] * b_vals, axis=0)
+    tl.atomic_add(
+        c_ptr + col * stride_ck + offs_n * stride_cn,
+        acc,
+        mask=mask_n,
+    )
+
+
+@triton.jit
+def _spmm_csc_trans_complex_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ri_ptr,
+    c_ri_ptr,
+    n_cols,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_br,
+    stride_ck,
+    stride_cn,
+    stride_cr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    SEG: tl.constexpr,
+    CONJ: tl.constexpr,
+):
+    col = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if col >= n_cols:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(indptr_ptr + col)
+    end = tl.load(indptr_ptr + col + 1)
+    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    mask = offs < end
+    rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+    a_re = tl.load(data_ri_ptr + offs * 2, mask=mask, other=0.0)
+    a_im_raw = tl.load(data_ri_ptr + offs * 2 + 1, mask=mask, other=0.0)
+    a_im = a_im_raw
+    if CONJ:
+        a_im = -a_im_raw
+    b_re = tl.load(
+        b_ri_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+        mask=mask[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    b_im = tl.load(
+        b_ri_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn + stride_br,
+        mask=mask[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    prod_re = a_re[:, None] * b_re - a_im[:, None] * b_im
+    prod_im = a_re[:, None] * b_im + a_im[:, None] * b_re
+    acc_re = tl.sum(prod_re, axis=0)
+    acc_im = tl.sum(prod_im, axis=0)
+    tl.atomic_add(
+        c_ri_ptr + col * stride_ck + offs_n * stride_cn,
+        acc_re,
+        mask=mask_n,
+    )
+    tl.atomic_add(
+        c_ri_ptr + col * stride_ck + offs_n * stride_cn + stride_cr,
+        acc_im,
+        mask=mask_n,
+    )
+
+
+def _select_block_n(n_dense_cols, dtype, device=None):
+    rocm_launch = _spmm_rocm_launch_overrides(
+        n_dense_cols=n_dense_cols,
+        fmt="csc",
+        dtype=dtype,
+        device=device,
+    )
+    if rocm_launch is not None and rocm_launch.get("block_n") is not None:
+        return int(rocm_launch["block_n"])
     if dtype in (torch.float64, torch.complex128):
         return 16 if n_dense_cols >= 16 else 8
     return 32 if n_dense_cols >= 32 else 16
@@ -381,7 +491,7 @@ def prepare_spmm_csc_route(
     )
 
 
-def _validate_spmm_csc_B(B, prepared):
+def _validate_spmm_csc_B(B, prepared, op_code):
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -392,18 +502,31 @@ def _validate_spmm_csc_B(B, prepared):
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
-    if B.shape[0] != prepared.n_cols:
-        raise ValueError(f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}")
+    if _spmm_csc_op_transposes(op_code):
+        expected = prepared.n_rows
+        name = "n_rows"
+    else:
+        expected = prepared.n_cols
+        name = "n_cols"
+    if B.shape[0] != expected:
+        raise ValueError(f"B.shape[0] must be {name}={expected}, got {B.shape[0]}")
     return B
 
 
-def _triton_spmm_csc_base_kernel(prepared, B):
+def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
+    op_code = _normalize_spmm_csc_op(prepared.op if op_code is None else op_code)
+    transposes = _spmm_csc_op_transposes(op_code)
     dtype = prepared.data.dtype
     n_dense_cols = int(B.shape[1])
-    C = torch.zeros((prepared.n_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
+    out_rows = prepared.n_cols if transposes else prepared.n_rows
+    C = torch.zeros((out_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
     if prepared.nnz == 0 or n_dense_cols == 0:
         return C
-    block_n = prepared.block_n if prepared.block_n_override else _select_block_n(n_dense_cols, dtype)
+    block_n = (
+        prepared.block_n
+        if prepared.block_n_override
+        else _select_block_n(n_dense_cols, dtype, prepared.data.device)
+    )
     grid = (
         prepared.n_cols,
         triton.cdiv(n_dense_cols, block_n),
@@ -413,53 +536,98 @@ def _triton_spmm_csc_base_kernel(prepared, B):
             data_ri = torch.view_as_real(prepared.data).reshape(-1)
             B_ri = torch.view_as_real(B)
             C_ri = torch.view_as_real(C)
-            _spmm_csc_non_complex_kernel[grid](
-                data_ri,
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                B_ri,
-                C_ri,
-                prepared.n_cols,
-                n_dense_cols,
-                B_ri.stride(0),
-                B_ri.stride(1),
-                B_ri.stride(2),
-                C_ri.stride(0),
-                C_ri.stride(1),
-                C_ri.stride(2),
-                BLOCK_N=block_n,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-            )
+            if transposes:
+                _spmm_csc_trans_complex_kernel[grid](
+                    data_ri,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B_ri,
+                    C_ri,
+                    prepared.n_cols,
+                    n_dense_cols,
+                    B_ri.stride(0),
+                    B_ri.stride(1),
+                    B_ri.stride(2),
+                    C_ri.stride(0),
+                    C_ri.stride(1),
+                    C_ri.stride(2),
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                    CONJ=op_code == SPMM_CSC_OP_CONJ_TRANS,
+                )
+            else:
+                _spmm_csc_non_complex_kernel[grid](
+                    data_ri,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B_ri,
+                    C_ri,
+                    prepared.n_cols,
+                    n_dense_cols,
+                    B_ri.stride(0),
+                    B_ri.stride(1),
+                    B_ri.stride(2),
+                    C_ri.stride(0),
+                    C_ri.stride(1),
+                    C_ri.stride(2),
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
         else:
-            _spmm_csc_non_real_kernel[grid](
-                prepared.data,
-                prepared.kernel_indices,
-                prepared.kernel_indptr,
-                B,
-                C,
-                prepared.n_cols,
-                n_dense_cols,
-                B.stride(0),
-                B.stride(1),
-                C.stride(0),
-                C.stride(1),
-                BLOCK_N=block_n,
-                BLOCK_NNZ=prepared.block_nnz,
-                SEG=seg,
-            )
+            if transposes:
+                _spmm_csc_trans_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B,
+                    C,
+                    prepared.n_cols,
+                    n_dense_cols,
+                    B.stride(0),
+                    B.stride(1),
+                    C.stride(0),
+                    C.stride(1),
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
+            else:
+                _spmm_csc_non_real_kernel[grid](
+                    prepared.data,
+                    prepared.kernel_indices,
+                    prepared.kernel_indptr,
+                    B,
+                    C,
+                    prepared.n_cols,
+                    n_dense_cols,
+                    B.stride(0),
+                    B.stride(1),
+                    C.stride(0),
+                    C.stride(1),
+                    BLOCK_N=block_n,
+                    BLOCK_NNZ=prepared.block_nnz,
+                    SEG=seg,
+                )
     return C
 
 
 def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
     del diagnostics
     compute_ms = None
+    block_n = (
+        prepared.block_n
+        if prepared.block_n_override
+        else _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device)
+    )
+    backend_info = _get_device_backend_info(prepared.data.device)
     if timing:
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-    C = _triton_spmm_csc_base_kernel(prepared, B)
+    C = _triton_spmm_csc_base_kernel(prepared, B, _normalize_spmm_csc_op(prepared.op))
     if timing:
         end.record()
         torch.cuda.synchronize()
@@ -468,6 +636,10 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_cpu_ms": 0.0,
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": compute_ms,
+        "block_n": int(block_n),
+        "block_nnz": int(prepared.block_nnz),
+        "launch_backend": backend_info["backend"],
+        "device_warp_size": int(backend_info["device_warp_size"]),
     }
 
 
@@ -591,7 +763,7 @@ def flagsparse_spmm_csc_run(
         raise ValueError(f"op={op_name} does not match prepared.op={prepared.op}")
     alg_name = prepared.alg if alg is None else _normalize_spmm_csc_alg(alg)
     algorithm = resolve_spmm_csc_algorithm(alg_name, op_name, prepared.data.dtype)
-    B = _validate_spmm_csc_B(B, prepared)
+    B = _validate_spmm_csc_B(B, prepared, _normalize_spmm_csc_op(op_name))
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
         torch.cuda.synchronize()
@@ -618,8 +790,10 @@ def flagsparse_spmm_csc_run(
             "display_name": algorithm.display_name,
             "op": op_name,
             "logical_shape": prepared.shape,
-            "block_n": prepared.block_n,
-            "block_nnz": prepared.block_nnz,
+            "block_n": route_meta.get("block_n", prepared.block_n),
+            "block_nnz": route_meta.get("block_nnz", prepared.block_nnz),
+            "launch_backend": route_meta.get("launch_backend"),
+            "device_warp_size": route_meta.get("device_warp_size"),
             "max_segments": prepared.max_segments,
             "nnz": prepared.nnz,
             "operator_ms": operator_ms,

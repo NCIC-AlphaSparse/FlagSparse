@@ -42,7 +42,7 @@ from flagsparse.sparse_operations import spmm_csr as spmm_ops
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = (torch.int32, torch.int64)
 OPS = ("non", "trans", "conj")
-SUPPORTED_OPS = ("non",)
+SUPPORTED_OPS = OPS
 ALGS = ("auto", "spmm_csc_base", "base", "all")
 TEST_SIZES = ((64, 96, 16), (160, 1024, 32), (128, 256, 48))
 WARMUP = 10
@@ -336,10 +336,28 @@ def _csc_to_torch_coo(data, indices, indptr, shape):
     ).coalesce()
 
 
-def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype):
+def _op_transposes(op):
+    return str(op).lower() in ("trans", "conj")
+
+
+def _logical_b_rows(shape, op):
+    return int(shape[0]) if _op_transposes(op) else int(shape[1])
+
+
+def _logical_out_rows(shape, op):
+    return int(shape[1]) if _op_transposes(op) else int(shape[0])
+
+
+def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, op):
     ref_dtype = _reference_dtype(dtype)
     A = _csc_to_torch_coo(data.to(ref_dtype), indices, indptr, shape)
-    return torch.sparse.mm(A, B.to(ref_dtype)).to(dtype)
+    if op == "non":
+        return torch.sparse.mm(A, B.to(ref_dtype)).to(dtype)
+    if op == "trans":
+        return torch.sparse.mm(A.transpose(0, 1), B.to(ref_dtype)).to(dtype)
+    if op == "conj":
+        return torch.sparse.mm(A.conj().transpose(0, 1), B.to(ref_dtype)).to(dtype)
+    raise ValueError(f"unsupported op: {op}")
 
 
 def _cuda_event_benchmark(op, warmup, iters):
@@ -391,10 +409,6 @@ def _time_flagsparse_csc(data, indices, indptr, B, shape, alg, op, warmup, iters
     }
 
 
-def _is_rocm_runtime_for_tests():
-    return getattr(torch.version, "hip", None) is not None
-
-
 def _cupy_csc_unavailable_reason():
     if cp is None or cpx_sparse is None:
         return "CuPy cupyx.scipy.sparse is not available"
@@ -403,14 +417,17 @@ def _cupy_csc_unavailable_reason():
     return None
 
 
-def _time_cusparse_csc(data, indices, indptr, B, shape, warmup, iters):
+def _is_rocm_runtime_for_tests():
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _time_cusparse_csc(data, indices, indptr, B, shape, op, warmup, iters):
     backend, backend_reason = spmm_ops._spmm_csc_sparse_ref_backend(
         data.dtype, indices.dtype, indptr.dtype
     )
     if backend == "hipsparse":
-        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline, via
-        # hipsparseCreateCsc + the generic SpMM.  Without this branch the DCU
-        # run has no vendor column at all.
+        if op != "non":
+            return None, "hipSPARSE CSC baseline supports op='non' only in this runner", None
         ref = spmm_ops._benchmark_spmm_csc_sparse_ref(
             data, indices, indptr, B, shape, warmup, iters
         )
@@ -427,15 +444,23 @@ def _time_cusparse_csc(data, indices, indptr, B, shape, warmup, iters):
     ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
     B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
     A = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    if op == "non":
+        fn = lambda: A @ B_cp
+    elif op == "trans":
+        fn = lambda: A.T @ B_cp
+    elif op == "conj":
+        fn = lambda: A.conj().T @ B_cp
+    else:
+        raise ValueError(f"unsupported op: {op}")
     for _ in range(max(0, int(warmup))):
-        out_cp = A @ B_cp
+        out_cp = fn()
     cp.cuda.runtime.deviceSynchronize()
     start = cp.cuda.Event()
     end = cp.cuda.Event()
     count = max(1, int(iters))
     start.record()
     for _ in range(count):
-        out_cp = A @ B_cp
+        out_cp = fn()
     end.record()
     end.synchronize()
     out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
@@ -460,10 +485,11 @@ def _run_case(
     run_cusparse,
 ):
     B = _materialize_dense_layout(
-        _random_values((int(shape[1]), int(dense_cols)), dtype, data.device) * 0.125,
+        _random_values((_logical_b_rows(shape, op), int(dense_cols)), dtype, data.device) * 0.125,
         layout,
     )
-    ref = _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype)
+    ref = _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, op)
+    logical_out_rows = _logical_out_rows(shape, op)
     row = {
         "matrix": matrix_name,
         "dtype": _dtype_name(dtype),
@@ -472,7 +498,7 @@ def _run_case(
         "layout": layout,
         "alg": alg,
         "ref": "torch_spmm_coo",
-        "out_rows": int(shape[0]),
+        "out_rows": logical_out_rows,
         "n_rows": int(shape[0]),
         "n_cols": int(shape[1]),
         "nnz": int(data.numel()),
@@ -515,7 +541,7 @@ def _run_case(
     if row["status"] != "ERROR" and run_cusparse:
         try:
             cu_ms, cu_reason, cu_out = _time_cusparse_csc(
-                data, indices, indptr, B, shape, warmup, iters
+                data, indices, indptr, B, shape, op, warmup, iters
             )
             row["cusparse_ms"] = cu_ms
             row["cusparse_reason"] = cu_reason or ""
@@ -538,17 +564,18 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
-    print("FlagSparse CSC SpMM v1 supports native op=non only; trans/conj are reserved and reported as SKIP.")
+    print("FlagSparse CSC SpMM supports native op=non/trans/conj without CSR/COO conversion.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same CSC arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
     print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
     if run_cusparse:
-        reason = _cupy_csc_unavailable_reason()
-        if reason:
+        if _is_rocm_runtime_for_tests():
+            print("hipSPARSE CSC baseline: HS(ms) uses hipSPARSE CSC SpMM for op=non when supported; trans/conj report HS=N/A with reason.")
+        elif (reason := _cupy_csc_unavailable_reason()):
             print(f"CuPy CSC baseline: unavailable ({reason}); CU(ms)=N/A.")
         else:
-            print("CuPy CSC baseline: CU(ms) uses cupyx.scipy.sparse.csc_matrix @ dense with construction outside timing.")
+            print("CuPy CSC baseline: CU(ms) uses cupyx.scipy.sparse.csc_matrix op @ dense with construction outside timing.")
     else:
-        print("CuPy CSC baseline disabled by --no-cusparse; CU(ms)=N/A.")
+        print("Vendor CSC baseline disabled by --no-cusparse; vendor ms=N/A.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; CSC SpMM v1 has no process phase.")
 
 
@@ -586,7 +613,7 @@ def main():
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for native CSC SpMM benchmark")
+        raise RuntimeError("A CUDA/ROCm PyTorch device is required for native CSC SpMM benchmark")
     dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
     ops = _parse_ops(args.ops)
@@ -658,7 +685,7 @@ def main():
                                     "process_cpu_ms": 0.0,
                                     "cusparse_reason": "",
                                     "status": "SKIP",
-                                    "reason": "spmm_csc trans/conj are reserved but not implemented in v1",
+                                    "reason": f"spmm_csc does not support op={op!r}",
                                 }
                             )
                             rows.append(row)
