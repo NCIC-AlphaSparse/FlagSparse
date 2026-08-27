@@ -109,13 +109,13 @@ rather than move on. Name the operators explicitly and set a timeout as a backst
 ```bash
 python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
   --timeout 3600 \
-  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr
 ```
 
 That op list is the full `--list-ops` set minus the five solver entries. `--timeout 3600` is
 only a backstop: anything that does hang is recorded as `TIMEOUT` and the sweep continues
 instead of stalling. Measured on DCU, a full 30-matrix sweep takes ~3.3 h in total, and the
-heaviest per-operator benchmarks (`spmv_bsr`, `spmm_coo`, `spmm_bsr`, `spmm_csc`) each need
+heaviest per-operator benchmarks (`spmv_bsr`, `spmm_coo`, `spmm_bsr`, `spmm_bell`, `spmm_csc`) each need
 more than 1800 s to finish their matrix x dtype grid — hence the 3600 s budget.
 
 Note that `--gpus 0,1` does not help on its own: it splits the operators into two queues, and

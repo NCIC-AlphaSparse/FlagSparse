@@ -72,6 +72,7 @@ def test_operator_registry_interfaces_are_public_exports():
         "coo",
         "csc",
         "bsr",
+        "bell",
         "sell",
         "optimized",
         "alpha-sparse",

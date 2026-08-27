@@ -32,6 +32,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
+from mtx_fast import NonSquareMatrixError
 
 try:
     import cupy as cp
@@ -1493,20 +1494,19 @@ def run_all_supported_spsv_csr_csv(
                                 print(f"  NOTE: {pt_skip}")
                     except Exception as e:
                         err_msg = str(e)
-                        status = (
-                            "SKIP"
-                            if "SpSV requires square matrices" in err_msg
-                            else "ERROR"
-                        )
+                        is_skip = isinstance(e, NonSquareMatrixError)
+                        status = "SKIP" if is_skip else "ERROR"
+                        n_rows, n_cols = e.shape if is_skip else ("ERR", "ERR")
+                        nnz = "N/A" if is_skip else "ERR"
                         records_out.append(
                             {
                                 "matrix": os.path.basename(path),
                                 "value_dtype": _dtype_name(value_dtype),
                                 "index_dtype": _dtype_name(index_dtype),
                                 "opA": op_mode,
-                                "n_rows": "ERR",
-                                "n_cols": "ERR",
-                                "nnz": "ERR",
+                                "n_rows": n_rows,
+                                "n_cols": n_cols,
+                                "nnz": nnz,
                                 "FlagSparse_analysis_ms": None,
                                 "FlagSparse_solve_ms": None,
                                 "FlagSparse_ms": None,
@@ -1527,7 +1527,7 @@ def run_all_supported_spsv_csr_csv(
                         if len(os.path.basename(path)) > 27:
                             name = name + "…"
                         print(
-                            f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                            f"{name:<28} {str(n_rows):>7} {str(n_cols):>7} {str(nnz):>10} "
                             f"{_fmt_ms(None):>11} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                             f"{'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>10} "
                             f"{status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
@@ -1661,20 +1661,19 @@ def run_all_dtypes_spsv_coo_csv(
                                 print(f"  NOTE: {pt_skip}")
                     except Exception as e:
                         err_msg = str(e)
-                        status = (
-                            "SKIP"
-                            if "SpSV requires square matrices" in err_msg
-                            else "ERROR"
-                        )
+                        is_skip = isinstance(e, NonSquareMatrixError)
+                        status = "SKIP" if is_skip else "ERROR"
+                        n_rows, n_cols = e.shape if is_skip else ("ERR", "ERR")
+                        nnz = "N/A" if is_skip else "ERR"
                         records_out.append(
                             {
                                 "matrix": os.path.basename(path),
                                 "value_dtype": _dtype_name(value_dtype),
                                 "index_dtype": _dtype_name(index_dtype),
                                 "opA": op_mode,
-                                "n_rows": "ERR",
-                                "n_cols": "ERR",
-                                "nnz": "ERR",
+                                "n_rows": n_rows,
+                                "n_cols": n_cols,
+                                "nnz": nnz,
                                 "FlagSparse_analysis_ms": None,
                                 "FlagSparse_solve_ms": None,
                                 "FlagSparse_ms": None,
@@ -1695,7 +1694,7 @@ def run_all_dtypes_spsv_coo_csv(
                         if len(os.path.basename(path)) > 27:
                             name = name + "…"
                         print(
-                            f"{name:<28} {'ERR':>7} {'ERR':>7} {'ERR':>10} "
+                            f"{name:<28} {str(n_rows):>7} {str(n_cols):>7} {str(nnz):>10} "
                             f"{_fmt_ms(None):>11} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                             f"{'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>10} {status:>6} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                         )
@@ -1917,16 +1916,18 @@ def run_csr_transpose_check(
                         )
                     except Exception as e:
                         total += 1
-                        failed += 1
+                        is_skip = isinstance(e, NonSquareMatrixError)
+                        status = "SKIP" if is_skip else "ERROR"
+                        failed += int(not is_skip)
                         name = os.path.basename(path)[:27]
                         if len(os.path.basename(path)) > 27:
                             name += "..."
                         print(
                             f"{name:<28} {_dtype_name(value_dtype):>10} {_dtype_name(index_dtype):>7} {op_mode:>5} "
-                            f"{'ERR':>7} {'ERR':>10} {'ERROR':>6} "
+                            f"{'N/A' if is_skip else 'ERR':>7} {'N/A' if is_skip else 'ERR':>10} {status:>6} "
                             f"{_fmt_err(None):>10} {_fmt_err(None):>10} {_fmt_err(None):>10}"
                         )
-                        print(f"  ERROR: {e}")
+                        print(f"  {status}: {e}")
     print("-" * 150)
     print(f"Total cases: {total}  Failed: {failed}")
 

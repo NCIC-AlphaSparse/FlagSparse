@@ -34,6 +34,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
+from mtx_fast import NonSquareMatrixError
 
 FORMATS = ("csr", "coo")
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -957,7 +958,7 @@ def _load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 
     data, indices, indptr, shape = load_csr(file_path, dtype=dtype, device=device)
     if shape[0] != shape[1]:
-        raise ValueError("SpSM requires square matrices")
+        raise NonSquareMatrixError("SpSM", shape)
     return data, indices, indptr, shape
 
 def _run_one_spsm_case(
@@ -1198,17 +1199,16 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                             "and rerun the single failing matrix with CUDA_LAUNCH_BLOCKING=1."
                         )
                         raise
-                    status = (
-                        "SKIP"
-                        if "SpSM requires square matrices" in err_msg
-                        else "ERROR"
-                    )
+                    is_skip = isinstance(exc, NonSquareMatrixError)
+                    status = "SKIP" if is_skip else "ERROR"
+                    n_rows, n_cols = exc.shape if is_skip else ("ERR", "ERR")
+                    nnz = "N/A" if is_skip else "ERR"
                     record = {
                         **base,
                         "format": fmt,
-                        "n_rows": "ERR",
-                        "n_cols": "ERR",
-                        "nnz": "ERR",
+                        "n_rows": n_rows,
+                        "n_cols": n_cols,
+                        "nnz": nnz,
                         "n_rhs": int(n_rhs),
                         "FlagSparse_ms": None,
                         "cuSPARSE_ms": None,
@@ -1228,7 +1228,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     )
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
-                        f"{'ERR':>7} {int(n_rhs):>6} {'ERR':>10} "
+                        f"{str(n_rows):>7} {int(n_rhs):>6} {str(nnz):>10} "
                         f"{_fmt_ms(None):>10} {_fmt_ms(None):>10} "
                         f"{'N/A':>10} {status:>10} "
                         f"{_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12} {_fmt_err(None):>12}"
