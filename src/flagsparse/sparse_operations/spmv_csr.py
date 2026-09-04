@@ -212,10 +212,12 @@ def _spmv_seg_add(row_a, val_a, row_b, val_b):
 
 
 def _normalize_spmv_opt_device_props(device):
-    props = torch.cuda.get_device_properties(device)
+    props = _ACCEL.get_device_properties(device)
     device_name = str(getattr(props, "name", "cuda"))
     name_lower = device_name.lower()
-    is_hip = bool(getattr(torch.version, "hip", None)) or any(
+    # Package-wide probe first (so FLAGSPARSE_BACKEND reaches here), then the
+    # device-name fallback for ROCm builds that do not set torch.version.hip.
+    is_hip = _is_rocm_runtime() or any(
         token in name_lower for token in ("dcu", "hygon", "rocm", "amd")
     )
     warp_size = int(getattr(props, "warp_size", 64 if is_hip else 32) or 32)
@@ -225,7 +227,21 @@ def _normalize_spmv_opt_device_props(device):
         or max_threads_per_block
     )
     return {
-        "backend": "hip" if is_hip else "cuda",
+        # Only "hip" changes bucket tiers today; the other names are reported
+        # faithfully so a future backend can branch without another rename.
+        "backend": (
+            "hip"
+            if is_hip
+            else (
+                "metax"
+                if _is_maca_runtime()
+                else (
+                    "mthreads"
+                    if _is_mthreads_runtime()
+                    else ("ascend" if _is_ascend_runtime() else "cuda")
+                )
+            )
+        ),
         "device_name": device_name,
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
@@ -759,7 +775,7 @@ def _prepare_spmv_csr_matrix(
         )
     if data.numel() != indices.numel():
         raise ValueError("data and indices must have the same length (nnz)")
-    if not all(t.is_cuda for t in (data, indices, indptr)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr)):
         raise ValueError("data, indices, indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
@@ -808,7 +824,7 @@ def _validate_spmv_x(x, prepared):
         raise TypeError("x must be a torch.Tensor")
     if x.ndim != 1:
         raise ValueError("x must be a 1D tensor")
-    if not x.is_cuda:
+    if not _is_accel_tensor(x):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
@@ -907,6 +923,25 @@ def _get_spmv_baseline_data(prepared):
     return compute_dtype, prepared._baseline_data
 
 
+# ── MetaX/MACA tuning profiles ──────────────────────────────────────
+# Keyed by MetaX model (see _common._maca_device_model). C550 is FlagTree's
+# reference metax part; its entry is seeded from the CUDA path and is the one
+# place to change once C550 measurements say otherwise.
+_MACA_SPMV_PROFILES = {
+    "c550": {
+        "csr_kernel": "segbin",  # ROCm: "rowpar"
+    },
+}
+_MACA_SPMV_DEFAULT_PROFILE = "c550"
+
+
+def _maca_spmv_knob(name):
+    """Read one MetaX SpMV tuning knob for the current model."""
+    model = _maca_device_model() or _MACA_SPMV_DEFAULT_PROFILE
+    profile = _MACA_SPMV_PROFILES.get(model, _MACA_SPMV_PROFILES[_MACA_SPMV_DEFAULT_PROFILE])
+    return profile[name]
+
+
 def _spmv_csr_default_backend():
     """Pick the default (non-opt) CSR SpMV kernel family for this runtime.
 
@@ -922,7 +957,15 @@ def _spmv_csr_default_backend():
             "FLAGSPARSE_SPMV_CSR_KERNEL must be 'segbin' or 'rowpar', "
             f"got {override!r}"
         )
-    return "rowpar" if _is_rocm_runtime() else "segbin"
+    if _is_rocm_runtime():
+        return "rowpar"
+    if _is_maca_runtime():
+        # MetaX/MACA starts from the CUDA kernel; retune once C550 numbers exist.
+        return _maca_spmv_knob("csr_kernel")
+    if _is_mthreads_runtime() or _is_ascend_runtime():
+        # Moore Threads and Ascend also start from the CUDA kernel.
+        return "segbin"
+    return "segbin"
 
 
 def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
@@ -1191,24 +1234,24 @@ def flagsparse_spmv_csr(
     op_total_ms = None
     opt_buckets = None
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     if use_opt and prepared.supports_opt:
         opt_buckets = _build_spmv_opt_runtime_buckets(prepared)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t1 = time.perf_counter()
         symbolic_ms = (t1 - t0) * 1000.0 if use_opt and prepared.supports_opt else 0.0
     y = _run_spmv_prepared_with_fallback(
         prepared, x, use_opt=use_opt, opt_buckets=opt_buckets
     )
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t2 = time.perf_counter()
         compute_ms = (t2 - t1) * 1000.0
         op_total_ms = symbolic_ms + compute_ms
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != y.device:
             raise ValueError("out must be on the same CUDA device as the result")
@@ -1280,7 +1323,7 @@ def prepare_spmv_coo_tocsr(
     """One-time COO → CSR + bucket metadata; use with ``flagsparse_spmv_coo_tocsr(..., prepared=p)``."""
     if not all(torch.is_tensor(t) for t in (data, row, col)):
         raise TypeError("data, row, col must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col)):
         raise ValueError("data, row, col must all be CUDA tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must all be 1D tensors")
@@ -1348,7 +1391,7 @@ def flagsparse_spmv_coo_tocsr(
 
     if not all(torch.is_tensor(t) for t in (data, row, col, x)):
         raise TypeError("data, row, col, x must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col, x)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col, x)):
         raise ValueError("data, row, col, x must all be CUDA tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1 or x.ndim != 1:
         raise ValueError("data, row, col, x must all be 1D tensors")

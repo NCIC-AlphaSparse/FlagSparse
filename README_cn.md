@@ -32,7 +32,7 @@ pip install . --no-deps --no-build-isolation
 pip install torch triton cupy-cuda12x
 ```
 
-## 后端（CUDA / DCU）
+## 后端（CUDA / DCU / MetaX / 摩尔线程 / 昇腾）
 
 FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分发；Triton 内核本身在各后端保持不变。
 
@@ -40,6 +40,36 @@ FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分�
 | --- | --- | --- | --- |
 | NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy（`cupy-cuda12x`） |
 | DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+| MetaX / MACA（C550） | 见 `_detect_maca_runtime()` | 暂用 CuPy/cuSPARSE 兼容路径 | CuPy |
+| 摩尔线程 / MUSA | `torch.musa` 可用 | **`torch.sparse`**（暂定） | torch_musa |
+| 昇腾 / CANN（910B） | `torch.npu` 可用 | **ops-sparse**，缺失时回落 `torch.sparse` | torch_npu |
+
+> ⚠️ **摩尔线程与昇腾不是 CUDA 兼容的**：torch 把它们暴露成独立设备类型
+> （`musa` / `npu`），`torch.cuda.*` 和 `Tensor.is_cuda` 都不适用。
+> **设备抽象迁移已完成**：`sparse_operations/` 下 269 处 CUDA 专属调用已换成
+> `_ACCEL.*`（189 处）和 `_is_accel_tensor()`（82 处）。在 CUDA / ROCm / MACA 上
+> `_ACCEL is torch.cuda`，因此对这三个后端是**逐字等价**，内核一行未改。
+
+MACA 与 CUDA 源码兼容，机器上 `torch.version.cuda` 有值而 `torch.version.hip` 为 `None`，
+**靠 ROCm 那套判据分不出 MetaX 和 NVIDIA**。检测按顺序尝试：`FLAGSPARSE_BACKEND` 环境变量、
+MetaX 专有的 `torch.version` 属性、MACA SDK 环境变量（`MACA_PATH` / `MACA_HOME`）、
+设备名（先认厂商串，再认 `c550` / `c500` 型号串）。
+**在真机上先显式指定，等自动探测确认无误后再依赖它：**
+
+```bash
+export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend
+export FLAGSPARSE_MACA_MODEL=c550   # 覆盖型号检测
+export FLAGSPARSE_MACA_VENDOR=none  # CuPy 不可用时跳过厂商基线
+
+# 摩尔线程 / 昇腾的基线选择
+export FLAGSPARSE_MTHREADS_VENDOR=torch      # torch | musparse | none
+export FLAGSPARSE_ASCEND_VENDOR=ops_sparse   # ops_sparse | torch | none
+```
+
+调优参数按型号分档，在 `spmv_csr.py` 的 `_MACA_SPMV_PROFILES` 和 `spsv.py` 的
+`_MACA_SPSV_PROFILES`。目前只有 **C550**（FlagTree metax 后端的参考型号）一档，
+内容是从 CUDA 平移的；识别不出的型号会回落到它。每个参数旁注了 gfx936 上实测的
+ROCm 值，是有意不继承的。
 
 在 DCU/ROCm 机器上，安装与 ROCm 版本匹配的 hip-python：
 

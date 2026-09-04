@@ -15,6 +15,7 @@
 """Shared imports, dtypes, and helpers for FlagSparse sparse ops."""
 
 import ctypes
+import os
 import statistics
 import time
 
@@ -58,9 +59,117 @@ _SUPPORTED_VALUE_DTYPES = [
 SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
+# Defined here (before the runtime probes) because the ROCm probe below needs it.
+_BACKEND_NAMES = ("cuda", "rocm", "metax", "mthreads", "ascend")
 # torch.version.hip is set only by ROCm/DCU builds of PyTorch, so it is the cheapest
 # reliable way to pick the vendor backend without touching a device.
 _IS_ROCM_RUNTIME = getattr(torch.version, "hip", None) is not None
+if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() in _BACKEND_NAMES:
+    _IS_ROCM_RUNTIME = os.environ["FLAGSPARSE_BACKEND"].strip().lower() == "rocm"
+
+# MetaX/MACA (e.g. X201) ships a CUDA-compatible stack: torch.version.cuda is set and
+# torch.version.hip is None, so the ROCm probe above cannot tell it apart from NVIDIA.
+# Detection therefore walks several signals, most explicit first.
+# Vendor/stack tokens, then the concrete Xiyun C-series parts FlagTree's metax
+# backend targets (C550 is the reference platform, C500 the sibling part).
+_MACA_DEVICE_NAME_TOKENS = ("metax", "maca", "mxc", "xcore")
+_MACA_DEVICE_MODEL_TOKENS = ("c550", "c500")
+
+
+def _maca_device_model(device=0):
+    """Normalized MetaX model string, e.g. 'c550'. None when not on MetaX.
+
+    Used to pick per-model tuning: C550 is the only part with measured numbers,
+    so anything else falls back to the C550 profile until it gets its own.
+    """
+    if not _IS_MACA_RUNTIME:
+        return None
+    override = os.environ.get("FLAGSPARSE_MACA_MODEL", "").strip().lower()
+    if override:
+        return override
+    try:
+        name = torch.cuda.get_device_properties(device).name.lower()
+    except Exception:
+        return None
+    for tok in _MACA_DEVICE_MODEL_TOKENS:
+        if tok in name:
+            return tok
+    return None
+
+
+def _backend_override():
+    """FLAGSPARSE_BACKEND, validated. None when unset."""
+    override = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    if not override:
+        return None
+    if override not in _BACKEND_NAMES:
+        raise ValueError(
+            "FLAGSPARSE_BACKEND must be one of "
+            f"{', '.join(_BACKEND_NAMES)}; got {override!r}"
+        )
+    return override
+
+
+def _detect_maca_runtime():
+    override = _backend_override()
+    if override:
+        return override == "metax"
+    # A MetaX torch build may expose its own version attribute.
+    for attr in ("maca", "metax"):
+        if getattr(torch.version, attr, None) is not None:
+            return True
+    # MACA SDK environment, present on a configured MetaX host.
+    for env in ("MACA_PATH", "MACA_HOME", "MACA_PATH_CUDA"):
+        if os.environ.get(env):
+            return True
+    # Last resort: the device name, the only signal left when MACA presents itself
+    # as CUDA. Guarded so import never fails on a machine without a GPU.
+    try:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_properties(0).name.lower()
+            if any(tok in name for tok in _MACA_DEVICE_NAME_TOKENS):
+                return True
+            # A bare model string ("C550") with no vendor prefix still identifies
+            # MetaX, since NVIDIA/AMD parts do not use these names.
+            return any(tok in name for tok in _MACA_DEVICE_MODEL_TOKENS)
+    except Exception:
+        pass
+    return False
+
+
+_IS_MACA_RUNTIME = _detect_maca_runtime()
+
+
+# ── Moore Threads (MUSA) and Ascend (CANN) ──────────────────────────
+# Unlike CUDA/ROCm/MACA these are NOT CUDA-compatible: torch exposes them as a
+# separate device type ('musa' / 'npu') through an out-of-tree extension, so
+# torch.cuda.* and Tensor.is_cuda do not apply. See _accel_* below.
+def _detect_mthreads_runtime():
+    override = _backend_override()
+    if override:
+        return override == "mthreads"
+    if getattr(torch, "musa", None) is not None:
+        try:
+            return bool(torch.musa.is_available())
+        except Exception:
+            return True
+    return False
+
+
+def _detect_ascend_runtime():
+    override = _backend_override()
+    if override:
+        return override == "ascend"
+    if getattr(torch, "npu", None) is not None:
+        try:
+            return bool(torch.npu.is_available())
+        except Exception:
+            return True
+    return False
+
+
+_IS_MTHREADS_RUNTIME = _detect_mthreads_runtime()
+_IS_ASCEND_RUNTIME = _detect_ascend_runtime()
 _CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -78,6 +187,27 @@ __all__ = (
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
     "_is_rocm_runtime",
+    "_is_maca_runtime",
+    "_is_mthreads_runtime",
+    "_is_ascend_runtime",
+    "_resolve_accel",
+    "_accel_module",
+    "_accel_fallback_reason",
+    "_accel_device_type",
+    "_ACCEL",
+    "_ACCEL_DEVICE_TYPE",
+    "_accel_oom_error",
+    "_accel_graph_available",
+    "_is_accel_tensor",
+    "_backend_name",
+    "_maca_device_model",
+    "_maca_vendor_sparse_library",
+    "_mthreads_vendor_sparse_library",
+    "_ascend_vendor_sparse_library",
+    "_is_ops_sparse_available",
+    "_ops_sparse_unavailable_reason",
+    "ops_sparse",
+    "_vendor_sparse_library",
     "_is_hipsparse_available",
     "_require_cupy",
     "_cupy_dtype_from_torch",
@@ -210,6 +340,198 @@ def _tolerance_for_dtype(value_dtype):
 
 def _is_rocm_runtime():
     return bool(_IS_ROCM_RUNTIME)
+
+
+def _is_maca_runtime():
+    """True on MetaX/MACA (X201 and friends)."""
+    return bool(_IS_MACA_RUNTIME)
+
+
+def _is_mthreads_runtime():
+    """True on Moore Threads (MUSA)."""
+    return bool(_IS_MTHREADS_RUNTIME)
+
+
+def _is_ascend_runtime():
+    """True on Ascend (CANN / 910B)."""
+    return bool(_IS_ASCEND_RUNTIME)
+
+
+def _backend_name():
+    """Canonical runtime: 'rocm'|'metax'|'mthreads'|'ascend'|'cuda'."""
+    if _IS_ROCM_RUNTIME:
+        return "rocm"
+    if _IS_MACA_RUNTIME:
+        return "metax"
+    if _IS_MTHREADS_RUNTIME:
+        return "mthreads"
+    if _IS_ASCEND_RUNTIME:
+        return "ascend"
+    return "cuda"
+
+
+def _resolve_accel():
+    """Resolve (module, device_type) together, so they can never disagree.
+
+    CUDA, ROCm and MACA all present themselves as torch.cuda. MUSA and Ascend are
+    separate device types supplied by an out-of-tree torch extension; when that
+    extension is not importable we fall back to torch.cuda/"cuda" *as a pair* —
+    returning torch.cuda while claiming device type "musa" would make
+    _is_accel_tensor() reject every tensor.
+    """
+    if _IS_MTHREADS_RUNTIME:
+        mod = getattr(torch, "musa", None)
+        if mod is not None:
+            return mod, "musa"
+    if _IS_ASCEND_RUNTIME:
+        mod = getattr(torch, "npu", None)
+        if mod is not None:
+            return mod, "npu"
+    return torch.cuda, "cuda"
+
+
+def _accel_module():
+    """The torch submodule driving this backend: torch.cuda / .musa / .npu."""
+    return _resolve_accel()[0]
+
+
+def _accel_device_type():
+    """Device type string for torch.device(): 'cuda' | 'musa' | 'npu'."""
+    return _resolve_accel()[1]
+
+
+def _accel_fallback_reason():
+    """Why the accelerator module fell back to torch.cuda, or None.
+
+    Non-None means the selected backend's torch extension is missing, so the
+    package is running on torch.cuda despite FLAGSPARSE_BACKEND asking otherwise.
+    """
+    if _IS_MTHREADS_RUNTIME and getattr(torch, "musa", None) is None:
+        return "backend 'mthreads' selected but torch.musa is unavailable (torch_musa not installed?); falling back to torch.cuda"
+    if _IS_ASCEND_RUNTIME and getattr(torch, "npu", None) is None:
+        return "backend 'ascend' selected but torch.npu is unavailable (torch_npu not installed?); falling back to torch.cuda"
+    return None
+
+
+def _is_accel_tensor(t):
+    """Backend-neutral replacement for Tensor.is_cuda."""
+    return getattr(t, "device", None) is not None and t.device.type == _ACCEL_DEVICE_TYPE
+
+
+def _accel_oom_error():
+    """The backend's OOM exception type, for `except` clauses."""
+    exc = getattr(_ACCEL, "OutOfMemoryError", None)
+    if isinstance(exc, type) and issubclass(exc, BaseException):
+        return exc
+    return torch.cuda.OutOfMemoryError
+
+
+def _accel_graph_available():
+    """Whether this backend exposes CUDA-Graph-style capture.
+
+    MUSA and Ascend may not; callers must fall back to plain event timing.
+    """
+    return hasattr(_ACCEL, "graph") and hasattr(_ACCEL, "CUDAGraph")
+
+
+# Cached accelerator handles. On CUDA, ROCm and MACA these are exactly
+# torch.cuda / "cuda", so every _ACCEL.* call below is identical to the
+# torch.cuda.* it replaced. Only MUSA and Ascend see a different module.
+_ACCEL = _accel_module()
+_ACCEL_DEVICE_TYPE = _accel_device_type()
+
+
+def _maca_vendor_sparse_library():
+    """Which vendor sparse library MetaX/MACA uses for reference baselines.
+
+    MACA is CUDA-source-compatible, so CuPy/cuSPARSE-style calls are the working
+    default until a native mcSPARSE binding is wired up. Override with
+    FLAGSPARSE_MACA_VENDOR=cupy_cusparse|none.
+    """
+    override = os.environ.get("FLAGSPARSE_MACA_VENDOR", "").strip().lower()
+    if override in ("cupy_cusparse", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_MACA_VENDOR must be 'cupy_cusparse' or 'none', "
+            f"got {override!r}"
+        )
+    return "cupy_cusparse"
+
+
+def _mthreads_vendor_sparse_library():
+    """Baseline library on Moore Threads.
+
+    Deliberately the portable torch.sparse path for now: it runs on MUSA today
+    and gives a real reference, whereas musparse has no Python binding wired up
+    here. Override with FLAGSPARSE_MTHREADS_VENDOR=torch|musparse|none.
+    """
+    override = os.environ.get("FLAGSPARSE_MTHREADS_VENDOR", "").strip().lower()
+    if override in ("torch", "musparse", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_MTHREADS_VENDOR must be 'torch', 'musparse' or 'none'; "
+            f"got {override!r}"
+        )
+    return "torch"
+
+
+_OPS_SPARSE_IMPORT_ERROR = None
+try:  # Ascend vendor sparse library (CANN ops-sparse).
+    import ops_sparse  # type: ignore
+except Exception as exc:  # pragma: no cover - depends on the installed runtime
+    ops_sparse = None
+    _OPS_SPARSE_IMPORT_ERROR = exc
+
+
+def _is_ops_sparse_available():
+    return ops_sparse is not None
+
+
+def _ops_sparse_unavailable_reason():
+    if ops_sparse is not None:
+        return None
+    if not _IS_ASCEND_RUNTIME:
+        return "ops-sparse requires an Ascend/CANN runtime"
+    reason = "Ascend runtime detected but the ops-sparse library is unavailable"
+    if _OPS_SPARSE_IMPORT_ERROR is not None:
+        reason += f": {_OPS_SPARSE_IMPORT_ERROR}"
+    return reason
+
+
+def _ascend_vendor_sparse_library():
+    """Baseline library on Ascend: CANN's ops-sparse when importable.
+
+    Falls back to torch.sparse when it is not. Override with
+    FLAGSPARSE_ASCEND_VENDOR=ops_sparse|torch|none.
+    """
+    override = os.environ.get("FLAGSPARSE_ASCEND_VENDOR", "").strip().lower()
+    if override in ("ops_sparse", "torch", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_ASCEND_VENDOR must be 'ops_sparse', 'torch' or 'none'; "
+            f"got {override!r}"
+        )
+    return "ops_sparse" if _is_ops_sparse_available() else "torch"
+
+
+def _vendor_sparse_library():
+    """Vendor sparse library for this runtime, or None when there is none.
+
+    hipsparse (ROCm) | cupy_cusparse (CUDA, MACA) | torch (MUSA) |
+    ops_sparse (Ascend, when installed) | None
+    """
+    if _IS_ROCM_RUNTIME:
+        return "hipsparse"
+    if _IS_MACA_RUNTIME:
+        return _maca_vendor_sparse_library()
+    if _IS_MTHREADS_RUNTIME:
+        return _mthreads_vendor_sparse_library()
+    if _IS_ASCEND_RUNTIME:
+        return _ascend_vendor_sparse_library()
+    return "cupy_cusparse"
 
 
 def _is_hipsparse_available():
@@ -428,7 +750,7 @@ def _destroy_hip_event(evt):
 
 
 def _torch_current_stream_ptr():
-    stream = torch.cuda.current_stream()
+    stream = _ACCEL.current_stream()
     for attr_name in ("cuda_stream", "hip_stream"):
         stream_ptr = getattr(stream, attr_name, None)
         if callable(stream_ptr):
@@ -823,6 +1145,13 @@ def _hipsparse_spmv_csc_skip_reason(value_dtype, index_dtype, op="non"):
 
 def _cupy_cusparse_spmv_skip_reason(value_dtype):
     """Why the CuPy/cuSPARSE vendor baseline cannot serve this dtype."""
+    if _IS_MTHREADS_RUNTIME or _IS_ASCEND_RUNTIME:
+        # Neither runtime exposes CuPy; each has its own baseline (torch.sparse on
+        # MUSA, ops-sparse on Ascend), so the CuPy path is simply not applicable.
+        return (
+            f"CuPy/cuSPARSE is not applicable on the {_backend_name()} backend "
+            f"(baseline: {_vendor_sparse_library() or 'none'})"
+        )
     if cp is None or cpx_sparse is None:
         return "CuPy/cuSPARSE is not available"
     if value_dtype not in _CUPY_SPMV_SUPPORTED_VALUE_DTYPES:
@@ -1049,7 +1378,7 @@ def _prepare_spmv_coo_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, row, col, x)):
         raise TypeError("data, row, col, x must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col, x)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col, x)):
         raise ValueError("data, row, col, x must all be CUDA tensors")
     if not all(t.device == data.device for t in (row, col, x)):
         raise ValueError("data, row, col, x must be on the same CUDA device")
@@ -1084,7 +1413,7 @@ def _prepare_spmv_coo_ref_hipsparse(
     else:
         if not torch.is_tensor(y):
             raise TypeError("out must be a torch.Tensor")
-        if not y.is_cuda or y.device != data.device:
+        if not _is_accel_tensor(y) or y.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
         if y.dtype != data.dtype or y.shape != (y_size,):
             raise ValueError("out must match the result shape and dtype")
@@ -1372,7 +1701,7 @@ def _prepare_spmv_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, x)):
         raise TypeError("data, indices, indptr, x must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, x)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, x)):
         raise ValueError("data, indices, indptr, x must all be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr, x)):
         raise ValueError("data, indices, indptr, x must be on the same CUDA device")
@@ -1413,7 +1742,7 @@ def _prepare_spmv_ref_hipsparse(
     else:
         if not torch.is_tensor(y):
             raise TypeError("out must be a torch.Tensor")
-        if not y.is_cuda or y.device != data.device:
+        if not _is_accel_tensor(y) or y.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
         if y.dtype != data.dtype or y.shape != (y_size,):
             raise ValueError("out must match the result shape and dtype")
@@ -1963,7 +2292,7 @@ def _validate_common_inputs(dense_vector, indices):
         raise ValueError("dense_vector must be a 1D tensor")
     if indices.ndim != 1:
         raise ValueError("indices must be a 1D tensor")
-    if not dense_vector.is_cuda or not indices.is_cuda:
+    if not _is_accel_tensor(dense_vector) or not _is_accel_tensor(indices):
         raise ValueError("dense_vector and indices must both be CUDA tensors")
     if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
         raise TypeError(
@@ -2016,7 +2345,7 @@ def _prepare_scatter_inputs(
         raise ValueError(
             "sparse_values and indices must have the same number of elements"
         )
-    if not sparse_values.is_cuda or not indices.is_cuda:
+    if not _is_accel_tensor(sparse_values) or not _is_accel_tensor(indices):
         raise ValueError("sparse_values and indices must both be CUDA tensors")
     if sparse_values.dtype not in SUPPORTED_VALUE_DTYPES:
         raise TypeError(
@@ -2056,7 +2385,7 @@ def _prepare_scatter_inputs(
     if out is not None:
         if out.ndim != 1:
             raise ValueError("out must be a 1D tensor")
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.dtype != sparse_values.dtype:
             raise TypeError("out dtype must match sparse_values dtype")
@@ -2085,13 +2414,13 @@ def _benchmark_cuda_op(op, warmup, iters):
     for _ in range(warmup):
         output = op()
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     if cp is not None:
         cp.cuda.runtime.deviceSynchronize()
     start_time = time.perf_counter()
     for _ in range(iters):
         output = op()
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     if cp is not None:
         cp.cuda.runtime.deviceSynchronize()
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
@@ -2111,7 +2440,7 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
             output = run_fn(state)
 
         if _is_rocm_runtime() and _hip_runtime_event_available():
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
             start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
             stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
             _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
@@ -2123,14 +2452,14 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
             )
             return output, _hip_event_elapsed_ms(start_ev, stop_ev) / iters
 
-        torch.cuda.synchronize()
-        start_ev_torch = torch.cuda.Event(enable_timing=True)
-        end_ev_torch = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        start_ev_torch = _ACCEL.Event(enable_timing=True)
+        end_ev_torch = _ACCEL.Event(enable_timing=True)
         start_ev_torch.record()
         for _ in range(iters):
             output = run_fn(state)
         end_ev_torch.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         return output, start_ev_torch.elapsed_time(end_ev_torch) / iters
     finally:
         _destroy_hip_event(stop_ev)
@@ -2158,7 +2487,7 @@ def _benchmark_prepared_hip_event_op(
         for _ in range(warmup):
             output = run_fn(state)
 
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
         stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
         _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
@@ -2182,36 +2511,46 @@ def _benchmark_cuda_graph_op(
     repeats=10,
     capture_setup=None,
 ):
-    """Measure allocation-free CUDA work without Python/FFI launch gaps."""
+    """Measure allocation-free CUDA work without Python/FFI launch gaps.
+
+    Falls back to plain event timing on backends without graph capture (MUSA and
+    Ascend may not expose it); the return contract is the same either way.
+    """
     graph_batch = max(1, int(graph_batch))
     warmup = max(0, int(warmup))
     repeats = max(1, int(repeats))
 
-    torch.cuda.synchronize()
-    capture_stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
+    if not _accel_graph_available():
+        if capture_setup is not None:
+            capture_setup()
+        _, ms = _benchmark_cuda_op(op, warmup=warmup, iters=graph_batch)
+        return ms
 
-    with torch.cuda.stream(capture_stream):
+    _ACCEL.synchronize()
+    capture_stream = _ACCEL.Stream()
+    graph = _ACCEL.CUDAGraph()
+
+    with _ACCEL.stream(capture_stream):
         if capture_setup is not None:
             capture_setup()
         op()
     capture_stream.synchronize()
 
-    with torch.cuda.graph(graph, stream=capture_stream):
+    with _ACCEL.graph(graph, stream=capture_stream):
         for _ in range(graph_batch):
             op()
     capture_stream.synchronize()
 
-    with torch.cuda.stream(capture_stream):
+    with _ACCEL.stream(capture_stream):
         for _ in range(warmup):
             graph.replay()
     capture_stream.synchronize()
 
     samples_ms = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = _ACCEL.Event(enable_timing=True)
+    end = _ACCEL.Event(enable_timing=True)
     for _ in range(repeats):
-        with torch.cuda.stream(capture_stream):
+        with _ACCEL.stream(capture_stream):
             start.record()
             graph.replay()
             end.record()

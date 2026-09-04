@@ -152,7 +152,7 @@ def _spsv_alg4_worker_count(n_rows, device, is_rocm):
         return min(n_rows, SPSV_ROCM_ALG4_WORKER_COUNT)
     # One persistent program per CU keeps the complete worker grid resident on
     # gfx936 while exposing enough independent rows to hide ready-flag latency.
-    cu_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
     return min(n_rows, max(1, cu_count))
 
 
@@ -640,7 +640,7 @@ def _prepare_spsv_csr_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, rhs)):
         raise TypeError("data, indices, indptr, rhs must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, rhs)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, rhs)):
         raise ValueError("data, indices, indptr, rhs must all be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr, rhs)):
         raise ValueError("data, indices, indptr, rhs must be on the same CUDA device")
@@ -681,7 +681,7 @@ def _prepare_spsv_csr_ref_hipsparse(
     else:
         if not torch.is_tensor(solution):
             raise TypeError("out must be a torch.Tensor")
-        if not solution.is_cuda or solution.device != data.device:
+        if not _is_accel_tensor(solution) or solution.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
         if solution.dtype != data.dtype or solution.shape != rhs.shape:
             raise ValueError("out must match the solution shape and dtype")
@@ -1039,15 +1039,15 @@ def _benchmark_spsv_csr_sparse_ref(
                 for _ in range(warmup):
                     _reanalyze_spsv_csr_ref_hipsparse_prepared(state)
                     values = _run_spsv_csr_ref_hipsparse_prepared(state)
-                    torch.cuda.synchronize()
+                    _ACCEL.synchronize()
 
                 times = []
                 for _ in range(iters):
-                    torch.cuda.synchronize()
+                    _ACCEL.synchronize()
                     t0 = time.perf_counter()
                     _reanalyze_spsv_csr_ref_hipsparse_prepared(state)
                     values = _run_spsv_csr_ref_hipsparse_prepared(state)
-                    torch.cuda.synchronize()
+                    _ACCEL.synchronize()
                     times.append((time.perf_counter() - t0) * 1000.0)
             finally:
                 _destroy_spsv_csr_ref_hipsparse_prepared(state)
@@ -1091,7 +1091,7 @@ def _prepare_spsv_inputs(data, indices, indptr, b, shape):
     """Validate and normalize inputs for sparse solve A x = b with CSR A."""
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, b)):
         raise TypeError("data, indices, indptr, b must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, b)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, b)):
         raise ValueError("data, indices, indptr, b must all be CUDA tensors")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
         raise ValueError("data, indices, indptr must be 1D")
@@ -1163,7 +1163,7 @@ def _prepare_spsv_sell_matrix_inputs(
     tensors = (values, col_indices, slice_offsets)
     if not all(torch.is_tensor(t) for t in tensors):
         raise TypeError("SELL SpSV matrix inputs must be torch.Tensor")
-    if any(not t.is_cuda or t.ndim != 1 for t in tensors):
+    if any(not _is_accel_tensor(t) or t.ndim != 1 for t in tensors):
         raise ValueError("SELL SpSV matrix inputs must be 1D CUDA tensors")
     if len({t.device for t in tensors}) != 1:
         raise ValueError("SELL SpSV matrix inputs must use one CUDA device")
@@ -1973,6 +1973,8 @@ def _choose_spsv_nontrans_auto_route(
     # the heuristics below.
     if _is_rocm_runtime() and not SPSV_ROCM_ENABLE_ADVANCED_AUTO:
         return "csr_cw"
+    if _is_maca_runtime() and not _maca_spsv_knob("enable_advanced_auto"):
+        return "csr_cw"
     if bool(unit_diagonal):
         return "csr_cw"
     n_rows = int(n_rows)
@@ -2189,7 +2191,7 @@ def _build_spsv_nnz_balance_metadata(indices64, indptr64, n_rows, *, lower, unit
     }
     if n_rows == 0:
         return empty_meta
-    if indices64.is_cuda:
+    if _is_accel_tensor(indices64):
         if not lower:
             # Upper-triangular preprocessing reuses the generic host path for now.
             indices_cpu = indices64.to("cpu", non_blocking=False).tolist()
@@ -2304,7 +2306,7 @@ def _build_spsv_level_schedule_metadata(
 
     # The GPU level-schedule builder is CUDA-only; DCU/ROCm falls back to the
     # host path below.
-    if lower and indices64.is_cuda and not _is_rocm_runtime():
+    if lower and _is_accel_tensor(indices64) and not _is_rocm_runtime():
         return _build_spsv_level_schedule_metadata_lower_gpu(
             indices64,
             indptr64,
@@ -5006,7 +5008,11 @@ def _triton_spsv_csr_n_lo_roc_vector(
     ready_in=None,
 ):
     # DCU/ROCm launches ALG3 at the 64-wide wavefront; CUDA keeps 32.
-    warp_size = SPSV_ROCM_ALG3_WARP_SIZE if _is_rocm_runtime() else 32
+    warp_size = (
+        SPSV_ROCM_ALG3_WARP_SIZE
+        if _is_rocm_runtime()
+        else (_maca_spsv_knob("alg3_warp_size") if _is_maca_runtime() else 32)
+    )
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -5047,7 +5053,11 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     ready_in=None,
 ):
     # DCU/ROCm launches ALG3 at the 64-wide wavefront; CUDA keeps 32.
-    warp_size = SPSV_ROCM_ALG3_WARP_SIZE if _is_rocm_runtime() else 32
+    warp_size = (
+        SPSV_ROCM_ALG3_WARP_SIZE
+        if _is_rocm_runtime()
+        else (_maca_spsv_knob("alg3_warp_size") if _is_maca_runtime() else 32)
+    )
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -5267,6 +5277,31 @@ def _spsv_csr_smblk_persistent_kernel_complex(
         tl.atomic_add(ready_ptr + row, 1, sem="release", scope="gpu")
 
 
+# ── MetaX/MACA tuning profiles ──────────────────────────────────────
+# Keyed by MetaX model (see _common._maca_device_model). C550 is FlagTree's
+# reference metax part and the only profile with a home here so far; it is
+# seeded from the CUDA path because MACA is CUDA-compatible, so the NVIDIA
+# defaults are the safer starting point. The ROCm value measured on gfx936 is
+# noted beside each knob and deliberately NOT inherited.
+_MACA_SPSV_PROFILES = {
+    "c550": {
+        "smblk_persistent": False,   # ROCm: True
+        "enable_advanced_auto": True,  # ROCm: False (forces ALG1)
+        "alg3_warp_size": 32,        # ROCm: 64
+        "alg4_warp_size": 32,        # ROCm: 64
+        "cw_serial": False,          # ROCm: True (worker_count forced to 1)
+    },
+}
+_MACA_SPSV_DEFAULT_PROFILE = "c550"
+
+
+def _maca_spsv_knob(name):
+    """Read one MetaX SpSV tuning knob for the current model."""
+    model = _maca_device_model() or _MACA_SPSV_DEFAULT_PROFILE
+    profile = _MACA_SPSV_PROFILES.get(model, _MACA_SPSV_PROFILES[_MACA_SPSV_DEFAULT_PROFILE])
+    return profile[name]
+
+
 def _spsv_smblk_use_persistent():
     """Whether ALG4 runs the DCU persistent-worker kernel.
 
@@ -5281,6 +5316,11 @@ def _spsv_smblk_use_persistent():
             "FLAGSPARSE_SPSV_SMBLK_KERNEL must be 'rowprog' or 'persistent', "
             f"got {override!r}"
         )
+    if _is_maca_runtime():
+        return _maca_spsv_knob("smblk_persistent")
+    if _is_mthreads_runtime() or _is_ascend_runtime():
+        # Seeded from CUDA: one program per row, not the DCU persistent grid.
+        return False
     return _is_rocm_runtime()
 
 
@@ -5297,7 +5337,11 @@ def _triton_spsv_csr_n_lo_smblk_vector(
 ):
     # DCU/ROCm launches ALG4 at the 64-wide wavefront; CUDA keeps 32.
     is_rocm = _is_rocm_runtime()
-    warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
+    warp_size = (
+        SPSV_ROCM_ALG4_WARP_SIZE
+        if is_rocm
+        else (_maca_spsv_knob("alg4_warp_size") if _is_maca_runtime() else 32)
+    )
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -5357,7 +5401,11 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
 ):
     # DCU/ROCm launches ALG4 at the 64-wide wavefront; CUDA keeps 32.
     is_rocm = _is_rocm_runtime()
-    warp_size = SPSV_ROCM_ALG4_WARP_SIZE if is_rocm else 32
+    warp_size = (
+        SPSV_ROCM_ALG4_WARP_SIZE
+        if is_rocm
+        else (_maca_spsv_knob("alg4_warp_size") if _is_maca_runtime() else 32)
+    )
     x = torch.zeros_like(b_vec)
     ready = ready_in if ready_in is not None else torch.zeros(
         n_rows, dtype=torch.int32, device=b_vec.device
@@ -5808,7 +5856,7 @@ def _run_spsv_csc_preprocess(
 def _prepare_spsv_coo_inputs(data, row, col, b, shape):
     if not all(torch.is_tensor(t) for t in (data, row, col, b)):
         raise TypeError("data, row, col, b must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, row, col, b)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col, b)):
         raise ValueError("data, row, col, b must all be CUDA tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must be 1D")
@@ -6035,7 +6083,7 @@ def _analyze_spsv_csr(
     if clear_cache:
         _clear_spsv_csr_preprocess_cache()
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     (
         _data,
@@ -6060,7 +6108,7 @@ def _analyze_spsv_csr(
         solve_plan, trans_mode, requested_solve_kind=solve_kind
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         return (time.perf_counter() - t0) * 1000.0
 
 
@@ -6206,7 +6254,7 @@ def _execute_spsv_csr_plan(
     diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
 
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     worker_count_use = cw_worker_count
     matrix_stats_use = dict(matrix_stats)
@@ -6220,6 +6268,8 @@ def _execute_spsv_csr_plan(
     # Keep ALG1 serial on ROCm/DCU because cross-program ready-flag polling does
     # not make forward progress reliably on the current gfx936 Triton stack.
     if solve_kind == "csr_cw" and _is_rocm_runtime():
+        worker_count_use = 1
+    if solve_kind == "csr_cw" and _is_maca_runtime() and _maca_spsv_knob("cw_serial"):
         worker_count_use = 1
     complex_kernel_data_ri = None
     if torch.is_complex(data_in):
@@ -6255,7 +6305,7 @@ def _execute_spsv_csr_plan(
             max_segments_use,
         )
         preprocess_stream_ctx = (
-            torch.cuda.stream(solve_stream)
+            _ACCEL.stream(solve_stream)
             if solve_stream is not None
             else nullcontext()
         )
@@ -6275,7 +6325,7 @@ def _execute_spsv_csr_plan(
             workspace.prepared_solve_kind = "transpose_cw"
             workspace.prepared_signature = transpose_sig
     stream_ctx = (
-        torch.cuda.stream(solve_stream)
+        _ACCEL.stream(solve_stream)
         if solve_stream is not None
         else nullcontext()
     )
@@ -6464,7 +6514,7 @@ def _execute_spsv_csr_plan(
     if x.dtype != target_dtype:
         x = x.to(target_dtype)
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != x.shape or out.dtype != x.dtype:
@@ -6499,7 +6549,7 @@ def flagsparse_spsv_solve_csr(
         raise ValueError("descr must reference a CSR-canonicalized SpSV analysis")
     if not torch.is_tensor(b):
         raise TypeError("b must be a torch.Tensor")
-    if not b.is_cuda:
+    if not _is_accel_tensor(b):
         raise ValueError("b must be a CUDA tensor")
     if b.ndim != 1:
         raise ValueError("b must be a 1D dense vector (DnVec)")
@@ -6964,7 +7014,7 @@ def flagsparse_spsv_solve_sell(
         raise ValueError("descr must reference a SELL SpSV analysis")
     if not torch.is_tensor(b):
         raise TypeError("b must be a torch.Tensor")
-    if not b.is_cuda or b.ndim != 1:
+    if not _is_accel_tensor(b) or b.ndim != 1:
         raise ValueError("b must be a 1D CUDA tensor")
     if b.device != descr.data.device:
         raise ValueError("b device must match the analyzed SELL matrix")
@@ -6977,7 +7027,7 @@ def flagsparse_spsv_solve_sell(
         out = torch.empty_like(b)
     elif (
         not torch.is_tensor(out)
-        or not out.is_cuda
+        or not _is_accel_tensor(out)
         or out.ndim != 1
         or not out.is_contiguous()
         or out.device != b.device

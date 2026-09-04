@@ -466,7 +466,7 @@ def _prepare_spmv_bsr_matrix(data, indices, indptr, shape, block_dim):
         )
     if data.shape[0] != indices.numel():
         raise ValueError("data.shape[0] and indices length must both equal nnzb")
-    if not all(t.is_cuda for t in (data, indices, indptr)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr)):
         raise ValueError("data, indices, indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
@@ -576,7 +576,7 @@ def _validate_spmv_bsr_x(x, prepared, op_code):
         raise TypeError("x must be a torch.Tensor")
     if x.ndim != 1:
         raise ValueError("x must be a 1D tensor")
-    if not x.is_cuda:
+    if not _is_accel_tensor(x):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
@@ -758,22 +758,22 @@ def _triton_spmv_bsr_blockrow_reduce_kernel(prepared, x, buckets=None):
 
 
 def _run_spmv_bsr_blockrow_reduce_with_timing(prepared, x):
-    torch.cuda.synchronize()
-    process_start = torch.cuda.Event(enable_timing=True)
-    process_end = torch.cuda.Event(enable_timing=True)
+    _ACCEL.synchronize()
+    process_start = _ACCEL.Event(enable_timing=True)
+    process_end = _ACCEL.Event(enable_timing=True)
     process_start.record()
     buckets = _build_spmv_bsr_blockrow_reduce_buckets(
         prepared.block_row_lengths, prepared.max_block_row_nnz
     )
     process_end.record()
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     process_gpu_ms = process_start.elapsed_time(process_end)
-    compute_start = torch.cuda.Event(enable_timing=True)
-    compute_end = torch.cuda.Event(enable_timing=True)
+    compute_start = _ACCEL.Event(enable_timing=True)
+    compute_end = _ACCEL.Event(enable_timing=True)
     compute_start.record()
     y = _triton_spmv_bsr_blockrow_reduce_kernel(prepared, x, buckets=buckets)
     compute_end.record()
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     compute_ms = compute_start.elapsed_time(compute_end)
     return y, {
         "process_cpu_ms": 0.0,
@@ -853,13 +853,13 @@ def _run_spmv_bsr_algorithm(prepared, x, op_code, algorithm, collect_timing=Fals
             "launch_configs": None,
         }
     if collect_timing:
-        torch.cuda.synchronize()
-        compute_start = torch.cuda.Event(enable_timing=True)
-        compute_end = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        compute_start = _ACCEL.Event(enable_timing=True)
+        compute_end = _ACCEL.Event(enable_timing=True)
         compute_start.record()
         y = _triton_spmv_bsr_kernel(prepared, x, op_code)
         compute_end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = compute_start.elapsed_time(compute_end)
         return y, {
             "process_cpu_ms": 0.0,
@@ -965,13 +965,13 @@ def flagsparse_spmv_bsr(
     x = _validate_spmv_bsr_x(x, prepared, op_code)
     do_timing = bool(return_time or return_meta)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     y, alg_timing = _run_spmv_bsr_prepared_with_fallback(
         prepared, x, op_code, algorithm, collect_timing=do_timing
     )
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         wall_total_ms = (time.perf_counter() - t0) * 1000.0
         compute_ms = alg_timing["compute_ms"]
         process_cpu_ms = alg_timing["process_cpu_ms"]
@@ -987,7 +987,7 @@ def flagsparse_spmv_bsr(
         process_gpu_ms = None
         op_total_ms = None
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != y.device:
             raise ValueError("out must be on the same CUDA device as the result")

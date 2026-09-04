@@ -96,7 +96,7 @@ def _validate_csr(data, indices, indptr, shape, tag):
         )
     if data.numel() != indices.numel():
         raise ValueError(f"{tag}_data and {tag}_indices must have the same length")
-    if not data.is_cuda or not indices.is_cuda or not indptr.is_cuda:
+    if not _is_accel_tensor(data) or not _is_accel_tensor(indices) or not _is_accel_tensor(indptr):
         raise ValueError(f"{tag} tensors must be CUDA tensors")
     if data.dtype not in SUPPORTED_SPGEMM_VALUE_DTYPES:
         raise TypeError(f"{tag}_data dtype must be torch.float32 or torch.float64")
@@ -772,7 +772,7 @@ def _spgemm_esc_rows_chunked(prepared, rows, rw, budget=_SPGEMM_ESC_CHUNK_PRODUC
             crow_parts.append(cr)
             ccol_parts.append(cc)
             cval_parts.append(cv)
-        torch.cuda.empty_cache()
+        _ACCEL.empty_cache()
     if not crow_parts:
         return (
             torch.empty(0, dtype=torch.int64, device=device),
@@ -1045,7 +1045,7 @@ def _spgemm_compute(prepared):
     if _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
         try:
             result = _spgemm_hash_hybrid_compute(prepared)
-        except (triton.runtime.errors.OutOfResources, torch.cuda.OutOfMemoryError):
+        except (triton.runtime.errors.OutOfResources, _accel_oom_error()):
             # genuinely out of shared memory / device memory: ESC still works
             result = None
         if result is not None:
@@ -1077,7 +1077,7 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
         if not isinstance(out, (tuple, list)) or len(out) != 3:
             raise TypeError("out must be a tuple/list of (data, indices, indptr)")
         out_data, out_indices, out_indptr = out
-        if not out_data.is_cuda or not out_indices.is_cuda or not out_indptr.is_cuda:
+        if not _is_accel_tensor(out_data) or not _is_accel_tensor(out_indices) or not _is_accel_tensor(out_indptr):
             raise ValueError("out data/indices/indptr must be CUDA tensors")
         if (
             out_data.device != prepared.a_data.device
@@ -1096,11 +1096,11 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
         out_data = out_indices = out_indptr = None
 
     if measure_stage:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     c_data, c_indices, c_indptr = _spgemm_compute(prepared)
     if measure_stage:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         total_ms = (time.perf_counter() - t0) * 1000.0
     else:
         total_ms = None
@@ -1156,7 +1156,7 @@ def flagsparse_spgemm_csr(
                 "A/B CSR tensors and shapes are required when prepared is not provided"
             )
         if return_meta:
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
             t_prepare0 = time.perf_counter()
         prepared = prepare_spgemm_csr(
             a_data,
@@ -1169,14 +1169,14 @@ def flagsparse_spgemm_csr(
             b_shape,
         )
         if return_meta:
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
             prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
     elif not isinstance(prepared, SpGEMMPrepared):
         raise TypeError("prepared must be a SpGEMMPrepared instance")
 
     elapsed_ms = None
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     c_data, c_indices, c_indptr, stage_meta = _run_spgemm_prepared(
         prepared,
@@ -1185,7 +1185,7 @@ def flagsparse_spgemm_csr(
         measure_stage=bool(return_meta),
     )
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     result = (c_data, c_indices, c_indptr, (prepared.n_rows, prepared.n_cols))
@@ -1504,7 +1504,7 @@ def _prepare_spgemm_csr_ref_hipsparse(
         for t in (a_data, a_indices, a_indptr, b_data, b_indices, b_indptr)
     ):
         raise TypeError("all CSR inputs must be torch.Tensor")
-    if not all(t.is_cuda for t in (a_data, a_indices, a_indptr, b_data, b_indices, b_indptr)):
+    if not all(_is_accel_tensor(t) for t in (a_data, a_indices, a_indptr, b_data, b_indices, b_indptr)):
         raise ValueError("all CSR inputs must be CUDA tensors")
     if not all(
         t.device == a_data.device

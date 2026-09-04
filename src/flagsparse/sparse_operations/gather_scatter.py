@@ -464,7 +464,7 @@ def _set_cusparse_stream(lib, handle, *, strict=False):
             )
         return
     try:
-        stream = torch.cuda.current_stream()
+        stream = _ACCEL.current_stream()
         stream_ptr = getattr(stream, "cuda_stream", None)
         if stream_ptr is None:
             if strict:
@@ -689,7 +689,7 @@ def _prepare_hipsparse_gather(dense_vector, indices, out=None):
     else:
         if not torch.is_tensor(sparse_values):
             raise TypeError("out must be a torch.Tensor")
-        if not sparse_values.is_cuda or sparse_values.device != dense_vector.device:
+        if not _is_accel_tensor(sparse_values) or sparse_values.device != dense_vector.device:
             raise ValueError("out must be a CUDA tensor on the same device as dense_vector")
         if sparse_values.dtype != dense_vector.dtype or sparse_values.shape != (nnz,):
             raise ValueError("out shape/dtype must match gather output")
@@ -1115,7 +1115,7 @@ def flagsparse_gather(
         if out_tensor.dtype != dense_vector.dtype:
             raise TypeError("out dtype must match gather output dtype")
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     start_time = time.perf_counter()
     sparse_values = _triton_gather_impl(
         dense_vector,
@@ -1123,7 +1123,7 @@ def flagsparse_gather(
         out=out_tensor,
         block_size=block_size,
     )
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
 
     if out is not None:
@@ -1163,7 +1163,7 @@ def flagsparse_scatter(
         return_metadata=True,
     )
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     start_time = time.perf_counter()
     _ = _triton_scatter_impl(
         values_tensor,
@@ -1174,7 +1174,7 @@ def flagsparse_scatter(
         reset_output=reset_output,
         index_fallback_policy=index_fallback_policy,
     )
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
 
     if dense_backend == "cupy":
@@ -1229,10 +1229,10 @@ def triton_cusparse_scatter(
 def pytorch_index_gather(dense_vector, indices):
     """Baseline gather using PyTorch native indexing."""
     dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     start_time = time.perf_counter()
     sparse_values = dense_vector[indices]
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     return sparse_values, execution_time_ms
 
@@ -1254,12 +1254,12 @@ def pytorch_index_scatter(
         dtype_policy=dtype_policy,
         return_metadata=True,
     )
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     start_time = time.perf_counter()
     dense_values = _pytorch_scatter_impl(
         sparse_values, indices, dense_size, out=out, reset_output=reset_output
     )
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     return dense_values, execution_time_ms
 
@@ -1291,10 +1291,10 @@ def cusparse_spmv_gather(dense_vector, indices, selector_matrix=None):
         )
 
     try:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         start_time = time.perf_counter()
         sparse_values = _cusparse_spmv(selector_matrix, dense_vector)
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     except Exception as exc:
         raise RuntimeError(
@@ -1308,10 +1308,10 @@ def cusparse_native_gather(dense_vector, indices, out=None):
     """Native cuSPARSE gather baseline via SpVec/DnVec descriptors."""
     dense_vector, indices, _ = _prepare_inputs(dense_vector, indices)
     try:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         start_time = time.perf_counter()
         sparse_values = _cusparse_native_gather(dense_vector, indices, out=out)
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     except Exception as exc:
         raise RuntimeError(
@@ -1361,10 +1361,10 @@ def cusparse_spmv_scatter(
         )
 
     try:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         start_time = time.perf_counter()
         dense_values = _cusparse_spmv(selector_matrix, sparse_values)
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         execution_time_ms = (time.perf_counter() - start_time) * 1000.0
     except Exception as exc:
         raise RuntimeError(

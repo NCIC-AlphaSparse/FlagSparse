@@ -144,7 +144,7 @@ def _alpha_spmm_alg1_acc_dtype(dtype):
 
 
 def _normalize_alpha_spmm_alg1_device_props(device):
-    props = torch.cuda.get_device_properties(device)
+    props = _ACCEL.get_device_properties(device)
     return {
         "device_name": str(getattr(props, "name", "cuda")),
         "sm_count": int(getattr(props, "multi_processor_count", 0) or 0),
@@ -156,7 +156,7 @@ def _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out):
         raise ValueError("B is required")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -167,7 +167,7 @@ def _validate_alpha_spmm_alg1_runtime_inputs(prepared, B, out):
             f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
         )
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
             raise ValueError(
