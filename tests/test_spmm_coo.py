@@ -714,9 +714,14 @@ def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row")
             (data_cp, (row_cp, col_cp)),
             shape=(prepared_case["n_rows"], prepared_case["n_cols"]),
         )
+        # cupy has no native COO SpMM: _base.__matmul__ -> __mul__ ->
+        # ``self.tocsr().__mul__(other)``, and coo_matrix does not override it, so
+        # timing ``A_coo @ B`` charges cuSPARSE a full COO->CSR conversion on every
+        # iteration.  Hoist it out; the timed window holds only the SpMM kernel.
+        A_csr = A_coo.tocsr()
 
         def _run(rhs):
-            return A_coo @ rhs
+            return A_csr @ rhs
 
         try:
             out_cp, ms = _cupy_event_benchmark(_run, B_cp, warmup, iters)
@@ -1551,16 +1556,20 @@ def run_one_mtx(
                     shape=(prepared["n_rows"], prepared["n_cols"]),
                 )
 
+                # cupy COO ``@`` runs tocsr() internally on every call
+                # (_base.__mul__); hoist it so only the SpMM kernel is timed.
+                A_csr = A_coo.tocsr()
+
                 def _run_cusparse_timing(rhs):
                     torch.cuda.synchronize()
                     for _ in range(warmup):
-                        _ = A_coo @ rhs
+                        _ = A_csr @ rhs
                     torch.cuda.synchronize()
                     start = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     start.record()
                     for _ in range(iters):
-                        _ = A_coo @ rhs
+                        _ = A_csr @ rhs
                     end.record()
                     torch.cuda.synchronize()
                     return start.elapsed_time(end) / iters
@@ -1913,8 +1922,11 @@ def _benchmark_spmm_coo_synthetic_policy(
                     (data_cp, (row_cp, col_cp)),
                     shape=(prepared["n_rows"], prepared["n_cols"]),
                 )
+                # cupy COO ``@`` runs tocsr() internally on every call
+                # (_base.__mul__); hoist it so only the SpMM kernel is timed.
+                A_csr = A_coo.tocsr()
                 cusparse_values_cp, cusparse_ms = ast_ops._benchmark_cuda_op(
-                    lambda: A_coo @ B_cp,
+                    lambda: A_csr @ B_cp,
                     warmup=warmup,
                     iters=iters,
                 )

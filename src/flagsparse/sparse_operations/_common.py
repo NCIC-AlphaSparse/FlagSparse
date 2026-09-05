@@ -2327,8 +2327,16 @@ def _benchmark_spmv_coo_sparse_ref(
     col_cp = _cupy_from_torch(col.to(torch.int64))
     x_cp = _cupy_from_torch(x)
     matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    # cupy has no native COO matvec: cupyx.scipy.sparse._base.__matmul__ delegates to
+    # __mul__, which is ``self.tocsr().__mul__(other)``, and coo_matrix does not
+    # override it.  Timing ``coo_matrix @ x`` therefore charges cuSPARSE a full
+    # COO->CSR sort+scan on *every* iteration, which is what made this column read
+    # ~75x slower than the kernel it is meant to represent.  Hoist the conversion out
+    # so the timed window holds only the SpMV kernel, matching how every other
+    # operator's vendor baseline is measured.
+    matrix_csr = matrix.tocsr()
     values_cp, ms = _benchmark_cuda_op(
-        lambda: _apply_cupy_sparse_matmul_op(matrix, x_cp, op_name),
+        lambda: _apply_cupy_sparse_matmul_op(matrix_csr, x_cp, op_name),
         warmup=warmup,
         iters=iters,
     )

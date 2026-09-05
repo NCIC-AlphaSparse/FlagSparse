@@ -928,7 +928,11 @@ def run_all_dtypes_coo_csv(
     print(
         "Input: MatrixMarket -> COO. FlagSparse: native COO Triton only (seg + atomic), no CSR."
     )
-    print("PyTorch = COO sparse.mm; CuPy = COO matvec (coo_matrix @ x, no tocsr).")
+    print(
+        "PyTorch = COO sparse.mm; CuPy = cuSPARSE csrmv, with the COO->CSR "
+        "conversion hoisted out of the timed window (cupy's COO @ does it "
+        "internally on every call)."
+    )
     print(
         "Timing policy: Base/Opt ms = process_cpu_ms + GPU event time. "
         "Row-run sort + seg_starts are GPU process; atomic has no process. "

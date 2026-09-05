@@ -366,6 +366,18 @@ def _cusparse_native_gather_skip_reason(value_dtype):
     return None
 
 
+def _cusparse_native_scatter_skip_reason(value_dtype):
+    if value_dtype == torch.bfloat16:
+        return "bfloat16 is not supported by native cusparseScatter; skipped"
+    try:
+        lib = _load_cusparse_library()
+    except Exception as exc:
+        return str(exc)
+    if not hasattr(lib, "cusparseScatter"):
+        return "loaded cuSPARSE does not export cusparseScatter"
+    return None
+
+
 def _cuda_data_type_from_torch(torch_dtype):
     mapping = {
         torch.float16: _CUDA_R_16F,
@@ -436,6 +448,16 @@ def _load_cusparse_library():
                 ctypes.c_void_p,
             ]
             lib.cusparseGather.restype = ctypes.c_int
+            # cusparseScatter takes the same (handle, SpVec, DnVec) shape as
+            # cusparseGather, with the direction reversed.  Bound conditionally so a
+            # cuSPARSE that predates it still loads and serves the gather baseline.
+            if hasattr(lib, "cusparseScatter"):
+                lib.cusparseScatter.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                lib.cusparseScatter.restype = ctypes.c_int
             if hasattr(lib, "cusparseSetStream"):
                 lib.cusparseSetStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
                 lib.cusparseSetStream.restype = ctypes.c_int
@@ -582,6 +604,154 @@ class _PreparedCusparseNativeGather:
 
 def _cusparse_native_gather(dense_vector, indices, out=None):
     plan = _PreparedCusparseNativeGather(dense_vector, indices, out=out)
+    try:
+        return plan.run()
+    finally:
+        plan.close()
+
+
+class _PreparedCusparseNativeScatter:
+    """Native ``cusparseScatter`` plan, the mirror of :class:`_PreparedCusparseNativeGather`.
+
+    This replaced a baseline that built a ``dense_size x nnz`` selector matrix and ran a
+    full cuSPARSE SpMV against it.  That is a strictly larger operation than a scatter,
+    so it reported FlagSparse as ~115x faster than "cuSPARSE" while gather -- which has
+    always used the native entry point -- reported 0.22x.  Descriptor construction stays
+    outside the timed window (as it does for gather); only ``run()`` is timed.
+    """
+
+    def __init__(self, sparse_values, indices, dense_size, out=None, reset_output=True):
+        # Note: _prepare_inputs() validates indices against its *first* argument's
+        # length, which is right for gather (dense in) but wrong here (values in), so
+        # the scatter-shaped checks are done directly against dense_size.
+        if sparse_values.ndim != 1 or indices.ndim != 1:
+            raise ValueError("sparse_values and indices must be 1D tensors")
+        if sparse_values.numel() != indices.numel():
+            raise ValueError(
+                "sparse_values and indices must have the same number of elements"
+            )
+        if indices.dtype not in SUPPORTED_INDEX_DTYPES:
+            raise TypeError("indices dtype must be torch.int32 or torch.int64")
+        sparse_values = sparse_values.contiguous()
+        indices = indices.contiguous()
+        if indices.numel() > 0:
+            if bool(torch.any(indices < 0).item()):
+                raise IndexError("indices must be non-negative")
+            max_index = int(indices.max().item())
+            if max_index >= int(dense_size):
+                raise IndexError(
+                    f"indices out of range: max index {max_index}, "
+                    f"dense size {int(dense_size)}"
+                )
+        skip_reason = _cusparse_native_scatter_skip_reason(sparse_values.dtype)
+        if skip_reason:
+            raise RuntimeError(skip_reason)
+
+        nnz = int(indices.numel())
+        if out is None:
+            dense_vector = torch.zeros(
+                dense_size, dtype=sparse_values.dtype, device=sparse_values.device
+            )
+        else:
+            dense_vector = out
+            if dense_vector.shape != (dense_size,):
+                raise ValueError("out shape must match scatter output shape")
+            if dense_vector.dtype != sparse_values.dtype:
+                raise TypeError("out dtype must match scatter output dtype")
+
+        self.lib = _load_cusparse_library()
+        self.handle = ctypes.c_void_p()
+        self.dn_desc = ctypes.c_void_p()
+        self.sp_desc = ctypes.c_void_p()
+        self.dense_vector = dense_vector
+        self.indices = indices
+        self.sparse_values = sparse_values
+        self.dense_size = int(dense_size)
+        self.nnz = nnz
+        # cusparseScatter only writes the nnz positions it is given.  FlagSparse's
+        # scatter with reset_output=True zeroes the whole dense buffer first, so the
+        # baseline must do the same or the two are not the same operation.
+        self.reset_output = bool(reset_output)
+        self.closed = False
+
+        if self.nnz == 0:
+            return
+
+        try:
+            _check_cusparse_status(
+                self.lib.cusparseCreate(ctypes.byref(self.handle)),
+                "cusparseCreate",
+            )
+            _set_cusparse_stream(self.lib, self.handle)
+            _check_cusparse_status(
+                self.lib.cusparseCreateDnVec(
+                    ctypes.byref(self.dn_desc),
+                    ctypes.c_int64(int(self.dense_vector.numel())),
+                    ctypes.c_void_p(int(self.dense_vector.data_ptr())),
+                    ctypes.c_int(_cuda_data_type_from_torch(self.dense_vector.dtype)),
+                ),
+                "cusparseCreateDnVec",
+            )
+            _check_cusparse_status(
+                self.lib.cusparseCreateSpVec(
+                    ctypes.byref(self.sp_desc),
+                    ctypes.c_int64(int(self.dense_vector.numel())),
+                    ctypes.c_int64(self.nnz),
+                    ctypes.c_void_p(int(self.indices.data_ptr())),
+                    ctypes.c_void_p(int(self.sparse_values.data_ptr())),
+                    ctypes.c_int(_cusparse_index_type_from_torch(self.indices.dtype)),
+                    ctypes.c_int(_CUSPARSE_INDEX_BASE_ZERO),
+                    ctypes.c_int(_cuda_data_type_from_torch(self.sparse_values.dtype)),
+                ),
+                "cusparseCreateSpVec",
+            )
+        except Exception:
+            self.close()
+            raise
+
+    def run(self):
+        if self.closed:
+            raise RuntimeError("Prepared cuSPARSE scatter plan is already closed")
+        if self.reset_output:
+            self.dense_vector.zero_()
+        if self.nnz == 0:
+            return self.dense_vector
+        _check_cusparse_status(
+            self.lib.cusparseScatter(self.handle, self.sp_desc, self.dn_desc),
+            "cusparseScatter",
+        )
+        return self.dense_vector
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.sp_desc.value:
+            try:
+                self.lib.cusparseDestroySpVec(self.sp_desc)
+            except Exception:
+                pass
+            self.sp_desc = ctypes.c_void_p()
+        if self.dn_desc.value:
+            try:
+                self.lib.cusparseDestroyDnVec(self.dn_desc)
+            except Exception:
+                pass
+            self.dn_desc = ctypes.c_void_p()
+        if self.handle.value:
+            try:
+                self.lib.cusparseDestroy(self.handle)
+            except Exception:
+                pass
+            self.handle = ctypes.c_void_p()
+
+
+def _cusparse_native_scatter(
+    sparse_values, indices, dense_size, out=None, reset_output=True
+):
+    plan = _PreparedCusparseNativeScatter(
+        sparse_values, indices, dense_size, out=out, reset_output=reset_output
+    )
     try:
         return plan.run()
     finally:

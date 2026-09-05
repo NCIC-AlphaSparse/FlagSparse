@@ -673,8 +673,12 @@ def _benchmark_spmm_coo_sparse_ref(data, row, col, B, shape, warmup, iters):
     col_cp = _cupy_from_torch(col.to(torch.int64))
     B_cp = _cupy_from_torch(B)
     A_coo = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    # cupy COO ``@`` calls tocsr() internally on every invocation
+    # (cupyx.scipy.sparse._base.__mul__), so the conversion is hoisted here and the
+    # timed window holds only the SpMM kernel.
+    A_csr = A_coo.tocsr()
     values_cp, ms = _benchmark_cuda_op(
-        lambda: A_coo @ B_cp,
+        lambda: A_csr @ B_cp,
         warmup=warmup,
         iters=iters,
     )
@@ -2576,8 +2580,11 @@ def benchmark_spmm_coo_case(
                 A_coo = cpx_sparse.coo_matrix(
                     (data_cp, (row_cp, col_cp)), shape=effective_shape
                 )
+                # cupy COO ``@`` runs tocsr() internally each call; hoist it so only
+                # the SpMM kernel is timed.
+                A_csr = A_coo.tocsr()
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
-                    lambda: A_coo @ B_cp, warmup=warmup, iters=iters
+                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
                 cusparse_summary = _spmm_coo_pairwise_summary(
