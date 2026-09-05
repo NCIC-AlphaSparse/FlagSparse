@@ -267,7 +267,7 @@ def _prepare_spmv_csc_matrix(data, indices, indptr, shape):
         )
     if data.numel() != indices.numel():
         raise ValueError("data and indices must have the same length (nnz)")
-    if not all(t.is_cuda for t in (data, indices, indptr)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr)):
         raise ValueError("data, indices, indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
@@ -351,7 +351,7 @@ def _validate_spmv_csc_x(x, prepared, op_code):
         raise TypeError("x must be a torch.Tensor")
     if x.ndim != 1:
         raise ValueError("x must be a 1D tensor")
-    if not x.is_cuda:
+    if not _is_accel_tensor(x):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
@@ -545,18 +545,18 @@ def flagsparse_spmv_csc(
     x = _validate_spmv_csc_x(x, prepared, op_code)
     do_timing = bool(return_time or return_meta)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     y = _run_spmv_csc_prepared_with_fallback(prepared, x, op_code)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = (time.perf_counter() - t0) * 1000.0
         op_total_ms = compute_ms
     else:
         compute_ms = None
         op_total_ms = None
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != y.device:
             raise ValueError("out must be on the same CUDA device as the result")

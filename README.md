@@ -16,7 +16,7 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
-## Backends (CUDA / DCU)
+## Backends (CUDA / DCU / MetaX / Moore Threads / Ascend)
 
 FlagSparse dispatches its **vendor reference and baseline** paths on the detected
 runtime; the Triton kernels themselves are unchanged across backends.
@@ -25,6 +25,38 @@ runtime; the Triton kernels themselves are unchanged across backends.
 | --- | --- | --- | --- |
 | NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy (`cupy-cuda12x`) |
 | DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
+| MetaX / MACA (C550) | see `_detect_maca_runtime()` | CuPy/cuSPARSE-compatible (provisional) | CuPy |
+| Moore Threads / MUSA | `torch.musa` available | **`torch.sparse`** (provisional) | torch_musa |
+| Ascend / CANN (910B) | `torch.npu` available | **ops-sparse**, falls back to `torch.sparse` | torch_npu |
+
+> ⚠️ **Moore Threads and Ascend are not CUDA-compatible**: torch exposes them as
+> separate device types (`musa` / `npu`), so `torch.cuda.*` and `Tensor.is_cuda` do not
+> apply. **The device abstraction migration is done**: 269 CUDA-specific uses across
+> `sparse_operations/` are now `_ACCEL.*` (189) and `_is_accel_tensor()` (82). On CUDA,
+> ROCm and MACA `_ACCEL is torch.cuda`, so those three backends are **byte-for-byte
+> equivalent** and no kernel was touched.
+
+MACA is CUDA-source-compatible, so `torch.version.cuda` is set and `torch.version.hip`
+is `None` there — the ROCm probe cannot tell MetaX from NVIDIA. Detection walks, in
+order: `FLAGSPARSE_BACKEND`, a MetaX-specific `torch.version` attribute, the MACA SDK
+environment (`MACA_PATH` / `MACA_HOME`), then the device name (vendor tokens, then the
+`c550` / `c500` model strings). **On a real machine, pin it explicitly until the
+automatic probe is confirmed:**
+
+```bash
+export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend
+export FLAGSPARSE_MACA_MODEL=c550   # overrides model detection
+export FLAGSPARSE_MACA_VENDOR=none  # skip the vendor baseline if CuPy is unusable
+
+# Baseline choice for Moore Threads / Ascend
+export FLAGSPARSE_MTHREADS_VENDOR=torch      # torch | musparse | none
+export FLAGSPARSE_ASCEND_VENDOR=ops_sparse   # ops_sparse | torch | none
+```
+
+Tuning is per model, in `_MACA_SPMV_PROFILES` (`spmv_csr.py`) and `_MACA_SPSV_PROFILES`
+(`spsv.py`). **C550** — FlagTree's reference metax part — is the only profile so far and
+is seeded from the CUDA path; an unrecognised model falls back to it. Each knob carries
+the ROCm value measured on gfx936 as a comment, deliberately not inherited.
 
 On a DCU/ROCm host, install the hip-python bindings matching your ROCm release:
 

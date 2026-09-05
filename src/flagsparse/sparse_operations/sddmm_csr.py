@@ -84,7 +84,7 @@ def _prepare_sddmm_csr_pattern(indices, indptr, shape, validate=True):
         raise ValueError(
             f"indptr length must be n_rows+1={n_rows + 1}, got {indptr.numel()}"
         )
-    if not indices.is_cuda or not indptr.is_cuda:
+    if not _is_accel_tensor(indices) or not _is_accel_tensor(indptr):
         raise ValueError("indices and indptr must be CUDA tensors")
     if indices.dtype != torch.int32:
         raise TypeError("indices dtype must be torch.int32")
@@ -295,7 +295,7 @@ def _sddmm_csr_real_kernel_altreduce(
 def _validate_sddmm_dense_inputs(data, prepared, x, y):
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError("x and y must be 2D dense tensors")
-    if not x.is_cuda or not y.is_cuda:
+    if not _is_accel_tensor(x) or not _is_accel_tensor(y):
         raise ValueError("x and y must be CUDA tensors")
     if x.device != y.device or x.device != prepared.indices.device:
         raise ValueError("x, y, and sparse pattern must be on the same CUDA device")
@@ -327,7 +327,7 @@ def _prepare_validated_sddmm_out(prepared, x, out, out_dtype=None):
         return torch.empty(nnz, dtype=target_dtype, device=x.device)
     if out.ndim != 1 or out.numel() != nnz:
         raise ValueError("out must be a 1D tensor with length nnz")
-    if not out.is_cuda or out.device != x.device:
+    if not _is_accel_tensor(out) or out.device != x.device:
         raise ValueError("out must be a CUDA tensor on the same device as x")
     if out.dtype != target_dtype:
         raise TypeError("out dtype must match the requested output dtype")
@@ -499,14 +499,14 @@ def flagsparse_sddmm_csr(
                 "indices, indptr, and shape are required when prepared is not provided"
             )
         if timed:
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
         t_prepare0 = time.perf_counter()
         k_hint = int(x.shape[1]) if (x is not None and x.ndim == 2) else 64
         prepared = prepare_sddmm_csr(
             indices, indptr, shape, k_hint=k_hint, validate=validate
         )
         if timed:
-            torch.cuda.synchronize()
+            _ACCEL.synchronize()
             prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
     elif not isinstance(prepared, SDDMMPrepared):
         raise TypeError("prepared must be a SDDMMPrepared instance")
@@ -537,7 +537,7 @@ def flagsparse_sddmm_csr(
         return out
 
     if timed:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
     t0 = time.perf_counter()
     out_tensor, launch_meta = _run_sddmm_prepared(
         prepared,
@@ -551,7 +551,7 @@ def flagsparse_sddmm_csr(
     )
     elapsed_ms = 0.0
     if timed:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     if return_time and return_meta:

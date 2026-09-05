@@ -409,7 +409,7 @@ def _prepare_coo_tensors(data, row, col, shape, sort_by_row):
         raise TypeError("data, row, col must all be torch.Tensor")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must be 1D")
-    if not all(t.is_cuda for t in (data, row, col)):
+    if not all(_is_accel_tensor(t) for t in (data, row, col)):
         raise ValueError("data, row, col must be CUDA tensors")
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.numel() != row.numel() or data.numel() != col.numel():
@@ -576,7 +576,7 @@ def _validate_x_coo(x, prepared):
         raise TypeError("x must be a torch.Tensor")
     if x.ndim != 1:
         raise ValueError("x must be a 1D tensor")
-    if not x.is_cuda:
+    if not _is_accel_tensor(x):
         raise ValueError("x must be a CUDA tensor")
     if x.dtype != prepared.data.dtype:
         raise TypeError("x dtype must match sparse matrix dtype")
@@ -803,7 +803,7 @@ def flagsparse_spmv_coo(
         raise ValueError("block_inner must be a positive power of 2")
     t0 = None
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     y = _run_spmv_coo_prepared_with_fallback(
         launch,
@@ -814,7 +814,7 @@ def flagsparse_spmv_coo(
     )
     elapsed_ms = None
     if return_time:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if out is not None:
         if out.shape != y.shape or out.dtype != y.dtype:

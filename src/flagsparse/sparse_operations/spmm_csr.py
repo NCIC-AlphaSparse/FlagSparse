@@ -364,7 +364,7 @@ def _prepare_spmm_csr_matrix(data, indices, indptr, shape):
     if data.numel() != indices.numel():
         raise ValueError("data and indices must have the same length (nnz)")
 
-    if not all(t.is_cuda for t in (data, indices, indptr)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr)):
         raise ValueError("data, indices, and indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, and indptr must be on the same CUDA device")
@@ -480,7 +480,7 @@ def _prepare_spmm_csr_inputs(data, indices, indptr, B, shape):
     ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
     if B.shape[0] != n_cols:
         raise ValueError(f"B.shape[0] must be n_cols={n_cols}, got {B.shape[0]}")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != data.device:
         raise ValueError("B must be on the same CUDA device as the sparse matrix")
@@ -536,18 +536,27 @@ def _resolve_spmm_alg1_launch_config(
 
 
 def _normalize_spmm_base_device_props(device):
-    props = torch.cuda.get_device_properties(device)
+    props = _ACCEL.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
     max_threads_per_mp = int(
         getattr(props, "max_threads_per_multi_processor", 2048) or 2048
     )
     return {
-        "is_hip": getattr(torch.version, "hip", None) is not None,
+        # Use the package-wide runtime probe so FLAGSPARSE_BACKEND overrides reach
+        # the launch tuning too; reading torch.version.hip directly would bypass it.
+        "is_hip": _is_rocm_runtime(),
+        "is_maca": _is_maca_runtime(),
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
     }
+
+
+def _spmm_is_maca_device(device_props):
+    """True on MetaX/MACA. Kept separate from _spmm_is_hip_device so the launch
+    tuning below can diverge from both NVIDIA and ROCm once X201 data exists."""
+    return bool(device_props and device_props.get("is_maca"))
 
 
 def _spmm_is_hip_device(device_props):
@@ -848,7 +857,7 @@ def _validate_spmm_route_runtime_inputs(prepared, B):
         raise ValueError("B is required")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -890,8 +899,8 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     if op_name == "non":
         return prepared, 0.0 if timing else None
 
-    start = torch.cuda.Event(enable_timing=True) if timing else None
-    end = torch.cuda.Event(enable_timing=True) if timing else None
+    start = _ACCEL.Event(enable_timing=True) if timing else None
+    end = _ACCEL.Event(enable_timing=True) if timing else None
     if start is not None:
         start.record()
     data, indices, indptr, shape = _materialize_spmm_csr_op(
@@ -911,7 +920,7 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     )
     if end is not None:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         return runtime_prepared, start.elapsed_time(end)
     return runtime_prepared, None
 
@@ -974,8 +983,8 @@ def _run_spmm_csr_base_route_impl(
     process_gpu_ms = 0.0 if timing else None
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _triton_spmm_csr_impl(
         prepared.data,
@@ -994,7 +1003,7 @@ def _run_spmm_csr_base_route_impl(
     )
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": route_name,
@@ -1083,13 +1092,13 @@ def _run_alpha_spmm_alg1_tle_route(
     process_gpu_ms = 0.0 if timing else None
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = run_fn(B=B, prepared=alpha_prepared, meta=launch_meta, out=C_out)
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": route_name,
@@ -1282,7 +1291,7 @@ def _spmm_csr_alg1_empty_split_metadata(device, row_index_dtype):
 
 
 def _spmm_csr_alg1_build_bucket_descriptors(rows_flat, counts, offsets):
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     counts_cpu = counts.cpu().tolist()
     offsets_cpu = offsets.cpu().tolist()
@@ -1355,8 +1364,8 @@ def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
     block_m = 256
     grid = (triton.cdiv(row_count, block_m),)
 
-    start = torch.cuda.Event(enable_timing=True) if timing else None
-    end = torch.cuda.Event(enable_timing=True) if timing else None
+    start = _ACCEL.Event(enable_timing=True) if timing else None
+    end = _ACCEL.Event(enable_timing=True) if timing else None
     if start is not None:
         start.record()
     if row_count > 0:
@@ -1384,10 +1393,10 @@ def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
         )
     if end is not None:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         process_gpu_ms = start.elapsed_time(end)
     else:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         process_gpu_ms = None
 
     row_buckets, long_rows, process_cpu_ms = _spmm_csr_alg1_build_bucket_descriptors(
@@ -1396,8 +1405,8 @@ def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
         offsets,
     )
 
-    split_start = torch.cuda.Event(enable_timing=True) if timing else None
-    split_end = torch.cuda.Event(enable_timing=True) if timing else None
+    split_start = _ACCEL.Event(enable_timing=True) if timing else None
+    split_end = _ACCEL.Event(enable_timing=True) if timing else None
     if split_start is not None:
         split_start.record()
     if long_rows.numel() > 0:
@@ -1420,7 +1429,7 @@ def _spmm_csr_alg1_build_process_plan(prepared, *, timing=False):
         ) = _spmm_csr_alg1_empty_split_metadata(device, row_index_dtype)
     if split_end is not None:
         split_end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         process_gpu_ms = float(process_gpu_ms or 0.0) + split_start.elapsed_time(
             split_end
         )
@@ -1602,7 +1611,7 @@ def _spmm_csr_alg1_run_split_bucket(plan, B, C_out, block_n, device_props):
 def _spmm_csr_alg1_compute(plan, B, *, out=None, dense_layout="row"):
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != plan.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -1675,13 +1684,13 @@ def _run_spmm_csr_alg1_route(
     plan = _spmm_csr_alg1_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _spmm_csr_alg1_compute(plan, B, out=C_out, dense_layout=dense_layout)
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": "spmm_csr_alg1",
@@ -1825,7 +1834,7 @@ def _spmm_csr_alg2_bucket_specs(dtype):
 
 
 def _normalize_spmm_csr_alg2_device_props(device):
-    props = torch.cuda.get_device_properties(device)
+    props = _ACCEL.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     sm_count = int(getattr(props, "multi_processor_count", 0) or 0)
     max_threads_per_mp = int(
@@ -1835,7 +1844,10 @@ def _normalize_spmm_csr_alg2_device_props(device):
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
         "device_name": str(getattr(props, "name", "cuda")),
-        "is_hip": getattr(torch.version, "hip", None) is not None,
+        # Use the package-wide runtime probe so FLAGSPARSE_BACKEND overrides reach
+        # the launch tuning too; reading torch.version.hip directly would bypass it.
+        "is_hip": _is_rocm_runtime(),
+        "is_maca": _is_maca_runtime(),
         "warp_size": max(1, warp_size),
         "sm_count": max(0, sm_count),
         "max_threads_per_mp": max(32, max_threads_per_mp),
@@ -2053,7 +2065,7 @@ def _spmm_csr_alg2_process_compact_kernel(
 
 
 def _spmm_csr_alg2_build_bucket_descriptors(rows_flat, counts, offsets, dtype):
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     counts_cpu = counts.cpu().tolist()
     offsets_cpu = offsets.cpu().tolist()
@@ -2107,8 +2119,8 @@ def _spmm_csr_alg2_build_process_plan(prepared, *, timing=False):
     block_m = 256
     grid = (triton.cdiv(row_count, block_m),)
 
-    start = torch.cuda.Event(enable_timing=True) if timing else None
-    end = torch.cuda.Event(enable_timing=True) if timing else None
+    start = _ACCEL.Event(enable_timing=True) if timing else None
+    end = _ACCEL.Event(enable_timing=True) if timing else None
     if start is not None:
         start.record()
     if row_count > 0:
@@ -2136,10 +2148,10 @@ def _spmm_csr_alg2_build_process_plan(prepared, *, timing=False):
         )
     if end is not None:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         process_gpu_ms = start.elapsed_time(end)
     else:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         process_gpu_ms = None
 
     row_buckets, long_row_count, process_cpu_ms = (
@@ -2294,7 +2306,7 @@ def _spmm_csr_alg2_compute(
 ):
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != plan.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -2388,13 +2400,13 @@ def _run_spmm_csr_alg2_route(
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _spmm_csr_alg2_compute(plan, B, out=C_out, dense_layout=dense_layout)
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": "spmm_csr_alg2",
@@ -2481,8 +2493,8 @@ def _run_spmm_csr_alg2_accuracy_impl(
     plan = _spmm_csr_alg2_build_process_plan(prepared, timing=bool(timing))
     compute_ms = None
     if timing:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _spmm_csr_alg2_compute(
         plan,
@@ -2494,7 +2506,7 @@ def _run_spmm_csr_alg2_accuracy_impl(
     )
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     meta = {
         "alg": route_name,
@@ -2733,7 +2745,7 @@ def flagsparse_spmm_csr_run(
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -2741,11 +2753,11 @@ def flagsparse_spmm_csr_run(
         raise TypeError("B dtype must match sparse matrix dtype")
 
     start = (
-        torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+        _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
     )
-    end = torch.cuda.Event(enable_timing=True) if (return_time or return_meta) else None
+    end = _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
     if start is not None:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         start.record()
     runtime_prepared, op_process_gpu_ms = _materialize_spmm_csr_route_op(
         prepared,
@@ -2761,7 +2773,7 @@ def flagsparse_spmm_csr_run(
     )
     if end is not None:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         gpu_ms = start.elapsed_time(end)
     else:
         gpu_ms = None
@@ -2943,7 +2955,7 @@ def _select_spmm_opt_block_n(n_dense_cols):
 
 
 def _normalize_spmm_opt_device_props(device):
-    props = torch.cuda.get_device_properties(device)
+    props = _ACCEL.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     max_threads_per_block = int(getattr(props, "max_threads_per_block", 1024) or 1024)
     max_threads_per_mp = int(
@@ -2951,7 +2963,10 @@ def _normalize_spmm_opt_device_props(device):
     )
     shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
     return {
-        "is_hip": getattr(torch.version, "hip", None) is not None,
+        # Use the package-wide runtime probe so FLAGSPARSE_BACKEND overrides reach
+        # the launch tuning too; reading torch.version.hip directly would bypass it.
+        "is_hip": _is_rocm_runtime(),
+        "is_maca": _is_maca_runtime(),
         "warp_size": max(1, warp_size),
         "max_threads_per_block": max(32, max_threads_per_block),
         "max_threads_per_mp": max(32, max_threads_per_mp),
@@ -4065,7 +4080,7 @@ def _run_spmm_opt_split_bucket(prepared, B, C_out, block_n, device_props):
 def _triton_spmm_csr_impl_opt_prepared(prepared, B):
     if not prepared.supports_opt:
         raise TypeError("spmm opt only supports float32 and float64")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as the sparse matrix")
@@ -4175,7 +4190,7 @@ def flagsparse_spmm_csr(
         raise ValueError(
             f"B.shape[0] must be n_cols={effective_n_cols}, got {B.shape[0]}"
         )
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != data.device:
         raise ValueError("B must be on the same CUDA device as the sparse matrix")
@@ -4185,7 +4200,7 @@ def flagsparse_spmm_csr(
     n_dense_cols = int(B.shape[1])
 
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != data.device:
             raise ValueError("out must be on the same CUDA device as the inputs")
@@ -4198,7 +4213,7 @@ def flagsparse_spmm_csr(
     op_total_ms = None
 
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     if _spmm_op_transposes(op_code):
         data, indices, indptr, shape = _materialize_spmm_csr_op(
@@ -4218,7 +4233,7 @@ def flagsparse_spmm_csr(
             _max_row_nnz,
         ) = _prepare_spmm_csr_matrix(data, indices, indptr, shape)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t1 = time.perf_counter()
         symbolic_ms = (t1 - t0) * 1000.0 if _spmm_op_transposes(op_code) else 0.0
 
@@ -4239,7 +4254,7 @@ def flagsparse_spmm_csr(
     )
 
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t1 = time.perf_counter()
     C = _triton_spmm_csr_impl(
         data,
@@ -4254,7 +4269,7 @@ def flagsparse_spmm_csr(
         num_stages=launch["num_stages"],
     )
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t2 = time.perf_counter()
         compute_ms = (t2 - t1) * 1000.0
         op_total_ms = symbolic_ms + compute_ms
@@ -4308,12 +4323,12 @@ def _flagsparse_spmm_csr_opt_alg1_impl(
         raise ValueError("B is required")
     if not prepared.supports_opt:
         raise TypeError(f"{api_name} only supports float32 and float64")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
             raise ValueError(
@@ -4329,16 +4344,16 @@ def _flagsparse_spmm_csr_opt_alg1_impl(
     compute_ms = None
     op_total_ms = None
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     runtime_prepared = runtime_symbolic_builder(prepared)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t1 = time.perf_counter()
         symbolic_ms = (t1 - t0) * 1000.0
     C, _long_row_fallback_used = _triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t2 = time.perf_counter()
         compute_ms = (t2 - t1) * 1000.0
         op_total_ms = symbolic_ms + compute_ms
@@ -4572,7 +4587,7 @@ def _prepare_spmm_ref_hipsparse(
         raise RuntimeError(skip_reason)
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
         raise TypeError("data, indices, indptr, B must all be torch.Tensor")
-    if not all(t.is_cuda for t in (data, indices, indptr, B)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, B)):
         raise ValueError("data, indices, indptr, B must all be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr, B)):
         raise ValueError("data, indices, indptr, B must be on the same CUDA device")
@@ -4631,7 +4646,7 @@ def _prepare_spmm_ref_hipsparse(
     else:
         if not torch.is_tensor(C):
             raise TypeError("out must be a torch.Tensor")
-        if not C.is_cuda or C.device != data.device:
+        if not _is_accel_tensor(C) or C.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
         if C.dtype != data.dtype or C.shape != (n_rows, n_dense_cols):
             raise ValueError("out must match the result shape and dtype")
@@ -5037,10 +5052,10 @@ def benchmark_spmm_opt_case(
     shape = (n_rows, n_cols)
     prepared = prepare_spmm_csr_opt(data, indices, indptr, shape)
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     base_values = flagsparse_spmm_csr(data, indices, indptr, B, shape)
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     base_first_call_ms = (time.perf_counter() - t0) * 1000.0
     base_values, base_ms = _benchmark_cuda_op(
         lambda: flagsparse_spmm_csr(data, indices, indptr, B, shape),
@@ -5048,10 +5063,10 @@ def benchmark_spmm_opt_case(
         iters=iters,
     )
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     opt_values = flagsparse_spmm_csr_opt(B=B, prepared=prepared)
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     opt_first_call_ms = (time.perf_counter() - t0) * 1000.0
     opt_values, opt_ms = _benchmark_cuda_op(
         lambda: flagsparse_spmm_csr_opt(B=B, prepared=prepared),
@@ -5195,10 +5210,10 @@ def benchmark_spmm_case(
         "op": op_name,
     }
 
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     t0 = time.perf_counter()
     _ = flagsparse_spmm_csr(**triton_kwargs)
-    torch.cuda.synchronize()
+    _ACCEL.synchronize()
     triton_first_call_ms = (time.perf_counter() - t0) * 1000.0
     triton_C, triton_ms = _benchmark_cuda_op(
         lambda: flagsparse_spmm_csr(**triton_kwargs),

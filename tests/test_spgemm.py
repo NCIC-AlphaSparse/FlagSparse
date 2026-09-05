@@ -526,8 +526,20 @@ def _build_cupy_spgemm_reference(
         shape=b_shape,
     )
 
+    # The timed window holds exactly the vendor SpGEMM call and nothing else.
+    # cupy's ``@`` redoes the whole cusparseSpGEMM sequence (createDescr ->
+    # workEstimation x2 -> compute x2 -> alloc -> copy) on every call with zero
+    # cross-call caching, so no amortisable setup is being hoisted out of it -- what
+    # stays outside is only the torch<->cupy marshalling and the
+    # CSR->COO->coalesce->CSR round trip below, which exists solely so the result can
+    # be compared against ours. FlagSparse never pays that, and ``coalesce()`` is a
+    # full sort over nnz(C); leaving it inside the clock made this column 3-15x slower
+    # than cuSPARSE actually is (roadNet 9.27ms vs 0.63ms, ecology1 13.50 vs 0.85) and
+    # is what produced the bogus "4.0x cuSPARSE" headline.
     def _op():
-        c_cp = a_cp @ b_cp
+        return a_cp @ b_cp
+
+    def _to_torch_csr(c_cp):
         c_coo = c_cp.tocoo()
         rows = ast_ops._torch_from_cupy(c_coo.row).to(torch.int64)
         cols = ast_ops._torch_from_cupy(c_coo.col).to(torch.int64)
@@ -540,7 +552,7 @@ def _build_cupy_spgemm_reference(
         ).coalesce()
         return ast_ops._torch_sparse_to_csr(c_t)
 
-    return _op(), "CSR", _op
+    return _to_torch_csr(_op()), "CSR", _op
 
 
 def _build_hipsparse_spgemm_reference(

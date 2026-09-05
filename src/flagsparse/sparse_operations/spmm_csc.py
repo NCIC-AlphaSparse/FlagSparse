@@ -403,7 +403,7 @@ def _prepare_spmm_csc_matrix(data, indices, indptr, shape):
         )
     if data.numel() != indices.numel():
         raise ValueError("data and indices must have the same length (nnz)")
-    if not all(t.is_cuda for t in (data, indices, indptr)):
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr)):
         raise ValueError("data, indices, indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
@@ -496,7 +496,7 @@ def _validate_spmm_csc_B(B, prepared, op_code):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -623,14 +623,14 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
     )
     backend_info = _get_device_backend_info(prepared.data.device)
     if timing:
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _triton_spmm_csc_base_kernel(prepared, B, _normalize_spmm_csc_op(prepared.op))
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     return C, {
         "process_cpu_ms": 0.0,
@@ -766,9 +766,9 @@ def flagsparse_spmm_csc_run(
     B = _validate_spmm_csc_B(B, prepared, _normalize_spmm_csc_op(op_name))
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
-        torch.cuda.synchronize()
-        event_start = torch.cuda.Event(enable_timing=True)
-        event_end = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        event_start = _ACCEL.Event(enable_timing=True)
+        event_end = _ACCEL.Event(enable_timing=True)
         event_start.record()
     C, route_meta = _run_spmm_csc_prepared_with_fallback(
         prepared,
@@ -778,7 +778,7 @@ def flagsparse_spmm_csc_run(
     )
     if collect_timing:
         event_end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         gpu_ms = event_start.elapsed_time(event_end)
     else:
         gpu_ms = None
@@ -891,7 +891,7 @@ def flagsparse_spmm_csc(
     if out is None:
         return C
     result = C[0] if return_time or return_meta else C
-    if not out.is_cuda:
+    if not _is_accel_tensor(out):
         raise ValueError("out must be a CUDA tensor")
     if out.device != result.device:
         raise ValueError("out must be on the same CUDA device as the result")

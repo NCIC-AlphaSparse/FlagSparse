@@ -23,10 +23,12 @@ from .gather_scatter import (
     _gather_scatter_sparse_ref_backend,
     _scatter_dtype_error_message,
     _cusparse_native_gather_skip_reason,
+    _cusparse_native_scatter_skip_reason,
     _cusparse_spmv,
     benchmark_hipsparse_gather,
     benchmark_hipsparse_scatter,
     _make_scatter_selector_matrix,
+    _PreparedCusparseNativeScatter,
     _pytorch_scatter_impl,
     _set_cusparse_stream,
     _triton_gather_impl,
@@ -383,18 +385,32 @@ def benchmark_scatter_case(
                 "sparse scatter baseline only matches reset_output=True semantics"
             )
         else:
-            skip_reason = _cusparse_baseline_skip_reason(sparse_values.dtype)
+            # Native cusparseScatter has its own dtype/symbol constraints; the CuPy-era
+            # _cusparse_baseline_skip_reason no longer applies to this path.
+            skip_reason = _cusparse_native_scatter_skip_reason(sparse_values.dtype)
         if skip_reason:
             cusparse_reason = skip_reason
         else:
             try:
-                selector_matrix = _make_scatter_selector_matrix(
-                    indices, dense_size, sparse_values.dtype
+                # Native cusparseScatter, mirroring the native cusparseGather baseline.
+                # The previous baseline built a dense_size x nnz selector matrix and ran
+                # a full cuSPARSE SpMV against it -- a strictly larger operation than a
+                # scatter, which is why this column reported ~115x while gather (native
+                # all along) reported 0.22x.  Descriptor setup is hoisted out of the
+                # timed window, so only the kernel is measured.
+                cusparse_plan = _PreparedCusparseNativeScatter(
+                    sparse_values,
+                    indices,
+                    dense_size,
+                    out=torch.empty_like(base_out),
+                    reset_output=reset_output,
                 )
-                cusparse_op = lambda: _cusparse_spmv(selector_matrix, sparse_values)
-                cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                    cusparse_op, warmup=warmup, iters=iters
-                )
+                try:
+                    cusparse_values, cusparse_ms = _benchmark_cuda_op(
+                        cusparse_plan.run, warmup=warmup, iters=iters
+                    )
+                finally:
+                    cusparse_plan.close()
                 cusparse_match = torch.allclose(
                     cusparse_values, expected, atol=atol, rtol=rtol
                 )

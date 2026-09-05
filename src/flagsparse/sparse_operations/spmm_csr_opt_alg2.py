@@ -193,7 +193,7 @@ def _round_down_power_of_two(value):
 
 
 def _normalize_spmm_opt_alg2_device_props(device):
-    props = torch.cuda.get_device_properties(device)
+    props = _ACCEL.get_device_properties(device)
     warp_size = int(getattr(props, "warp_size", 32) or 32)
     sm_count = int(getattr(props, "multi_processor_count", 0) or 0)
     max_threads_per_mp = int(
@@ -951,7 +951,7 @@ def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
         raise ValueError("B is required")
     if B.ndim != 2:
         raise ValueError("B must be a 2D dense tensor")
-    if not B.is_cuda:
+    if not _is_accel_tensor(B):
         raise ValueError("B must be a CUDA tensor")
     if B.device != prepared.data.device:
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
@@ -962,7 +962,7 @@ def _validate_spmm_opt_alg2_runtime_inputs(prepared, B, out):
             f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
         )
     if out is not None:
-        if not out.is_cuda:
+        if not _is_accel_tensor(out):
             raise ValueError("out must be a CUDA tensor")
         if out.device != prepared.data.device:
             raise ValueError(
@@ -1171,7 +1171,7 @@ def flagsparse_spmm_csr_opt_alg2(
     op_total_ms = None
 
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t0 = time.perf_counter()
     opt_buckets = _build_spmm_opt_alg2_buckets_triton_symbolic(
         prepared.row_lengths,
@@ -1179,7 +1179,7 @@ def flagsparse_spmm_csr_opt_alg2(
     )
     prepared.opt_buckets = opt_buckets
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t1 = time.perf_counter()
         symbolic_ms = (t1 - t0) * 1000.0
 
@@ -1190,7 +1190,7 @@ def flagsparse_spmm_csr_opt_alg2(
         return_meta=return_meta,
     )
     if do_timing:
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         t2 = time.perf_counter()
         compute_ms = (t2 - t1) * 1000.0
         op_total_ms = symbolic_ms + compute_ms
