@@ -5279,16 +5279,19 @@ def _spsv_csr_smblk_persistent_kernel_complex(
 
 # ── MetaX/MACA tuning profiles ──────────────────────────────────────
 # Keyed by MetaX model (see _common._maca_device_model). C550 is FlagTree's
-# reference metax part and the only profile with a home here so far; it is
-# seeded from the CUDA path because MACA is CUDA-compatible, so the NVIDIA
-# defaults are the safer starting point. The ROCm value measured on gfx936 is
-# noted beside each knob and deliberately NOT inherited.
+# reference metax part and the only profile with a home here so far. Knobs
+# without a measurement are seeded from the CUDA path because MACA is
+# CUDA-compatible, so the NVIDIA defaults are the safer starting point; the
+# ROCm value measured on gfx936 is noted beside each and deliberately NOT
+# inherited. Knobs marked "C550:" have been measured on real hardware.
 _MACA_SPSV_PROFILES = {
     "c550": {
         "smblk_persistent": False,   # ROCm: True
         "enable_advanced_auto": True,  # ROCm: False (forces ALG1)
-        "alg3_warp_size": 32,        # ROCm: 64
-        "alg4_warp_size": 32,        # ROCm: 64
+        # C550 reports warp_size 64 (torch.cuda.get_device_properties), same as
+        # gfx936 and unlike NVIDIA's 32, so the warp knobs follow the hardware.
+        "alg3_warp_size": 64,        # C550: measured; ROCm: 64; CUDA: 32
+        "alg4_warp_size": 64,        # C550: measured; ROCm: 64; CUDA: 32
         "cw_serial": False,          # ROCm: True (worker_count forced to 1)
     },
 }

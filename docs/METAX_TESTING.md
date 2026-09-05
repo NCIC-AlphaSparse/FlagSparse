@@ -94,7 +94,23 @@ EOF
 1. `torch.version` 有没有 `maca` / `metax` 属性；
 2. **设备名的确切字符串**（决定设备名探测能否命中）；
 3. **`warp_size` 是 32 还是 64** —— 直接决定 SpSV 两个 warp knob 填得对不对。
-   目前按 CUDA 填的是 32。
+
+### ✅ 已实测（2026-09-04，C550 实机）
+
+| 项 | 实测值 | 影响 |
+| --- | --- | --- |
+| `torch.version.maca` | `'3.8.1.0'` | **存在**，`_detect_maca_runtime()` 第 2 优先级直接命中 |
+| `torch.version.cuda` / `.hip` | `'11.6'` / `None` | 证实 MACA 伪装成 CUDA，ROCm 探针分不出来 |
+| 设备名 | `'MetaX C550'` | 同时命中 `metax` 厂商串和 `c550` 型号串 |
+| **`warp_size`** | **64** | 已回填 `_MACA_SPSV_PROFILES`（见第 7 节） |
+| MP count | 104 | |
+| max_threads_per_mp | 2048 | |
+| regs_per_mp | 131072 | |
+| shared_mem_per_block | 65536 | |
+| 显存 | 65120 MB | |
+| torch | `2.10.0+metax3.8.1.0`（SDK 3.8.2.6 上可用） | 小版本错配不影响 |
+
+**结论：自动探测可用**，`FLAGSPARSE_BACKEND` / `FLAGSPARSE_MACA_MODEL` 都不必显式指定。
 
 ---
 
@@ -215,12 +231,13 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent python tests/test_spsv.py --synthetic
 | `spmv_csr.py` `_MACA_SPMV_PROFILES["c550"]` | `csr_kernel` | `"segbin"` | `"rowpar"` |
 | `spsv.py` `_MACA_SPSV_PROFILES["c550"]` | `smblk_persistent` | `False` | `True` |
 | | `enable_advanced_auto` | `True` | `False`（强制 ALG1） |
-| | `alg3_warp_size` | `32` | `64` |
-| | `alg4_warp_size` | `32` | `64` |
+| | `alg3_warp_size` | ~~`32`~~ → **`64`** ✅ | `64` |
+| | `alg4_warp_size` | ~~`32`~~ → **`64`** ✅ | `64` |
 | | `cw_serial` | `False` | `True` |
 
-**若第 2 步测得 `warp_size == 64`，`alg3/alg4_warp_size` 很可能要跟着改成 64** ——
-这是最有可能需要立刻修正的两项。
+**`alg3/alg4_warp_size` 已按实测的 `warp_size == 64` 改掉**（2026-09-04）。
+其余四个 knob 仍是 CUDA 平移值，需要按上面的 A/B 命令实测后回填 —— 它们是行为选择
+而非硬件事实，不能靠指纹推断。
 
 新增型号（如 C500）只要在这两个字典里加一个 key，`_maca_device_model()` 会自动选中；
 识别不出的型号回落到 `c550` 档。
@@ -244,7 +261,9 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent python tests/test_spsv.py --synthetic
 
 MetaX 这条路径**整条都没有在真机上执行过**。相对而言：
 
-- **检测逻辑**（`_detect_maca_runtime` / `_maca_device_model`）——纯推测，第 2 节就是为了修它；
+- ~~**检测逻辑**（`_detect_maca_runtime` / `_maca_device_model`）——纯推测~~
+  **已在 C550 实机验证通过**（2026-09-04，见第 2 节）：`torch.version.maca` 存在，
+  设备名 `'MetaX C550'` 也命中，两条探测路径都能自动认出来；
 - **调优 profile**——占位值，无任何 C550 依据；
 - **算子本身**——风险最低。Triton 内核体两个后端同源，MetaX 走的就是 CUDA 那份
   已经在 NVIDIA 上验证过的代码，只要 FlagTree metax 后端能正确编译执行就应当可用。
