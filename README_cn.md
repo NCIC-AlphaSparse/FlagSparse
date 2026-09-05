@@ -151,12 +151,12 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 ```bash
 python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
   --timeout 3600 \
-  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr
 ```
 
 这个算子清单就是 `--list-ops` 的全集去掉那五个求解器条目。`--timeout 3600` 只是兜底：
 真卡住的会记成 `TIMEOUT` 并继续往下跑，而不是整轮停摆。DCU 实测 30 个矩阵跑完全程约 3.3 小时，
-其中 `spmv_bsr`、`spmm_coo`、`spmm_bsr`、`spmm_csc` 四个算子的矩阵 x dtype 网格单个就超过 1800 秒，
+其中 `spmv_bsr`、`spmm_coo`、`spmm_bsr`、`spmm_bell`、`spmm_csc` 等算子的矩阵 x dtype 网格单个就超过 1800 秒，
 所以预算给到 3600。
 
 注意 `--gpus 0,1` 单独用没有用 —— 它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样堵死。

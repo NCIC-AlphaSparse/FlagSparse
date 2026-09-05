@@ -35,6 +35,7 @@ from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_bsr as spmv_bsr_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_csc as spmv_csc_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops  # noqa: E402
+from flagsparse.sparse_operations import spmm_bell as spmm_bell_ops  # noqa: E402
 from flagsparse.sparse_operations import spmm_bsr as spmm_bsr_ops  # noqa: E402
 from flagsparse.sparse_operations import spmm_csc as spmm_csc_ops  # noqa: E402
 # isort: on
@@ -154,6 +155,19 @@ def test_spmm_csc_op_normalization(op, expected):
     assert spmm_csc_ops._normalize_spmm_csc_op(op) == expected
 
 
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (None, 0),
+        ("non", 0),
+        ("trans", 1),
+        ("conj", 2),
+    ],
+)
+def test_spmm_bell_op_normalization(op, expected):
+    assert spmm_bell_ops._normalize_spmm_bell_op(op) == expected
+
+
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_op_transpose_contract(op):
     if op == "non":
@@ -224,15 +238,67 @@ def test_spmm_bsr_supported_ops_accepted_by_policy(op):
     )
 
 
-def test_spmm_csc_supported_non_op_accepted_by_policy():
-    assert spmm_csc_ops._ensure_spmm_csc_supported_op(0) is None
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmm_csc_op_transpose_contract(op):
+    if op == "non":
+        assert (
+            spmm_csc_ops._spmm_csc_op_transposes(
+                spmm_csc_ops._normalize_spmm_csc_op(op)
+            )
+            is False
+        )
+    else:
+        assert (
+            spmm_csc_ops._spmm_csc_op_transposes(
+                spmm_csc_ops._normalize_spmm_csc_op(op)
+            )
+            is True
+        )
 
 
 @pytest.mark.parametrize("op", ["trans", "conj"])
-def test_spmm_csc_transpose_family_rejected_by_policy(op):
-    with pytest.raises(ValueError, match="reserved"):
+def test_spmm_bell_op_transpose_contract(op):
+    assert (
+        spmm_bell_ops._spmm_bell_op_transposes(
+            spmm_bell_ops._normalize_spmm_bell_op(op)
+        )
+        is True
+    )
+
+
+def test_spmm_bell_non_op_transpose_contract():
+    assert (
+        spmm_bell_ops._spmm_bell_op_transposes(
+            spmm_bell_ops._normalize_spmm_bell_op("non")
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("op", ["non", "trans", "conj"])
+def test_spmm_csc_supported_ops_accepted_by_policy(op):
+    assert (
         spmm_csc_ops._ensure_spmm_csc_supported_op(
             spmm_csc_ops._normalize_spmm_csc_op(op)
+        )
+        is None
+    )
+
+
+def test_spmm_bell_supported_non_op_accepted_by_policy():
+    assert (
+        spmm_bell_ops._ensure_spmm_bell_supported_op(
+            spmm_bell_ops._normalize_spmm_bell_op("non")
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("op", ["trans", "conj"])
+def test_spmm_bell_reserved_ops_rejected_by_policy(op):
+    with pytest.raises(ValueError, match="reserved"):
+        spmm_bell_ops._ensure_spmm_bell_supported_op(
+            spmm_bell_ops._normalize_spmm_bell_op(op)
         )
 
 
@@ -246,6 +312,12 @@ def test_spmm_bsr_algorithm_normalization(alg):
 def test_spmm_csc_algorithm_normalization(alg):
     normalized = spmm_csc_ops._normalize_spmm_csc_alg(alg)
     assert normalized in ("auto", "spmm_csc_base")
+
+
+@pytest.mark.parametrize("alg", ["auto", "base", "spmm_bell_base"])
+def test_spmm_bell_algorithm_normalization(alg):
+    normalized = spmm_bell_ops._normalize_spmm_bell_alg(alg)
+    assert normalized in ("auto", "spmm_bell_base")
 
 
 def test_scatter_policy_validator_rejects_unknown_policy():

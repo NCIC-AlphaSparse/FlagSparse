@@ -577,7 +577,15 @@ def _validate_spmm_bsr_B(B, prepared, op_code):
     return padded
 
 
-def _select_block_n(n_dense_cols, dtype):
+def _select_block_n(n_dense_cols, dtype, device=None):
+    rocm_launch = _spmm_rocm_launch_overrides(
+        n_dense_cols=n_dense_cols,
+        fmt="bsr",
+        dtype=dtype,
+        device=device,
+    )
+    if rocm_launch is not None and rocm_launch.get("block_n") is not None:
+        return int(rocm_launch["block_n"])
     if dtype in (torch.float64, torch.complex128):
         return 16 if n_dense_cols >= 16 else 8
     return 32 if n_dense_cols >= 32 else 16
@@ -596,7 +604,7 @@ def _triton_spmm_bsr_base_kernel(prepared, B, op_code=None):
     )
     if prepared.nnzb == 0 or n_dense_cols == 0:
         return C
-    block_n = _select_block_n(n_dense_cols, dtype)
+    block_n = _select_block_n(n_dense_cols, dtype, prepared.data.device)
     grid = (
         prepared.n_block_rows,
         prepared.block_dim,
@@ -693,6 +701,8 @@ def _triton_spmm_bsr_base_kernel(prepared, B, op_code=None):
 def _run_spmm_bsr_base_route(prepared, B, *, timing=False, diagnostics=False):
     del diagnostics
     compute_ms = None
+    block_n = _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device)
+    backend_info = _get_device_backend_info(prepared.data.device)
     if timing:
         _ACCEL.synchronize()
         start = _ACCEL.Event(enable_timing=True)
@@ -707,6 +717,10 @@ def _run_spmm_bsr_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_cpu_ms": 0.0,
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": compute_ms,
+        "block_n": int(block_n),
+        "block_nnz": int(prepared.block_nnz),
+        "launch_backend": backend_info["backend"],
+        "device_warp_size": int(backend_info["device_warp_size"]),
     }
 
 
@@ -863,6 +877,10 @@ def flagsparse_spmm_bsr_run(
             "n_block_cols": prepared.n_block_cols,
             "nnzb": prepared.nnzb,
             "stored_nnz": prepared.stored_nnz,
+            "block_n": route_meta.get("block_n"),
+            "block_nnz": route_meta.get("block_nnz"),
+            "launch_backend": route_meta.get("launch_backend"),
+            "device_warp_size": route_meta.get("device_warp_size"),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,

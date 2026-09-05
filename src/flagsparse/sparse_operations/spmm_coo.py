@@ -1122,23 +1122,40 @@ def _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout="row"):
     return data, kernel_row, kernel_col, B, n_rows, n_cols, int(B.shape[1])
 
 
-def _resolve_spmm_coo_launch_config(n_dense_cols, nnz, block_n=None, block_nnz=256):
+def _resolve_spmm_coo_launch_config(n_dense_cols, nnz, block_n=None, block_nnz=None, device=None):
     warp_size, factor = _select_spmm_alg1_warp_and_factor(n_dense_cols)
+    rocm_launch = _spmm_rocm_launch_overrides(
+        n_dense_cols=n_dense_cols,
+        nnz=nnz,
+        fmt="coo",
+        device=device,
+    )
 
     if block_n is None:
-        block_n = warp_size * factor
+        block_n = (
+            int(rocm_launch["block_n"])
+            if rocm_launch is not None and rocm_launch.get("block_n") is not None
+            else warp_size * factor
+        )
     if block_nnz is None:
-        block_nnz = 256
+        block_nnz = (
+            int(rocm_launch["block_nnz"])
+            if rocm_launch is not None and rocm_launch.get("block_nnz") is not None
+            else 256
+        )
 
     if block_n <= 0 or block_nnz <= 0:
         raise ValueError("block_n and block_nnz must be positive when provided")
 
+    backend_info = _get_device_backend_info(device)
     return {
         "block_n": int(block_n),
         "block_nnz": int(block_nnz),
         "required_nnz_tiles": int(triton.cdiv(nnz, block_nnz) if nnz > 0 else 0),
         "heuristic_warp_size": int(warp_size),
         "heuristic_factor": int(factor),
+        "launch_backend": backend_info["backend"],
+        "device_warp_size": int(backend_info["device_warp_size"]),
     }
 
 
@@ -1554,7 +1571,9 @@ def _run_spmm_coo_rowrun_route(
 ):
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
-    launch = _resolve_spmm_coo_launch_config(int(B.shape[1]), prepared.nnz)
+    launch = _resolve_spmm_coo_launch_config(
+        int(B.shape[1]), prepared.nnz, device=prepared.data.device
+    )
     compute_ms = None
     if timing:
         start = _ACCEL.Event(enable_timing=True)
@@ -1601,6 +1620,8 @@ def _run_spmm_coo_rowrun_route(
             "block_nnz": launch["block_nnz"],
             "warp_size": launch["heuristic_warp_size"],
             "factor": launch["heuristic_factor"],
+            "launch_backend": launch["launch_backend"],
+            "device_warp_size": launch["device_warp_size"],
             "grid_m": prepared.n_segs,
             "grid_n": triton.cdiv(int(B.shape[1]), launch["block_n"]),
             "dense_layout": dense_layout,
@@ -1616,7 +1637,9 @@ def _run_spmm_coo_atomic_route(
 ):
     dense_layout = _normalize_dense_layout(dense_layout)
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
-    launch = _resolve_spmm_coo_launch_config(int(B.shape[1]), prepared.nnz)
+    launch = _resolve_spmm_coo_launch_config(
+        int(B.shape[1]), prepared.nnz, device=prepared.data.device
+    )
     compute_ms = None
     if timing:
         start = _ACCEL.Event(enable_timing=True)
@@ -1662,6 +1685,8 @@ def _run_spmm_coo_atomic_route(
             "block_nnz": launch["block_nnz"],
             "warp_size": launch["heuristic_warp_size"],
             "factor": launch["heuristic_factor"],
+            "launch_backend": launch["launch_backend"],
+            "device_warp_size": launch["device_warp_size"],
             "grid_m": prepared.nnz,
             "grid_n": int(B.shape[1]),
             "dense_layout": dense_layout,
@@ -1752,7 +1777,9 @@ def _run_spmm_coo_alg1_route(
     C_compute = _zeros_dense_layout(
         (prepared.n_rows, n_dense_cols), prepared.compute_dtype, device, dense_layout
     )
-    launch = _resolve_spmm_coo_launch_config(n_dense_cols, prepared.nnz)
+    launch = _resolve_spmm_coo_launch_config(
+        n_dense_cols, prepared.nnz, device=prepared.data.device
+    )
     acc_dtype = tl.float64 if prepared.compute_dtype == torch.float64 else tl.float32
     compute_ms = None
     if timing:
@@ -1826,6 +1853,8 @@ def _run_spmm_coo_alg1_route(
             "block_nnz": "32|64|128|128|256",
             "warp_size": launch["heuristic_warp_size"],
             "factor": launch["heuristic_factor"],
+            "launch_backend": launch["launch_backend"],
+            "device_warp_size": launch["device_warp_size"],
             "grid_m": prepared.n_segs,
             "grid_n": triton.cdiv(n_dense_cols, launch["block_n"]),
             "dense_layout": dense_layout,
@@ -2024,6 +2053,7 @@ def _run_spmm_coo_canonical_route(
         canonical_data.numel(),
         block_n=block_n,
         block_nnz=block_nnz,
+        device=canonical_data.device,
     )
 
     if out is not None:
@@ -2436,6 +2466,7 @@ def benchmark_spmm_coo_case(
         canonical_data.numel(),
         block_n=block_n,
         block_nnz=block_nnz,
+        device=canonical_data.device,
     )
     seg_starts = _seg_starts_from_sorted_rows(
         canonical_row, canonical_data.numel(), device

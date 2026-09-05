@@ -187,6 +187,8 @@ __all__ = (
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
     "_is_rocm_runtime",
+    "_get_device_backend_info",
+    "_spmm_rocm_launch_overrides",
     "_is_maca_runtime",
     "_is_mthreads_runtime",
     "_is_ascend_runtime",
@@ -340,6 +342,90 @@ def _tolerance_for_dtype(value_dtype):
 
 def _is_rocm_runtime():
     return bool(_IS_ROCM_RUNTIME)
+
+
+def _get_device_backend_info(device=None):
+    backend = "hip" if _is_rocm_runtime() else "cuda"
+    default_warp = 64 if backend == "hip" else 32
+    info = {
+        "backend": backend,
+        "device_name": "",
+        "device_warp_size": default_warp,
+        "max_threads_per_block": 1024,
+        "max_threads_per_multi_processor": 0,
+        "multi_processor_count": 0,
+    }
+    if not torch.cuda.is_available():
+        info["backend"] = "unavailable"
+        return info
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    info.update(
+        {
+            "backend": backend,
+            "device_name": str(getattr(props, "name", "")),
+            "device_warp_size": int(getattr(props, "warp_size", default_warp) or default_warp),
+            "max_threads_per_block": int(
+                getattr(props, "max_threads_per_block", 1024) or 1024
+            ),
+            "max_threads_per_multi_processor": int(
+                getattr(props, "max_threads_per_multi_processor", 0) or 0
+            ),
+            "multi_processor_count": int(
+                getattr(props, "multi_processor_count", 0) or 0
+            ),
+        }
+    )
+    return info
+
+
+def _spmm_rocm_launch_overrides(
+    *,
+    n_dense_cols,
+    max_row_nnz=0,
+    nnz=0,
+    fmt="csr",
+    dtype=None,
+    device=None,
+):
+    del dtype
+    if not _is_rocm_runtime():
+        return None
+    info = _get_device_backend_info(device)
+    dense_n = max(1, int(n_dense_cols))
+    max_row_nnz = max(0, int(max_row_nnz or 0))
+    nnz = max(0, int(nnz or 0))
+    fmt = str(fmt).strip().lower()
+    wave = max(1, int(info.get("device_warp_size") or 64))
+
+    if dense_n <= 16:
+        block_n = 16
+        num_warps = 1
+    elif dense_n <= 64:
+        block_n = 32 if wave >= 64 else 64
+        num_warps = 2
+    else:
+        block_n = 64
+        num_warps = 4
+
+    block_nnz = 64 if fmt == "csr" else 128
+    if max_row_nnz >= 512 or nnz >= 1_000_000:
+        block_nnz = 128 if fmt == "csr" else 256
+
+    max_threads = max(1, int(info.get("max_threads_per_block") or 1024))
+    while num_warps > 1 and num_warps * wave > max_threads:
+        num_warps //= 2
+
+    return {
+        "block_n": int(block_n),
+        "block_nnz": int(block_nnz),
+        "num_warps": int(num_warps),
+        "num_stages": 1,
+        "backend": info["backend"],
+        "device_name": info["device_name"],
+        "device_warp_size": int(info["device_warp_size"]),
+    }
 
 
 def _is_maca_runtime():

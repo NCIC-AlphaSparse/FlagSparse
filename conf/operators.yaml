@@ -181,6 +181,24 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: spmm_bell
+    description: |
+      Computes sparse matrix-dense matrix multiplication for a Blocked-ELL matrix.
+    for:
+      - flagsparse_spmm_bell
+      - flagsparse_spmm_bell_run
+      - prepare_spmm_bell_route
+    labels:
+      - flagsparse
+      - sparse
+      - bell
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - beta: "1.0"
+
   - id: spmm_csc
     description: |
       Computes sparse matrix-dense matrix multiplication for a CSC matrix.

@@ -15,6 +15,17 @@ import torch
 from scipy.io import mmread
 
 
+class NonSquareMatrixError(ValueError):
+    """Raised when a triangular solve benchmark receives a non-square matrix."""
+
+    def __init__(self, operator, shape):
+        self.operator = str(operator)
+        self.shape = (int(shape[0]), int(shape[1]))
+        super().__init__(
+            f"{self.operator} requires a square matrix, got {self.shape}"
+        )
+
+
 def read_scipy_csr(file_path):
     """Return a canonical scipy CSR (symmetry expanded, duplicates summed, sorted)."""
     csr = mmread(str(file_path)).tocsr()
@@ -106,6 +117,8 @@ def load_csr_spsv(file_path, dtype=torch.float32, device=None, lower=True):
     A = mmread(str(file_path)).tocsr()
     A.sum_duplicates()
     A.sort_indices()
+    if A.shape[0] != A.shape[1]:
+        raise NonSquareMatrixError("SpSV", A.shape)
     if np.iscomplexobj(A.data):
         A = A.real.tocsr()
     A = A.astype(np.float64)
