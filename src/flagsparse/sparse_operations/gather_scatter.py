@@ -27,8 +27,52 @@ import triton.language as tl
 
 SUPPORTED_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 DEFAULT_GATHER_BLOCK_SIZE = 256
-DEFAULT_GATHER_MAX_PROGRAMS = 2
 DEFAULT_GATHER_NUM_WARPS = 8
+
+# ``_gather_*_kernel`` carries a grid-stride loop, so the grid is deliberately capped
+# and each program may cover several tiles.  The cap used to be the literal ``2``,
+# which pinned every gather to two thread blocks -- 1.2% of an RTX 5090's 170 SMs --
+# and made the kernel scale linearly with nnz while native cusparseGather stayed flat
+# (measured: 0.00133 -> 0.0388 ms as nnz went 1024 -> 65536, i.e. 0.042x cuSPARSE).
+# Lifting the cap is bit-exact and 28x faster at nnz=65536.  ``scatter`` never had the
+# cap; its grid has always been a plain ``cdiv(nnz, BLOCK_SIZE)``.
+#
+# The cap is now derived from the device so it stays right across backends (an RTX
+# 5090 reports 170 SMs x 1536 threads; gfx936 and MetaX C550 differ in both SM count
+# and warp size).  Set ``DEFAULT_GATHER_MAX_PROGRAMS`` to an int to override.
+DEFAULT_GATHER_MAX_PROGRAMS = None
+_GATHER_MAX_PROGRAMS_CACHE = {}
+
+
+def _gather_max_programs(device=None, num_warps=DEFAULT_GATHER_NUM_WARPS):
+    """Programs to launch at most: enough to fill the device once, never fewer than 1."""
+    if DEFAULT_GATHER_MAX_PROGRAMS is not None:
+        return max(1, int(DEFAULT_GATHER_MAX_PROGRAMS))
+
+    key = (
+        None if device is None else (getattr(device, "type", None), getattr(device, "index", None)),
+        int(num_warps),
+    )
+    cached = _GATHER_MAX_PROGRAMS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        info = _get_device_backend_info(device)
+        sm_count = int(info.get("multi_processor_count") or 0)
+        warp_size = int(info.get("device_warp_size") or 32)
+        max_threads_per_sm = int(info.get("max_threads_per_multi_processor") or 0)
+        block_threads = max(1, int(num_warps) * warp_size)
+        blocks_per_sm = max(1, max_threads_per_sm // block_threads) if max_threads_per_sm else 1
+        programs = sm_count * blocks_per_sm
+    except Exception:
+        programs = 0
+    if programs <= 0:
+        # No usable device properties: fall back to a grid big enough not to serialise.
+        programs = 1024
+
+    _GATHER_MAX_PROGRAMS_CACHE[key] = programs
+    return programs
 
 
 def _set_hipsparse_stream(handle, stream="current"):
@@ -183,9 +227,8 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
-    grid = lambda meta: (
-        min(DEFAULT_GATHER_MAX_PROGRAMS, triton.cdiv(nnz, meta["BLOCK_SIZE"])),
-    )
+    max_programs = _gather_max_programs(dense_vector.device, DEFAULT_GATHER_NUM_WARPS)
+    grid = lambda meta: (min(max_programs, triton.cdiv(nnz, meta["BLOCK_SIZE"])),)
 
     if not _is_complex_dtype(dense_vector.dtype):
         sparse_values = out

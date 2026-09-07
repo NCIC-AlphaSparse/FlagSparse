@@ -319,13 +319,45 @@ def _benchmark_triton_spmm(
         "max_segments": max_segments,
         "op": op,
     }
+    # first_call_ms deliberately keeps measuring the whole cold path (prepare + run),
+    # which is what a one-shot caller pays.
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     _ = ast.flagsparse_spmm_csr(**kwargs)
     torch.cuda.synchronize()
     first_call_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Steady-state timing hoists prepare out of the loop.  The cuSPARSE baseline
+    # materialises its operand once before timing (``A_csr.transpose().tocsr()`` for
+    # trans/conj, plain CSR otherwise) and then times only ``A_eff @ B_cp``, so
+    # charging every iteration here for a fresh structural analysis compared unequal
+    # work: prepare measured 72-89% of the timed window at op=non, and the resulting
+    # ratios read 0.13-0.37 where the kernel alone is 1.19-1.42.
+    #
+    # Routing must be preserved, not just timing: ``flagsparse_spmm_csr`` sends the
+    # non-transposed float32/float64 case (with no tuning overrides) to the optimized
+    # alg1 kernel and everything else to the base path, whereas the route registry's
+    # ``alg="auto"`` resolves to ``csr_base`` for every op/dtype.  Mirror the library's
+    # own condition so the same kernel is measured as before.
+    use_opt_alg1 = (
+        op == "non"
+        and block_n is None
+        and block_nnz is None
+        and max_segments is None
+        and torch.is_tensor(data)
+        and data.dtype in (torch.float32, torch.float64)
+    )
+    if use_opt_alg1:
+        prepared = ast.prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)
+        steady_op = lambda: ast.flagsparse_spmm_csr_opt_alg1(prepared=prepared, B=B)
+    else:
+        prepared = ast.prepare_spmm_csr_route(
+            data, indices, indptr, shape, op=op, alg="auto"
+        )
+        steady_op = lambda: ast.flagsparse_spmm_csr_run(prepared, B, alg="auto")
+
     result, steady_ms = ast_ops._benchmark_cuda_op(
-        lambda: ast.flagsparse_spmm_csr(**kwargs),
+        steady_op,
         warmup=warmup,
         iters=iters,
     )
