@@ -433,7 +433,7 @@ def _load_cusparse():
 
 
 def _stream_ptr():
-    return ctypes.c_void_p(int(torch.cuda.current_stream().cuda_stream))
+    return ctypes.c_void_p(int(spsv_impl._ACCEL.current_stream().cuda_stream))
 
 
 def _csr_to_sell(values, cols, row_ptr, n_rows, slice_size):
@@ -489,13 +489,13 @@ def _time_cuda(run, warmup=None, iters=None):
     iters = ITERS if iters is None else int(iters)
     for _ in range(warmup):
         run()
-    torch.cuda.synchronize()
+    spsv_impl._ACCEL.synchronize()
 
     samples = []
     output = None
     for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = spsv_impl._ACCEL.Event(enable_timing=True)
+        end = spsv_impl._ACCEL.Event(enable_timing=True)
         start.record()
         output = run()
         end.record()
@@ -981,15 +981,15 @@ def _print_record(record):
 def test_spsv_sell_matches_cusparse(
     value_dtype, index_dtype, slice_size, alg_num, unit_diagonal
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
+    if not spsv_impl._ACCEL.is_available():
+        pytest.skip("GPU runtime is unavailable")
 
     n_rows = 64
     values, cols, row_ptr, shape = _build_random_triangular_csr(
         n_rows,
         value_dtype,
         index_dtype,
-        torch.device("cuda"),
+        torch.device(spsv_impl._ACCEL_DEVICE_TYPE),
         lower=True,
     )
     if value_dtype in (torch.complex64, torch.complex128):
@@ -1051,15 +1051,15 @@ def test_spsv_sell_matches_cusparse(
 def test_spsv_sell_trans_matches_cusparse(
     value_dtype, index_dtype, slice_size, unit_diagonal, op_mode
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
+    if not spsv_impl._ACCEL.is_available():
+        pytest.skip("GPU runtime is unavailable")
 
     n_rows = 64
     values, cols, row_ptr, shape = _build_random_triangular_csr(
         n_rows,
         value_dtype,
         index_dtype,
-        torch.device("cuda"),
+        torch.device(spsv_impl._ACCEL_DEVICE_TYPE),
         lower=True,
     )
     expected = _random_rhs_for_spsv(
@@ -1116,8 +1116,8 @@ def test_spsv_sell_alg_num_contract():
 
 
 def test_spsv_sell_complex_unsorted_matches_cusparse(alg_num):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
+    if not spsv_impl._ACCEL.is_available():
+        pytest.skip("GPU runtime is unavailable")
 
     n_rows = 37
     value_dtype = torch.complex64
@@ -1126,7 +1126,7 @@ def test_spsv_sell_complex_unsorted_matches_cusparse(alg_num):
         n_rows,
         value_dtype,
         index_dtype,
-        torch.device("cuda"),
+        torch.device(spsv_impl._ACCEL_DEVICE_TYPE),
         lower=True,
     )
     values = values.clone()
@@ -1269,8 +1269,8 @@ def main():
     alg_num = 1 if args.alg_num is None else args.alg_num
     op_mode = args.ops
 
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is unavailable")
+    if not spsv_impl._ACCEL.is_available():
+        raise SystemExit("GPU runtime is unavailable")
     WARMUP = max(0, args.warmup)
     ITERS = max(1, args.iters)
     paths = _expand_mtx_paths(args.mtx)
@@ -1296,7 +1296,7 @@ def main():
                     values, cols, row_ptr, shape = _load_mtx_to_csr_torch(
                         path,
                         dtype=value_dtype,
-                        device=torch.device("cuda"),
+                        device=torch.device(spsv_impl._ACCEL_DEVICE_TYPE),
                         lower=True,
                     )
                     if int(shape[0]) != int(shape[1]):

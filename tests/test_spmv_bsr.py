@@ -31,6 +31,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+import flagsparse.sparse_operations._common as fs_common
 
 try:
     import cupy as cp
@@ -56,6 +57,9 @@ PYTORCH_BSR_TRANSPOSE_UNSUPPORTED = (
 
 
 def _cupy_bsr_unavailable_reason():
+    vendor = fs_common._expected_vendor_sparse_backend()
+    if vendor != "cupy_cusparse":
+        return f"{fs_common._sparse_backend_label(vendor)} BSR SpMV baseline is not wired for this runner"
     if cp is None or cpx_sparse is None:
         return "CuPy/cupyx.scipy.sparse is not available"
     if not hasattr(cpx_sparse, "bsr_matrix"):
@@ -64,6 +68,17 @@ def _cupy_bsr_unavailable_reason():
 
 
 def _print_baseline_notes(run_cusparse=True):
+    vendor_reason = _cupy_bsr_unavailable_reason()
+    vendor_backend = None if vendor_reason else "cupy_cusparse"
+    for line in fs_common._backend_summary_lines(
+        op_name="SpMV BSR",
+        native_format="BSR",
+        correctness_ref="Ref=spmv-coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_cusparse,
+    ):
+        print(line)
     print(
         "FlagSparse BSR follows AlphaSparse/cuSPARSE-style padded block-grid semantics; native output is padded and correctness checks slice back to the logical output length."
     )
@@ -78,9 +93,11 @@ def _print_baseline_notes(run_cusparse=True):
         "PyTorch BSR trans/conj baseline: unsupported on CUDA because BSR transpose becomes SparseBsc; PT(ms)/PTPad(ms)=N/A for those ops."
     )
     if run_cusparse:
-        reason = _cupy_bsr_unavailable_reason()
-        if reason:
-            print(f"CuPy baseline: unavailable for BSR ({reason}); CU(ms)=N/A.")
+        if vendor_reason:
+            print(
+                f"{fs_common._expected_vendor_sparse_label()} baseline: unavailable for BSR "
+                f"({vendor_reason}); {fs_common._expected_vendor_sparse_short()}(ms)=N/A."
+            )
 
 
 def _dtype_name(dtype):
@@ -512,6 +529,9 @@ def _time_pytorch_padded(data, indices, indptr, x, shape, block_dim, op, warmup,
 
 
 def _time_cusparse(data, indices, indptr, x, shape, block_dim, op, warmup, iters):
+    vendor_reason = _cupy_bsr_unavailable_reason()
+    if vendor_reason:
+        return None, vendor_reason
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cupyx.scipy.sparse is not available"
     if not hasattr(cpx_sparse, "bsr_matrix"):
@@ -577,11 +597,12 @@ def _status(ok):
 
 
 def _header(timing=False):
+    vendor_short = fs_common._expected_vendor_sparse_short()
     split = f" {'ProcGPU':>9} {'Compute':>9}" if timing else ""
     return (
         f"{'Matrix':<28} {'Alg':>15} {'Op':>5} {'BDim':>5} {'Ref':>8} {'Out':>7} {'PadOut':>7} {'PadRows':>7} {'Rows':>7} {'Cols':>7} {'NNZB':>9} {'Pad':>7}  "
         f"{'BSR(ms)':>9} {'BSRGPU':>9} {'CPUProc':>9}{split} "
-        f"{'PT(ms)':>9} {'PTPad':>9} {'PTPMode':>9} {'CU(ms)':>9}  {'BSR/PT':>8} {'BSR/CU':>8} "
+        f"{'PT(ms)':>9} {'PTPad':>9} {'PTPMode':>9} {(vendor_short + '(ms)'):>9}  {'BSR/PT':>8} {('BSR/' + vendor_short):>8} "
         f"{'BSRErr':>10} {'PTPadErr':>10} {'B/PT':>10} {'B/PTPad':>10} {'Status':>6}"
     )
 
@@ -924,7 +945,7 @@ def _resolve_block_dims(block_dims, entries, shape):
 
 def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     device = torch.device("cuda")
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
@@ -979,7 +1000,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
 
 def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True, fail_fast=False):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     device = torch.device("cuda")
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
@@ -1159,7 +1180,17 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
     try:

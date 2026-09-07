@@ -504,6 +504,16 @@ def prepare_spmm_bsr_route(
     block_nnz_use = int(block_nnz)
     if block_nnz_use <= 0:
         raise ValueError("block_nnz must be positive")
+    launch = _spmm_rocm_launch_overrides(
+        n_dense_cols=1,
+        max_row_nnz=max_block_row_nnz,
+        nnz=data.shape[0],
+        fmt="bsr",
+        dtype=data.dtype,
+        device=data.device,
+    )
+    if launch is not None and launch.get("block_nnz") is not None:
+        block_nnz_use = min(block_nnz_use, int(launch["block_nnz"]))
     if max_segments is None:
         max_segments_use = max((max_block_row_nnz + block_nnz_use - 1) // block_nnz_use, 1)
         while max_segments_use > 2048 and block_nnz_use < 65536:
@@ -1062,11 +1072,17 @@ def _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op="non"):
 
 def _spmm_bsr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
     """Pick the vendor sparse library for a BSR SpMM reference, per backend."""
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spmm_bsr_skip_reason(value_dtype, index_dtype, op=op)
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} BSR SpMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     if not hasattr(cpx_sparse, "bsr_matrix"):

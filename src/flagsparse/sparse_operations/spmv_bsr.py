@@ -132,6 +132,8 @@ class PreparedBsrSpmv:
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
+        "launch_backend",
+        "device_warp_size",
     )
 
     def __init__(
@@ -152,6 +154,8 @@ class PreparedBsrSpmv:
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
+        launch_backend=None,
+        device_warp_size=None,
     ):
         self.data = data
         self.kernel_indices = kernel_indices
@@ -177,6 +181,13 @@ class PreparedBsrSpmv:
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
+        info = _get_device_backend_info(data.device)
+        self.launch_backend = launch_backend or info["backend"]
+        self.device_warp_size = int(
+            device_warp_size
+            if device_warp_size is not None
+            else info["device_warp_size"]
+        )
 
 
 @triton.jit
@@ -544,6 +555,20 @@ def prepare_spmv_bsr(
     block_nnz_use = int(block_nnz)
     if block_nnz_use <= 0:
         raise ValueError("block_nnz must be positive")
+    launch = _spmv_rocm_launch_overrides(
+        fmt="bsr",
+        dtype=data.dtype,
+        max_row_nnz=max_block_row_nnz,
+        nnz=data.shape[0],
+        block_nnz=block_nnz_use,
+        device=data.device,
+    )
+    launch_backend = None
+    device_warp_size = None
+    if launch is not None:
+        block_nnz_use = int(launch["block_nnz"])
+        launch_backend = launch["backend"]
+        device_warp_size = launch["device_warp_size"]
     if max_segments is None:
         max_segments_use = max((max_block_row_nnz + block_nnz_use - 1) // block_nnz_use, 1)
         while max_segments_use > 2048 and block_nnz_use < 65536:
@@ -568,6 +593,8 @@ def prepare_spmv_bsr(
         block_row_lengths=block_row_lengths,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
+        launch_backend=launch_backend,
+        device_warp_size=device_warp_size,
     )
 
 
@@ -671,20 +698,38 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
     return y
 
 
-def _spmv_bsr_blockrow_reduce_bucket_specs():
+def _spmv_bsr_blockrow_reduce_bucket_specs(dtype=None, device=None):
+    launch = _spmv_rocm_launch_overrides(
+        fmt="bsr",
+        dtype=dtype,
+        block_nnz=128,
+        device=device,
+    )
+    block_nnz_cap = int(launch["block_nnz"]) if launch is not None else None
+
+    def _cap(block_nnz):
+        if block_nnz_cap is None:
+            return int(block_nnz)
+        return int(min(block_nnz, block_nnz_cap))
+
     return (
         ("le1", 0, 1, 1, True),
         ("le4", 2, 4, 4, True),
         ("le16", 5, 16, 16, True),
-        ("le64", 17, 64, 64, True),
-        ("gt64", 65, None, 128, False),
+        ("le64", 17, 64, _cap(64), True),
+        ("gt64", 65, None, _cap(128), False),
     )
 
 
-def _build_spmv_bsr_blockrow_reduce_buckets(row_lengths, max_block_row_nnz):
+def _build_spmv_bsr_blockrow_reduce_buckets(
+    row_lengths, max_block_row_nnz, dtype=None, device=None
+):
     buckets = []
     lengths = row_lengths.to(torch.int64)
-    for label, low, high, block_nnz, direct_store in _spmv_bsr_blockrow_reduce_bucket_specs():
+    for label, low, high, block_nnz, direct_store in _spmv_bsr_blockrow_reduce_bucket_specs(
+        dtype=dtype,
+        device=device,
+    ):
         mask = lengths >= int(low)
         if high is not None:
             mask = mask & (lengths <= int(high))
@@ -713,7 +758,10 @@ def _triton_spmv_bsr_blockrow_reduce_kernel(prepared, x, buckets=None):
         return y
     if buckets is None:
         buckets = _build_spmv_bsr_blockrow_reduce_buckets(
-            prepared.block_row_lengths, prepared.max_block_row_nnz
+            prepared.block_row_lengths,
+            prepared.max_block_row_nnz,
+            dtype=prepared.data.dtype,
+            device=prepared.data.device,
         )
     if _is_complex_dtype(dtype):
         data_ri = torch.view_as_real(prepared.data).reshape(-1)
@@ -763,7 +811,10 @@ def _run_spmv_bsr_blockrow_reduce_with_timing(prepared, x):
     process_end = _ACCEL.Event(enable_timing=True)
     process_start.record()
     buckets = _build_spmv_bsr_blockrow_reduce_buckets(
-        prepared.block_row_lengths, prepared.max_block_row_nnz
+        prepared.block_row_lengths,
+        prepared.max_block_row_nnz,
+        dtype=prepared.data.dtype,
+        device=prepared.data.device,
     )
     process_end.record()
     _ACCEL.synchronize()
@@ -836,6 +887,8 @@ def _spmv_bsr_prepared_with_int32_indices(prepared, reason):
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=True,
         index_fallback_reason=str(reason),
+        launch_backend=prepared.launch_backend,
+        device_warp_size=prepared.device_warp_size,
     )
 
 
@@ -1006,6 +1059,10 @@ def flagsparse_spmv_bsr(
             "n_block_cols": prepared.n_block_cols,
             "nnzb": prepared.nnzb,
             "stored_nnz": prepared.stored_nnz,
+            "block_nnz": prepared.block_nnz,
+            "max_segments": prepared.max_segments,
+            "launch_backend": prepared.launch_backend,
+            "device_warp_size": prepared.device_warp_size,
             "symbolic_ms": (process_cpu_ms or 0.0) + (process_gpu_ms or 0.0) if do_timing else None,
             "process_cpu_ms": process_cpu_ms,
             "process_gpu_ms": process_gpu_ms,

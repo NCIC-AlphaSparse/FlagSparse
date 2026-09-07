@@ -4515,13 +4515,19 @@ def _hipsparse_spmm_csc_skip_reason(value_dtype, indices_dtype, indptr_dtype):
 def _spmm_csc_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
     """Pick the vendor sparse library for a CSC SpMM reference, per backend."""
     indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spmm_csc_skip_reason(
             value_dtype, index_dtype, indptr_dtype
         )
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} CSC SpMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     skip_reason = _cusparse_baseline_skip_reason(value_dtype)
@@ -4532,7 +4538,8 @@ def _spmm_csc_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
 
 def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
     indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spmm_csr_skip_reason(
             value_dtype,
             index_dtype,
@@ -4541,6 +4548,11 @@ def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} CSR SpMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     skip_reason = _cusparse_baseline_skip_reason(value_dtype)
@@ -4549,20 +4561,48 @@ def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
     return "cupy_cusparse", None
 
 
-def _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None):
+def _prepare_spmm_csr_ref_hipsparse(
+    data, indices, indptr, B, shape, out=None, op="non", dense_layout="row"
+):
     return _prepare_spmm_ref_hipsparse(
-        data, indices, indptr, B, shape, out=out, layout="csr"
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        out=out,
+        sparse_layout="csr",
+        op=op,
+        dense_layout=dense_layout,
     )
 
 
-def _prepare_spmm_csc_ref_hipsparse(data, indices, indptr, B, shape, out=None):
+def _prepare_spmm_csc_ref_hipsparse(
+    data, indices, indptr, B, shape, out=None, op="non", dense_layout="row"
+):
     return _prepare_spmm_ref_hipsparse(
-        data, indices, indptr, B, shape, out=out, layout="csc"
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        out=out,
+        sparse_layout="csc",
+        op=op,
+        dense_layout=dense_layout,
     )
 
 
 def _prepare_spmm_ref_hipsparse(
-    data, indices, indptr, B, shape, out=None, layout="csr"
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    out=None,
+    sparse_layout="csr",
+    op="non",
+    dense_layout="row",
 ):
     """Shared hipSPARSE generic-API SpMM setup for CSR and CSC.
 
@@ -4570,12 +4610,16 @@ def _prepare_spmm_ref_hipsparse(
     the dense descriptors, buffer sizing and SpMM call are identical.
     """
 
-    if layout not in ("csr", "csc"):
-        raise ValueError(f"layout must be 'csr' or 'csc', got {layout!r}")
-    fmt = layout.upper()
+    if sparse_layout not in ("csr", "csc"):
+        raise ValueError(f"sparse_layout must be 'csr' or 'csc', got {sparse_layout!r}")
+    fmt = sparse_layout.upper()
+    op_name = _normalize_sparse_reference_op(op)
+    dense_layout = str(dense_layout).strip().lower()
+    if dense_layout not in ("row", "col"):
+        raise ValueError(f"dense_layout must be 'row' or 'col', got {dense_layout!r}")
     skip_fn = (
         _hipsparse_spmm_csr_skip_reason
-        if layout == "csr"
+        if sparse_layout == "csr"
         else _hipsparse_spmm_csc_skip_reason
     )
     skip_reason = skip_fn(
@@ -4600,31 +4644,40 @@ def _prepare_spmm_ref_hipsparse(
 
     n_rows = int(shape[0])
     n_cols = int(shape[1])
-    n_slots = n_rows if layout == "csr" else n_cols
-    slot_name = "n_rows" if layout == "csr" else "n_cols"
+    transposes = op_name in ("trans", "conj")
+    b_rows = n_rows if transposes else n_cols
+    c_rows = n_cols if transposes else n_rows
+    n_slots = n_rows if sparse_layout == "csr" else n_cols
+    slot_name = "n_rows" if sparse_layout == "csr" else "n_cols"
     if indptr.numel() != n_slots + 1:
         raise ValueError(f"indptr length must be {slot_name}+1={n_slots + 1}")
-    if int(B.shape[0]) != n_cols:
-        raise ValueError(f"B.shape[0] must equal n_cols={n_cols}")
+    if int(B.shape[0]) != b_rows:
+        raise ValueError(f"B.shape[0] must equal {b_rows} for op={op_name}")
     if B.dtype != data.dtype:
         raise TypeError("B dtype must match sparse value dtype for direct hipSPARSE SpMM")
-    if not B.is_contiguous():
-        raise ValueError("hipSPARSE CSR SpMM direct reference expects contiguous row-major B")
+    if dense_layout == "row":
+        if not B.is_contiguous():
+            raise ValueError("hipSPARSE SpMM dense_layout=row expects contiguous row-major B")
+    elif B.stride(0) != 1:
+        raise ValueError("hipSPARSE SpMM dense_layout=col expects column-major dense B")
 
     n_dense_cols = int(B.shape[1])
     if n_dense_cols == 0:
         return {
             "backend": "hipsparse",
             "buffer_size": 0,
-            "format": layout,
-            "C": torch.empty((n_rows, 0), dtype=data.dtype, device=data.device),
+            "format": sparse_layout,
+            "op": op_name,
+            "dense_layout": dense_layout,
+            "C": torch.empty((c_rows, 0), dtype=data.dtype, device=data.device),
             "empty": True,
         }
 
     data = data.contiguous()
     indices = indices.contiguous()
     indptr = indptr.contiguous()
-    B = B.contiguous()
+    if dense_layout == "row":
+        B = B.contiguous()
     value_type = _hipsparse_value_type(data.dtype)
     alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
     beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
@@ -4634,24 +4687,34 @@ def _prepare_spmm_ref_hipsparse(
     entries_index_type = _hipsparse_index_type(
         indices.dtype, f"hipSPARSE {fmt} SpMM entry indices"
     )
-    op_enum = _hipsparse_lookup(
-        "hipsparseOperation_t", ("HIPSPARSE_OPERATION_NON_TRANSPOSE",)
-    )
-    order = _hipsparse_spmm_order("row", f"hipSPARSE {fmt} SpMM")
+    op_a_enum = _hipsparse_spmm_operation(op_name, f"hipSPARSE {fmt} SpMM")
+    op_b_enum = _hipsparse_spmm_operation("non", f"hipSPARSE {fmt} SpMM dense RHS")
+    order = _hipsparse_spmm_order(dense_layout, f"hipSPARSE {fmt} SpMM")
     alg = _hipsparse_spmm_alg_default()
 
+    c_shape = (c_rows, n_dense_cols)
     C = out
     if C is None:
-        C = torch.empty((n_rows, n_dense_cols), dtype=data.dtype, device=data.device)
+        if dense_layout == "row":
+            C = torch.empty(c_shape, dtype=data.dtype, device=data.device)
+        else:
+            C = torch.empty_strided(
+                c_shape,
+                (1, max(1, c_rows)),
+                dtype=data.dtype,
+                device=data.device,
+            )
     else:
         if not torch.is_tensor(C):
             raise TypeError("out must be a torch.Tensor")
         if not _is_accel_tensor(C) or C.device != data.device:
             raise ValueError("out must be a CUDA tensor on the same device as data")
-        if C.dtype != data.dtype or C.shape != (n_rows, n_dense_cols):
+        if C.dtype != data.dtype or C.shape != c_shape:
             raise ValueError("out must match the result shape and dtype")
-        if not C.is_contiguous():
+        if dense_layout == "row" and not C.is_contiguous():
             raise ValueError("out must be contiguous row-major")
+        if dense_layout == "col" and C.stride(0) != 1:
+            raise ValueError("out must be column-major for dense_layout=col")
 
     handle = None
     spmat = None
@@ -4663,8 +4726,10 @@ def _prepare_spmm_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
+        spmat = ptr_type()
         matb = ptr_type()
         matc = ptr_type()
+        spmat_ref = spmat.createRef()
         matb_ref = matb.createRef()
         matc_ref = matc.createRef()
 
@@ -4680,10 +4745,11 @@ def _prepare_spmm_ref_hipsparse(
 
         make_descriptor = (
             _hipsparse_create_csr_descriptor
-            if layout == "csr"
+            if sparse_layout == "csr"
             else _hipsparse_create_csc_descriptor
         )
-        spmat = make_descriptor(
+        make_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),
@@ -4697,18 +4763,18 @@ def _prepare_spmm_ref_hipsparse(
         )
         _hipsparse_create_dnmat_descriptor(
             matb_ref,
-            n_cols,
+            b_rows,
             n_dense_cols,
-            int(B.stride(0)),
+            int(B.stride(0) if dense_layout == "row" else B.stride(1)),
             b_ptr,
             value_type,
             order,
         )
         _hipsparse_create_dnmat_descriptor(
             matc_ref,
-            n_rows,
+            c_rows,
             n_dense_cols,
-            int(C.stride(0)),
+            int(C.stride(0) if dense_layout == "row" else C.stride(1)),
             c_ptr,
             value_type,
             order,
@@ -4718,8 +4784,8 @@ def _prepare_spmm_ref_hipsparse(
         _hip_check_result(
             hipsparse.hipsparseSpMM_bufferSize(
                 handle,
-                op_enum,
-                op_enum,
+                op_a_enum,
+                op_b_enum,
                 alpha,
                 spmat,
                 matb,
@@ -4740,8 +4806,8 @@ def _prepare_spmm_ref_hipsparse(
         _hip_check_result(
             hipsparse.hipsparseSpMM_preprocess(
                 handle,
-                op_enum,
-                op_enum,
+                op_a_enum,
+                op_b_enum,
                 alpha,
                 spmat,
                 matb,
@@ -4756,14 +4822,17 @@ def _prepare_spmm_ref_hipsparse(
         return {
             "backend": "hipsparse",
             "buffer_size": buffer_size,
-            "format": "csr",
+            "format": sparse_layout,
+            "op": op_name,
+            "dense_layout": dense_layout,
             "handle": handle,
             "spmat": spmat,
             "matb": matb,
             "matc": matc,
             "workspace": workspace,
             "workspace_allocated": workspace_allocated,
-            "op_enum": op_enum,
+            "op_a_enum": op_a_enum,
+            "op_b_enum": op_b_enum,
             "alpha": alpha,
             "beta": beta,
             "value_type": value_type,
@@ -4806,8 +4875,8 @@ def _run_spmm_csr_ref_hipsparse_prepared(state):
     _hip_check_result(
         hipsparse.hipsparseSpMM(
             state["handle"],
-            state["op_enum"],
-            state["op_enum"],
+            state["op_a_enum"],
+            state["op_b_enum"],
             state["alpha"],
             state["spmat"],
             state["matb"],
@@ -4862,14 +4931,28 @@ def _destroy_spmm_csr_ref_hipsparse_prepared(state):
             pass
 
 
-def _spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=None, return_metadata=False):
-    state = _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape, out=out)
+def _spmm_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    B,
+    shape,
+    out=None,
+    op="non",
+    dense_layout="row",
+    return_metadata=False,
+):
+    state = _prepare_spmm_csr_ref_hipsparse(
+        data, indices, indptr, B, shape, out=out, op=op, dense_layout=dense_layout
+    )
     try:
         C = _run_spmm_csr_ref_hipsparse_prepared(state)
         metadata = {
             "backend": "hipsparse",
             "buffer_size": int(state.get("buffer_size", 0)),
             "format": "csr",
+            "op": state.get("op", op),
+            "dense_layout": state.get("dense_layout", dense_layout),
         }
         if return_metadata:
             return C, metadata
@@ -4943,6 +5026,8 @@ def _benchmark_spmm_csr_sparse_ref(
     shape,
     warmup,
     iters,
+    op="non",
+    dense_layout="row",
 ):
     backend, reason = _spmm_csr_sparse_ref_backend(
         data.dtype, indices.dtype, indptr.dtype
@@ -4957,7 +5042,15 @@ def _benchmark_spmm_csr_sparse_ref(
         return result
     if backend == "hipsparse":
         values, ms = _benchmark_prepared_cuda_op(
-            lambda: _prepare_spmm_csr_ref_hipsparse(data, indices, indptr, B, shape),
+            lambda: _prepare_spmm_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                op=op,
+                dense_layout=dense_layout,
+            ),
             _run_spmm_csr_ref_hipsparse_prepared,
             _destroy_spmm_csr_ref_hipsparse_prepared,
             warmup=warmup,
@@ -4966,6 +5059,23 @@ def _benchmark_spmm_csr_sparse_ref(
         result["values"] = values
         result["ms"] = ms
         result["reason"] = None
+        return result
+
+    op_name = _normalize_sparse_reference_op(op)
+    dense_layout = str(dense_layout).strip().lower()
+    if op_name != "non":
+        result["backend"] = None
+        result["reason"] = (
+            "CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this runner; "
+            f"op={op_name} is unsupported"
+        )
+        return result
+    if dense_layout != "row":
+        result["backend"] = None
+        result["reason"] = (
+            "CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only "
+            f"in this runner; dense_layout={dense_layout} is unsupported"
+        )
         return result
 
     data_cp = _cupy_from_torch(data)
@@ -4997,6 +5107,8 @@ def _benchmark_spmm_csc_sparse_ref(
     shape,
     warmup,
     iters,
+    op="non",
+    dense_layout="row",
 ):
     """Vendor CSC SpMM baseline: hipSPARSE on ROCm, CuPy/cuSPARSE on CUDA."""
     backend, reason = _spmm_csc_sparse_ref_backend(
@@ -5007,7 +5119,15 @@ def _benchmark_spmm_csc_sparse_ref(
         return result
     if backend == "hipsparse":
         values, ms = _benchmark_prepared_cuda_op(
-            lambda: _prepare_spmm_csc_ref_hipsparse(data, indices, indptr, B, shape),
+            lambda: _prepare_spmm_csc_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                op=op,
+                dense_layout=dense_layout,
+            ),
             _run_spmm_csc_ref_hipsparse_prepared,
             _destroy_spmm_csc_ref_hipsparse_prepared,
             warmup=warmup,
@@ -5016,6 +5136,23 @@ def _benchmark_spmm_csc_sparse_ref(
         result["values"] = values
         result["ms"] = ms
         result["reason"] = None
+        return result
+
+    op_name = _normalize_sparse_reference_op(op)
+    dense_layout = str(dense_layout).strip().lower()
+    if op_name != "non":
+        result["backend"] = None
+        result["reason"] = (
+            "CuPy/cuSPARSE CSC SpMM baseline supports op=non only in this runner; "
+            f"op={op_name} is unsupported"
+        )
+        return result
+    if dense_layout != "row":
+        result["backend"] = None
+        result["reason"] = (
+            "CuPy/cuSPARSE CSC SpMM baseline supports row-major dense RHS only "
+            f"in this runner; dense_layout={dense_layout} is unsupported"
+        )
         return result
 
     data_cp = _cupy_from_torch(data)
@@ -5384,28 +5521,28 @@ def benchmark_spmm_case(
         value_dtype, indices.dtype, indptr.dtype
     )
     if run_cusparse and sparse_ref_backend == "hipsparse":
-        # DCU/ROCm: the vendor reference is hipSPARSE. Its SpMM entry point is
-        # non-transpose only, so trans/conj stay unbenchmarked rather than being
-        # compared against a differently-shaped operation.
-        if op_code != SPMM_OP_NON:
-            cusparse_reason = (
-                "hipSPARSE CSR SpMM reference covers op=non only; trans/conj skipped"
+        try:
+            sparse_ref = _benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+                op=op_name,
+                dense_layout="row",
             )
-        else:
-            try:
-                cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
-                    lambda: _prepare_spmm_csr_ref_hipsparse(
-                        data, indices, indptr, B, shape
-                    ),
-                    _run_spmm_csr_ref_hipsparse_prepared,
-                    _destroy_spmm_csr_ref_hipsparse_prepared,
-                    warmup=warmup,
-                    iters=iters,
-                )
+            cusparse_values = sparse_ref["values"]
+            cusparse_ms = sparse_ref["ms"]
+            cusparse_reason = sparse_ref.get("reason")
+            if cusparse_values is not None:
                 cusparse_metrics = _spmm_validation_metrics(cusparse_values, expected)
                 cusparse_match = cusparse_metrics["strict_allclose_match"]
-            except Exception as exc:
-                cusparse_reason = str(exc)
+        except Exception as exc:
+            cusparse_reason = str(exc)
+    elif run_cusparse and sparse_ref_backend is None:
+        cusparse_reason = sparse_ref_reason or "vendor sparse baseline is unavailable"
     elif run_cusparse:
         if cp is None or cpx_sparse is None:
             cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"

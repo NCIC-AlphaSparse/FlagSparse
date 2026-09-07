@@ -277,51 +277,56 @@ SpSV 是目前唯一做了完整 DCU 内核适配的算子，DCU 上的默认行
 
 | 行为 | DCU/ROCm | CUDA |
 | --- | --- | --- |
-| NON_TRANS 默认路由 | 强制 **ALG1 (`csr_cw`)** | ALG4 (`csr_smblk`) |
-| ALG1 worker 数 | 强制 **1（串行）** | 多 worker 并行 |
-| ALG3/ALG4 wavefront | **64** | 32 |
-| level-schedule 元数据 | 走 host 路径 | 走 GPU 内核 |
+| NON_TRANS 默认路由 | 默认允许高级 AUTO，lower/non-unit 走 **ALG3 (`csr_nnz_balance`)** | ALG4 (`csr_smblk`) |
+| ALG1 worker 数 | persistent 可用时按 CU 封顶，否则串行保护 | 多 worker 并行 |
+| ALG3 launch | `BLOCK_NNZ` + CU 封顶 persistent grid | one-NNZ-per-program |
+| ALG4 route | DCU 不再作为默认公开 route | CUDA/MACA 可显式测 |
+| level-schedule 元数据 | 可走 CU 封顶 persistent GPU 分析 | 走 GPU 内核 |
 
-ALG1 在 DCU 上被强制串行，是因为跨 program 的 ready-flag 轮询在当前 gfx936 Triton
-栈上无法可靠推进——这是**正确性保护，不是性能选择**，放开可能导致 hang 或错误结果。
+当前合并后的 DCU 策略来自 `flagsparse_merge`：ALG3 复用 NNZ-balance 路径，并在
+ROCm 上用 bounded persistent grid，让生产/消费依赖的 program 保持驻留。ALG1/CW 仍保留
+serial constexpr 保护路径；这是为了避免跨 program ready-flag 轮询在部分 ROCm Triton 栈上
+无法可靠推进。
 
 四个环境开关可覆盖默认值（仅用于实验，不要在验收测试里改）：
 
 ```bash
-FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=1   # 放开高级 AUTO 路由（默认 0）
-FLAGSPARSE_SPSV_ROCM_ALG3_WARP_SIZE=32|64     # 默认 64
-FLAGSPARSE_SPSV_ROCM_ALG4_WARP_SIZE=32|64     # 默认 64
-FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT=N      # 默认 0 = 每个 CU 一个持久 program
+FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=0|1          # 默认 1；0 回到保守 ALG1
+FLAGSPARSE_SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL=0|1    # 默认 1
+FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ=1|64|128|256       # 默认 256
+FLAGSPARSE_SPSV_ROCM_ALG3_WORKGROUPS_PER_CU=1..8       # 默认 4
+FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT=N               # 仅用于共享 worker-count helper
 ```
 
-**ALG4 在 DCU 上用的是另一个内核（持久化 worker）。** 与 SpMV 同样的做法——两个内核
-并存，按后端选，CUDA 完全不受影响：
+**ALG3 在 DCU 上使用 NNZ-balance persistent kernel。** CUDA 保留原 one-NNZ-per-program
+路径；DCU 只在 `_is_rocm_runtime()` 为真时启用 persistent grid：
 
-| 运行时 | ALG4 内核 | 差异 |
+| 运行时 | ALG3 内核 | 差异 |
 | --- | --- | --- |
-| CUDA | `_spsv_csr_smblk_kernel` | 一行一 program |
-| **DCU/ROCm** | `_spsv_csr_smblk_persistent_kernel` | 持久化 worker + AMD 内存语义修正 |
+| CUDA | `_spsv_csr_nnz_balance_kernel` | one-NNZ-per-program |
+| **DCU/ROCm** | `_spsv_csr_nnz_balance_kernel` | `PERSISTENT=True`，按 CU 和 `BLOCK_NNZ` 封顶 |
 
 DCU 版有三处 AMD 特定改动（不只是性能）：
 
-1. **持久化 worker**：`NUM_WORKERS` + `tl.range(worker_id, n_rows, NUM_WORKERS)`，
-   grid 从 `n_rows` 变成 `worker_count`（默认每 CU 一个 program）；
+1. **持久化 worker**：`NUM_WORKERS` + `BLOCK_NNZ`，grid 从 `nnz` 变成
+   `worker_count = min(ceil(nnz / BLOCK_NNZ), CU * workgroups_per_CU)`；
 2. **显式 acquire 语义**：ready 标志读取用 `sem="acquire", scope="gpu"`，与生产者的
    release 存储配对；
-3. **规避 AMD lowering 缺陷**：依赖值用普通 `tl.load` 而非 `tl.atomic_add(x, 0)`
-   ——后者在 Triton 3.6 的 AMD lowering 里会产生低效的 float 原子 RMW 广播。
+3. **运行时状态初始化前置**：`tmp_sum.zero_()`、`ready.zero_()`、`indegree.copy_()`
+   由框架 kernel 初始化一次，避免在 persistent kernel 内重复做 host 侧准备。
 
 第 3 条是 DCU 上**必须**的，不是可选优化。
 
-可用环境变量强制以做 A/B：
+可用环境变量强制 ALG4 做 A/B（CUDA/MACA 方向；DCU route normalization 会拒绝旧
+`csr_smblk` 路径）：
 
 ```bash
-FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog      # 强制 CUDA 版（一行一 program）
-FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent   # 强制 DCU 版（持久化 worker）
+FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog
+FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent
 ```
 
-> 注意：ALG4 只有在 `FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO=1` 时才会在 DCU 上被
-> 默认路由选中（否则强制 ALG1）。要测 ALG4 需同时设这两个变量，或显式指定 route。
+> 注意：DCU 上 `--alg_num 3` 映射到 `csr_nnz_balance`；旧 `csr_roc`、`csr_smblk`、
+> `alg4`、`alg8` 会被明确拒绝，避免误跑 CUDA-only route。
 
 ---
 
