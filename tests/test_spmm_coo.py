@@ -3125,6 +3125,19 @@ def main():
     print("=" * 140)
     print("FLAGSPARSE COO SpMM - SuiteSparse .mtx batch (error + performance)")
     print("=" * 140)
+    vendor_backend, vendor_reason = ast_ops._spmm_coo_sparse_ref_backend(
+        value_dtype, index_dtype
+    )
+    for line in fs_common._backend_summary_lines(
+        op_name="SpMM COO",
+        native_format="COO",
+        correctness_ref="PyTorch COO",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=not args.no_cusparse,
+    ):
+        print(line)
+    vendor_short = fs_common._expected_vendor_sparse_short()
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  dense_cols: {args.dense_cols}  "
@@ -3183,7 +3196,8 @@ def main():
                     print(
                         f"{row['matrix']:<32} {row['alg']:<16} {row['status']:<5} "
                         f"ms={_fmt_ms(row['ms'])} gpu={_fmt_ms(row['gpu_ms'])} "
-                        f"torch={_fmt_ms(row['torch_ms'])} err={_fmt_err(row['err_vs_torch'])} "
+                        f"torch={_fmt_ms(row['torch_ms'])} {vendor_short.lower()}={_fmt_ms(row['cusparse_ms'])} "
+                        f"err={_fmt_err(row['err_vs_torch'])} err_{vendor_short.lower()}={_fmt_err(row['err_vs_cusparse'])} "
                         f"reason={row.get('reason') or row.get('cusparse_reason') or ''}"
                     )
 

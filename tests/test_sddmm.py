@@ -15,7 +15,7 @@
 """
 SDDMM tests: load SuiteSparse .mtx as CSR pattern and benchmark
 out = alpha * dot(X[row], Y[col]) + beta * in.
-cuSPARSE baseline is cusparseSDDMM via torch.sparse.sampled_addmm.
+Vendor baseline is cuSPARSE SDDMM on CUDA and hipSPARSE SDDMM on ROCm/DCU.
 
 acc_mode notes:
 - acc_mode=f32 keeps the native float32 accumulate path for float32 inputs.
@@ -44,6 +44,7 @@ if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 import flagsparse as ast
+import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.sddmm_csr as ast_ops
 from test_spmm import load_mtx_to_csr_torch
 
@@ -419,20 +420,48 @@ def run_one_mtx(
 
     if run_cusparse:
         try:
-            result["cu_started"] = True
-            cu_vals, cusparse_ms = _benchmark_cusparse_sddmm(
-                indices=indices,
-                indptr=indptr,
-                shape=shape,
-                x=x,
-                y=y,
-                data_in=data_in,
-                alpha=alpha,
-                beta=beta,
-                warmup=warmup,
-                iters=iters,
+            vendor_backend, vendor_reason = ast_ops._sddmm_csr_sparse_ref_backend(
+                value_dtype, index_dtype
             )
-            result["cusparse_ms"] = cusparse_ms
+            if vendor_backend == "hipsparse":
+                result["cu_started"] = True
+                vendor_result = ast_ops._benchmark_sddmm_csr_sparse_ref(
+                    indices=indices,
+                    indptr=indptr,
+                    shape=shape,
+                    x=x,
+                    y=y,
+                    data_in=data_in,
+                    alpha=alpha,
+                    beta=beta,
+                    warmup=warmup,
+                    iters=iters,
+                )
+                cu_vals = vendor_result.get("values")
+                result["cusparse_ms"] = vendor_result.get("ms")
+                result["cu_reason"] = vendor_result.get("reason")
+            elif vendor_backend == "cupy_cusparse":
+                result["cu_started"] = True
+                cu_vals, cusparse_ms = _benchmark_cusparse_sddmm(
+                    indices=indices,
+                    indptr=indptr,
+                    shape=shape,
+                    x=x,
+                    y=y,
+                    data_in=data_in,
+                    alpha=alpha,
+                    beta=beta,
+                    warmup=warmup,
+                    iters=iters,
+                )
+                result["cusparse_ms"] = cusparse_ms
+            else:
+                cu_vals = None
+                result["cu_status"] = "PERF_UNAVAILABLE"
+                result["cu_reason"] = vendor_reason
+                result["cusparse_reason"] = vendor_reason
+                result["status"] = "PASS" if result["triton_ok_pt"] else "FAIL"
+                return result
             # cuSPARSE is now a real implementation of the same op, so it is a
             # correctness check as well as the performance baseline.
             if triton_values is not None and cu_vals is not None:
@@ -453,7 +482,7 @@ def run_one_mtx(
             result["cu_reason"] = str(exc)
     else:
         result["cu_status"] = "PERF_ONLY"
-        result["cu_reason"] = "cuSPARSE baseline is disabled by CLI"
+        result["cu_reason"] = "vendor sparse baseline is disabled by CLI"
 
     result["cusparse_reason"] = result["cu_reason"]
     result["status"] = "PASS" if result["triton_ok_pt"] else "FAIL"
@@ -494,12 +523,14 @@ def run_mtx_batch(
 
 
 def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mode):
+    vendor_label = fs_common._expected_vendor_sparse_label()
+    vendor_short = fs_common._expected_vendor_sparse_short()
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
     print(
-        "Formats: FlagSparse=CSR SDDMM vs cuSPARSE SDDMM (cusparseSDDMM via "
-        "torch.sparse.sampled_addmm). PyTorch = correctness reference only, not a "
+        f"Formats: FlagSparse=CSR SDDMM vs {vendor_label} CSR SDDMM when supported. "
+        "PyTorch = correctness reference only, not a "
         "performance baseline."
     )
     print(
@@ -513,8 +544,8 @@ def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mo
     print("-" * 196)
     print(
         f"{'Matrix':<28} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'K':>6} "
-        f"{'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>13} {'PyTorch(ms)':>11} "
-        f"{'FS/CU':>7} {'PT':>6} {'CU_Status':>12} {'Err(PT)':>10} {'Err(CU)':>10} {'Prep(ms)':>9}"
+        f"{'FlagSparse(ms)':>14} {(vendor_short + '(ms)'):>13} {'PyTorch(ms)':>11} "
+        f"{('FS/' + vendor_short):>7} {'PT':>6} {(vendor_short + '_Status'):>12} {'Err(PT)':>10} {('Err(' + vendor_short + ')'):>10} {'Prep(ms)':>9}"
     )
     print("-" * 196)
 
@@ -541,7 +572,7 @@ def _print_sddmm_mtx_row(entry):
         msg = str(cu_reason).replace("\n", " ")
         if len(msg) > 220:
             msg = msg[:217] + "..."
-        print(f"  CU_NOTE: {msg}")
+        print(f"  {fs_common._expected_vendor_sparse_short()}_NOTE: {msg}")
 
 
 def print_mtx_results(results, value_dtype, index_dtype, k_dim, alpha, beta, acc_mode):
@@ -819,12 +850,18 @@ def main():
     parser.add_argument(
         "--no-cusparse-ref",
         action="store_true",
-        help="Skip the cuSPARSE SDDMM performance baseline",
+        help="Skip the vendor SDDMM performance baseline",
     )
     parser.add_argument(
         "--no-cusparse",
         action="store_true",
         help="Alias of --no-cusparse-ref",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse_ref",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument("--skip-api-checks", action="store_true")

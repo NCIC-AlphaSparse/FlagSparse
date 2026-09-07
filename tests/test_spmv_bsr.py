@@ -32,6 +32,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
+import flagsparse.sparse_operations.spmv_bsr as bsr_ops
 
 try:
     import cupy as cp
@@ -56,10 +57,15 @@ PYTORCH_BSR_TRANSPOSE_UNSUPPORTED = (
 )
 
 
-def _cupy_bsr_unavailable_reason():
+def _vendor_bsr_unavailable_reason(value_dtype=torch.float32, index_dtype=torch.int32, op="non"):
+    backend, reason = bsr_ops._spmv_bsr_sparse_ref_backend(
+        value_dtype, index_dtype, op=op
+    )
+    if backend == "hipsparse":
+        return None
     vendor = fs_common._expected_vendor_sparse_backend()
     if vendor != "cupy_cusparse":
-        return f"{fs_common._sparse_backend_label(vendor)} BSR SpMV baseline is not wired for this runner"
+        return reason or f"{fs_common._sparse_backend_label(vendor)} BSR SpMV baseline is not wired for this runner"
     if cp is None or cpx_sparse is None:
         return "CuPy/cupyx.scipy.sparse is not available"
     if not hasattr(cpx_sparse, "bsr_matrix"):
@@ -68,8 +74,12 @@ def _cupy_bsr_unavailable_reason():
 
 
 def _print_baseline_notes(run_cusparse=True):
-    vendor_reason = _cupy_bsr_unavailable_reason()
-    vendor_backend = None if vendor_reason else "cupy_cusparse"
+    vendor_backend, vendor_reason = bsr_ops._spmv_bsr_sparse_ref_backend(
+        torch.float32, torch.int32, op="non"
+    )
+    if vendor_backend == "cupy_cusparse":
+        vendor_reason = _vendor_bsr_unavailable_reason()
+        vendor_backend = None if vendor_reason else "cupy_cusparse"
     for line in fs_common._backend_summary_lines(
         op_name="SpMV BSR",
         native_format="BSR",
@@ -529,7 +539,23 @@ def _time_pytorch_padded(data, indices, indptr, x, shape, block_dim, op, warmup,
 
 
 def _time_cusparse(data, indices, indptr, x, shape, block_dim, op, warmup, iters):
-    vendor_reason = _cupy_bsr_unavailable_reason()
+    backend, vendor_reason = bsr_ops._spmv_bsr_sparse_ref_backend(
+        data.dtype, indices.dtype, op=op
+    )
+    if backend == "hipsparse":
+        x_padded = _pad_vector(x, _padded_x_size(shape, block_dim, op))
+        result = bsr_ops._benchmark_spmv_bsr_sparse_ref(
+            data,
+            indices,
+            indptr,
+            x_padded,
+            shape,
+            block_dim,
+            warmup=warmup,
+            iters=iters,
+            op=op,
+        )
+        return result.get("ms"), result.get("reason")
     if vendor_reason:
         return None, vendor_reason
     if cp is None or cpx_sparse is None:

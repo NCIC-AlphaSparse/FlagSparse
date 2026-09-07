@@ -29,6 +29,8 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
+from flagsparse.sparse_operations import spmm_bell as bell_ops
 
 
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -64,13 +66,17 @@ PERF_FIELDS = [
     "ms",
     "gpu_ms",
     "process_cpu_ms",
+    "vendor_backend",
+    "vendor_ms",
     "torch_bell_ms",
     "cupy_bell_ms",
     "err_vs_ref",
+    "err_vs_vendor",
     "err_vs_torch_bell",
     "err_vs_cupy_bell",
     "status",
     "reason",
+    "vendor_reason",
     "torch_bell_reason",
     "cupy_bell_reason",
 ]
@@ -425,7 +431,23 @@ def _time_flagsparse_bell(data, indices, B, shape, block_dim, alg, op, warmup, i
     }
 
 
-def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_cols, layout, alg, op, warmup, iters, timing, max_bell_storage_mb):
+def _run_case(
+    matrix_name,
+    entries,
+    shape,
+    dtype,
+    index_dtype,
+    block_dim,
+    dense_cols,
+    layout,
+    alg,
+    op,
+    warmup,
+    iters,
+    timing,
+    max_bell_storage_mb,
+    run_vendor=True,
+):
     M, K = shape
     device = torch.device("cuda")
     plan = _estimate_bell_storage(entries, shape, dtype, index_dtype, block_dim)
@@ -452,15 +474,19 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
         "ms": None,
         "gpu_ms": None,
         "process_cpu_ms": 0.0,
+        "vendor_backend": fs_common._expected_vendor_sparse_backend(),
+        "vendor_ms": None,
         "torch_bell_ms": None,
         "cupy_bell_ms": None,
         "err_vs_ref": None,
+        "err_vs_vendor": None,
         "err_vs_torch_bell": None,
         "err_vs_cupy_bell": None,
         "status": "ERROR",
         "reason": "",
+        "vendor_reason": "",
         "torch_bell_reason": "PyTorch has no same-format BELL/Blocked-ELL SpMM baseline",
-        "cupy_bell_reason": "CuPy has no same-format BELL/Blocked-ELL SpMM baseline",
+        "cupy_bell_reason": "CuPy high-level sparse API has no same-format BELL/Blocked-ELL SpMM baseline",
     }
     if timing:
         row.update({"process_gpu_ms": None, "compute_ms": None})
@@ -496,6 +522,31 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
         )
         out = bell["out"]
         err = _error_ratio(out, ref, dtype)
+        vendor_out = None
+        vendor_ms = None
+        vendor_backend = None
+        vendor_reason = "vendor sparse baseline is disabled by CLI"
+        if run_vendor:
+            try:
+                vendor = bell_ops._benchmark_spmm_bell_sparse_ref(
+                    data,
+                    indices,
+                    B,
+                    shape,
+                    block_dim,
+                    warmup,
+                    iters,
+                    op=op,
+                    dense_layout=layout,
+                )
+                vendor_out = vendor.get("values")
+                vendor_ms = vendor.get("ms")
+                vendor_backend = vendor.get("backend")
+                vendor_reason = vendor.get("reason") or ""
+            except Exception as exc:
+                vendor_backend = fs_common._expected_vendor_sparse_backend()
+                vendor_reason = str(exc)
+        vendor_err = _error_ratio(out, vendor_out, dtype) if vendor_out is not None else None
         row.update(
             {
                 "c_stride": out.stride(0),
@@ -504,9 +555,13 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
                 "process_cpu_ms": bell["process_cpu_ms"],
                 "process_gpu_ms": bell["process_gpu_ms"],
                 "compute_ms": bell["compute_ms"],
+                "vendor_backend": vendor_backend or fs_common._expected_vendor_sparse_backend(),
+                "vendor_ms": vendor_ms,
                 "err_vs_ref": err,
+                "err_vs_vendor": vendor_err,
                 "status": "PASS" if err is not None and err <= 1.0 else "FAIL",
                 "reason": "" if err is not None and err <= 1.0 else "correctness check failed",
+                "vendor_reason": vendor_reason,
             }
         )
     except Exception as exc:
@@ -517,10 +572,25 @@ def _run_case(matrix_name, entries, shape, dtype, index_dtype, block_dim, dense_
     return row
 
 
-def _print_notes():
+def _print_notes(run_vendor=True):
+    vendor_backend, vendor_reason = bell_ops._spmm_bell_sparse_ref_backend(
+        torch.float32,
+        torch.int32,
+        op="non",
+        dense_layout="row",
+    )
+    for line in fs_common._backend_summary_lines(
+        op_name="SpMM BELL",
+        native_format="BELL",
+        correctness_ref="Ref=torch_spmm_coo_from_original_coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_vendor,
+    ):
+        print(line)
     print("FlagSparse BELL uses native Blocked-ELL arrays; empty slots are indices == -1.")
     print("Accuracy reference: Ref=torch_spmm_coo_from_original_coo builds torch sparse COO from the original matrix entries; this is correctness-only.")
-    print("PyTorch/vendor BELL baselines: unavailable unless a real same-format Blocked-ELL API is present; no casting or format fallback is used.")
+    print("Vendor BELL baseline: CUDA high-level CuPy has no BELL format; ROCm/DCU uses hipSPARSE Blocked-ELL when supported.")
     print("Timing policy: ms = process_cpu_ms + gpu_ms; BELL SpMM v1 has no process phase.")
     print("Memory guard: oversized BELL padded storage is reported as SKIP before tensor allocation.")
 
@@ -531,12 +601,15 @@ def _print_row(row, timing=False):
         if timing
         else ""
     )
+    vendor_note = ""
+    if row.get("vendor_reason"):
+        vendor_note = f" vendor_reason={row['vendor_reason']}"
     print(
         f"{os.path.basename(str(row['matrix']))[:28]:<28} {row['op']:<5} {row['alg']:<15} "
         f"{row['block_dim']:>4} {row['out_rows']:>8} {row['n_rows']:>8} {row['n_cols']:>8} "
         f"{row['nnzb']:>8} {row['ell_width_blocks']:>6} {row['estimated_storage_mb']:>8.1f} {row['dense_cols']:>6} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9}"
-        f"{extra} {_fmt(row['err_vs_ref'], 2):>10} {row['status']:>6}"
+        f" {_fmt(row.get('vendor_ms')):>9}{extra} {_fmt(row['err_vs_ref'], 2):>10} {_fmt(row.get('err_vs_vendor'), 2):>10} {row['status']:>6}{vendor_note}"
     )
     if row.get("reason"):
         print(f"  reason: {row['reason']}")
@@ -563,7 +636,8 @@ def main():
         default=DEFAULT_MAX_BELL_STORAGE_MB,
         help="Skip cases whose estimated BELL data+index storage exceeds this MiB guard",
     )
-    parser.add_argument("--no-cusparse", action="store_true", help="Accepted for CLI compatibility; no BELL vendor baseline is used")
+    parser.add_argument("--no-cusparse", action="store_true", help="Skip the vendor BELL performance baseline")
+    parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
@@ -578,7 +652,7 @@ def main():
     layouts = ("row", "col") if args.layout == "all" else (args.layout,)
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
-    _print_notes()
+    _print_notes(run_vendor=not args.no_cusparse)
     writer = None
     fh = None
     if args.csv_bell:
@@ -602,12 +676,13 @@ def main():
                     print("-" * 132)
                     print(f"Value dtype: {_dtype_name(dtype)} | Index dtype: {_dtype_name(index_dtype)} | op: {op}")
                     print("-" * 132)
+                    vendor_short = fs_common._expected_vendor_sparse_short()
                     header = (
                         f"{'Matrix':<28} {'Op':<5} {'Alg':<15} {'BDim':>4} {'Out':>8} {'Rows':>8} "
                         f"{'Cols':>8} {'NNZB':>8} {'ELLW':>6} {'MiB':>8} {'DCols':>6} {'ms':>9} {'gpu_ms':>9} "
-                        f"{'cpu_ms':>9}"
+                        f"{'cpu_ms':>9} {(vendor_short + '(ms)'):>9}"
                         + (f" {'gpu_proc':>9} {'compute':>9}" if args.timing else "")
-                        + f" {'Err':>10} {'Status':>6}"
+                        + f" {'Err':>10} {('Err' + vendor_short):>10} {'Status':>6}"
                     )
                     print(header)
                     for block_dim in block_dims:
@@ -640,6 +715,7 @@ def main():
                                             args.iters,
                                             args.timing,
                                             args.max_bell_storage_mb,
+                                            run_vendor=not args.no_cusparse,
                                         )
                                         rows.append(row)
                                         _print_row(row, timing=args.timing)

@@ -16,6 +16,7 @@
 
 from ._common import *
 
+import ctypes
 import triton
 import triton.language as tl
 
@@ -74,6 +75,280 @@ def _spmv_bsr_op_transposes(op):
         SPMV_BSR_OP_TRANS,
         SPMV_BSR_OP_CONJ_TRANS,
     )
+
+
+def _hipsparse_spmv_bsr_skip_reason(value_dtype, index_dtype, op="non"):
+    op_name = _spmv_bsr_op_to_name(op)
+    if not _is_rocm_runtime():
+        return "hipSPARSE BSR SpMV reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateBsr",
+        "hipsparseCreateDnVec",
+        "hipsparseDestroyDnVec",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMV_bufferSize",
+        "hipsparseSpMV",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE binding does not expose {symbol}"
+    try:
+        _hipsparse_value_type(value_dtype)
+        _hipsparse_index_type(index_dtype, "hipSPARSE BSR SpMV")
+        _hipsparse_spmv_operation(op_name, "hipSPARSE BSR SpMV")
+        _hipsparse_spmv_algorithm("bsr")
+        _hipsparse_spmm_order("row", "hipSPARSE BSR SpMV")
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spmv_bsr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    vendor = _expected_vendor_sparse_backend()
+    if vendor == "hipsparse":
+        reason = _hipsparse_spmv_bsr_skip_reason(value_dtype, index_dtype, op=op)
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} BSR SpMV baseline is not wired for this runner",
+        )
+    return "cupy_cusparse", None
+
+
+def _prepare_spmv_bsr_ref_hipsparse(data, indices, indptr, x, shape, block_dim, op="non"):
+    op_name = _spmv_bsr_op_to_name(op)
+    skip_reason = _hipsparse_spmv_bsr_skip_reason(data.dtype, indices.dtype, op=op_name)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, x)):
+        raise TypeError("data, indices, indptr, x must all be torch.Tensor")
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, x)):
+        raise ValueError("data, indices, indptr, x must all be accelerator tensors")
+    if not all(t.device == data.device for t in (indices, indptr, x)):
+        raise ValueError("data, indices, indptr, x must be on the same device")
+    if data.ndim != 3 or data.shape[1] != data.shape[2]:
+        raise ValueError("BSR data must have shape (nnzb, block_dim, block_dim)")
+    block_dim = int(block_dim)
+    if block_dim <= 0 or int(data.shape[1]) != block_dim:
+        raise ValueError("block_dim must match the BSR data block shape")
+    if indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
+        raise ValueError("indices, indptr, x must be 1D tensors")
+    if indices.dtype != indptr.dtype:
+        raise ValueError("hipSPARSE BSR SpMV requires indices/indptr to share dtype")
+
+    bsr_rows = int(indptr.numel()) - 1
+    if bsr_rows < 0:
+        raise ValueError("indptr must contain at least one element")
+    logical_rows, logical_cols = int(shape[0]), int(shape[1])
+    bsr_cols_from_shape = (logical_cols + block_dim - 1) // block_dim
+    bsr_cols_from_indices = (
+        int(indices.to(torch.int64).max().item()) + 1 if int(indices.numel()) else 0
+    )
+    bsr_cols = max(bsr_cols_from_shape, bsr_cols_from_indices)
+    padded_rows = bsr_rows * block_dim
+    padded_cols = bsr_cols * block_dim
+    x_size = padded_rows if _spmv_bsr_op_transposes(op_name) else padded_cols
+    y_size = padded_cols if _spmv_bsr_op_transposes(op_name) else padded_rows
+    if x.numel() != x_size:
+        raise ValueError(f"x length must be {x_size} for hipSPARSE BSR SpMV op={op_name}")
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    x = x.contiguous()
+    y = torch.zeros(y_size, dtype=data.dtype, device=data.device)
+
+    if y_size == 0:
+        return {
+            "backend": "hipsparse",
+            "format": "bsr",
+            "buffer_size": 0,
+            "y": y,
+            "empty": True,
+        }
+
+    handle = None
+    spmat = None
+    vecx = None
+    vecy = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        spmat = ptr_type()
+        vecx = ptr_type()
+        vecy = ptr_type()
+
+        value_type = _hipsparse_value_type(data.dtype)
+        index_type = _hipsparse_index_type(indices.dtype, "hipSPARSE BSR SpMV")
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        order = _hipsparse_spmm_order("row", "hipSPARSE BSR SpMV")
+        op_enum = _hipsparse_spmv_operation(op_name, "hipSPARSE BSR SpMV")
+        alg = _hipsparse_spmv_algorithm("bsr")
+        alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+        beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+
+        _hipsparse_create_bsr_descriptor(
+            spmat.createRef(),
+            bsr_rows,
+            bsr_cols,
+            int(indices.numel()),
+            block_dim,
+            block_dim,
+            HipPointer.fromObj(indptr.data_ptr()),
+            HipPointer.fromObj(indices.data_ptr()),
+            HipPointer.fromObj(data.data_ptr()),
+            index_type,
+            index_type,
+            index_base,
+            value_type,
+            order,
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(
+                vecx.createRef(), x_size, HipPointer.fromObj(x.data_ptr()), value_type
+            ),
+            "hipsparseCreateDnVec(x)",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(
+                vecy.createRef(), y_size, HipPointer.fromObj(y.data_ptr()), value_type
+            ),
+            "hipsparseCreateDnVec(y)",
+        )
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMV_bufferSize(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                vecx,
+                beta,
+                vecy,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMV_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        return {
+            "backend": "hipsparse",
+            "format": "bsr",
+            "handle": handle,
+            "spmat": spmat,
+            "vecx": vecx,
+            "vecy": vecy,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "y": y,
+            "empty": False,
+        }
+    except Exception:
+        _destroy_spmv_bsr_ref_hipsparse_prepared(
+            {
+                "handle": handle,
+                "spmat": spmat,
+                "vecx": vecx,
+                "vecy": vecy,
+                "workspace": workspace,
+                "workspace_allocated": workspace_allocated,
+            }
+        )
+        raise
+
+
+def _run_spmv_bsr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["y"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMV(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["vecx"],
+            state["beta"],
+            state["vecy"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMV",
+    )
+    return state["y"]
+
+
+def _destroy_spmv_bsr_ref_hipsparse_prepared(state):
+    for key, destroy_name in (
+        ("vecy", "hipsparseDestroyDnVec"),
+        ("vecx", "hipsparseDestroyDnVec"),
+        ("spmat", "hipsparseDestroySpMat"),
+    ):
+        obj = state.get(key)
+        if obj is not None:
+            try:
+                _hip_check_result(getattr(hipsparse, destroy_name)(obj), destroy_name)
+            except Exception:
+                pass
+    if state.get("workspace_allocated") and state.get("workspace"):
+        try:
+            _hip_check_result(hip.hipFree(state["workspace"]), "hipFree")
+        except Exception:
+            pass
+    handle = state.get("handle")
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _benchmark_spmv_bsr_sparse_ref(
+    data, indices, indptr, x, shape, block_dim, warmup, iters, op="non"
+):
+    backend, reason = _spmv_bsr_sparse_ref_backend(data.dtype, indices.dtype, op=op)
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend is None:
+        return result
+    if backend != "hipsparse":
+        result["reason"] = (
+            "CuPy/cuSPARSE BSR SpMV baseline is implemented in the benchmark runner"
+        )
+        return result
+    values, ms = _benchmark_prepared_cuda_op(
+        lambda: _prepare_spmv_bsr_ref_hipsparse(
+            data, indices, indptr, x, shape, block_dim, op=op
+        ),
+        _run_spmv_bsr_ref_hipsparse_prepared,
+        _destroy_spmv_bsr_ref_hipsparse_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = values
+    result["ms"] = ms
+    result["reason"] = None
+    return result
 
 
 def _ensure_spmv_bsr_supported_op(op_code):

@@ -238,14 +238,18 @@ __all__ = (
     "_hipsparse_spmm_operation",
     "_hipsparse_spmm_order",
     "_hipsparse_spmm_algorithm",
+    "_hipsparse_spmv_algorithm",
+    "_hipsparse_sddmm_algorithm",
     "_hipsparse_create_coo_descriptor",
     "_hipsparse_create_csr_descriptor",
     "_hipsparse_create_dnmat_descriptor",
+    "_hipsparse_create_bsr_descriptor",
     # Consumed by benchmarks.py through `from ._common import *`.
     "_prepare_spmv_csr_ref_hipsparse",
     "_run_spmv_csr_ref_hipsparse_prepared",
     "_destroy_spmv_csr_ref_hipsparse_prepared",
     "_hipsparse_create_csc_descriptor",
+    "_hipsparse_create_blocked_ell_descriptor",
     "_hipsparse_spmv_csc_skip_reason",
     "_prepare_spmv_csc_ref_hipsparse",
     "_run_spmv_csc_ref_hipsparse_prepared",
@@ -300,6 +304,7 @@ __all__ = (
     "cpx_sparse",
     "hip",
     "hipsparse",
+    "HipPointer",
     "time",
     "torch",
     "triton",
@@ -1225,6 +1230,148 @@ def _hipsparse_create_csr_descriptor(
     )
 
 
+def _hipsparse_create_bsr_descriptor(
+    spmat_ref,
+    bsr_rows,
+    bsr_cols,
+    nnzb,
+    row_block_dim,
+    col_block_dim,
+    row_ptr,
+    col_ptr,
+    values_ptr,
+    row_index_type,
+    col_index_type,
+    index_base,
+    value_type,
+    order,
+):
+    """Create a hipSPARSE generic BSR descriptor across wrapper signatures."""
+    if not hasattr(hipsparse, "hipsparseCreateBsr"):
+        raise RuntimeError("hipSPARSE binding does not expose hipsparseCreateBsr")
+    attempts = (
+        (
+            spmat_ref,
+            bsr_rows,
+            bsr_cols,
+            nnzb,
+            row_block_dim,
+            col_block_dim,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+            order,
+        ),
+        (
+            spmat_ref,
+            bsr_rows,
+            bsr_cols,
+            nnzb,
+            row_block_dim,
+            col_block_dim,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+        ),
+        (
+            spmat_ref,
+            bsr_rows,
+            bsr_cols,
+            nnzb,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+            row_block_dim,
+            col_block_dim,
+            order,
+        ),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateBsr(*args), "hipsparseCreateBsr"
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateBsr wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateBsr wrapper signature mismatch")
+
+
+def _hipsparse_create_blocked_ell_descriptor(
+    spmat_ref,
+    n_rows,
+    n_cols,
+    block_dim,
+    ell_cols,
+    indices_ptr,
+    values_ptr,
+    index_type,
+    index_base,
+    value_type,
+):
+    """Create a hipSPARSE generic Blocked-ELL descriptor."""
+    if not hasattr(hipsparse, "hipsparseCreateBlockedEll"):
+        raise RuntimeError(
+            "hipSPARSE binding does not expose hipsparseCreateBlockedEll"
+        )
+    attempts = (
+        (
+            spmat_ref,
+            n_rows,
+            n_cols,
+            block_dim,
+            ell_cols,
+            indices_ptr,
+            values_ptr,
+            index_type,
+            index_base,
+            value_type,
+        ),
+        (
+            spmat_ref,
+            n_rows,
+            n_cols,
+            block_dim,
+            ell_cols,
+            values_ptr,
+            indices_ptr,
+            index_type,
+            index_base,
+            value_type,
+        ),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateBlockedEll(*args),
+                "hipsparseCreateBlockedEll",
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateBlockedEll wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateBlockedEll wrapper signature mismatch")
+
+
 def _hipsparse_spmm_order(order_name, context):
     mapping = {
         "row": ("HIPSPARSE_ORDER_ROW",),
@@ -1247,10 +1394,34 @@ def _hipsparse_spmm_algorithm(format_name):
             "HIPSPARSE_COOMM_ALG1",
             "HIPSPARSE_SPMM_ALG_DEFAULT",
         ),
+        "bell": (
+            "HIPSPARSE_SPMM_BLOCKED_ELL_ALG1",
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
+        ),
     }
     if format_name not in mapping:
         raise RuntimeError(f"hipSPARSE SpMM does not support format={format_name}")
     return _hipsparse_lookup("hipsparseSpMMAlg_t", mapping[format_name])
+
+
+def _hipsparse_spmv_algorithm(format_name):
+    format_name = str(format_name).lower()
+    mapping = {
+        "csr": ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        "coo": ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        "csc": ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        "bsr": ("HIPSPARSE_SPMV_BSR_ALG1", "HIPSPARSE_SPMV_ALG_DEFAULT"),
+    }
+    if format_name not in mapping:
+        raise RuntimeError(f"hipSPARSE SpMV does not support format={format_name}")
+    return _hipsparse_lookup("hipsparseSpMVAlg_t", mapping[format_name])
+
+
+def _hipsparse_sddmm_algorithm():
+    return _hipsparse_lookup(
+        "hipsparseSDDMMAlg_t",
+        ("HIPSPARSE_SDDMM_ALG_DEFAULT",),
+    )
 
 
 def _hipsparse_create_dnmat_descriptor(
