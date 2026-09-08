@@ -72,8 +72,8 @@ def test_common_launch_tuning_is_backend_scoped_and_reusable():
 
     generic = _function_source(COMMON_TREE, COMMON_SOURCE, "_backend_launch_overrides")
     assert 'if info["backend"] != "hip":' in generic
-    assert "kind == \"spmm\"" in generic
-    assert "kind == \"spmv\"" in generic
+    assert 'kind == "spmm"' in generic
+    assert 'kind == "spmv"' in generic
 
     spmm = _function_source(COMMON_TREE, COMMON_SOURCE, "_spmm_rocm_launch_overrides")
     spmv = _function_source(COMMON_TREE, COMMON_SOURCE, "_spmv_rocm_launch_overrides")
@@ -106,9 +106,9 @@ def test_spsv_preserves_update_non_rocm_profiles_and_public_sell_api():
     assert "_is_ascend_runtime()" in SPSV_BENCHMARK_SOURCE
     assert "def flagsparse_spsv_sell(" in SPSV_SOURCE
 
-    init_source = (
-        PROJECT_ROOT / "src" / "flagsparse" / "__init__.py"
-    ).read_text(encoding="utf-8")
+    init_source = (PROJECT_ROOT / "src" / "flagsparse" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
     ops_source = (
         PROJECT_ROOT / "src" / "flagsparse" / "sparse_operations" / "__init__.py"
     ).read_text(encoding="utf-8")
@@ -128,17 +128,15 @@ def test_spsv_spsm_vendor_selectors_use_common_backend_policy():
     )
     for selector in (spsv_selector, spsm_selector):
         assert "_vendor_sparse_library()" in selector
-        assert "vendor == \"hipsparse\"" in selector
+        assert 'vendor == "hipsparse"' in selector
         assert "_backend_name()" in selector
 
     assert "def _expected_vendor_sparse_backend" in COMMON_SOURCE
     assert "_expected_vendor_sparse_backend" in SPSV_BENCHMARK_SOURCE
     assert "_expected_vendor_sparse_backend" in SPSM_BENCHMARK_SOURCE
     assert (
-        "fs_spsv_impl._is_rocm_runtime() else \"cuSPARSE\""
-        not in SPSV_BENCHMARK_SOURCE
+        'fs_spsv_impl._is_rocm_runtime() else "cuSPARSE"' not in SPSV_BENCHMARK_SOURCE
     )
     assert (
-        "fs_spsm_impl._is_rocm_runtime() else \"cuSPARSE\""
-        not in SPSM_BENCHMARK_SOURCE
+        'fs_spsm_impl._is_rocm_runtime() else "cuSPARSE"' not in SPSM_BENCHMARK_SOURCE
     )
