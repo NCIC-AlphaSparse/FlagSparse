@@ -96,6 +96,8 @@ class PreparedCscSpmv:
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
+        "launch_backend",
+        "device_warp_size",
     )
 
     def __init__(
@@ -115,6 +117,8 @@ class PreparedCscSpmv:
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
+        launch_backend=None,
+        device_warp_size=None,
     ):
         self.data = data
         self.kernel_indices = kernel_indices
@@ -134,6 +138,13 @@ class PreparedCscSpmv:
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
+        info = _get_device_backend_info(data.device)
+        self.launch_backend = launch_backend or info["backend"]
+        self.device_warp_size = int(
+            device_warp_size
+            if device_warp_size is not None
+            else info["device_warp_size"]
+        )
 
 
 @triton.jit
@@ -320,6 +331,20 @@ def prepare_spmv_csc(
     block_nnz_use = int(block_nnz)
     if block_nnz_use <= 0:
         raise ValueError("block_nnz must be positive")
+    launch = _spmv_rocm_launch_overrides(
+        fmt="csc",
+        dtype=data.dtype,
+        max_row_nnz=max_col_nnz,
+        nnz=data.numel(),
+        block_nnz=block_nnz_use,
+        device=data.device,
+    )
+    launch_backend = None
+    device_warp_size = None
+    if launch is not None:
+        block_nnz_use = int(launch["block_nnz"])
+        launch_backend = launch["backend"]
+        device_warp_size = launch["device_warp_size"]
     if max_segments is None:
         max_segments_use = max((max_col_nnz + block_nnz_use - 1) // block_nnz_use, 1)
         while max_segments_use > 2048 and block_nnz_use < 65536:
@@ -343,6 +368,8 @@ def prepare_spmv_csc(
         col_lengths=col_lengths,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
+        launch_backend=launch_backend,
+        device_warp_size=device_warp_size,
     )
 
 
@@ -468,6 +495,8 @@ def _spmv_csc_prepared_with_int32_indices(prepared, reason):
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=True,
         index_fallback_reason=str(reason),
+        launch_backend=prepared.launch_backend,
+        device_warp_size=prepared.device_warp_size,
     )
 
 
@@ -570,6 +599,10 @@ def flagsparse_spmv_csc(
             "symbolic_ms": 0.0 if do_timing else None,
             "compute_ms": compute_ms,
             "op_total_ms": op_total_ms,
+            "block_nnz": prepared.block_nnz,
+            "max_segments": prepared.max_segments,
+            "launch_backend": prepared.launch_backend,
+            "device_warp_size": prepared.device_warp_size,
             "index_fallback_applied": prepared.index_fallback_applied,
             "index_fallback_reason": prepared.index_fallback_reason,
         }

@@ -737,6 +737,20 @@ def _run_spmv_coo_prepared_with_fallback(
         )
 
 
+def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
+    launch = _spmv_rocm_launch_overrides(
+        fmt="coo",
+        dtype=prepared.data.dtype,
+        nnz=prepared.nnz,
+        block_size=block_size,
+        num_warps=num_warps,
+        device=prepared.data.device,
+    )
+    if launch is None:
+        return int(block_size), int(num_warps)
+    return int(launch["block_size"]), int(launch["num_warps"])
+
+
 def flagsparse_spmv_coo(
     data=None,
     row=None,
@@ -801,6 +815,9 @@ def flagsparse_spmv_coo(
         raise ValueError("num_warps must be a power of 2 in [1, 32]")
     if block_inner <= 0 or (block_inner & (block_inner - 1)) != 0:
         raise ValueError("block_inner must be a positive power of 2")
+    block_size, num_warps = _resolve_spmv_coo_kernel_launch(
+        launch, block_size, num_warps
+    )
     t0 = None
     if return_time:
         _ACCEL.synchronize()

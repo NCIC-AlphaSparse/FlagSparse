@@ -295,11 +295,17 @@ def _prepare_spmm_coo_canonical_inputs(data, row, col, B, shape, dense_layout="r
 
 
 def _spmm_coo_sparse_ref_backend(value_dtype, index_dtype):
-    if _is_rocm_runtime():
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
         reason = _hipsparse_spmm_coo_skip_reason(value_dtype, index_dtype)
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} COO SpMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     skip_reason = _cusparse_baseline_skip_reason(value_dtype)
@@ -427,8 +433,10 @@ def _prepare_spmm_coo_ref_hipsparse(
         handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
         ptr_type = type(handle)
 
+        spmat = ptr_type()
         matb = ptr_type()
         matc = ptr_type()
+        spmat_ref = spmat.createRef()
         matb_ref = matb.createRef()
         matc_ref = matc.createRef()
 
@@ -443,7 +451,8 @@ def _prepare_spmm_coo_ref_hipsparse(
             ("HIPSPARSE_INDEX_BASE_ZERO",),
         )
 
-        spmat = _hipsparse_create_coo_descriptor(
+        _hipsparse_create_coo_descriptor(
+            spmat_ref,
             n_rows,
             n_cols,
             int(data.numel()),
@@ -2547,9 +2556,6 @@ def benchmark_spmm_coo_case(
         value_dtype, cusparse_row.dtype
     )
     if run_cusparse and sparse_ref_backend == "hipsparse":
-        # DCU/ROCm: hipSPARSE COO SpMM stands in for the cuSPARSE baseline. The
-        # op has already been materialized into cusparse_row/col/data above, so the
-        # non-transpose hipSPARSE entry point covers every op here.
         try:
             cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
                 lambda: _prepare_spmm_coo_ref_hipsparse(
@@ -2566,6 +2572,8 @@ def benchmark_spmm_coo_case(
             cusparse_match = cusparse_summary["match"]
         except Exception as exc:
             cusparse_reason = str(exc)
+    elif run_cusparse and sparse_ref_backend is None:
+        cusparse_reason = sparse_ref_reason or "vendor sparse baseline is unavailable"
     elif run_cusparse:
         if cp is None or cpx_sparse is None:
             cusparse_reason = sparse_ref_reason or "CuPy/cuSPARSE is not available"

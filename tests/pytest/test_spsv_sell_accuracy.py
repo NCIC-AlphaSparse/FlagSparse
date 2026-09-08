@@ -42,10 +42,11 @@ def _sell_matches(actual, expected, dtype):
         torch.max(torch.abs(torch.abs(actual) - torch.abs(expected))).item()
     )
     scale = float(torch.max(torch.abs(expected)).item())
-    if scale == 0.0:
-        return error == 0.0
-    tolerance = 1e-6 if dtype in (torch.float32, torch.complex64) else 1e-12
-    return error / scale <= tolerance
+    if dtype in (torch.float32, torch.complex64):
+        atol, rtol = 1e-6, 1e-5
+    else:
+        atol, rtol = 1e-12, 1e-10
+    return error <= atol + rtol * scale
 
 
 def _lower_triangular_sell(

@@ -38,6 +38,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as ast
+import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmm_coo as ast_ops
 
 VALUE_DTYPES = [
@@ -671,13 +672,10 @@ def _skip_alg_row(
 def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row"):
     if dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
-    sparse_ref_backend, _ = ast_ops._spmm_coo_sparse_ref_backend(
+    sparse_ref_backend, sparse_ref_reason = ast_ops._spmm_coo_sparse_ref_backend(
         prepared_case["cusparse_data"].dtype, prepared_case["cusparse_row"].dtype
     )
     if sparse_ref_backend == "hipsparse":
-        # DCU/ROCm: hipSPARSE replaces cuSPARSE as the vendor baseline. COO SpMM
-        # materialises the op before the call, so every op is covered. Without
-        # this branch the DCU run silently reports the baseline as unavailable.
         try:
             ref = ast_ops._benchmark_spmm_coo_sparse_ref(
                 prepared_case["cusparse_data"],
@@ -694,6 +692,8 @@ def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row")
             return None, None, ref["reason"] or "hipSPARSE COO SpMM reference skipped"
         del ref_C
         return ref["values"], ref["ms"], ref["reason"] or ""
+    if sparse_ref_backend is None:
+        return None, None, sparse_ref_reason or "vendor sparse baseline is unavailable"
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx
@@ -831,7 +831,8 @@ def run_one_alg_case(
     cusparse_ms = None
     cusparse_reason = ""
     if run_cusparse:
-        stage_t0 = _start("time CuPy/cuSPARSE COO reference")
+        vendor_label = fs_common._expected_vendor_sparse_label()
+        stage_t0 = _start(f"time {vendor_label} COO reference")
         cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse_coo(
             case,
             ref,
@@ -841,7 +842,7 @@ def run_one_alg_case(
             layout=layout,
         )
         _done(
-            "time CuPy/cuSPARSE COO reference",
+            f"time {vendor_label} COO reference",
             stage_t0,
             f"ms={_fmt_ms(cusparse_ms)} reason={cusparse_reason or ''}",
         )
@@ -1525,6 +1526,10 @@ def run_one_mtx(
             result["cusparse_relative_error_diag"] = None
             result["triton_ok_cu"] = None
             result["cusparse_reason"] = str(exc)
+    elif run_cusparse and sparse_ref_backend is None:
+        result["cusparse_reason"] = (
+            sparse_ref_reason or "vendor sparse baseline is unavailable"
+        )
     elif run_cusparse:
         if value_dtype not in _cupy_supported_dtypes:
             result["cusparse_reason"] = (
@@ -1889,6 +1894,8 @@ def _benchmark_spmm_coo_synthetic_policy(
             )
         except Exception as exc:
             cusparse_reason = str(exc)
+    elif run_cusparse and bench_ref_backend is None:
+        cusparse_reason = bench_ref_reason or "vendor sparse baseline is unavailable"
     elif run_cusparse:
         if value_dtype not in (
             torch.float32,
@@ -2108,13 +2115,15 @@ def _print_spmm_coo_mtx_header(
     value_dtype, index_dtype, route, layout=None, timing=False
 ):
     route = _normalize_route(route)
+    vendor_label = fs_common._expected_vendor_sparse_label()
+    vendor_short = fs_common._expected_vendor_sparse_short()
     print(
         f"Value dtype: {_dtype_name(value_dtype)}  |  Index dtype: {_dtype_name(index_dtype)}"
     )
     if layout is not None:
         print(f"Dense layout: {layout}")
     print(
-        f"Formats: FlagSparse={_route_label(route)}, cuSPARSE=COO dense-mm, PyTorch=COO."
+        f"Formats: FlagSparse={_route_label(route)}, {vendor_label}=COO dense-mm, PyTorch=COO."
     )
     print(
         "Timing: FS(ms)=process_cpu_ms+FS_GPU(ms); --timing adds process_gpu_ms/compute_ms split."
@@ -2129,7 +2138,7 @@ def _print_spmm_coo_mtx_header(
         "Timing stays in native dtype. For float32, correctness references use float64 compute then cast."
     )
     print(
-        "PT/CU show per-reference correctness. Err(PT)/Err(CU)=max(|diff| / (atol + rtol*|ref|))."
+        f"PT/{vendor_short} show per-reference correctness. Err(PT)/Err({vendor_short})=max(|diff| / (atol + rtol*|ref|))."
     )
     print("PyTorch uses COO sparse.mm as the only correctness reference path.")
     if route == "compare":
@@ -2142,7 +2151,7 @@ def _print_spmm_coo_mtx_header(
     print(
         f"{'Matrix':<28} {'Op':>5} {'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} "
         f"{'FS(ms)':>9} {'FS_GPU':>9} {'CPUProc':>9} {split}"
-        f"{'cuSPARSE':>9} {'PyTorch':>9} {'FS/CU':>7} {'FS/PT':>7} {'PT':>6} {'CU':>6} {'Err(PT)':>10} {'Err(CU)':>10}"
+        f"{vendor_short:>9} {'PyTorch':>9} {('FS/' + vendor_short):>7} {'FS/PT':>7} {'PT':>6} {vendor_short:>6} {'Err(PT)':>10} {('Err(' + vendor_short + ')'):>10}"
     )
     print("-" * width)
 
@@ -2190,12 +2199,13 @@ def print_compare_results(results, value_dtype, index_dtype):
     if not any(entry.get("compare") for entry in results):
         return
 
-    print("Compare details (PT-COO / CU-COO / native parity)")
+    vendor_short = fs_common._expected_vendor_sparse_short()
+    print(f"Compare details (PT-COO / {vendor_short}-COO / native parity)")
     print("Row/PT is the main default-route diagnostic; Atomic/PT is debug-only.")
     print("-" * 174)
     print(
-        f"{'Matrix':<28} {'Lay':>4} {'Row/PT':>7} {'Atomic/PT':>9} {'CU/PT':>7} {'Row/Atomic':>11} "
-        f"{'Err(Row/PT)':>12} {'Err(Atomic/PT)':>14} {'Err(CU/PT)':>10} {'Err(Row/Atomic)':>15}"
+        f"{'Matrix':<28} {'Lay':>4} {'Row/PT':>7} {'Atomic/PT':>9} {(vendor_short + '/PT'):>7} {'Row/Atomic':>11} "
+        f"{'Err(Row/PT)':>12} {'Err(Atomic/PT)':>14} {('Err(' + vendor_short + '/PT)'):>10} {'Err(Row/Atomic)':>15}"
     )
     print("-" * 174)
     for entry in results:
@@ -2228,7 +2238,7 @@ def print_compare_results(results, value_dtype, index_dtype):
     print("-" * 178)
     print(
         f"{'Matrix':<28} {'Route':>8} {'Row':>8} {'DenseCol':>9} {'RowNNZ':>8} {'Err':>10} "
-        f"{'Rowrun':>18} {'Atomic':>18} {'PT':>18} {'CU':>18}"
+        f"{'Rowrun':>18} {'Atomic':>18} {'PT':>18} {vendor_short:>18}"
     )
     print("-" * 178)
     for name, debug in debug_rows:
@@ -2321,7 +2331,7 @@ def run_all_dtypes_export_csv(
 
 def run_api_validation_checks():
     if not torch.cuda.is_available():
-        print("API checks skipped: CUDA is not available.")
+        print("API checks skipped: a CUDA/ROCm PyTorch device is not available.")
         return 0
 
     device = torch.device("cuda")
@@ -2607,15 +2617,18 @@ def run_api_validation_checks():
 
 def run_coo_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True):
     if not torch.cuda.is_available():
-        print("COO branch coverage skipped: CUDA is not available.")
+        print(
+            "COO branch coverage skipped: a CUDA/ROCm PyTorch device is not available."
+        )
         return 0
 
+    vendor_short = fs_common._expected_vendor_sparse_short()
     print("=" * 144)
     print("COO native row-run dense-column coverage")
     print("=" * 144)
     print(
         f"{'DenseN':>8} {'BLOCK_N':>8} {'NNZTile':>8} {'Runs':>7} {'Tiles':>7} {'Warp':>6} {'Factor':>7} "
-        f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {'cuSPARSE(ms)':>12} {'PT':>6} {'CU':>6} {'Err(FS)':>11}"
+        f"{'PyTorch(ms)':>12} {'FlagSparse(ms)':>14} {((vendor_short + '(ms)')):>12} {'PT':>6} {vendor_short:>6} {'Err(FS)':>11}"
     )
     print("-" * 144)
 
@@ -2661,7 +2674,7 @@ def run_coo_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True):
         )
     print("-" * 144)
     if note:
-        print(f"cuSPARSE note: {note}")
+        print(f"{fs_common._expected_vendor_sparse_label()} note: {note}")
     print()
     return failed
 
@@ -2670,12 +2683,13 @@ def _print_synthetic_compare_results(compare_rows):
     if not compare_rows:
         return
 
-    print("Compare details (PT-COO / CU-COO / native parity)")
+    vendor_short = fs_common._expected_vendor_sparse_short()
+    print(f"Compare details (PT-COO / {vendor_short}-COO / native parity)")
     print("Row/PT is the main default-route diagnostic; Atomic/PT is debug-only.")
     print("-" * 168)
     print(
-        f"{'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'Row/PT':>7} {'Atomic/PT':>9} {'CU/PT':>7} {'Row/Atomic':>11} "
-        f"{'Err(Row/PT)':>12} {'Err(Atomic/PT)':>14} {'Err(CU/PT)':>10} {'Err(Row/Atomic)':>15}"
+        f"{'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'Row/PT':>7} {'Atomic/PT':>9} {(vendor_short + '/PT'):>7} {'Row/Atomic':>11} "
+        f"{'Err(Row/PT)':>12} {'Err(Atomic/PT)':>14} {('Err(' + vendor_short + '/PT)'):>10} {'Err(Row/Atomic)':>15}"
     )
     print("-" * 168)
     for entry in compare_rows:
@@ -2704,9 +2718,11 @@ def run_comprehensive_synthetic(
     timing=False,
 ):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
 
+    vendor_label = fs_common._expected_vendor_sparse_label()
+    vendor_short = fs_common._expected_vendor_sparse_short()
     route = _normalize_route(route)
     selected_route = _selected_route(route)
     op_names = ["non"] if op_names is None else op_names
@@ -2720,7 +2736,7 @@ def run_comprehensive_synthetic(
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}  Ops: {','.join(op_names)}  Layouts: {','.join(layout_names)}"
     )
     print(
-        f"Formats: FlagSparse={_route_label(route)}, cuSPARSE=COO dense-mm (when supported), PyTorch=COO."
+        f"Formats: FlagSparse={_route_label(route)}, {vendor_label}=COO dense-mm (when supported), PyTorch=COO."
     )
     print(
         "Timing: FS(ms)=process_cpu_ms+FS_GPU(ms); --timing adds process_gpu_ms/compute_ms split."
@@ -2732,7 +2748,7 @@ def run_comprehensive_synthetic(
         "Atomic has no current execution-plan preprocessing; host launch config and input normalization are excluded."
     )
     print(
-        "For float32, PT checks the float64-based correctness reference while CU reflects native cuSPARSE float32 consistency."
+        f"For float32, PT checks the float64-based correctness reference while {vendor_short} reflects native vendor float32 consistency."
     )
     if route == "compare":
         print(
@@ -2755,7 +2771,7 @@ def run_comprehensive_synthetic(
             print(
                 f"{'Op':>5} {'Lay':>4} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10} {'DenseN':>8} {'BN':>4} {'BNNZ':>6} {'Runs':>5} {'Tiles':>5} "
                 f"{'FS(ms)':>9} {'FS_GPU':>9} {'CPUProc':>9} {split_header}"
-                f"{'PyTorch':>9} {'cuSPARSE':>9} {'FS/PT':>8} {'FS/CU':>8} {'PT':>6} {'CU':>6} {'Err(FS)':>11} {'Err(CU)':>12}"
+                f"{'PyTorch':>9} {vendor_short:>9} {'FS/PT':>8} {('FS/' + vendor_short):>8} {'PT':>6} {vendor_short:>6} {'Err(FS)':>11} {('Err(' + vendor_short + ')'):>12}"
             )
             print("-" * width)
             combo_reason = None
@@ -2858,7 +2874,7 @@ def run_comprehensive_synthetic(
                             )
             print("-" * width)
             if combo_reason:
-                print(f"  cuSPARSE: {combo_reason}")
+                print(f"  {vendor_label}: {combo_reason}")
             print()
             if route == "compare":
                 _print_synthetic_compare_results(compare_rows)
@@ -2974,7 +2990,15 @@ def main():
     parser.add_argument("--warmup", type=int, default=10, help="Warmup runs")
     parser.add_argument("--iters", type=int, default=50, help="Timing iterations")
     parser.add_argument(
-        "--no-cusparse", action="store_true", help="Skip cuSPARSE baseline"
+        "--no-cusparse",
+        action="store_true",
+        help="Skip vendor sparse baseline (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--skip-api-checks",
@@ -2996,7 +3020,7 @@ def main():
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
 
     dtype_map = {
@@ -3101,6 +3125,19 @@ def main():
     print("=" * 140)
     print("FLAGSPARSE COO SpMM - SuiteSparse .mtx batch (error + performance)")
     print("=" * 140)
+    vendor_backend, vendor_reason = ast_ops._spmm_coo_sparse_ref_backend(
+        value_dtype, index_dtype
+    )
+    for line in fs_common._backend_summary_lines(
+        op_name="SpMM COO",
+        native_format="COO",
+        correctness_ref="PyTorch COO",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=not args.no_cusparse,
+    ):
+        print(line)
+    vendor_short = fs_common._expected_vendor_sparse_short()
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  dense_cols: {args.dense_cols}  "
@@ -3159,7 +3196,8 @@ def main():
                     print(
                         f"{row['matrix']:<32} {row['alg']:<16} {row['status']:<5} "
                         f"ms={_fmt_ms(row['ms'])} gpu={_fmt_ms(row['gpu_ms'])} "
-                        f"torch={_fmt_ms(row['torch_ms'])} err={_fmt_err(row['err_vs_torch'])} "
+                        f"torch={_fmt_ms(row['torch_ms'])} {vendor_short.lower()}={_fmt_ms(row['cusparse_ms'])} "
+                        f"err={_fmt_err(row['err_vs_torch'])} err_{vendor_short.lower()}={_fmt_err(row['err_vs_cusparse'])} "
                         f"reason={row.get('reason') or row.get('cusparse_reason') or ''}"
                     )
 

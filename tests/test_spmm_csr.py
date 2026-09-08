@@ -34,6 +34,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spmm_csr as spmm_ops
 
 from test_spmm import (
@@ -60,6 +61,7 @@ DEFAULT_RUN_DTYPE_NAMES = ("float32", "float64")
 DEFAULT_INDEX_DTYPE_NAMES = ("int32", "int64")
 DEFAULT_OP_NAMES = tuple(spmm_ops.SPMM_OP_NAMES.values())
 CUSPARSE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+TLE_CSR_SPMM_ALGORITHMS = {"alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"}
 MAIN_CSR_SPMM_ALGORITHMS = {
     "csr_base",
     "csr_base_accuracy",
@@ -275,7 +277,7 @@ def _parse_algs(value):
     return names
 
 
-def _expand_algs(alg_names, op, dtype):
+def _expand_algs(alg_names, op, dtype, exclude_tle=False):
     expanded = []
     for alg in alg_names:
         if alg == "all":
@@ -284,11 +286,56 @@ def _expand_algs(alg_names, op, dtype):
             expanded.append("auto")
         else:
             expanded.append(alg)
+    if exclude_tle:
+        expanded = [
+            alg
+            for alg in expanded
+            if alg not in TLE_CSR_SPMM_ALGORITHMS
+            and fs.resolve_spmm_csr_algorithm(alg, op, dtype).name
+            not in TLE_CSR_SPMM_ALGORITHMS
+        ]
     deduped = []
     for alg in expanded:
         if alg not in deduped:
             deduped.append(alg)
     return deduped
+
+
+def _selected_tle_algs(alg_names):
+    selected = set()
+    for alg in alg_names:
+        if alg == "all":
+            selected.update(("alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"))
+        elif alg in ("alpha_alg1_tle_opt", "alpha_alg1_tle_opt2"):
+            selected.add(alg)
+    return tuple(
+        name
+        for name in ("alpha_alg1_tle_opt", "alpha_alg1_tle_opt2")
+        if name in selected
+    )
+
+
+def _print_tle_availability(alg_names):
+    selected = _selected_tle_algs(alg_names)
+    if not selected:
+        return
+    checks = {
+        "alpha_alg1_tle_opt": (
+            fs.is_alpha_spmm_alg1_tle_opt_available,
+            fs.alpha_spmm_alg1_tle_opt_unavailable_reason,
+        ),
+        "alpha_alg1_tle_opt2": (
+            fs.is_alpha_spmm_alg1_tle_opt2_available,
+            fs.alpha_spmm_alg1_tle_opt2_unavailable_reason,
+        ),
+    }
+    print("TLE runtime availability:")
+    for name in selected:
+        available_fn, reason_fn = checks[name]
+        available = bool(available_fn())
+        print(f"{name}: {'available' if available else 'unavailable'}")
+        if not available:
+            print(f"  reason: {reason_fn()}")
 
 
 def _cuda_event_benchmark(op, warmup, iters):
@@ -415,9 +462,57 @@ def _skip_row(
     return row
 
 
-def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="row"):
+def _vendor_label():
+    return fs_common._expected_vendor_sparse_label()
+
+
+def _vendor_column_label():
+    return fs_common._expected_vendor_sparse_short().lower()
+
+
+def _time_vendor_sparse_ref(
+    data, indices, indptr, shape, B, op, warmup, iters, layout="row"
+):
+    vendor = fs_common._expected_vendor_sparse_backend()
+    if vendor == "hipsparse":
+        try:
+            sparse_ref = spmm_ops._benchmark_spmm_csr_sparse_ref(
+                data,
+                indices,
+                indptr,
+                B,
+                shape,
+                warmup=warmup,
+                iters=iters,
+                op=op,
+                dense_layout=layout,
+            )
+        except Exception as exc:
+            return None, None, str(exc)
+        if sparse_ref["backend"] is None:
+            return None, None, sparse_ref["reason"]
+        return sparse_ref["values"], sparse_ref["ms"], None
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            None,
+            f"{fs_common._sparse_backend_label(vendor)} CSR SpMM baseline is not wired for this runner",
+        )
+
     if data.dtype not in CUSPARSE_DTYPES:
         return None, None, "dtype not supported by CuPy/cuSPARSE reference"
+    if op != "non":
+        return (
+            None,
+            None,
+            f"CuPy/cuSPARSE CSR SpMM baseline supports op=non only in this runner; op={op} is unsupported",
+        )
+    if layout != "row":
+        return (
+            None,
+            None,
+            f"CuPy/cuSPARSE CSR SpMM baseline supports row-major dense RHS only in this runner; layout={layout} is unsupported",
+        )
     try:
         import cupy as cp
         import cupyx.scipy.sparse as cpx_sparse
@@ -431,17 +526,7 @@ def _time_cusparse(data, indices, indptr, shape, B, op, warmup, iters, layout="r
         indptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
         B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
         A = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-        if op == "trans":
-            A = A.transpose().tocsr()
-        elif op == "conj":
-            A = A.transpose().conj().tocsr()
-        try:
-            out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
-        except Exception:
-            if layout != "col":
-                raise
-            B_cp = cp.asfortranarray(B_cp)
-            out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
+        out_cp, ms = _cupy_event_benchmark(lambda: A @ B_cp, warmup, iters)
         out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
         return out, ms, None
     except Exception as exc:
@@ -462,6 +547,7 @@ def run_one_case(
     run_cusparse,
     timing,
     diagnose,
+    exclude_tle=False,
 ):
     device = torch.device("cuda")
     data, indices, indptr, shape = load_mtx_to_csr_torch(
@@ -484,7 +570,7 @@ def run_one_case(
     cusparse_ms = None
     cusparse_reason = ""
     if run_cusparse:
-        cusparse_out, cusparse_ms, cusparse_reason = _time_cusparse(
+        cusparse_out, cusparse_ms, cusparse_reason = _time_vendor_sparse_ref(
             data, indices, indptr, shape, B, op, warmup, iters, layout=layout
         )
 
@@ -493,7 +579,7 @@ def run_one_case(
     prepared = fs.prepare_spmm_csr_route(
         data, indices, indptr, shape, op=op, alg="auto"
     )
-    for alg in _expand_algs(alg_names, op, dtype):
+    for alg in _expand_algs(alg_names, op, dtype, exclude_tle=exclude_tle):
         try:
             resolved = fs.resolve_spmm_csr_algorithm(alg, op, dtype)
             if layout == "col" and resolved.name not in MAIN_CSR_SPMM_ALGORITHMS:
@@ -527,7 +613,7 @@ def run_one_case(
                 diagnose=diagnose,
                 layout=layout,
             )
-        except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError) as exc:
+        except (fs.SpmmCsrAlgorithmUnavailable, ValueError, TypeError, RuntimeError) as exc:
             rows.append(
                 _skip_row(
                     path,
@@ -542,7 +628,7 @@ def run_one_case(
                     b_stride,
                     torch_ms,
                     cusparse_ms,
-                    str(exc),
+                    f"{type(exc).__name__}: {exc}",
                     timing,
                     cusparse_reason=cusparse_reason,
                 )
@@ -675,10 +761,23 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", default=None, help="Performance CSV path")
     parser.add_argument(
-        "--no-cusparse", action="store_true", help="Disable cuSPARSE reference"
+        "--no-cusparse",
+        action="store_true",
+        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--timing", action="store_true", help="Add process_gpu_ms/compute_ms columns"
+    )
+    parser.add_argument(
+        "--exclude-tle",
+        action="store_true",
+        help="Exclude alpha_alg1_tle_opt and alpha_alg1_tle_opt2 from --alg sweeps",
     )
     parser.add_argument(
         "--diagnose", action="store_true", help="Write separate diagnose metadata CSV"
@@ -686,7 +785,7 @@ def main():
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     paths = _resolve_input_paths(args.input)
     if not paths:
@@ -715,10 +814,33 @@ def main():
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
     diag_rows = []
+    if args.exclude_tle:
+        print("TLE runtime availability: skipped by --exclude-tle")
+    else:
+        _print_tle_availability(alg_names)
+    vendor_label = _vendor_label()
+    vendor_column = _vendor_column_label()
+    first_dtype = DTYPE_MAP[dtype_names[0]]
+    first_index_dtype = INDEX_DTYPE_MAP[index_dtype_names[0]]
+    vendor_backend, vendor_reason = spmm_ops._spmm_csr_sparse_ref_backend(
+        first_dtype, first_index_dtype, first_index_dtype
+    )
+    for line in fs_common._backend_summary_lines(
+        op_name="SpMM CSR",
+        native_format="CSR",
+        correctness_ref="PyTorch CSR/COO",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=not args.no_cusparse,
+    ):
+        print(line)
+    print(
+        f"Vendor sparse baseline: {vendor_label}; unsupported combinations are reported as N/A with reason."
+    )
     print(
         f"{'Matrix':<28} {'DType':<10} {'Idx':<5} {'Op':<5} {'Lay':<4} {'Alg':<10} "
-        f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {'cu':>9} "
-        f"{'PT/Alg':>9} {'CU/Alg':>9} {'ErrPT':>10} {'Status':>6}"
+        f"{'ms':>9} {'gpu_ms':>9} {'cpu_ms':>9} {'torch':>9} {vendor_column:>9} "
+        f"{'PT/Alg':>9} {'V/Alg':>9} {'ErrPT':>10} {'Status':>6}"
     )
     for dtype_name in dtype_names:
         dtype = DTYPE_MAP[dtype_name]
@@ -742,6 +864,7 @@ def main():
                                 not args.no_cusparse,
                                 args.timing,
                                 args.diagnose,
+                                exclude_tle=args.exclude_tle,
                             )
                             rows.extend(case_rows)
                             diag_rows.extend(case_diag)
