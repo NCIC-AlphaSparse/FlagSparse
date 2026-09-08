@@ -87,7 +87,9 @@ def test_spsv_rocm_alg_updates_are_present_but_backend_scoped():
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ", "256"' in SPSV_SOURCE
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_WORKGROUPS_PER_CU", "4"' in SPSV_SOURCE
 
-    normalize = _function_source(SPSV_TREE, SPSV_SOURCE, "_normalize_requested_spsv_route")
+    normalize = _function_source(
+        SPSV_TREE, SPSV_SOURCE, "_normalize_requested_spsv_route"
+    )
     assert '"alg3": "csr_nnz_balance" if is_rocm else "csr_roc"' in normalize
     assert "CUDA-only route" in normalize
 
@@ -118,8 +120,12 @@ def test_spsv_preserves_update_non_rocm_profiles_and_public_sell_api():
 
 
 def test_spsv_spsm_vendor_selectors_use_common_backend_policy():
-    spsv_selector = _function_source(SPSV_TREE, SPSV_SOURCE, "_spsv_csr_sparse_ref_backend")
-    spsm_selector = _function_source(SPSM_TREE, SPSM_SOURCE, "_spsm_csr_sparse_ref_backend")
+    spsv_selector = _function_source(
+        SPSV_TREE, SPSV_SOURCE, "_spsv_csr_sparse_ref_backend"
+    )
+    spsm_selector = _function_source(
+        SPSM_TREE, SPSM_SOURCE, "_spsm_csr_sparse_ref_backend"
+    )
     for selector in (spsv_selector, spsm_selector):
         assert "_vendor_sparse_library()" in selector
         assert "vendor == \"hipsparse\"" in selector
@@ -128,5 +134,11 @@ def test_spsv_spsm_vendor_selectors_use_common_backend_policy():
     assert "def _expected_vendor_sparse_backend" in COMMON_SOURCE
     assert "_expected_vendor_sparse_backend" in SPSV_BENCHMARK_SOURCE
     assert "_expected_vendor_sparse_backend" in SPSM_BENCHMARK_SOURCE
-    assert "fs_spsv_impl._is_rocm_runtime() else \"cuSPARSE\"" not in SPSV_BENCHMARK_SOURCE
-    assert "fs_spsm_impl._is_rocm_runtime() else \"cuSPARSE\"" not in SPSM_BENCHMARK_SOURCE
+    assert (
+        "fs_spsv_impl._is_rocm_runtime() else \"cuSPARSE\""
+        not in SPSV_BENCHMARK_SOURCE
+    )
+    assert (
+        "fs_spsm_impl._is_rocm_runtime() else \"cuSPARSE\""
+        not in SPSM_BENCHMARK_SOURCE
+    )
