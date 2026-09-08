@@ -535,8 +535,9 @@ def prepare_spmm_csc_route(
     # Per-nonzero owning column for the nnz-parallel op="non" kernel.  Structural, so it
     # is built once here rather than searched per launch (the SDDMM path measured the
     # inlined-search alternative a net loss).
+    # Needed by both the op="non" nnz-parallel kernel and the gated trans one.
     col_ids = None
-    if int(data.numel()) > 0 and not _spmm_csc_op_transposes(op_code):
+    if int(data.numel()) > 0:
         try:
             from .sddmm_csr import _build_row_ids
 
@@ -697,6 +698,7 @@ def _spmm_csc_trans_real_folded_kernel(
     stride_cn,
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
 ):
     """trans/conj with the segment loop folded in, and the atomics gone with it.
 
@@ -725,7 +727,7 @@ def _spmm_csc_trans_real_folded_kernel(
     mask_n = offs_n < n_dense_cols
     start = tl.load(indptr_ptr + col)
     end = tl.load(indptr_ptr + col + 1)
-    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
     for s in tl.range(0, tl.cdiv(end - start, BLOCK_NNZ)):
         offs = start + s * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
         mask = offs < end
@@ -736,7 +738,7 @@ def _spmm_csc_trans_real_folded_kernel(
             mask=mask[:, None] & mask_n[None, :],
             other=0.0,
         )
-        acc += tl.sum(vals[:, None] * b_vals, axis=0)
+        acc += tl.sum(vals[:, None] * b_vals, axis=0).to(ACC_DTYPE)
     tl.store(c_ptr + col * stride_ck + offs_n * stride_cn, acc, mask=mask_n)
 
 
@@ -758,6 +760,7 @@ def _spmm_csc_trans_complex_folded_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     CONJ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
 ):
     """Complex counterpart of :func:`_spmm_csc_trans_real_folded_kernel`."""
     col = tl.program_id(0)
@@ -768,8 +771,8 @@ def _spmm_csc_trans_complex_folded_kernel(
     mask_n = offs_n < n_dense_cols
     start = tl.load(indptr_ptr + col)
     end = tl.load(indptr_ptr + col + 1)
-    acc_re = tl.zeros([BLOCK_N], dtype=tl.float32)
-    acc_im = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc_re = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+    acc_im = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
     for s in tl.range(0, tl.cdiv(end - start, BLOCK_NNZ)):
         offs = start + s * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
         mask = offs < end
@@ -783,8 +786,8 @@ def _spmm_csc_trans_complex_folded_kernel(
         base = b_ri_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn
         b_re = tl.load(base, mask=m2, other=0.0)
         b_im = tl.load(base + stride_br, mask=m2, other=0.0)
-        acc_re += tl.sum(a_re[:, None] * b_re - a_im[:, None] * b_im, axis=0)
-        acc_im += tl.sum(a_re[:, None] * b_im + a_im[:, None] * b_re, axis=0)
+        acc_re += tl.sum(a_re[:, None] * b_re - a_im[:, None] * b_im, axis=0).to(ACC_DTYPE)
+        acc_im += tl.sum(a_re[:, None] * b_im + a_im[:, None] * b_re, axis=0).to(ACC_DTYPE)
     out = c_ri_ptr + col * stride_ck + offs_n * stride_cn
     tl.store(out, acc_re, mask=mask_n)
     tl.store(out + stride_cr, acc_im, mask=mask_n)
@@ -907,6 +910,182 @@ def _spmm_csc_non_complex_nnzpar_kernel(
     )
 
 
+SPMM_CSC_TRANS_COLS_PER_BLOCK = 8
+SPMM_CSC_TRANS_MERGE_MEAN_MAX = 64.0
+
+
+@triton.jit
+def _spmm_csc_trans_real_multicol_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_cols,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_ck,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    COLS_PER_BLOCK: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    """trans/conj handling several columns per program, for short-column matrices.
+
+    The folded kernel still launches one program per column, so a matrix with a million
+    columns of five nonzeros each launches a million programs that each do almost
+    nothing.  This walks COLS_PER_BLOCK columns per program, keeping the zero-atomic
+    structure (each column is still owned outright and written with ``tl.store``).
+
+    Two alternatives were measured over the 30-matrix corpus (fp32, op=trans) and
+    rejected: parallelising over nonzeros with atomics is **1.099x geomean but slower on
+    16 of 30 matrices, worst 0.17x** -- it reintroduces the atomics this kernel does not
+    have -- and merging columns unconditionally is 1.121x but regresses TSOPF_FS_b300_c1
+    to 0.59x and c8_mat11 to 0.91x.  Merging only helps while a single column is too
+    small to fill a program, so it is gated on mean column length:
+    ``mean < 64`` with 8 columns per program scores **1.1257x geomean, no matrix below
+    0.98x**, which is 97% of the per-matrix oracle (1.1609x).
+    """
+    base = tl.program_id(0) * COLS_PER_BLOCK
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    for c in tl.static_range(0, COLS_PER_BLOCK):
+        col = base + c
+        if col < n_cols:
+            start = tl.load(indptr_ptr + col)
+            end = tl.load(indptr_ptr + col + 1)
+            acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
+            for s in tl.range(0, tl.cdiv(end - start, BLOCK_NNZ)):
+                offs = start + s * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+                mask = offs < end
+                rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+                vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
+                b_vals = tl.load(
+                    b_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+                    mask=mask[:, None] & mask_n[None, :],
+                    other=0.0,
+                )
+                acc += tl.sum(vals[:, None] * b_vals, axis=0).to(ACC_DTYPE)
+            tl.store(c_ptr + col * stride_ck + offs_n * stride_cn, acc, mask=mask_n)
+
+
+# Per-dtype gate for the nnz-parallel trans path.  None disables it entirely.
+SPMM_CSC_TRANS_NNZPAR = {
+    torch.float32: (12.0, 64),
+    torch.float64: (12.0, 64),
+    torch.complex128: (128.0, 32),
+    torch.complex64: None,
+}
+
+
+@triton.jit
+def _spmm_csc_trans_real_nnzpar_kernel(
+    data_ptr,
+    indices_ptr,
+    col_ids_ptr,
+    b_ptr,
+    c_ptr,
+    nnz,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_ck,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    """trans/conj parallelised over nonzeros, for matrices whose columns are too short.
+
+    The column-parallel kernels above give one program per column, which collapses on
+    short-column matrices: wiki-Talk has 2.4M columns averaging 2.1 nonzeros, and an
+    ablation measured its effective gather bandwidth at **0.8% of peak** there.  Shrinking
+    the B working set from 1226 MB to 0.1 MB changed nothing (1.00x), so that is a
+    load-balance problem, not a locality one.
+
+    This trades the column-parallel kernel's zero atomics for one atomic per nonzero, so
+    it only pays where columns are short.  The gate is per dtype because the crossover is
+    **not** transferable -- measured over the 30-matrix corpus, op=trans:
+
+      float32     mean < 12,  BLOCK_NNZ=64  -> 1.549x geomean, worst 1.03x
+      float64     mean < 12,  BLOCK_NNZ=64  -> 1.613x geomean, worst 0.99x
+      complex128  mean < 128, BLOCK_NNZ=32  -> 2.485x geomean, worst 1.00x
+      complex64   disabled
+
+    complex64 is excluded on purpose: its speedup does not correlate with mean column
+    length at all (roadNet-TX 0.76x, wheel_601 0.64x and ASIC_680ks 4.57x all sit near
+    mean 3), so every threshold drags in a regression -- CurlCurl_1 falls to 0.30x.
+    """
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs = pid_k.to(tl.int64) * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ).to(tl.int64)
+    mask = offs < nnz
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    m2 = mask[:, None] & mask_n[None, :]
+    rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+    cols = tl.load(col_ids_ptr + offs, mask=mask, other=0)
+    vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
+    b_vals = tl.load(
+        b_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn, mask=m2, other=0.0
+    )
+    tl.atomic_add(
+        c_ptr + cols[:, None] * stride_ck + offs_n[None, :] * stride_cn,
+        vals[:, None] * b_vals,
+        mask=m2,
+    )
+
+
+@triton.jit
+def _spmm_csc_trans_complex_nnzpar_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    col_ids_ptr,
+    b_ri_ptr,
+    c_ri_ptr,
+    nnz,
+    n_dense_cols,
+    stride_bm,
+    stride_bn,
+    stride_br,
+    stride_ck,
+    stride_cn,
+    stride_cr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    CONJ: tl.constexpr,
+):
+    """Complex counterpart; real and imaginary parts go out in one 3-D atomic."""
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs = pid_k.to(tl.int64) * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ).to(tl.int64)
+    mask = offs < nnz
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    m2 = mask[:, None] & mask_n[None, :]
+    rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+    cols = tl.load(col_ids_ptr + offs, mask=mask, other=0)
+    a_re = tl.load(data_ri_ptr + offs * 2, mask=mask, other=0.0)
+    a_im_raw = tl.load(data_ri_ptr + offs * 2 + 1, mask=mask, other=0.0)
+    a_im = -a_im_raw if CONJ else a_im_raw
+    base_b = b_ri_ptr + rows[:, None] * stride_bm + offs_n[None, :] * stride_bn
+    b_re = tl.load(base_b, mask=m2, other=0.0)
+    b_im = tl.load(base_b + stride_br, mask=m2, other=0.0)
+    ri = tl.arange(0, 2)[None, None, :]
+    pre = a_re[:, None] * b_re - a_im[:, None] * b_im
+    pim = a_re[:, None] * b_im + a_im[:, None] * b_re
+    tl.atomic_add(
+        c_ri_ptr
+        + cols[:, None, None] * stride_ck
+        + offs_n[None, :, None] * stride_cn
+        + ri * stride_cr,
+        tl.where(ri == 0, pre[:, :, None], pim[:, :, None]),
+        mask=m2[:, :, None],
+    )
+
+
 def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
     op_code = _normalize_spmm_csc_op(prepared.op if op_code is None else op_code)
     transposes = _spmm_csc_op_transposes(op_code)
@@ -979,6 +1158,90 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
             BLOCK_NNZ=SPMM_CSC_NNZPAR_BLOCK,
         )
         return C
+    # Short-column trans/conj: parallelise over nonzeros.  Gated per dtype because the
+    # crossover does not transfer between them; see _spmm_csc_trans_real_nnzpar_kernel.
+    _gate = SPMM_CSC_TRANS_NNZPAR.get(dtype)
+    col_ids = getattr(prepared, "col_ids", None)
+    if (
+        transposes
+        and _gate is not None
+        and col_ids is not None
+        and prepared.n_cols > 0
+        and (int(prepared.nnz) / prepared.n_cols) < _gate[0]
+    ):
+        bnz = _gate[1]
+        grid_nnz = (
+            triton.cdiv(int(prepared.nnz), bnz),
+            triton.cdiv(n_dense_cols, block_n),
+        )
+        if _is_complex_dtype(dtype):
+            data_ri = torch.view_as_real(prepared.data).reshape(-1)
+            B_ri = torch.view_as_real(B)
+            C_ri = torch.view_as_real(C)
+            _spmm_csc_trans_complex_nnzpar_kernel[grid_nnz](
+                data_ri,
+                prepared.kernel_indices,
+                col_ids,
+                B_ri,
+                C_ri,
+                int(prepared.nnz),
+                n_dense_cols,
+                B_ri.stride(0),
+                B_ri.stride(1),
+                B_ri.stride(2),
+                C_ri.stride(0),
+                C_ri.stride(1),
+                C_ri.stride(2),
+                BLOCK_N=block_n,
+                BLOCK_NNZ=bnz,
+                CONJ=op_code == SPMM_CSC_OP_CONJ_TRANS,
+            )
+            return C
+        _spmm_csc_trans_real_nnzpar_kernel[grid_nnz](
+            prepared.data,
+            prepared.kernel_indices,
+            col_ids,
+            B,
+            C,
+            int(prepared.nnz),
+            n_dense_cols,
+            B.stride(0),
+            B.stride(1),
+            C.stride(0),
+            C.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_NNZ=bnz,
+        )
+        return C
+    # Short-column trans/conj: several columns per program.  Real dtypes only -- the
+    # complex path was not measured for this and merging is gated on measurement here.
+    if (
+        transposes
+        and not _is_complex_dtype(dtype)
+        and prepared.n_cols > 0
+        and (int(prepared.nnz) / prepared.n_cols) < SPMM_CSC_TRANS_MERGE_MEAN_MAX
+    ):
+        cpb = SPMM_CSC_TRANS_COLS_PER_BLOCK
+        _spmm_csc_trans_real_multicol_kernel[
+            (triton.cdiv(prepared.n_cols, cpb), triton.cdiv(n_dense_cols, block_n))
+        ](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            C,
+            prepared.n_cols,
+            n_dense_cols,
+            B.stride(0),
+            B.stride(1),
+            C.stride(0),
+            C.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_NNZ=prepared.block_nnz,
+            COLS_PER_BLOCK=cpb,
+            ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
+        )
+        return C
     if prepared.max_segments > 1 and transposes:
         conj = op_code == SPMM_CSC_OP_CONJ_TRANS
         if _is_complex_dtype(dtype):
@@ -1002,6 +1265,7 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
                 BLOCK_N=block_n,
                 BLOCK_NNZ=prepared.block_nnz,
                 CONJ=conj,
+                ACC_DTYPE=tl.float64 if dtype == torch.complex128 else tl.float32,
             )
             return C
         _spmm_csc_trans_real_folded_kernel[grid](
@@ -1018,6 +1282,7 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
             C.stride(1),
             BLOCK_N=block_n,
             BLOCK_NNZ=prepared.block_nnz,
+            ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
         )
         return C
     if prepared.max_segments > 1 and not transposes:
