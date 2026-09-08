@@ -317,11 +317,12 @@ def _status(ok):
 
 
 def _header(timing=False):
+    vendor_short = ast_ops._expected_vendor_sparse_short()
     split = f" {'ProcGPU':>9} {'Compute':>9}" if timing else ""
     return (
         f"{'Matrix':<28} {'Op':>5} {'Out':>7} {'N_rows':>7} {'N_cols':>7} {'NNZ':>10}  "
         f"{'CSC(ms)':>9} {'CSCGPU':>9} {'CPUProc':>9}{split} "
-        f"{'PT(ms)':>9} {'CU(ms)':>9}  {'CSC/PT':>8} {'CSC/CU':>8} "
+        f"{'PT(ms)':>9} {(vendor_short + '(ms)'):>9}  {'CSC/PT':>8} {('CSC/' + vendor_short):>8} "
         f"{'Err':>10} {'Status':>6}"
     )
 
@@ -461,7 +462,7 @@ def run_synthetic(
     run_cusparse=True,
 ):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     device = torch.device("cuda")
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
@@ -519,7 +520,7 @@ def run_csv(
     fail_fast=False,
 ):
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        print("A CUDA/ROCm PyTorch device is not available.")
         return
     device = torch.device("cuda")
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
@@ -633,7 +634,17 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
     try:

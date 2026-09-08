@@ -102,6 +102,16 @@ def _transpose_arg(op_mode):
     return op_mode
 
 
+def _skip_removed_rocm_route(solve_kind):
+    if fs_spsv_impl._is_rocm_runtime() and solve_kind in {
+        "csr_roc",
+        "csr_smblk",
+        "alg4",
+        "alg8",
+    }:
+        pytest.skip(f"{solve_kind} is a CUDA-only SpSV route")
+
+
 def _dense_ref_spsv(A, b, *, lower, op_mode="NON", unit_diagonal=False):
     A_eff = _apply_ref_op(A, op_mode)
     x = torch.linalg.solve_triangular(
@@ -335,7 +345,8 @@ def test_spsv_csr_complex_non_trans_defaults_to_smblk_route():
         data, indices, indptr, b, (n, n), True, False, False
     )
     selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
-    assert selected["solve_kind"] == "csr_smblk"
+    expected = "csr_nnz_balance" if fs_spsv_impl._is_rocm_runtime() else "csr_smblk"
+    assert selected["solve_kind"] == expected
 
 
 @pytest.mark.spsv
@@ -354,7 +365,8 @@ def test_spsv_csr_complex_upper_non_trans_defaults_to_smblk_route():
         data, indices, indptr, b, (n, n), False, False, False
     )
     selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
-    assert selected["solve_kind"] == "csr_smblk"
+    expected = "csr_cw" if fs_spsv_impl._is_rocm_runtime() else "csr_smblk"
+    assert selected["solve_kind"] == expected
 
 
 @pytest.mark.spsv
@@ -407,7 +419,8 @@ def test_spsv_auto_route_promotes_dense_real_lower_to_nnz_balance():
         unit_diagonal=False,
         value_dtype=torch.float64,
     )
-    assert route == "csr_smblk"
+    expected = "csr_nnz_balance" if fs_spsv_impl._is_rocm_runtime() else "csr_smblk"
+    assert route == expected
 
 
 @pytest.mark.spsv
@@ -427,7 +440,8 @@ def test_spsv_auto_route_promotes_dense_real_upper_to_nnz_balance():
         unit_diagonal=False,
         value_dtype=torch.float64,
     )
-    assert route == "csr_smblk"
+    expected = "csr_cw" if fs_spsv_impl._is_rocm_runtime() else "csr_smblk"
+    assert route == expected
 
 
 @pytest.mark.spsv
@@ -540,7 +554,8 @@ def test_spsv_auto_route_promotes_wide_frontier_real_lower_to_levelschd():
         unit_diagonal=False,
         value_dtype=torch.float32,
     )
-    assert route == "csr_smblk"
+    expected = "csr_nnz_balance" if fs_spsv_impl._is_rocm_runtime() else "csr_smblk"
+    assert route == expected
 
 
 @pytest.mark.spsv
@@ -560,7 +575,8 @@ def test_spsv_auto_route_promotes_wide_frontier_real_upper_to_levelschd():
         unit_diagonal=False,
         value_dtype=torch.float32,
     )
-    assert route == "csr_smblk"
+    expected = "csr_cw" if fs_spsv_impl._is_rocm_runtime() else "csr_smblk"
+    assert route == expected
 
 
 @pytest.mark.spsv
@@ -641,6 +657,7 @@ def test_spsv_csr_transpose_public_solve_uses_transpose_kernel(monkeypatch, op_m
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_roc_route_matches_dense():
+    _skip_removed_rocm_route("csr_roc")
     device = torch.device("cuda")
     dtype = torch.float64
     n = 64
@@ -667,6 +684,7 @@ def test_spsv_csr_explicit_roc_route_matches_dense():
 @pytest.mark.parametrize("dtype", SUPPORTED_COMPLEX_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("solve_kind", ["csr_roc", "csr_cw_levelschd", "alg2"])
 def test_spsv_csr_explicit_complex_level_routes_match_dense(dtype, solve_kind):
+    _skip_removed_rocm_route(solve_kind)
     device = torch.device("cuda")
     n = 64
     A = _build_triangular(n, dtype, device, lower=True)
@@ -715,6 +733,7 @@ def test_spsv_csr_explicit_complex_nnz_balance_routes_match_dense(dtype, solve_k
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_roc_analysis_builds_only_level_metadata():
+    _skip_removed_rocm_route("csr_roc")
     device = torch.device("cuda")
     dtype = torch.float64
     n = 64
@@ -732,8 +751,8 @@ def test_spsv_csr_explicit_roc_analysis_builds_only_level_metadata():
     )
     assert descr.solve_kind == "csr_roc"
     assert int(descr.solve_plan["level_row_map32"].numel()) == n
-    assert int(descr.solve_plan["nnz_balance_row_idx32"].numel()) == 0
-    assert int(descr.solve_plan["nnz_balance_indegree32"].numel()) == 0
+    assert "nnz_balance_row_idx32" not in descr.solve_plan
+    assert "nnz_balance_indegree32" not in descr.solve_plan
 
 
 @pytest.mark.spsv
@@ -779,8 +798,8 @@ def test_spsv_csr_explicit_levelschd_analysis_builds_only_level_metadata():
     )
     assert descr.solve_kind == "csr_cw_levelschd"
     assert int(descr.solve_plan["level_row_map32"].numel()) == n
-    assert int(descr.solve_plan["nnz_balance_row_idx32"].numel()) == 0
-    assert int(descr.solve_plan["nnz_balance_indegree32"].numel()) == 0
+    assert "nnz_balance_row_idx32" not in descr.solve_plan
+    assert "nnz_balance_indegree32" not in descr.solve_plan
 
 
 @pytest.mark.spsv
@@ -809,7 +828,7 @@ def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
 
 
 @pytest.mark.spsv
-def test_spsv_csr_explicit_nnz_balance_analysis_builds_only_nnz_metadata():
+def test_spsv_csr_explicit_nnz_balance_analysis_builds_backend_metadata():
     device = torch.device("cuda")
     dtype = torch.float64
     n = 96
@@ -827,7 +846,7 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_only_nnz_metadata():
         solve_kind="csr_nnz_balance",
     )
     assert descr.solve_kind == "csr_nnz_balance"
-    assert int(descr.solve_plan["level_row_map32"].numel()) == 0
+    assert "level_row_map32" not in descr.solve_plan
     assert int(descr.solve_plan["nnz_balance_row_idx32"].numel()) == int(
         Asp.values().numel()
     )
@@ -841,6 +860,8 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_only_nnz_metadata():
     ["csr_roc", "csr_smblk", "csr_cw_levelschd", "csr_nnz_balance"],
 )
 def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind):
+    if fs_spsv_impl._is_rocm_runtime():
+        pytest.skip("DCU advanced SpSV routes currently target lower NON_TRANS")
     device = torch.device("cuda")
     n = 96 if solve_kind == "csr_nnz_balance" else 64
     A = _build_triangular(n, dtype, device, lower=False)
@@ -868,6 +889,8 @@ def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind)
     ["csr_roc", "csr_smblk", "csr_cw_levelschd", "csr_nnz_balance"],
 )
 def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_kind):
+    if fs_spsv_impl._is_rocm_runtime():
+        pytest.skip("DCU advanced SpSV routes currently target lower NON_TRANS")
     device = torch.device("cuda")
     dtype = torch.float64
     n = 96 if solve_kind == "csr_nnz_balance" else 64
@@ -905,6 +928,7 @@ def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_
 
 @pytest.mark.spsv
 def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
+    _skip_removed_rocm_route("csr_roc")
     device = torch.device("cuda")
     dtype = torch.float64
     n = 64
@@ -947,6 +971,7 @@ def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
 def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(
     dtype, solve_kind
 ):
+    _skip_removed_rocm_route(solve_kind)
     device = torch.device("cuda")
     n = 64
     A = _build_triangular(n, dtype, device, lower=True)
@@ -987,6 +1012,7 @@ def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(
 def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(
     dtype, solve_kind
 ):
+    _skip_removed_rocm_route(solve_kind)
     device = torch.device("cuda")
     n = 64
     A = _build_triangular(n, dtype, device, lower=True)

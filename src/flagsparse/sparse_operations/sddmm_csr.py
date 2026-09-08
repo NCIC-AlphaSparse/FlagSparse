@@ -14,12 +14,311 @@
 
 """CSR SDDMM kernels and helpers."""
 
+import ctypes
 import math
 
 from ._common import *
 
 SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
 SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS = ("baseline", "acc64", "acc64_out64", "altreduce")
+
+
+def _hipsparse_sddmm_csr_skip_reason(value_dtype, index_dtype):
+    if not _is_rocm_runtime():
+        return "hipSPARSE SDDMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseCreateDnMat",
+        "hipsparseDestroyDnMat",
+        "hipsparseDestroySpMat",
+        "hipsparseSDDMM_bufferSize",
+        "hipsparseSDDMM_preprocess",
+        "hipsparseSDDMM",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE binding does not expose {symbol}"
+    try:
+        _hipsparse_value_type(value_dtype)
+        _hipsparse_index_type(index_dtype, "hipSPARSE CSR SDDMM")
+        _hipsparse_spmm_order("row", "hipSPARSE CSR SDDMM")
+        _hipsparse_sddmm_algorithm()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _sddmm_csr_sparse_ref_backend(value_dtype, index_dtype):
+    vendor = _expected_vendor_sparse_backend()
+    if vendor == "hipsparse":
+        reason = _hipsparse_sddmm_csr_skip_reason(value_dtype, index_dtype)
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if vendor == "cupy_cusparse":
+        return "cupy_cusparse", None
+    return (
+        None,
+        f"{_sparse_backend_label(vendor)} CSR SDDMM baseline is not wired for this runner",
+    )
+
+
+def _prepare_sddmm_csr_ref_hipsparse(
+    indices,
+    indptr,
+    shape,
+    x,
+    y,
+    data_in,
+    alpha=1.0,
+    beta=0.0,
+):
+    skip_reason = _hipsparse_sddmm_csr_skip_reason(x.dtype, indices.dtype)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (indices, indptr, x, y, data_in)):
+        raise TypeError("indices, indptr, x, y, data_in must all be torch.Tensor")
+    if not all(_is_accel_tensor(t) for t in (indices, indptr, x, y, data_in)):
+        raise ValueError("indices, indptr, x, y, data_in must all be accelerator tensors")
+    if not all(t.device == indices.device for t in (indptr, x, y, data_in)):
+        raise ValueError("indices, indptr, x, y, data_in must be on the same device")
+    if indices.dtype != indptr.dtype:
+        raise ValueError("hipSPARSE CSR SDDMM requires indices/indptr to share dtype")
+    if x.ndim != 2 or y.ndim != 2:
+        raise ValueError("x and y must be 2D dense matrices")
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if x.shape[0] != n_rows or y.shape[0] != n_cols or x.shape[1] != y.shape[1]:
+        raise ValueError("x/y shapes must match CSR SDDMM shape and K dimension")
+    if data_in.ndim != 1 or data_in.numel() != indices.numel():
+        raise ValueError("data_in must be a 1D tensor with one value per CSR nonzero")
+
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    x = x.contiguous()
+    y = y.contiguous()
+    values = data_in.contiguous().clone() if float(beta) != 0.0 else torch.zeros_like(data_in)
+
+    if values.numel() == 0:
+        return {
+            "backend": "hipsparse",
+            "format": "csr",
+            "buffer_size": 0,
+            "values": values,
+            "empty": True,
+        }
+
+    handle = None
+    spmat = None
+    matx = None
+    maty = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        spmat = ptr_type()
+        matx = ptr_type()
+        maty = ptr_type()
+
+        value_type = _hipsparse_value_type(values.dtype)
+        index_type = _hipsparse_index_type(indices.dtype, "hipSPARSE CSR SDDMM")
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        order = _hipsparse_spmm_order("row", "hipSPARSE CSR SDDMM")
+        op_non = _hipsparse_spmm_operation("non", "hipSPARSE CSR SDDMM")
+        op_trans = _hipsparse_spmm_operation("trans", "hipSPARSE CSR SDDMM")
+        alg = _hipsparse_sddmm_algorithm()
+        alpha_scalar = _hipsparse_scalar(values.dtype, float(alpha), 0.0)
+        beta_scalar = _hipsparse_scalar(values.dtype, float(beta), 0.0)
+        k_dim = int(x.shape[1])
+
+        _hipsparse_create_csr_descriptor(
+            spmat.createRef(),
+            n_rows,
+            n_cols,
+            int(indices.numel()),
+            HipPointer.fromObj(indptr.data_ptr()),
+            HipPointer.fromObj(indices.data_ptr()),
+            HipPointer.fromObj(values.data_ptr()),
+            index_type,
+            index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matx.createRef(),
+            n_rows,
+            k_dim,
+            k_dim,
+            HipPointer.fromObj(x.data_ptr()),
+            value_type,
+            order,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            maty.createRef(),
+            n_cols,
+            k_dim,
+            k_dim,
+            HipPointer.fromObj(y.data_ptr()),
+            value_type,
+            order,
+        )
+
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSDDMM_bufferSize(
+                handle,
+                op_non,
+                op_trans,
+                alpha_scalar,
+                matx,
+                maty,
+                beta_scalar,
+                spmat,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSDDMM_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        _hip_check_result(
+            hipsparse.hipsparseSDDMM_preprocess(
+                handle,
+                op_non,
+                op_trans,
+                alpha_scalar,
+                matx,
+                maty,
+                beta_scalar,
+                spmat,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSDDMM_preprocess",
+        )
+        return {
+            "backend": "hipsparse",
+            "format": "csr",
+            "handle": handle,
+            "spmat": spmat,
+            "matx": matx,
+            "maty": maty,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_a": op_non,
+            "op_b": op_trans,
+            "alpha": alpha_scalar,
+            "beta": beta_scalar,
+            "value_type": value_type,
+            "alg": alg,
+            "values": values,
+            "buffer_size": buffer_size,
+            "empty": False,
+        }
+    except Exception:
+        _destroy_sddmm_csr_ref_hipsparse_prepared(
+            {
+                "handle": handle,
+                "spmat": spmat,
+                "matx": matx,
+                "maty": maty,
+                "workspace": workspace,
+                "workspace_allocated": workspace_allocated,
+            }
+        )
+        raise
+
+
+def _run_sddmm_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["values"]
+    _hip_check_result(
+        hipsparse.hipsparseSDDMM(
+            state["handle"],
+            state["op_a"],
+            state["op_b"],
+            state["alpha"],
+            state["matx"],
+            state["maty"],
+            state["beta"],
+            state["spmat"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSDDMM",
+    )
+    return state["values"]
+
+
+def _destroy_sddmm_csr_ref_hipsparse_prepared(state):
+    for key, destroy_name in (
+        ("maty", "hipsparseDestroyDnMat"),
+        ("matx", "hipsparseDestroyDnMat"),
+        ("spmat", "hipsparseDestroySpMat"),
+    ):
+        obj = state.get(key)
+        if obj is not None:
+            try:
+                _hip_check_result(getattr(hipsparse, destroy_name)(obj), destroy_name)
+            except Exception:
+                pass
+    if state.get("workspace_allocated") and state.get("workspace"):
+        try:
+            _hip_check_result(hip.hipFree(state["workspace"]), "hipFree")
+        except Exception:
+            pass
+    handle = state.get("handle")
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _benchmark_sddmm_csr_sparse_ref(
+    indices,
+    indptr,
+    shape,
+    x,
+    y,
+    data_in,
+    alpha,
+    beta,
+    warmup,
+    iters,
+):
+    backend, reason = _sddmm_csr_sparse_ref_backend(x.dtype, indices.dtype)
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend is None:
+        return result
+    if backend != "hipsparse":
+        result["reason"] = "CUDA cuSPARSE SDDMM baseline is implemented in the benchmark runner"
+        return result
+    values, ms = _benchmark_prepared_cuda_op(
+        lambda: _prepare_sddmm_csr_ref_hipsparse(
+            indices, indptr, shape, x, y, data_in, alpha=alpha, beta=beta
+        ),
+        _run_sddmm_csr_ref_hipsparse_prepared,
+        _destroy_sddmm_csr_ref_hipsparse_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = values
+    result["ms"] = ms
+    result["reason"] = None
+    return result
 
 
 class SDDMMPrepared:

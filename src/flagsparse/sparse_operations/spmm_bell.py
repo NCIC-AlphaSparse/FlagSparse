@@ -14,6 +14,7 @@
 
 """Native Blocked-ELL (BELL) SpMM kernels and route helpers."""
 
+import ctypes
 from dataclasses import dataclass
 
 from ._common import *
@@ -577,6 +578,457 @@ def list_spmm_bell_algorithms(op=None, dtype=None):
             continue
         out.append(name)
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Vendor BELL SpMM reference
+#
+# PyTorch and CuPy do not expose a same-format Blocked-ELL sparse matrix.  ROCm's
+# hipSPARSE generic API does, via hipsparseCreateBlockedEll + hipsparseSpMM.
+# ---------------------------------------------------------------------------
+
+
+def _hipsparse_spmm_bell_skip_reason(value_dtype, index_dtype, op="non", dense_layout="row"):
+    op_name = _spmm_bell_op_to_name(op)
+    if not _is_rocm_runtime():
+        return "hipSPARSE BELL SpMM reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    if op_name != "non":
+        return f"hipSPARSE BELL SpMM covers op=non only; {op_name} skipped"
+    dense_layout = str(dense_layout).strip().lower()
+    if dense_layout not in ("row", "col"):
+        return f"hipSPARSE BELL SpMM dense_layout must be row or col, got {dense_layout!r}"
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateBlockedEll",
+        "hipsparseCreateDnMat",
+        "hipsparseDestroyDnMat",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMM_bufferSize",
+        "hipsparseSpMM_preprocess",
+        "hipsparseSpMM",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE BELL SpMM direct API is unavailable: missing {symbol}"
+    if value_dtype not in SUPPORTED_SPMM_BELL_VALUE_DTYPES:
+        return f"hipSPARSE BELL SpMM has no supported value dtype mapping for {value_dtype}"
+    if index_dtype != torch.int32:
+        return "hipSPARSE BELL SpMM requires int32 Blocked-ELL column indices"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(index_dtype, "hipSPARSE BELL SpMM indices")
+        _ = _hipsparse_spmm_order(dense_layout, "hipSPARSE BELL SpMM")
+        _ = _hipsparse_spmm_algorithm("bell")
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _spmm_bell_sparse_ref_backend(value_dtype, index_dtype, op="non", dense_layout="row"):
+    """Pick the vendor sparse library for a BELL SpMM reference, per backend."""
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
+        reason = _hipsparse_spmm_bell_skip_reason(
+            value_dtype,
+            index_dtype,
+            op=op,
+            dense_layout=dense_layout,
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} BELL SpMM baseline is not wired for this runner",
+        )
+    return (
+        None,
+        "CuPy/cuSPARSE high-level sparse API has no same-format BELL/Blocked-ELL baseline",
+    )
+
+
+def _spmm_bell_dense_layout_name(B):
+    if B.is_contiguous():
+        return "row"
+    if B.ndim == 2 and B.stride(0) == 1:
+        return "col"
+    raise ValueError("B must be contiguous row-major or column-major for hipSPARSE BELL SpMM")
+
+
+def _empty_bell_dense(shape, dtype, device, dense_layout):
+    rows, cols = int(shape[0]), int(shape[1])
+    if dense_layout == "row":
+        return torch.empty((rows, cols), dtype=dtype, device=device)
+    return torch.empty_strided((rows, cols), (1, max(1, rows)), dtype=dtype, device=device)
+
+
+def _zeros_bell_dense(shape, dtype, device, dense_layout):
+    out = _empty_bell_dense(shape, dtype, device, dense_layout)
+    out.zero_()
+    return out
+
+
+def _bell_values_for_hipsparse(data):
+    block_dim = int(data.shape[2])
+    return (
+        data.contiguous()
+        .permute(0, 2, 1, 3)
+        .reshape(int(data.shape[0]) * block_dim, int(data.shape[1]) * block_dim)
+        .contiguous()
+    )
+
+
+def _prepare_spmm_bell_ref_hipsparse(
+    data, indices, B, shape, block_dim=None, out=None, op="non", dense_layout="auto"
+):
+    if dense_layout == "auto":
+        dense_layout = _spmm_bell_dense_layout_name(B)
+    dense_layout = str(dense_layout).strip().lower()
+    skip_reason = _hipsparse_spmm_bell_skip_reason(
+        data.dtype,
+        indices.dtype,
+        op=op,
+        dense_layout=dense_layout,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, B)):
+        raise TypeError("data, indices, B must all be torch.Tensor")
+    if not all(_is_accel_tensor(t) for t in (data, indices, B)):
+        raise ValueError("data, indices, B must all be accelerator tensors")
+    if not all(t.device == data.device for t in (indices, B)):
+        raise ValueError("data, indices, B must be on the same accelerator device")
+    if data.ndim != 4 or indices.ndim != 2:
+        raise ValueError("BELL data must be 4D and indices must be 2D")
+    if B.ndim != 2:
+        raise ValueError("hipSPARSE BELL SpMM reference expects a 2D dense RHS")
+    if B.dtype != data.dtype:
+        raise TypeError("B dtype must match sparse value dtype for direct hipSPARSE BELL SpMM")
+    if indices.dtype != torch.int32:
+        raise RuntimeError("hipSPARSE BELL SpMM requires int32 Blocked-ELL column indices")
+
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if block_dim is None:
+        block_dim = int(data.shape[2])
+    block_dim = int(block_dim)
+    if data.shape[2] != block_dim or data.shape[3] != block_dim:
+        raise ValueError("BELL data must use square blocks matching block_dim")
+    n_block_rows = int(data.shape[0])
+    ell_width_blocks = int(data.shape[1])
+    n_block_cols = (n_cols + block_dim - 1) // block_dim
+    padded_rows = n_block_rows * block_dim
+    padded_cols = n_block_cols * block_dim
+    if indices.shape != (n_block_rows, ell_width_blocks):
+        raise ValueError("BELL indices shape must match data block rows and ELL width")
+    if int(B.shape[0]) != n_cols:
+        raise ValueError(f"B.shape[0] must equal logical n_cols={n_cols}")
+    if dense_layout == "row" and not B.is_contiguous():
+        raise ValueError("hipSPARSE BELL SpMM dense_layout=row expects contiguous row-major B")
+    if dense_layout == "col" and B.stride(0) != 1:
+        raise ValueError("hipSPARSE BELL SpMM dense_layout=col expects column-major dense B")
+
+    n_dense_cols = int(B.shape[1])
+    if n_dense_cols == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "bell",
+            "op": "non",
+            "dense_layout": dense_layout,
+            "C": torch.empty((n_rows, 0), dtype=data.dtype, device=data.device),
+            "empty": True,
+        }
+
+    values = _bell_values_for_hipsparse(data)
+    indices = indices.contiguous()
+    if padded_cols == n_cols:
+        B_padded = B.contiguous() if dense_layout == "row" else B
+    else:
+        B_padded = _zeros_bell_dense(
+            (padded_cols, n_dense_cols),
+            data.dtype,
+            data.device,
+            dense_layout,
+        )
+        B_padded[:n_cols, :].copy_(B)
+    C_padded = _zeros_bell_dense(
+        (padded_rows, n_dense_cols),
+        data.dtype,
+        data.device,
+        dense_layout,
+    )
+    C_logical = C_padded[:n_rows, :]
+    if out is not None:
+        if not torch.is_tensor(out):
+            raise TypeError("out must be a torch.Tensor")
+        if out.shape != (n_rows, n_dense_cols) or out.dtype != data.dtype:
+            raise ValueError("out must match the logical result shape and dtype")
+        if not _is_accel_tensor(out) or out.device != data.device:
+            raise ValueError("out must be an accelerator tensor on the same device as data")
+
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    index_type = _hipsparse_index_type(indices.dtype, "hipSPARSE BELL SpMM indices")
+    op_enum = _hipsparse_spmm_operation("non", "hipSPARSE BELL SpMM")
+    order = _hipsparse_spmm_order(dense_layout, "hipSPARSE BELL SpMM")
+    alg = _hipsparse_spmm_algorithm("bell")
+
+    handle = None
+    spmat = None
+    matb = None
+    matc = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+        spmat = ptr_type()
+        matb = ptr_type()
+        matc = ptr_type()
+        spmat_ref = spmat.createRef()
+        matb_ref = matb.createRef()
+        matc_ref = matc.createRef()
+
+        values_ptr = HipPointer.fromObj(values.data_ptr())
+        indices_ptr = HipPointer.fromObj(indices.data_ptr())
+        b_ptr = HipPointer.fromObj(B_padded.data_ptr())
+        c_ptr = HipPointer.fromObj(C_padded.data_ptr())
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t",
+            ("HIPSPARSE_INDEX_BASE_ZERO",),
+        )
+        ell_cols = ell_width_blocks * block_dim
+
+        _hipsparse_create_blocked_ell_descriptor(
+            spmat_ref,
+            padded_rows,
+            padded_cols,
+            block_dim,
+            ell_cols,
+            indices_ptr,
+            values_ptr,
+            index_type,
+            index_base,
+            value_type,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matb_ref,
+            padded_cols,
+            n_dense_cols,
+            int(B_padded.stride(0) if dense_layout == "row" else B_padded.stride(1)),
+            b_ptr,
+            value_type,
+            order,
+        )
+        _hipsparse_create_dnmat_descriptor(
+            matc_ref,
+            padded_rows,
+            n_dense_cols,
+            int(C_padded.stride(0) if dense_layout == "row" else C_padded.stride(1)),
+            c_ptr,
+            value_type,
+            order,
+        )
+
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_bufferSize(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMM_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        _hip_check_result(
+            hipsparse.hipsparseSpMM_preprocess(
+                handle,
+                op_enum,
+                op_enum,
+                alpha,
+                spmat,
+                matb,
+                beta,
+                matc,
+                value_type,
+                alg,
+                workspace,
+            ),
+            "hipsparseSpMM_preprocess",
+        )
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "bell",
+            "op": "non",
+            "dense_layout": dense_layout,
+            "handle": handle,
+            "spmat": spmat,
+            "matb": matb,
+            "matc": matc,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_a_enum": op_enum,
+            "op_b_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "values_storage": values,
+            "indices_storage": indices,
+            "B_padded": B_padded,
+            "C_padded": C_padded,
+            "C": C_logical,
+            "out": out,
+            "empty": False,
+        }
+    except Exception:
+        _destroy_spmm_bell_ref_hipsparse_prepared(
+            {
+                "handle": handle,
+                "spmat": spmat,
+                "matb": matb,
+                "matc": matc,
+                "workspace": workspace,
+                "workspace_allocated": workspace_allocated,
+            }
+        )
+        raise
+
+
+def _run_spmm_bell_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["C"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMM(
+            state["handle"],
+            state["op_a_enum"],
+            state["op_b_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["matb"],
+            state["beta"],
+            state["matc"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMM",
+    )
+    C = state["C"]
+    out = state.get("out")
+    if out is not None:
+        out.copy_(C)
+        return out
+    return C
+
+
+def _destroy_spmm_bell_ref_hipsparse_prepared(state):
+    matc = state.get("matc")
+    matb = state.get("matb")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if matc is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matc), "hipsparseDestroyDnMat(C)"
+            )
+        except Exception:
+            pass
+    if matb is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnMat(matb), "hipsparseDestroyDnMat(B)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def _benchmark_spmm_bell_sparse_ref(
+    data,
+    indices,
+    B,
+    shape,
+    block_dim,
+    warmup,
+    iters,
+    op="non",
+    dense_layout="auto",
+):
+    """Vendor BELL SpMM baseline: hipSPARSE on ROCm when supported."""
+    if dense_layout == "auto":
+        try:
+            dense_layout = _spmm_bell_dense_layout_name(B)
+        except Exception as exc:
+            return {"backend": None, "values": None, "ms": None, "reason": str(exc)}
+    backend, reason = _spmm_bell_sparse_ref_backend(
+        data.dtype,
+        indices.dtype,
+        op=op,
+        dense_layout=dense_layout,
+    )
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend != "hipsparse":
+        return result
+    values, ms = _benchmark_prepared_cuda_op(
+        lambda: _prepare_spmm_bell_ref_hipsparse(
+            data,
+            indices,
+            B,
+            shape,
+            block_dim=block_dim,
+            op=op,
+            dense_layout=dense_layout,
+        ),
+        _run_spmm_bell_ref_hipsparse_prepared,
+        _destroy_spmm_bell_ref_hipsparse_prepared,
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = values.contiguous()
+    result["ms"] = ms
+    result["reason"] = None
+    return result
 
 
 def flagsparse_spmm_bell_run(

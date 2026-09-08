@@ -33,6 +33,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
 from mtx_fast import NonSquareMatrixError
 
@@ -124,6 +125,23 @@ def _safe_ratio(other_ms, triton_ms):
     return other_ms / triton_ms
 
 
+def _vendor_backend_name():
+    return fs_common._expected_vendor_sparse_label()
+
+
+def _vendor_short_name():
+    return fs_common._expected_vendor_sparse_short()
+
+
+def _vendor_reference_route():
+    backend = fs_common._expected_vendor_sparse_backend()
+    if backend == "hipsparse":
+        return "hipSPARSE csrsm2 direct API"
+    if backend in ("cupy_cusparse", "native_cusparse"):
+        return "native cuSPARSE SpSM API"
+    return f"{fs_common._expected_vendor_sparse_label()} route"
+
+
 def _fmt_trace_times(times):
     if not times:
         return "[]"
@@ -190,7 +208,7 @@ def _parse_ops_filter(raw):
 
 
 def _build_triangular_case(n=512, n_rhs=1024, value_dtype=torch.float32):
-    device = torch.device("cuda")
+    device = torch.device(fs_spsm_impl._ACCEL_DEVICE_TYPE)
     A = torch.tril(torch.randn((n, n), dtype=value_dtype, device=device) * 0.02)
     diag_base_dtype = torch.float32 if value_dtype == torch.complex64 else torch.float64
     diag = (torch.rand((n,), dtype=diag_base_dtype, device=device) + 2.0).to(
@@ -310,17 +328,17 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
             size=shape,
             device=data.device,
         )
-        if not A_csr.is_cuda:
+        if not fs_spsm_impl._is_accel_tensor(A_csr):
             raise RuntimeError("torch.sparse.spsolve CUDA path is unavailable")
         cols = []
         for bj in torch.unbind(B, dim=1):
             cols.append(sparse_spsolve(A_csr, bj))
         X_ref = torch.stack(cols, dim=1) if cols else B.new_empty(B.shape)
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         return X_ref.to(B.dtype), None
     except Exception as exc:
-        if "out of memory" in str(exc).lower() and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if "out of memory" in str(exc).lower() and fs_spsm_impl._ACCEL.is_available():
+            fs_spsm_impl._ACCEL.empty_cache()
         return None, f"PyTorch sparse solve unavailable ({exc})"
 
 
@@ -504,7 +522,7 @@ def _load_cusparse_spsm_library():
 
 
 def _current_cuda_stream_ptr():
-    stream_ptr = getattr(torch.cuda.current_stream(), "cuda_stream", None)
+    stream_ptr = getattr(fs_spsm_impl._ACCEL.current_stream(), "cuda_stream", None)
     if stream_ptr is None:
         raise RuntimeError("Could not obtain the current CUDA stream pointer")
     return ctypes.c_void_p(int(stream_ptr))
@@ -514,8 +532,8 @@ class _PreparedCusparseNativeSpSM:
     def __init__(self, data, row, col, indptr, B, shape, fmt):
         if fmt not in FORMATS:
             raise ValueError(f"Unsupported native cuSPARSE SpSM format: {fmt}")
-        if not all(t.is_cuda for t in (data, row, col, indptr, B)):
-            raise ValueError("Native cuSPARSE SpSM inputs must be CUDA tensors")
+        if not all(fs_spsm_impl._is_accel_tensor(t) for t in (data, row, col, indptr, B)):
+            raise ValueError("Native cuSPARSE SpSM inputs must be accelerator tensors")
 
         self.data = data.contiguous()
         self.row = row.contiguous()
@@ -766,38 +784,60 @@ class _PreparedCusparseNativeSpSM:
 def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup, iters):
     # Vendor triangular-solve baseline per backend: hipSPARSE csrsm2 on DCU/ROCm,
     # native cuSPARSE SpSM on CUDA.
-    if fs_spsm_impl._is_rocm_runtime() and indptr is not None:
+    vendor_backend, selector_reason = fs_spsm_impl._spsm_csr_sparse_ref_backend(
+        data.dtype,
+        col.dtype,
+        indptr.dtype if indptr is not None else col.dtype,
+    )
+    if vendor_backend is None:
+        return None, None, selector_reason, None
+    if vendor_backend == "hipsparse":
+        if indptr is None:
+            return None, None, "hipSPARSE csrsm2 requires CSR row offsets", None
         sparse_ref = fs_spsm_impl._benchmark_spsm_csr_sparse_ref(
             data,
-            col if fmt == "csr" else row,
+            col,
             indptr,
             B,
             shape,
             warmup=warmup,
             iters=iters,
         )
-        if sparse_ref["backend"] is None:
-            return None, None, sparse_ref["reason"]
-        return sparse_ref["values"], sparse_ref["ms"], None
+        if sparse_ref.get("backend") != "hipsparse":
+            reason = sparse_ref.get("reason") or "backend selector returned no reason"
+            return (
+                None,
+                None,
+                f"ROCm/DCU vendor dispatch did not select hipSPARSE: {reason}",
+                None,
+            )
+        return (
+            sparse_ref["values"],
+            sparse_ref["ms"],
+            sparse_ref.get("reason"),
+            "hipSPARSE csrsm2 direct API",
+        )
+    if vendor_backend != "native_cusparse":
+        return None, None, f"unsupported vendor backend: {vendor_backend}", None
     plan = None
     try:
         plan = _PreparedCusparseNativeSpSM(data, row, col, indptr, B, shape, fmt)
         warmup_times = []
         for _ in range(warmup):
             plan.reset_analysis_state()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             start = time.perf_counter()
             X_t = plan.prepare_and_solve()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             if TRACE_CUSPARSE:
                 warmup_times.append((time.perf_counter() - start) * 1000.0)
         times = []
         for _ in range(iters):
             plan.reset_analysis_state()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             start = time.perf_counter()
             X_t = plan.prepare_and_solve()
-            torch.cuda.synchronize()
+            fs_spsm_impl._ACCEL.synchronize()
             times.append((time.perf_counter() - start) * 1000.0)
         total_ms = _allinone_filtered_avg_ms(times)
         _emit_cusparse_trace(
@@ -806,9 +846,9 @@ def _benchmark_cusparse_reference(data, row, col, indptr, B, shape, fmt, warmup,
             times,
             total_ms,
         )
-        return X_t, total_ms, None
+        return X_t, total_ms, None, "native cuSPARSE SpSM API"
     except Exception as exc:
-        return None, None, str(exc)
+        return None, None, str(exc), None
     finally:
         if plan is not None:
             plan.close()
@@ -862,18 +902,18 @@ def _benchmark_flagsparse_full_round(
     X = None
     for _ in range(warmup):
         reset_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         analyze_call()
         X = solve_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
     times = []
     for _ in range(iters):
         reset_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         start = time.perf_counter()
         analyze_call()
         X = solve_call()
-        torch.cuda.synchronize()
+        fs_spsm_impl._ACCEL.synchronize()
         times.append((time.perf_counter() - start) * 1000.0)
     return X, _allinone_filtered_avg_ms(times)
 
@@ -994,9 +1034,10 @@ def _run_one_spsm_case(
             shape,
         )
     (
-        X_cu,
-        cusparse_ms,
-        _cusparse_reason,
+        X_vendor,
+        vendor_ms,
+        vendor_reason,
+        vendor_route,
     ) = _benchmark_cusparse_reference(
         data_eff, row, col, indptr_eff, B, shape, fmt, warmup, iters
     )
@@ -1004,11 +1045,11 @@ def _run_one_spsm_case(
         data_eff, indices_eff, indptr_eff, shape, B
     )
 
-    err_cu = None
-    ok_cu = None
-    if X_cu is not None:
-        err_cu = _reference_max_relative_error(X_cu, X_fs)
-        ok_cu = err_cu <= _reference_check_threshold(value_dtype)
+    err_vendor = None
+    ok_vendor = None
+    if X_vendor is not None:
+        err_vendor = _reference_max_relative_error(X_vendor, X_fs)
+        ok_vendor = err_vendor <= _reference_check_threshold(value_dtype)
 
     err_pt = None
     ok_pt = None
@@ -1022,17 +1063,18 @@ def _run_one_spsm_case(
     residual_ok = math.isfinite(err_res) and (
         err_res <= _reference_check_threshold(value_dtype)
     )
-    err_ref = err_cu if err_cu is not None else err_pt
+    err_ref = err_vendor if err_vendor is not None else err_pt
 
-    if ok_cu is not None:
-        status = "PASS" if ok_cu and residual_ok else "FAIL"
+    if ok_vendor is not None:
+        status = "PASS" if ok_vendor and residual_ok else "FAIL"
     elif ok_pt is not None:
         status = "PASS" if ok_pt and residual_ok else "FAIL"
-    elif X_pt is None and X_cu is None:
+    elif X_pt is None and X_vendor is None:
         status = "REF_FAIL"
     else:
         status = "FAIL"
 
+    vendor_backend = _vendor_backend_name()
     return {
         "format": fmt,
         "n_rows": n_rows,
@@ -1040,33 +1082,41 @@ def _run_one_spsm_case(
         "nnz": int(data_eff.numel()),
         "n_rhs": int(n_rhs),
         "FlagSparse_ms": flagsparse_ms,
-        "cuSPARSE_ms": cusparse_ms,
-        "FlagSparse_vs_cuSPARSE_speedup": _safe_ratio(cusparse_ms, flagsparse_ms),
+        "vendor_backend": vendor_backend,
+        "vendor_route": vendor_route,
+        "cuSPARSE_ms": vendor_ms if vendor_backend == "cuSPARSE" else None,
+        "hipSPARSE_ms": vendor_ms if vendor_backend == "hipSPARSE" else None,
+        "FlagSparse_vs_vendor_speedup": _safe_ratio(vendor_ms, flagsparse_ms),
         "status": status,
         "err_ref": err_ref,
         "err_res": err_res,
         "err_pt": err_pt,
-        "err_cu": err_cu,
-        "cusparse_reason": _cusparse_reason,
+        "err_vendor": err_vendor,
+        "vendor_reason": vendor_reason,
         "pytorch_reason": pytorch_reason,
         "error": None,
     }
 
 
 def run_spsm_synthetic_all(n=512, n_rhs=1024):
-    if not torch.cuda.is_available():
-        print("CUDA is not available.")
+    if not fs_spsm_impl._ACCEL.is_available():
+        print("GPU runtime is not available.")
         return
+    vendor_name = _vendor_backend_name()
+    vendor_short = _vendor_short_name()
     total = 0
     failed = 0
     print("=" * 138)
     print("FLAGSPARSE SpSM synthetic test")
     print("=" * 138)
     print("Every timed round performs analysis/preparation + solve.")
+    print(f"Vendor backend: {vendor_name}")
+    print(f"Vendor route: {_vendor_reference_route()}")
     print(
         f"{'Fmt':>5} {'dtype':>9} {'index':>7} {'N':>6} {'RHS':>6} {'NNZ':>10} "
-        f"{'FS(ms)':>10} {'CU(ms)':>10} {'FS/CU':>10} "
-        f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} {'Err(CU)':>12}"
+        f"{'FS(ms)':>10} {(vendor_short + '(ms)'):>10} {(vendor_short + '.spdT'):>10} "
+        f"{'Status':>10} {'Err(Ref)':>12} {'Err(Res)':>12} {'Err(PT)':>12} "
+        f"{('Err(' + vendor_short + ')'):>12}"
     )
     print("-" * 138)
 
@@ -1094,15 +1144,17 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                 print(
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
-                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(one['cuSPARSE_ms']):>10} "
-                    f"{_fmt_ratio(one['FlagSparse_vs_cuSPARSE_speedup']):>10} "
+                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(one[f'{vendor_name}_ms']):>10} "
+                    f"{_fmt_ratio(one['FlagSparse_vs_vendor_speedup']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
-                    f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_cu']):>12}"
+                    f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_vendor']):>12}"
                 )
+                if one["vendor_route"]:
+                    print(f"  Vendor route used: {one['vendor_route']}")
                 if one["status"] in ("FAIL", "REF_FAIL"):
-                    if one["cusparse_reason"]:
+                    if one["vendor_reason"]:
                         print(
-                            f"  NOTE: native cuSPARSE unavailable: {one['cusparse_reason']}"
+                            f"  NOTE: {vendor_name} unavailable: {one['vendor_reason']}"
                         )
                     if one["pytorch_reason"]:
                         print(f"  NOTE: {one['pytorch_reason']}")
@@ -1112,17 +1164,19 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
 
 
 def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
-    if not torch.cuda.is_available():
-        print("CUDA is not available.")
+    if not fs_spsm_impl._ACCEL.is_available():
+        print("GPU runtime is not available.")
         return
-    device = torch.device("cuda")
+    device = torch.device(fs_spsm_impl._ACCEL_DEVICE_TYPE)
     records_out = []
     fmt = "coo" if use_coo else "csr"
+    vendor_name = _vendor_backend_name()
+    vendor_short = _vendor_short_name()
 
     print("=" * 146)
     print(
         f"FLAGSPARSE SpSM .mtx batch ({fmt.upper()}) | "
-        "FS/CU: every round analysis/preparation + solve"
+        f"FS/{vendor_short}: every round analysis/preparation + solve"
     )
     print("=" * 146)
     print(
@@ -1130,13 +1184,17 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         "(filtered per-round averages; override with --warmup/--iters)"
     )
     print(
-        "FS(ms) and CU(ms) each include one fresh analysis/preparation plus one solve. "
-        "FS/CU = CU(ms) / FS(ms)."
+        f"FS(ms) and {vendor_short}(ms) each include one fresh "
+        "analysis/preparation plus one solve. "
+        f"{vendor_short}.spdT = {vendor_short}(ms) / FS(ms)."
     )
+    print(f"Vendor backend: {vendor_name}")
+    print(f"Vendor route: {_vendor_reference_route()}")
     print(
         f"{'Matrix':<28} {'dtype':>9} {'index':>7} {'N':>7} {'RHS':>6} {'NNZ':>10} "
-        f"{'FS(ms)':>10} {'CU(ms)':>10} {'FS/CU':>10} "
-        f"{'Status':>10} {'Eref':>12} {'Eres':>12} {'Ept':>12} {'Ecu':>12}"
+        f"{'FS(ms)':>10} {(vendor_short + '(ms)'):>10} {(vendor_short + '.spdT'):>10} "
+        f"{'Status':>10} {'Eref':>12} {'Eres':>12} {'Ept':>12} "
+        f"{('E' + vendor_short):>12}"
     )
     print("-" * 146)
 
@@ -1177,16 +1235,18 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{record['n_rows']:>7} {record['n_rhs']:>6} {record['nnz']:>10} "
-                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(record['cuSPARSE_ms']):>10} "
-                        f"{_fmt_ratio(record['FlagSparse_vs_cuSPARSE_speedup']):>10} "
+                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(record[f'{vendor_name}_ms']):>10} "
+                        f"{_fmt_ratio(record['FlagSparse_vs_vendor_speedup']):>10} "
                         f"{record['status']:>10} {_fmt_err(record['err_ref']):>12} {_fmt_err(record['err_res']):>12} "
-                        f"{_fmt_err(record['err_pt']):>12} {_fmt_err(record['err_cu']):>12}"
+                        f"{_fmt_err(record['err_pt']):>12} {_fmt_err(record['err_vendor']):>12}"
                     )
+                    if record["vendor_route"]:
+                        print(f"  Vendor route used: {record['vendor_route']}")
                     if record["status"] in ("FAIL", "REF_FAIL"):
-                        if record["cusparse_reason"]:
+                        if record["vendor_reason"]:
                             print(
-                                "  NOTE: native cuSPARSE unavailable: "
-                                f"{record['cusparse_reason']}"
+                                f"  NOTE: {vendor_name} unavailable: "
+                                f"{record['vendor_reason']}"
                             )
                         if record["pytorch_reason"]:
                             print(f"  NOTE: {record['pytorch_reason']}")
@@ -1211,14 +1271,17 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                         "nnz": nnz,
                         "n_rhs": int(n_rhs),
                         "FlagSparse_ms": None,
+                        "vendor_backend": vendor_name,
+                        "vendor_route": None,
                         "cuSPARSE_ms": None,
-                        "FlagSparse_vs_cuSPARSE_speedup": None,
+                        "hipSPARSE_ms": None,
+                        "FlagSparse_vs_vendor_speedup": None,
                         "status": status,
                         "err_ref": None,
                         "err_res": None,
                         "err_pt": None,
-                        "err_cu": None,
-                        "cusparse_reason": None,
+                        "err_vendor": None,
+                        "vendor_reason": None,
                         "pytorch_reason": None,
                         "error": err_msg,
                     }
@@ -1246,14 +1309,17 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         "nnz",
         "n_rhs",
         "FlagSparse_ms",
+        "vendor_backend",
+        "vendor_route",
         "cuSPARSE_ms",
-        "FlagSparse_vs_cuSPARSE_speedup",
+        "hipSPARSE_ms",
+        "FlagSparse_vs_vendor_speedup",
         "status",
         "err_ref",
         "err_res",
         "err_pt",
-        "err_cu",
-        "cusparse_reason",
+        "err_vendor",
+        "vendor_reason",
         "pytorch_reason",
         "error",
     ]
@@ -1261,7 +1327,9 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for record in records_out:
-            w.writerow({k: ("" if v is None else v) for k, v in record.items()})
+            w.writerow(
+                {k: ("" if record.get(k) is None else record.get(k)) for k in fieldnames}
+            )
     print(f"Wrote {len(records_out)} rows to {csv_path}")
 
 

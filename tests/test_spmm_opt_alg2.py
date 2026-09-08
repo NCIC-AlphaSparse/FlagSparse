@@ -274,28 +274,29 @@ def _timed_torch_reference(data, indices, indptr, B, shape, dtype, warmup, iters
 
 
 def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enabled):
-    backend_name = (
-        "hipsparse_ref" if getattr(torch.version, "hip", None) else "cusparse_ref"
+    backend, reason = spmm_csr_mod._spmm_csr_sparse_ref_backend(
+        data.dtype,
+        indices.dtype,
+        indptr.dtype,
     )
+    backend_name = backend or "vendor_ref"
     if not enabled:
         return None, None, backend_name, "disabled"
-    try:
-        import cupy as cp
-        import cupyx.scipy.sparse as cpx
-    except Exception as exc:
-        return None, None, backend_name, str(exc)
+    if backend is None:
+        return None, None, backend_name, reason or "vendor sparse baseline is unavailable"
 
-    try:
-        data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-        ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices.to(torch.int64)))
-        ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
-        B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
-        sparse = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-        out_cp, elapsed = _benchmark(lambda: sparse @ B_cp, warmup, iters)
-        out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-        return out, elapsed, backend_name, None
-    except Exception as exc:
-        return None, None, backend_name, str(exc)
+    ref = spmm_csr_mod._benchmark_spmm_csr_sparse_ref(
+        data,
+        indices,
+        indptr,
+        B,
+        shape,
+        warmup=warmup,
+        iters=iters,
+        op="non",
+        dense_layout="row",
+    )
+    return ref.get("values"), ref.get("ms"), ref.get("backend") or backend_name, ref.get("reason")
 
 
 def _benchmark(op, warmup, iters):

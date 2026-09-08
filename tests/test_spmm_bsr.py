@@ -32,6 +32,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_bsr as bsr_ops
 
 try:
@@ -782,6 +783,18 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
+    vendor_backend, vendor_reason = bsr_ops._spmm_bsr_sparse_ref_backend(
+        torch.float32, torch.int32, op="non"
+    )
+    for line in fs_common._backend_summary_lines(
+        op_name="SpMM BSR",
+        native_format="BSR",
+        correctness_ref="Ref=torch_spmm_coo",
+        vendor_backend=vendor_backend,
+        vendor_reason=vendor_reason,
+        run_vendor=run_cusparse,
+    ):
+        print(line)
     print("FlagSparse BSR SpMM follows padded block-grid semantics; native output is padded and correctness checks slice back to logical rows/cols by op.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same BSR arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
     print("PyTorch BSR baseline is attempted only for same-format supported cases; CUDA BSR transpose-family is recorded as N/A with no fallback.")
@@ -790,9 +803,14 @@ def _print_notes(run_cusparse):
     else:
         print("SciPy CPU BSR baseline: same BSR arrays with padded shape; CPU-vs-GPU speedup is diagnostic only.")
     if run_cusparse:
-        reason = _cupy_bsr_unavailable_reason()
+        _backend, reason = bsr_ops._spmm_bsr_sparse_ref_backend(
+            torch.float32, torch.int32, op="non"
+        )
         if reason:
-            print(f"CuPy baseline: unavailable for BSR ({reason}); CU(ms)=N/A.")
+            print(
+                f"{fs_common._expected_vendor_sparse_label()} baseline: unavailable for BSR "
+                f"({reason}); {fs_common._expected_vendor_sparse_short()}(ms)=N/A."
+            )
 
 
 def _print_row(row, timing=False):
@@ -826,12 +844,22 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
-    parser.add_argument("--no-cusparse", action="store_true")
+    parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
+    )
+    parser.add_argument(
+        "--no-hipsparse",
+        dest="no_cusparse",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for native BSR SpMM benchmark")
+        raise RuntimeError("A CUDA/ROCm PyTorch device is required for native BSR SpMM benchmark")
     dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
     block_dims = _parse_block_dims(args.block_dims)
@@ -840,6 +868,7 @@ def main():
     layouts = _layout_names(args.layout)
     run_cusparse = not args.no_cusparse
     _print_notes(run_cusparse)
+    vendor_short = fs_common._expected_vendor_sparse_short()
 
     fields = PERF_FIELDS + (TIMING_FIELDS if args.timing else [])
     rows = []
@@ -857,7 +886,7 @@ def main():
         print(
             f"{'Matrix':<28} {'DType':<10} {'Index':<5} {'Op':<4} {'Lay':<4} {'Alg':<14} "
             f"{'BDim':>4} {'Rows':>7} {'Cols':>7} {'NNZB':>8} {'DCols':>5} "
-            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'PT':>9} {'CU':>9} {'SciPy':>9} "
+            f"{'MS':>9} {'GPU':>9} {'CPUProc':>9} {'PT':>9} {vendor_short:>9} {'SciPy':>9} "
             f"{'PT/Alg':>8} {'Sci/Alg':>8} {'Err':>10} {'SciErr':>10} {'Status':>6}"
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )

@@ -187,12 +187,22 @@ def _hipsparse_csrsm2_skip_reason(value_dtype, index_dtype, indptr_dtype=None):
 
 
 def _spsm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
-    reason = _hipsparse_csrsm2_skip_reason(
-        value_dtype, index_dtype, indptr_dtype
-    )
-    if reason is None:
-        return "hipsparse_csrsm2", None
-    return None, reason
+    """Select the same-format vendor SpSM baseline for the active backend."""
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
+        reason = _hipsparse_csrsm2_skip_reason(
+            value_dtype, index_dtype, indptr_dtype
+        )
+        if reason is None:
+            return "hipsparse", None
+        return None, reason
+    if vendor == "cupy_cusparse" and _backend_name() == "cuda":
+        return "native_cusparse", None
+    if vendor == "cupy_cusparse":
+        return None, f"native cuSPARSE SpSM baseline is not implemented for {_backend_name()}"
+    if vendor is None:
+        return None, f"no vendor sparse SpSM baseline is configured for {_backend_name()}"
+    return None, f"{vendor} SpSM baseline is not implemented"
 
 
 def _destroy_spsm_csr_ref_hipsparse_prepared(state):
@@ -313,7 +323,7 @@ def _prepare_spsm_csr_ref_hipsparse(
         raise TypeError("B dtype must match sparse value dtype")
 
     state = {
-        "backend": "hipsparse_csrsm2",
+        "backend": "hipsparse",
         "handle": None,
         "descr": None,
         "info": None,
@@ -487,7 +497,7 @@ def _spsm_csr_ref_hipsparse(
     try:
         values = _run_spsm_csr_ref_hipsparse_prepared(state)
         metadata = {
-            "backend": "hipsparse_csrsm2",
+            "backend": "hipsparse",
             "analysis_ms": float(state.get("analysis_ms", 0.0)),
             "buffer_size": int(state.get("buffer_size", 0)),
             "format": "csr",
@@ -519,6 +529,11 @@ def _benchmark_spsm_csr_sparse_ref(
         "reason": reason,
     }
     if backend is None:
+        return result
+    if backend != "hipsparse":
+        result["reason"] = (
+            "native cuSPARSE SpSM execution is provided by the benchmark harness"
+        )
         return result
     state = None
     try:
@@ -601,7 +616,7 @@ def _prepare_spsm_csr_inputs(data, indices, indptr, B, shape, opA, opB, major):
     if not all(torch.is_tensor(t) for t in (data, indices, indptr, B)):
         raise TypeError("data, indices, indptr, B must all be torch.Tensor")
     if not all(_is_accel_tensor(t) for t in (data, indices, indptr, B)):
-        raise ValueError("data, indices, indptr, B must all be CUDA tensors")
+        raise ValueError("data, indices, indptr, B must all be accelerator tensors")
     if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1:
         raise ValueError("data, indices, indptr must be 1D")
     if B.ndim != 2:
@@ -642,7 +657,7 @@ def _prepare_spsm_coo_inputs(data, row, col, B, shape, opA, opB, major):
     if not all(torch.is_tensor(t) for t in (data, row, col, B)):
         raise TypeError("data, row, col, B must all be torch.Tensor")
     if not all(_is_accel_tensor(t) for t in (data, row, col, B)):
-        raise ValueError("data, row, col, B must all be CUDA tensors")
+        raise ValueError("data, row, col, B must all be accelerator tensors")
     if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
         raise ValueError("data, row, col must be 1D")
     if data.numel() != row.numel() or data.numel() != col.numel():
