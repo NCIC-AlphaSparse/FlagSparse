@@ -54,6 +54,7 @@ from .sddmm_csr import benchmark_sddmm_case
 from .spsm import benchmark_spsm_case
 
 _GATHER_GRAPH_BATCH = 100
+_SCATTER_GRAPH_BATCH = 100
 
 
 def _cupy_spmv_op_matrix(matrix, op_code):
@@ -338,10 +339,34 @@ def benchmark_scatter_case(
         index_fallback_policy="strict",
     )
 
-    pytorch_values, pytorch_ms = _benchmark_cuda_op(
-        pytorch_op, warmup=warmup, iters=iters
-    )
-    triton_values, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
+    # CUDA-Graph timing, matching benchmark_gather_case.  Under the previous
+    # wall-clock _benchmark_cuda_op the measured floor was ~12-23us and flat across
+    # every dense_size/nnz, because it charges each iteration's Python dispatch: a
+    # Triton launch from Python costs ~15-25us against ~6-7us for the baseline's
+    # single ctypes call.  That made scatter read 0.54x cuSPARSE while the kernels are
+    # at parity (measured 1.11x at 32K/1024 and 0.96x at 1M/65536 once the Python
+    # overhead is amortised out).  The ops write into preallocated buffers, so the
+    # values are read back from those after timing, exactly as gather does.
+    try:
+        pytorch_ms = _benchmark_cuda_graph_op(
+            pytorch_op,
+            graph_batch=_SCATTER_GRAPH_BATCH,
+            warmup=warmup,
+            repeats=iters,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"PyTorch CUDA Graph timing failed: {exc}") from exc
+    try:
+        triton_ms = _benchmark_cuda_graph_op(
+            triton_op,
+            graph_batch=_SCATTER_GRAPH_BATCH,
+            warmup=warmup,
+            repeats=iters,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Triton CUDA Graph timing failed: {exc}") from exc
+    pytorch_values = pytorch_out
+    triton_values = triton_out
 
     atol, rtol = _tolerance_for_dtype(effective_value_dtype)
     triton_match = torch.allclose(triton_values, expected, atol=atol, rtol=rtol)
@@ -406,9 +431,16 @@ def benchmark_scatter_case(
                     reset_output=reset_output,
                 )
                 try:
-                    cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                        cusparse_plan.run, warmup=warmup, iters=iters
+                    cusparse_ms = _benchmark_cuda_graph_op(
+                        cusparse_plan.run,
+                        graph_batch=_SCATTER_GRAPH_BATCH,
+                        warmup=warmup,
+                        repeats=iters,
+                        capture_setup=lambda: _set_cusparse_stream(
+                            cusparse_plan.lib, cusparse_plan.handle, strict=True
+                        ),
                     )
+                    cusparse_values = cusparse_plan.dense_vector
                 finally:
                     cusparse_plan.close()
                 cusparse_match = torch.allclose(
@@ -444,6 +476,8 @@ def benchmark_scatter_case(
             "fallback_applied": bool(fallback_applied),
             "index_fallback_policy": str(index_fallback_policy).lower(),
             "kernel_index_dtype": triton_index_meta["kernel_index_dtype"],
+            "kernel_graph_batch": _SCATTER_GRAPH_BATCH,
+            "kernel_timing_method": "cuda_graph_event_amortized_device_estimate",
         },
         "performance": {
             "pytorch_ms": pytorch_ms,

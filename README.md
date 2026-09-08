@@ -157,6 +157,54 @@ For the full DCU bring-up procedure — environment checks, the stale-install tr
 confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
 [docs/DCU_TESTING.md](docs/DCU_TESTING.md).
 
+### Running the tests on MetaX (C550)
+
+Verified on a MetaX C550 (`warp_size=64`, 104 MPs, 64 GB) with MACA SDK 3.8.2.6, torch
+`2.10.0+metax3.8.1.0` and triton `3.6.0+metax3.8.1.0`. Backend detection needs no
+environment variable there — `torch.version.maca` is set and the device reports itself as
+`MetaX C550` — but the vendor baseline does, since CuPy is not available:
+
+```bash
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_MACA_VENDOR=none
+
+python -c "import flagsparse; print(flagsparse.__file__)"   # must be <repo>/src/...
+python -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model())"
+# expect: metax c550
+```
+
+**921 tests pass** across SpMV (CSR/COO/CSC/BSR), SpMM (CSR/COO/CSC/BSR), SpGEMM, SDDMM
+and gather/scatter:
+
+```bash
+timeout -s KILL 3600 python -m pytest tests/pytest -q \
+  -m "spmv_csr or spmv_coo or spmv_csc or spmv_bsr or spmv_coo_tocsr or \
+      spmm_csr or spmm_coo or spmm_csc or spmm_bsr or \
+      spgemm_csr or sddmm_csr or gather or scatter"
+```
+
+Known limits on this backend:
+
+- **SpSV/SpSM are broken.** `_spsv_csr_cw_kernel` faults with an illegal memory access on
+  every `lower` + `unit_diagonal` solve — including a diagonal-only matrix that never
+  enters the dependency branch — and its ready-flag spin fails to make progress, the same
+  way it does on DCU/gfx936. Always wrap solver runs in `timeout -s KILL`: a wedged kernel
+  cannot be interrupted with Ctrl-C and otherwise costs the whole container.
+- **`alpha_spmm_alg1` is unavailable**: MetaX's Triton build has no
+  `triton.experimental.tle`, and the FlagTree wheel that does requires GLIBC 2.38 while
+  the image ships 2.31. No other operator depends on TLE.
+- **Complex SpMM COO needs a launch clamp** (already applied): the rowrun kernels unroll
+  `tl.static_range(0, BLOCK_NNZ)`, so at the public default of 256 a complex kernel asks
+  for 8 KB of per-thread private memory against the driver's 4 KB cap and the launch is
+  rejected outright. Clamping MACA+complex to `BLOCK_NNZ=4` fixed all 24 failures and cut
+  the suite from 23m48s to 11.8s.
+
+For the operating manual — per-marker commands, the SpSV minimal repro, the private-memory
+diagnosis and a troubleshooting table — see
+[docs/METAX_RUNNING.md](docs/METAX_RUNNING.md); for first-time bring-up (SDK install, wheel
+selection, the vendor pip index, fingerprint collection) see
+[docs/METAX_TESTING.md](docs/METAX_TESTING.md).
+
 ## Layout
 
 - `src/flagsparse/` - core package (`sparse_operations/` is emitted as several `.py` modules from string literals in `flagsparse.py`)

@@ -164,6 +164,48 @@ python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matr
 DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
 已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。
 
+### 在 MetaX（C550）上跑测试
+
+已在 MetaX C550（`warp_size=64`、104 MP、64 GB）实机验证，环境为 MACA SDK 3.8.2.6、
+torch `2.10.0+metax3.8.1.0`、triton `3.6.0+metax3.8.1.0`。后端探测**不需要**设环境变量
+（`torch.version.maca` 存在，设备名是 `MetaX C550`），但厂商基线要关掉 —— 本机没有 CuPy：
+
+```bash
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_MACA_VENDOR=none
+
+python -c "import flagsparse; print(flagsparse.__file__)"   # 必须指向 <仓库>/src/
+python -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model())"
+# 期望：metax c550
+```
+
+SpMV（CSR/COO/CSC/BSR）、SpMM（CSR/COO/CSC/BSR）、SpGEMM、SDDMM、gather/scatter
+共 **921 个用例全部通过**：
+
+```bash
+timeout -s KILL 3600 python -m pytest tests/pytest -q \
+  -m "spmv_csr or spmv_coo or spmv_csc or spmv_bsr or spmv_coo_tocsr or \
+      spmm_csr or spmm_coo or spmm_csc or spmm_bsr or \
+      spgemm_csr or sddmm_csr or gather or scatter"
+```
+
+本后端的已知限制：
+
+- **SpSV/SpSM 不可用。** `_spsv_csr_cw_kernel` 在所有 `lower` + `unit_diagonal` 的求解上
+  非法访存 —— 连从不进入依赖分支的纯对角矩阵也崩；它的 ready-flag 自旋也推不动，
+  和 DCU/gfx936 是同一个故障模式。跑求解器算子**永远套 `timeout -s KILL`**：
+  内核挂死后 Ctrl-C 送不进去，代价是整个容器要重开。
+- **`alpha_spmm_alg1` 用不了**：沐曦的 Triton 构建没有 `triton.experimental.tle`，
+  而带 TLE 的 FlagTree wheel 要 GLIBC 2.38，本机镜像是 2.31。其余算子都不依赖 TLE。
+- **复数 SpMM COO 需要钳制启动参数**（已修复）：rowrun 内核会展开
+  `tl.static_range(0, BLOCK_NNZ)`，公开默认值 256 下复数内核要 8 KB/线程私有内存，
+  超过驱动 4 KB 上限直接拒绝启动。MACA+复数钳到 `BLOCK_NNZ=4` 后 24 个失败全部消失，
+  整组耗时从 23m48s 降到 11.8s。
+
+日常操作手册（逐 marker 命令、SpSV 最小复现、私有内存问题的定位过程、排查速查表）见
+[docs/METAX_RUNNING.md](docs/METAX_RUNNING.md)；首次 bring-up（装 SDK、选 wheel、
+厂商 pip 源、采集指纹）见 [docs/METAX_TESTING.md](docs/METAX_TESTING.md)。
+
 ## 目录说明
 
 - `src/flagsparse/` - 核心包（`sparse_operations/` 由 `flagsparse.py` 内嵌字符串生成多个 `.py`）

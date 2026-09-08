@@ -4109,6 +4109,44 @@ def _triton_spmm_csr_impl_opt_prepared(prepared, B):
     return C_out, long_row_fallback_used
 
 
+def _spmm_csr_auto_prefers_alg1(data, indptr, shape):
+    """Pick between the bucketed alg1 kernel and the base kernel for ``op='non'``.
+
+    ``flagsparse_spmm_csr`` used to send *every* non-transposed float32/float64 case to
+    ``flagsparse_spmm_csr_opt_alg1``.  Measured over the 30-matrix corpus that choice is
+    on average **1.70x off the better of the two kernels**, and up to 6.0x off
+    (msc10848 0.293ms on alg1 vs 0.049ms on base; trdheim 4.2x; smt 3.5x): alg1 wins on
+    short and/or heavily skewed rows, base wins on longer regular rows.
+
+    The rule below reproduces the per-matrix optimum on all 30 (geomean 1.0001 of the
+    oracle, worst case 1.00x).  Both features are host-side scalars plus a single
+    row-length max, so no extra device synchronisation beyond that reduction:
+
+    * ``mean < 3.5``            - very short rows: alg1's bucketing wins outright.
+    * ``mean < 9 and max/mean < 5`` - short and regular: alg1.
+    * ``max_row_nnz >= 20000``  - extreme skew (wiki-Talk, Stanford, mip1): base's
+      uniform row mapping collapses, alg1's bucketing absorbs it.
+    * otherwise                 - base.
+
+    Caveat: the ``mean < 3.5`` clause is supported by two matrices (wheel_601, ASIC_680ks)
+    and buys 1.24x / 1.02x there; dropping it costs 0.8% on average if it ever proves to
+    be corpus-specific.
+    """
+    n_rows = int(shape[0])
+    nnz = int(data.numel())
+    if n_rows <= 0 or nnz <= 0:
+        return True
+    mean = nnz / n_rows
+    if mean < 3.5:
+        return True
+    if indptr.numel() < 2:
+        return True
+    max_row_nnz = int((indptr[1:] - indptr[:-1]).max().item())
+    if max_row_nnz >= 20000:
+        return True
+    return mean < 9.0 and (max_row_nnz / mean) < 5.0
+
+
 def flagsparse_spmm_csr(
     data,
     indices,
@@ -4159,6 +4197,7 @@ def flagsparse_spmm_csr(
         and not return_meta
         and torch.is_tensor(data)
         and data.dtype in (torch.float32, torch.float64)
+        and _spmm_csr_auto_prefers_alg1(data, indptr, shape)
     ):
         return flagsparse_spmm_csr_opt_alg1(
             data=data,

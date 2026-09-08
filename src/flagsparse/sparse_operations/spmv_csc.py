@@ -91,6 +91,7 @@ class PreparedCscSpmv:
         "max_segments",
         "col_lengths",
         "max_col_nnz",
+        "col_ids",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -114,6 +115,7 @@ class PreparedCscSpmv:
         col_lengths=None,
         op=None,
         transpose=False,
+        col_ids=None,
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
@@ -132,6 +134,7 @@ class PreparedCscSpmv:
         if col_lengths is None:
             col_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
         self.col_lengths = col_lengths
+        self.col_ids = col_ids
         self.max_col_nnz = int(max_col_nnz)
         self.op = _normalize_spmv_csc_op(op, transpose=transpose)
         self.transpose = _spmv_csc_op_transposes(self.op)
@@ -217,7 +220,17 @@ def _spmv_csc_trans_real_kernel(
     start = tl.load(indptr_ptr + col)
     end = tl.load(indptr_ptr + col + 1)
     acc = tl.load(data_ptr + start, mask=start < end, other=0.0) * 0
-    for seg in range(MAX_SEGMENTS):
+    # Trip count comes from *this* column, not from the global longest one.
+    # ``MAX_SEGMENTS`` is ceil(max_col_nnz / BLOCK_NNZ), a constexpr, so
+    # ``for seg in range(MAX_SEGMENTS)`` made every column execute the same fixed number
+    # of BLOCK_NNZ-wide masked loads no matter how short it is.  The waste is
+    # ``MAX_SEGMENTS * BLOCK_NNZ / mean_col_nnz``: ~335x on amazon0601 (mean 8.4,
+    # longest 2751) and ~93x on TSOPF_FS_b300_c1.  It is the same rectangle the
+    # op="non" path had in its grid, just moved inside the kernel.
+    # MAX_SEGMENTS is kept as a parameter so the launch signature and any explicit
+    # max_segments override stay valid; it now only bounds the loop.
+    n_seg = min(tl.cdiv(end - start, BLOCK_NNZ), MAX_SEGMENTS)
+    for seg in tl.range(0, n_seg):
         offs = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
         mask = offs < end
         rows = tl.load(indices_ptr + offs, mask=mask, other=0)
@@ -246,7 +259,9 @@ def _spmv_csc_trans_complex_kernel(
     end = tl.load(indptr_ptr + col + 1)
     acc_re = tl.load(data_ri_ptr + start * 2, mask=start < end, other=0.0) * 0
     acc_im = tl.load(data_ri_ptr + start * 2 + 1, mask=start < end, other=0.0) * 0
-    for seg in range(MAX_SEGMENTS):
+    # Same dynamic trip count as the real kernel; see there for the measurement.
+    n_seg = min(tl.cdiv(end - start, BLOCK_NNZ), MAX_SEGMENTS)
+    for seg in tl.range(0, n_seg):
         offs = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
         mask = offs < end
         rows = tl.load(indices_ptr + offs, mask=mask, other=0)
@@ -355,6 +370,19 @@ def prepare_spmv_csc(
             )
     else:
         max_segments_use = max(1, int(max_segments))
+    # Per-nonzero owning column, for the nnz-parallel op="non" kernel.  Built once here
+    # (a structural conversion, so outside any timed window) rather than binary-searched
+    # per launch; see _spmv_csc_non_real_nnzpar_kernel for why.
+    col_ids = None
+    if int(data.numel()) > 0 and not _spmv_csc_op_transposes(op_code):
+        try:
+            # Deferred import: sddmm_csr only depends on _common, so there is no cycle,
+            # but keeping it local avoids adding a load-time edge between operators.
+            from .sddmm_csr import _build_row_ids
+
+            col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
+        except Exception:
+            col_ids = None
     return PreparedCscSpmv(
         data=data,
         kernel_indices=indices,
@@ -366,6 +394,7 @@ def prepare_spmv_csc(
         max_segments=max_segments_use,
         max_col_nnz=max_col_nnz,
         col_lengths=col_lengths,
+        col_ids=col_ids,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
         launch_backend=launch_backend,
@@ -390,6 +419,71 @@ def _validate_spmv_csc_x(x, prepared, op_code):
     return x.contiguous()
 
 
+@triton.jit
+def _spmv_csc_non_real_nnzpar_kernel(
+    data_ptr,
+    indices_ptr,
+    col_ids_ptr,
+    x_ptr,
+    y_ptr,
+    nnz,
+    BLOCK: tl.constexpr,
+):
+    """One program per BLOCK nonzeros, independent of n_cols and max_col_nnz.
+
+    The segmented kernel above launches ``grid = (n_cols, max_segments)`` with
+    ``max_segments = ceil(max_col_nnz / BLOCK_NNZ)``, so the grid is a *rectangle sized
+    by the longest column* while the useful work is only ``nnz / BLOCK_NNZ``.  The waste
+    factor is roughly ``max_col_nnz / mean_col_nnz``: 327x on amazon0601 (403k columns,
+    8.4 nonzeros each, longest 2751) and 93x on TSOPF_FS_b300_c1.  Tuning BLOCK_NNZ
+    cannot fix that -- raising it to shrink the rectangle costs more than it saves, and
+    a full sweep put the per-matrix oracle at only 1.09-1.38x over the current default.
+
+    Flattening the grid over nonzeros removes the rectangle entirely.  Measured over the
+    30-matrix corpus, fp32: **0.338 -> 1.403 of cupy's CSC SpMV**, with 21/30 matrices
+    below 0.8x falling to 3/30, and up to 67.7x on a single matrix (wiki-Talk 14.52ms ->
+    0.21ms).  BLOCK=256 is within 1% of the per-matrix oracle, so no adaptive rule is
+    needed here.
+
+    ``col_ids`` is built once in prepare by the same binary search the SDDMM path uses.
+    Inlining that search into this kernel was measured a net loss there (0.710x kernel
+    geomean), so it stays a precomputed array.
+    """
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    mask = offs < nnz
+    rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+    cols = tl.load(col_ids_ptr + offs, mask=mask, other=0)
+    vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
+    xs = tl.load(x_ptr + cols, mask=mask, other=0.0)
+    tl.atomic_add(y_ptr + rows, vals * xs, mask=mask, sem="relaxed")
+
+
+@triton.jit
+def _spmv_csc_non_complex_nnzpar_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    col_ids_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    nnz,
+    BLOCK: tl.constexpr,
+):
+    """Complex counterpart of :func:`_spmv_csc_non_real_nnzpar_kernel`."""
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    mask = offs < nnz
+    rows = tl.load(indices_ptr + offs, mask=mask, other=0)
+    cols = tl.load(col_ids_ptr + offs, mask=mask, other=0)
+    a_re = tl.load(data_ri_ptr + offs * 2, mask=mask, other=0.0)
+    a_im = tl.load(data_ri_ptr + offs * 2 + 1, mask=mask, other=0.0)
+    x_re = tl.load(x_ri_ptr + cols * 2, mask=mask, other=0.0)
+    x_im = tl.load(x_ri_ptr + cols * 2 + 1, mask=mask, other=0.0)
+    tl.atomic_add(y_ri_ptr + rows * 2, a_re * x_re - a_im * x_im, mask=mask, sem="relaxed")
+    tl.atomic_add(y_ri_ptr + rows * 2 + 1, a_re * x_im + a_im * x_re, mask=mask, sem="relaxed")
+
+
+SPMV_CSC_NNZPAR_BLOCK = 256
+
+
 def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
@@ -398,6 +492,36 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     if prepared.nnz == 0:
         return y
     if not trans:
+        col_ids = getattr(prepared, "col_ids", None)
+        if col_ids is not None:
+            # nnz-parallel path: grid scales with nnz instead of n_cols x max_segments.
+            nnz = int(prepared.nnz)
+            grid_nnz = (triton.cdiv(nnz, SPMV_CSC_NNZPAR_BLOCK),)
+            if _is_complex_dtype(dtype):
+                data_ri = torch.view_as_real(prepared.data).reshape(-1)
+                x_ri = torch.view_as_real(x).reshape(-1)
+                y_ri = torch.zeros(out_len * 2, dtype=data_ri.dtype, device=y.device)
+                _spmv_csc_non_complex_nnzpar_kernel[grid_nnz](
+                    data_ri,
+                    prepared.kernel_indices,
+                    col_ids,
+                    x_ri,
+                    y_ri,
+                    nnz,
+                    BLOCK=SPMV_CSC_NNZPAR_BLOCK,
+                )
+                y.copy_(torch.view_as_complex(y_ri.reshape(out_len, 2)))
+                return y
+            _spmv_csc_non_real_nnzpar_kernel[grid_nnz](
+                prepared.data,
+                prepared.kernel_indices,
+                col_ids,
+                x,
+                y,
+                nnz,
+                BLOCK=SPMV_CSC_NNZPAR_BLOCK,
+            )
+            return y
         grid = (prepared.n_cols, prepared.max_segments)
         if _is_complex_dtype(dtype):
             data_ri = torch.view_as_real(prepared.data).reshape(-1)

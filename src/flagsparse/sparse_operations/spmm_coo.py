@@ -682,12 +682,19 @@ def _benchmark_spmm_coo_sparse_ref(data, row, col, B, shape, warmup, iters):
     col_cp = _cupy_from_torch(col.to(torch.int64))
     B_cp = _cupy_from_torch(B)
     A_coo = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
-    # cupy COO ``@`` calls tocsr() internally on every invocation
-    # (cupyx.scipy.sparse._base.__mul__), so the conversion is hoisted here and the
-    # timed window holds only the SpMM kernel.
-    A_csr = A_coo.tocsr()
+    # Native cuSPARSE COO SpMM (cusparseSpMM + cusparseCreateCoo), reached through
+    # cupyx.cusparse.spmm, which accepts a coo_matrix directly.  Timing ``A_coo @ B``
+    # instead measured cupy's *CSR* kernel, because cupyx.scipy.sparse._base.__mul__ is
+    # ``self.tocsr().__mul__(other)`` and coo_matrix does not override it -- so a COO
+    # operator was being compared against cuSPARSE's CSR path.  Measured on this box,
+    # cuSPARSE's COO SpMM is 0.72-0.96x the time of its CSR SpMM, i.e. the CSR stand-in
+    # was the *more forgiving* baseline, not a harsher one.
+    # sum_duplicates() (canonical form) and asfortranarray() are format conversions and
+    # stay outside the timed window, matching how every other baseline here is measured.
+    A_coo.sum_duplicates()
+    B_f = cp.asfortranarray(B_cp)
     values_cp, ms = _benchmark_cuda_op(
-        lambda: A_csr @ B_cp,
+        lambda: _cupy_cusparse.spmm(A_coo, B_f),
         warmup=warmup,
         iters=iters,
     )
@@ -1135,7 +1142,14 @@ def _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout="row"):
     return data, kernel_row, kernel_col, B, n_rows, n_cols, int(B.shape[1])
 
 
-def _resolve_spmm_coo_launch_config(n_dense_cols, nnz, block_n=None, block_nnz=None, device=None):
+# Largest BLOCK_NNZ a complex COO SpMM kernel can launch with on MetaX/MACA before
+# it exceeds the driver's 4 KB/thread private-memory cap.  See the clamp below.
+_MACA_SPMM_COO_COMPLEX_BLOCK_NNZ = 4
+
+
+def _resolve_spmm_coo_launch_config(
+    n_dense_cols, nnz, block_n=None, block_nnz=None, device=None, value_dtype=None
+):
     warp_size, factor = _select_spmm_alg1_warp_and_factor(n_dense_cols)
     rocm_launch = _spmm_rocm_launch_overrides(
         n_dense_cols=n_dense_cols,
@@ -1151,17 +1165,64 @@ def _resolve_spmm_coo_launch_config(n_dense_cols, nnz, block_n=None, block_nnz=N
             else warp_size * factor
         )
     if block_nnz is None:
+        # The default used to be 256 and it dominated COO SpMM's whole cost.
+        # ``_spmm_coo_rowrun_*_kernel`` iterates a row with
+        # ``for kk in tl.static_range(0, BLOCK_NNZ)``, and BLOCK_NNZ is a constexpr, so
+        # the body is unrolled BLOCK_NNZ times *whatever the row length is* and the
+        # surplus iterations are masked off.  At 256 a roadNet-TX row (2.8 nonzeros)
+        # ran ~253 dead loads per useful one.
+        #
+        # Swept 4/8/16/32/64/128/256 over the 30-matrix corpus (fp32, 32 dense cols):
+        # 256 lands 6.96x off the per-matrix optimum on average and 24.2x off on
+        # roadNet-TX, while a flat 4 lands 1.02x off with a 1.24x worst case
+        # (TSOPF_FS_b300_c1).  A flat 4 also beat every skew- or mean-conditioned rule
+        # tried (best of those was 1.047x), so the constant is deliberate -- long rows
+        # simply take more trips round the outer ``tl.range`` loop, which is cheap.
+        # Measured effect on the operator: 0.052 -> 0.364 of native cuSPARSE COO SpMM.
+        #
+        # The ROCm override is left as upstream tuned it on gfx936; this box cannot
+        # re-measure it.
         block_nnz = (
             int(rocm_launch["block_nnz"])
             if rocm_launch is not None and rocm_launch.get("block_nnz") is not None
-            else 256
+            else 4
         )
+
+    # MetaX/MACA: the rowrun kernels unroll ``tl.static_range(0, BLOCK_NNZ)``, so
+    # BLOCK_NNZ multiplies the kernel's per-thread private memory.  C550's driver caps
+    # that at 4 KB/thread (tunable only host-side via ``insmod metax.ko pri_mem_sz=``),
+    # and the complex kernels carry real+imag, i.e. twice the real footprint.  At the
+    # public default of 256 they ask for 8 KB and the launch is rejected outright with
+    # "memory size or pointer value too large to fit in 32 bit" -- every complex
+    # SpMM COO case fails, while real dtypes still fit.  Measured on C550: BLOCK_NNZ
+    # 256 fails, 4 launches and matches the dense reference.  4 is also what the
+    # 30-matrix sweep picked as the optimum, so the cap costs nothing here.
+    if (
+        _is_maca_runtime()
+        and value_dtype is not None
+        and _is_complex_dtype(value_dtype)
+        and block_nnz > _MACA_SPMM_COO_COMPLEX_BLOCK_NNZ
+    ):
+        block_nnz = _MACA_SPMM_COO_COMPLEX_BLOCK_NNZ
 
     if block_n <= 0 or block_nnz <= 0:
         raise ValueError("block_n and block_nnz must be positive when provided")
 
     backend_info = _get_device_backend_info(device)
+    # The rowrun kernels vectorise over BLOCK_N dense columns and nothing else, so the
+    # program only needs BLOCK_N lanes.  No num_warps was being passed, leaving Triton's
+    # default of 4 warps (128 threads on a 32-wide warp) to work a 32-element vector --
+    # three quarters of the threads idle.  Deriving it from the device's own warp size
+    # keeps this right on the 64-wide backends (gfx936, MetaX C550) too.
+    #
+    # Measured over the 30-matrix corpus (fp32, 32 dense cols, BLOCK_N=32 -> 1 warp):
+    # 0.355 -> 1.100 of native cuSPARSE COO SpMM, a 1.22-4.33x per-matrix speedup.
+    # This is a launch-parameter change only: max relative error against an fp64
+    # reference is bit-for-bit unchanged between num_warps 4 and 1 on every matrix.
+    warp_size = max(1, int(backend_info.get("device_warp_size") or 32))
+    num_warps = max(1, int(block_n) // warp_size)
     return {
+        "num_warps": int(num_warps),
         "block_n": int(block_n),
         "block_nnz": int(block_nnz),
         "required_nnz_tiles": int(triton.cdiv(nnz, block_nnz) if nnz > 0 else 0),
@@ -1185,7 +1246,12 @@ def _triton_spmm_coo_rowrun_impl(
     out=None,
     dense_layout="row",
     seg_starts=None,
+    num_warps=None,
 ):
+    # Derived by _resolve_spmm_coo_launch_config; falls back to matching BLOCK_N to
+    # whole warps if a caller does not supply it.
+    if num_warps is None:
+        num_warps = max(1, int(block_n) // 32)
     device = data.device
     dtype = data.dtype
     dense_layout = _normalize_dense_layout(dense_layout)
@@ -1241,6 +1307,7 @@ def _triton_spmm_coo_rowrun_impl(
             BLOCK_N=block_n,
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
+            num_warps=num_warps,
         )
         if dtype != output_dtype:
             C_cast = C_compute.to(output_dtype)
@@ -1290,6 +1357,7 @@ def _triton_spmm_coo_rowrun_impl(
         BLOCK_N=block_n,
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
+        num_warps=num_warps,
     )
     if dtype != output_dtype:
         C_cast = C_compute.to(output_dtype)
@@ -1604,6 +1672,7 @@ def _run_spmm_coo_rowrun_route(
         output_dtype=prepared.output_dtype,
         dense_layout=dense_layout,
         seg_starts=prepared.seg_starts,
+        num_warps=launch["num_warps"],
     )
     if timing:
         end.record()
@@ -1977,6 +2046,29 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto"):
     )
 
 
+def _select_spmm_coo_auto_alg(prepared):
+    """Resolve ``alg="auto"`` from the matrix, instead of always returning coo_rowrun.
+
+    ``resolve_spmm_coo_algorithm`` maps "auto" to ``coo_rowrun`` unconditionally, and
+    ``coo_rowrun`` launches one program per row (``grid = (n_segs, ...)``, with
+    ``n_segs == n_rows``).  On short-row matrices that is a fixed ~35ns per row with no
+    relation to nnz: roadNet-TX (2.8 nnz/row) took 48.8ms against 7.1ms for
+    ``spmm_coo_alg1``, and ecology1 35.4ms against 5.2ms.
+
+    That row-per-program cost was traced to BLOCK_NNZ, not to the mapping: see
+    ``_resolve_spmm_coo_launch_config``.  Once BLOCK_NNZ is 4 instead of 256,
+    ``coo_rowrun`` is the fastest of the three algorithms on **all 30** matrices in the
+    corpus, so "auto" resolves to it unconditionally -- an nnz/row threshold fitted
+    against the crippled kernel (rowrun below 100 nnz/row, alg1 above) would now send
+    roadNet-TX to ``spmm_coo_alg1`` at 7.14ms instead of ``coo_rowrun`` at 2.02ms.
+    ``coo_atomic`` was never the best choice on any matrix -- its grid is
+    ``(nnz, n_dense_cols)``, i.e. ~99M single-FMA programs on cfd2, running 18-76ms --
+    so "auto" never selects it either.
+    """
+    del prepared  # currently unconditional; kept as the hook for a future rule
+    return "coo_rowrun"
+
+
 def flagsparse_spmm_coo_run(
     prepared,
     B,
@@ -1992,7 +2084,25 @@ def flagsparse_spmm_coo_run(
     if not isinstance(prepared, PreparedCooSpmmRoute):
         raise TypeError("prepared must be a PreparedCooSpmmRoute instance")
     alg_name = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
-    algorithm = resolve_spmm_coo_algorithm(alg_name, prepared.op, prepared.output_dtype)
+    if alg_name == "auto":
+        # Resolved here rather than in resolve_spmm_coo_algorithm(), which only sees
+        # (alg, op, dtype) and cannot look at the matrix.  Falls back to the registry's
+        # default if the selected algorithm cannot serve this op/dtype.
+        selected = _select_spmm_coo_auto_alg(prepared)
+        try:
+            algorithm = resolve_spmm_coo_algorithm(
+                selected, prepared.op, prepared.output_dtype
+            )
+        except (ValueError, TypeError):
+            algorithm = resolve_spmm_coo_algorithm(
+                "auto", prepared.op, prepared.output_dtype
+            )
+        else:
+            alg_name = selected
+    else:
+        algorithm = resolve_spmm_coo_algorithm(
+            alg_name, prepared.op, prepared.output_dtype
+        )
     dense_layout = _normalize_dense_layout(dense_layout)
     start = (
         _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
@@ -2067,6 +2177,7 @@ def _run_spmm_coo_canonical_route(
         block_n=block_n,
         block_nnz=block_nnz,
         device=canonical_data.device,
+        value_dtype=canonical_data.dtype,
     )
 
     if out is not None:
@@ -2480,6 +2591,7 @@ def benchmark_spmm_coo_case(
         block_n=block_n,
         block_nnz=block_nnz,
         device=canonical_data.device,
+        value_dtype=canonical_data.dtype,
     )
     seg_starts = _seg_starts_from_sorted_rows(
         canonical_row, canonical_data.numel(), device
@@ -2588,11 +2700,11 @@ def benchmark_spmm_coo_case(
                 A_coo = cpx_sparse.coo_matrix(
                     (data_cp, (row_cp, col_cp)), shape=effective_shape
                 )
-                # cupy COO ``@`` runs tocsr() internally each call; hoist it so only
-                # the SpMM kernel is timed.
-                A_csr = A_coo.tocsr()
+                # Native cuSPARSE COO SpMM; see _benchmark_spmm_coo_sparse_ref.
+                A_coo.sum_duplicates()
+                B_f = cp.asfortranarray(B_cp)
                 cusparse_values_cp, cusparse_ms = _benchmark_cuda_op(
-                    lambda: A_csr @ B_cp, warmup=warmup, iters=iters
+                    lambda: _cupy_cusparse.spmm(A_coo, B_f), warmup=warmup, iters=iters
                 )
                 cusparse_values = _torch_from_cupy(cusparse_values_cp)
                 cusparse_summary = _spmm_coo_pairwise_summary(

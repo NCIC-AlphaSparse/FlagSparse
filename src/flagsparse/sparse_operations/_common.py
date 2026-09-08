@@ -31,9 +31,16 @@ except ImportError as exc:
 try:
     import cupy as cp
     import cupyx.scipy.sparse as cpx_sparse
+
+    # cupyx.cusparse exposes the *generic* cuSPARSE entry points, notably
+    # ``spmm`` (cusparseSpMM), which accepts a coo_matrix directly and therefore
+    # gives a native COO SpMM baseline.  ``coo_matrix @ B`` cannot: it routes
+    # through cupyx.scipy.sparse._base.__mul__ = ``self.tocsr().__mul__(other)``.
+    import cupyx.cusparse as _cupy_cusparse
 except ImportError:
     cp = None
     cpx_sparse = None
+    _cupy_cusparse = None
 
 # DCU/ROCm backend: the vendor reference library is hipSPARSE, reached through the
 # `hip-python` bindings. The import is optional in exactly the same way CuPy is, so a
@@ -302,6 +309,7 @@ __all__ = (
     "_benchmark_cuda_graph_op",
     "cp",
     "cpx_sparse",
+    "_cupy_cusparse",
     "hip",
     "hipsparse",
     "HipPointer",
