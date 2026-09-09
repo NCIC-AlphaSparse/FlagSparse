@@ -50,6 +50,29 @@ def test_hipsparse_sparse_descriptors_use_create_ref_contract():
     assert "spmat_ref = spmat.createRef()" in SPSV_SOURCE
 
 
+def test_hipsparse_spsv_reference_exposes_stage_timing_contract():
+    prepare = _function_source(
+        SPSV_TREE, SPSV_SOURCE, "_prepare_spsv_csr_ref_hipsparse"
+    )
+    assert "run_analysis=True" in prepare
+    assert "measure_buffer_size=False" in prepare
+    assert "buffer_size_ms" in prepare
+
+    benchmark = _function_source(
+        SPSV_TREE, SPSV_SOURCE, "_benchmark_spsv_csr_sparse_ref"
+    )
+    assert '"buffer_size_ms": None' in benchmark
+    assert '"analysis_ms": None' in benchmark
+    assert '"solve_ms": None' in benchmark
+    assert "run_analysis=False" in benchmark
+    assert "measure_buffer_size=True" in benchmark
+
+    assert "def _run_spsv_csr_ref_hipsparse_analysis_prepared" in SPSV_SOURCE
+    assert "def _benchmark_spsv_hipsparse_stage" in SPSV_SOURCE
+    assert "FlagSparse_bufferSize_ms" in SPSV_BENCHMARK_SOURCE
+    assert "FlagSparse_solve_ms" in SPSV_BENCHMARK_SOURCE
+
+
 def test_spsv_spsm_sources_keep_update_multi_backend_abstraction():
     for source in (SPSV_SOURCE, SPSM_SOURCE):
         assert "torch.cuda.synchronize()" not in source
@@ -85,12 +108,23 @@ def test_spsv_rocm_alg_updates_are_present_but_backend_scoped():
     assert '"FLAGSPARSE_SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL", "1"' in SPSV_SOURCE
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ", "256"' in SPSV_SOURCE
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_WORKGROUPS_PER_CU", "4"' in SPSV_SOURCE
+    assert "sell_trans_csc" in SPSV_SOURCE
+    assert "_build_spsv_sell_trans_csc_metadata" in SPSV_SOURCE
+    assert "_launch_spsv_sell_trans_csc" in SPSV_SOURCE
 
     normalize = _function_source(
         SPSV_TREE, SPSV_SOURCE, "_normalize_requested_spsv_route"
     )
     assert '"alg3": "csr_nnz_balance" if is_rocm else "csr_roc"' in normalize
     assert "CUDA-only route" in normalize
+
+    sell_analysis = _function_source(
+        SPSV_TREE, SPSV_SOURCE, "flagsparse_spsv_analysis_sell"
+    )
+    assert "ALG1 keeps the direct SELL scatter queue" in sell_analysis
+    assert "ALG2 builds a CSC gather view" in sell_analysis
+    assert "compute_dtype = torch.float64" in sell_analysis
+    assert "compute_dtype = torch.complex128" in sell_analysis
 
     launch = _function_source(SPSV_TREE, SPSV_SOURCE, "_spsv_nnz_balance_launch_config")
     assert "if not is_rocm:" in launch

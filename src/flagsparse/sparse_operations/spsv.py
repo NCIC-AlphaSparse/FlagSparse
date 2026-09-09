@@ -640,6 +640,8 @@ def _prepare_spsv_csr_ref_hipsparse(
     unit_diagonal=False,
     op="non",
     out=None,
+    run_analysis=True,
+    measure_buffer_size=False,
 ):
     op_name = _normalize_sparse_reference_op(op)
     skip_reason = _hipsparse_spsv_skip_reason(
@@ -704,6 +706,7 @@ def _prepare_spsv_csr_ref_hipsparse(
         return {
             "backend": "hipsparse",
             "buffer_size": 0,
+            "buffer_size_ms": 0.0,
             "format": "csr",
             "solution": solution,
             "empty": True,
@@ -767,11 +770,14 @@ def _prepare_spsv_csr_ref_hipsparse(
             ("hipsparseSpSV_bufferSize",),
             "hipsparseSpSV_bufferSize",
         )
-        analysis_fn = _hipsparse_call(
-            ("hipsparseSpSV_analysis",),
-            "hipsparseSpSV_analysis",
-        )
         size_out = ctypes.c_size_t()
+        buffer_start = None
+        buffer_stop = None
+        if measure_buffer_size:
+            _ACCEL.synchronize()
+            buffer_start = _ACCEL.Event(enable_timing=True)
+            buffer_stop = _ACCEL.Event(enable_timing=True)
+            buffer_start.record()
         _hip_check_result(
             buffer_size_fn(
                 handle,
@@ -787,30 +793,22 @@ def _prepare_spsv_csr_ref_hipsparse(
             ),
             "hipsparseSpSV_bufferSize",
         )
+        if measure_buffer_size:
+            buffer_stop.record()
+            _ACCEL.synchronize()
+            buffer_size_ms = buffer_start.elapsed_time(buffer_stop)
+        else:
+            buffer_size_ms = None
         buffer_size = int(size_out.value)
         if buffer_size > 0:
             workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
             workspace_allocated = True
         else:
             workspace = 0
-        _hip_check_result(
-            analysis_fn(
-                handle,
-                op_enum,
-                alpha,
-                spmat,
-                rhs_desc,
-                sol_desc,
-                value_type,
-                alg,
-                spsv_descr,
-                workspace,
-            ),
-            "hipsparseSpSV_analysis",
-        )
-        return {
+        state = {
             "backend": "hipsparse",
             "buffer_size": buffer_size,
+            "buffer_size_ms": buffer_size_ms,
             "format": "csr",
             "handle": handle,
             "spmat": spmat,
@@ -827,6 +825,9 @@ def _prepare_spsv_csr_ref_hipsparse(
             "stream_binding_warning": stream_warning,
             "empty": False,
         }
+        if run_analysis:
+            _run_spsv_csr_ref_hipsparse_analysis_prepared(state)
+        return state
     finally:
         if handle is None and spsv_descr is not None:
             try:
@@ -862,6 +863,31 @@ def _prepare_spsv_csr_ref_hipsparse(
                 _hip_check_result(hip.hipFree(workspace), "hipFree")
             except Exception:
                 pass
+
+
+def _run_spsv_csr_ref_hipsparse_analysis_prepared(state):
+    if state.get("empty"):
+        return state
+    analysis_fn = _hipsparse_call(
+        ("hipsparseSpSV_analysis",),
+        "hipsparseSpSV_analysis",
+    )
+    _hip_check_result(
+        analysis_fn(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["rhs_desc"],
+            state["sol_desc"],
+            state["value_type"],
+            state["alg"],
+            state["spsv_descr"],
+            state["workspace"],
+        ),
+        "hipsparseSpSV_analysis",
+    )
+    return state
 
 
 def _run_spsv_csr_ref_hipsparse_prepared(state):
@@ -945,6 +971,35 @@ def _destroy_spsv_csr_ref_hipsparse_prepared(state):
             pass
 
 
+def _benchmark_spsv_hipsparse_stage(state, run_fn, warmup, iters, fmt):
+    output = None
+    for _ in range(max(0, int(warmup))):
+        output = run_fn(state)
+    times = []
+    for _ in range(max(1, int(iters))):
+        _ACCEL.synchronize()
+        start_event = _ACCEL.Event(enable_timing=True)
+        stop_event = _ACCEL.Event(enable_timing=True)
+        start_event.record()
+        output = run_fn(state)
+        stop_event.record()
+        _ACCEL.synchronize()
+        times.append(start_event.elapsed_time(stop_event))
+    if str(fmt).upper() == "COO":
+        avg = sum(times) / len(times)
+        kept = [value for value in times if value < 2.0 * avg]
+        return output, sum(kept) / len(kept) if kept else avg
+    ordered = sorted(times)
+    middle = len(ordered) // 2
+    median = (
+        (ordered[middle - 1] + ordered[middle]) / 2.0
+        if len(ordered) % 2 == 0
+        else ordered[middle]
+    )
+    kept = [value for value in ordered if median * 0.9 <= value <= median * 1.1]
+    return output, sum(kept) / len(kept) if kept else median
+
+
 def _benchmark_spsv_csr_sparse_ref(
     data,
     indices,
@@ -958,6 +1013,7 @@ def _benchmark_spsv_csr_sparse_ref(
     warmup=0,
     iters=1,
     fresh_each_iter=False,
+    fmt="CSR",
 ):
     backend, reason = _spsv_csr_sparse_ref_backend(
         data.dtype,
@@ -969,6 +1025,9 @@ def _benchmark_spsv_csr_sparse_ref(
         "backend": backend,
         "values": None,
         "ms": None,
+        "buffer_size_ms": None,
+        "analysis_ms": None,
+        "solve_ms": None,
         "reason": reason,
     }
     if backend is None:
@@ -1030,22 +1089,40 @@ def _benchmark_spsv_csr_sparse_ref(
             else:
                 ms = None
         else:
-            values, ms = _benchmark_prepared_cuda_op(
-                lambda: _prepare_spsv_csr_ref_hipsparse(
-                    data,
-                    indices,
-                    indptr,
-                    rhs,
-                    shape,
-                    lower=lower,
-                    unit_diagonal=unit_diagonal,
-                    op=op,
-                ),
-                _run_spsv_csr_ref_hipsparse_prepared,
-                _destroy_spsv_csr_ref_hipsparse_prepared,
-                warmup=warmup,
-                iters=iters,
+            state = _prepare_spsv_csr_ref_hipsparse(
+                data,
+                indices,
+                indptr,
+                rhs,
+                shape,
+                lower=lower,
+                unit_diagonal=unit_diagonal,
+                op=op,
+                run_analysis=False,
+                measure_buffer_size=True,
             )
+            try:
+                _, analysis_ms = _benchmark_spsv_hipsparse_stage(
+                    state,
+                    _run_spsv_csr_ref_hipsparse_analysis_prepared,
+                    warmup=warmup,
+                    iters=iters,
+                    fmt=fmt,
+                )
+                values, solve_ms = _benchmark_spsv_hipsparse_stage(
+                    state,
+                    _run_spsv_csr_ref_hipsparse_prepared,
+                    warmup=warmup,
+                    iters=iters,
+                    fmt=fmt,
+                )
+                buffer_size_ms = float(state["buffer_size_ms"] or 0.0)
+                ms = buffer_size_ms + analysis_ms + solve_ms
+            finally:
+                _destroy_spsv_csr_ref_hipsparse_prepared(state)
+            result["buffer_size_ms"] = buffer_size_ms
+            result["analysis_ms"] = analysis_ms
+            result["solve_ms"] = solve_ms
         result["values"] = values
         result["ms"] = ms
         result["reason"] = None
@@ -1287,6 +1364,8 @@ def _spsv_sell_trans_analysis_signature(
     shape,
     slice_size,
     unit_diagonal,
+    trans_mode,
+    alg_num,
 ):
     if not all(torch.is_tensor(t) for t in (values, col_indices, slice_offsets)):
         return None
@@ -1295,9 +1374,9 @@ def _spsv_sell_trans_analysis_signature(
         tuple(int(v) for v in shape),
         int(slice_size),
         bool(unit_diagonal),
-        str(values.device),
-        str(values.dtype),
-        int(values.numel()),
+        str(trans_mode),
+        int(alg_num),
+        _tensor_cache_token(values),
         _tensor_cache_token(col_indices),
         _tensor_cache_token(slice_offsets),
     )
@@ -1422,6 +1501,11 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("indegree", n_rows, torch.int32),
             _workspace_entry("ready_queue", n_rows, torch.int32),
             _workspace_entry("queue_state", 2, torch.int32),
+        )
+    if solve_kind == "sell_trans_csc":
+        return (
+            _workspace_entry("ready", n_rows, torch.int32),
+            _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "csr_roc":
         return (
@@ -5311,6 +5395,82 @@ def _build_spsv_sell_trans_queue_metadata(
     }
 
 
+def _build_spsv_sell_trans_csc_metadata(
+    values,
+    col_indices,
+    slice_offsets,
+    n_rows,
+    slice_size,
+    *,
+    compute_dtype,
+    conjugate,
+):
+    """Build rows of op(A) once so TRANS/CONJ can gather deterministically."""
+
+    n_rows = int(n_rows)
+    index_dtype = col_indices.dtype
+    device = col_indices.device
+    if n_rows == 0:
+        return {
+            "data": torch.empty(0, dtype=compute_dtype, device=device),
+            "indices": torch.empty(0, dtype=index_dtype, device=device),
+            "indptr": torch.zeros(1, dtype=index_dtype, device=device),
+            "worker_count": 0,
+        }
+
+    slice_lengths = (slice_offsets[1:] - slice_offsets[:-1]).to(torch.int64)
+    n_entries = int(col_indices.numel())
+    slice_ids = torch.repeat_interleave(
+        torch.arange(
+            slice_offsets.numel() - 1,
+            device=device,
+            dtype=torch.int64,
+        ),
+        slice_lengths,
+        output_size=n_entries,
+    )
+    slice_starts = torch.repeat_interleave(
+        slice_offsets[:-1].to(torch.int64),
+        slice_lengths,
+        output_size=n_entries,
+    )
+    entry_offsets = torch.arange(n_entries, device=device, dtype=torch.int64)
+    local_offsets = entry_offsets - slice_starts
+    source_rows = slice_ids * int(slice_size) + local_offsets.remainder(
+        int(slice_size)
+    )
+    source_cols = col_indices.to(torch.int64)
+    triangular = (
+        (source_rows < n_rows) & (source_cols >= 0) & (source_cols <= source_rows)
+    )
+    entry_offsets = entry_offsets[triangular]
+    source_rows = source_rows[triangular]
+    source_cols = source_cols[triangular]
+
+    # Row c of A^T/A^H contains entries (c, r) from A(r, c). Descending r
+    # matches the existing CSR CW upper-row dependency order.
+    key = source_cols * n_rows + (n_rows - 1 - source_rows)
+    order = torch.argsort(key, stable=True)
+    source_cols = source_cols[order]
+    trans_indices = source_rows[order].to(index_dtype).contiguous()
+    trans_data = values.index_select(0, entry_offsets[order]).to(compute_dtype)
+    if conjugate and torch.is_complex(trans_data):
+        trans_data = trans_data.conj().resolve_conj()
+    trans_data = trans_data.contiguous()
+
+    counts = torch.bincount(source_cols, minlength=n_rows)
+    trans_indptr64 = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    trans_indptr64[1:] = torch.cumsum(counts, dim=0)
+    trans_indptr = trans_indptr64.to(index_dtype).contiguous()
+    worker_count = _snap_cw_worker_count(min(32, n_rows), n_rows)
+    return {
+        "data": trans_data,
+        "indices": trans_indices,
+        "indptr": trans_indptr,
+        "worker_count": int(worker_count),
+    }
+
+
 def _launch_spsv_sell_trans_queue(
     values,
     col_indices,
@@ -5338,7 +5498,7 @@ def _launch_spsv_sell_trans_queue(
     if int(n_rows) == 0:
         return out
     is_complex = torch.is_complex(values)
-    use_fp64_acc = values.dtype in (torch.float64, torch.complex128)
+    use_fp64_acc = residual_in.dtype in (torch.float64, torch.complex128)
     if is_complex:
         if values_ri_in is None:
             raise RuntimeError("SELL TRANS complex analysis is missing interleaved values")
@@ -5418,6 +5578,75 @@ def _launch_spsv_sell_trans_queue(
             BLOCK_SLOTS=int(block_slots),
             UNIT_DIAG=bool(unit_diagonal),
             USE_FP64_ACC=bool(use_fp64_acc),
+            num_warps=1,
+        )
+    return out
+
+
+def _launch_spsv_sell_trans_csc(
+    data,
+    indices,
+    indptr,
+    b_vec,
+    n_rows,
+    *,
+    worker_count,
+    out,
+    ready,
+    row_counter,
+    unit_diagonal=False,
+    data_ri_in=None,
+):
+    """Solve the analyzed upper CSC view with one gather owner per row."""
+
+    ready.zero_()
+    row_counter.zero_()
+    if int(n_rows) == 0:
+        return out
+    if _is_rocm_runtime():
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, True)
+    diag_eps = _spsv_diag_eps_for_dtype(data.dtype)
+    serial_execution = _is_rocm_runtime() and not SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL
+    if serial_execution:
+        worker_count = 1
+    if torch.is_complex(data):
+        if data_ri_in is None:
+            raise RuntimeError("SELL CSC analysis is missing interleaved values")
+        b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
+        out_ri = torch.view_as_real(out.contiguous()).reshape(-1).contiguous()
+        _spsv_csr_cw_kernel_complex[(int(worker_count),)](
+            data_ri_in,
+            indices,
+            indptr,
+            b_ri,
+            out_ri,
+            ready,
+            row_counter,
+            int(n_rows),
+            LOWER=False,
+            REVERSE_ORDER=True,
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=data.dtype == torch.complex128,
+            DIAG_EPS=diag_eps,
+            SERIAL_EXECUTION=serial_execution,
+            num_warps=1,
+        )
+    else:
+        _spsv_csr_cw_kernel[(int(worker_count),)](
+            data,
+            indices,
+            indptr,
+            b_vec,
+            out,
+            ready,
+            row_counter,
+            int(n_rows),
+            LOWER=False,
+            REVERSE_ORDER=True,
+            UNIT_DIAG=bool(unit_diagonal),
+            USE_FP64_ACC=data.dtype == torch.float64,
+            DIAG_EPS=diag_eps,
+            SERIAL_EXECUTION=serial_execution,
             num_warps=1,
         )
     return out
@@ -7411,11 +7640,20 @@ def flagsparse_spsv_analysis_sell(
     When ``unit_diagonal`` is true, stored diagonal entries are ignored and
     missing diagonal entries are interpreted as one, matching SpSV descriptor
     semantics used by cuSPARSE.  ``transpose`` accepts the same N/T/C forms as
-    the CSR API; T solves A^T x=b and C solves A^H x=b.
+    the CSR API; T solves A^T x=b and C solves A^H x=b. For TRANS/CONJ,
+    ALG1 keeps the direct SELL scatter queue and ALG2 builds a CSC gather view
+    during analysis.
     """
 
     unit_diagonal = bool(unit_diagonal)
     trans_mode = _normalize_spsv_transpose_mode(transpose)
+    trans_alg_num = None
+    if trans_mode != "N":
+        trans_alg_num = (
+            SPSV_SELL_ALG1
+            if alg_num is None
+            else _normalize_spsv_sell_alg_num(alg_num)
+        )
     trans_analysis_key = None
     trans_analysis = None
     if trans_mode != "N":
@@ -7426,6 +7664,8 @@ def flagsparse_spsv_analysis_sell(
             shape,
             slice_size,
             unit_diagonal,
+            trans_mode,
+            trans_alg_num,
         )
         if trans_analysis_key is not None:
             trans_analysis = _spsv_cache_get(
@@ -7447,6 +7687,11 @@ def flagsparse_spsv_analysis_sell(
         _validate_spsv_non_trans_combo(values.dtype, cols.dtype, "SELL")
     else:
         _validate_spsv_trans_combo(values.dtype, cols.dtype, "SELL")
+    compute_dtype = values.dtype
+    if trans_mode != "N" and values.dtype == torch.float32:
+        compute_dtype = torch.float64
+    elif trans_mode != "N" and values.dtype == torch.complex64:
+        compute_dtype = torch.complex128
     if trans_mode == "N":
         alg_num = (
             SPSV_SELL_ALG1
@@ -7464,24 +7709,33 @@ def flagsparse_spsv_analysis_sell(
             )
         solve_kind = f"sell_alg{alg_num}"
     else:
-        if alg_num is not None:
-            raise ValueError("SELL TRANS/CONJ do not accept alg_num")
         if alg2_worker_count is not None:
             raise ValueError("SELL TRANS/CONJ do not accept worker-count tuning")
         if trans_analysis is None:
-            queue_meta = _build_spsv_sell_trans_queue_metadata(
-                cols,
-                offsets,
-                n_rows,
-                slice_size,
-            )
-            trans_analysis = {
-                "indegree_init32": queue_meta["indegree_init32"],
-                "diag_offsets": queue_meta["diag_offsets"],
-                "row_widths32": queue_meta["row_widths32"],
-                "block_slots": int(queue_meta["block_slots"]),
-                "worker_count": int(queue_meta["worker_count"]),
-            }
+            if trans_alg_num == SPSV_SELL_ALG1:
+                queue_meta = _build_spsv_sell_trans_queue_metadata(
+                    cols,
+                    offsets,
+                    n_rows,
+                    slice_size,
+                )
+                trans_analysis = {
+                    "indegree_init32": queue_meta["indegree_init32"],
+                    "diag_offsets": queue_meta["diag_offsets"],
+                    "row_widths32": queue_meta["row_widths32"],
+                    "block_slots": int(queue_meta["block_slots"]),
+                    "worker_count": int(queue_meta["worker_count"]),
+                }
+            else:
+                trans_analysis = _build_spsv_sell_trans_csc_metadata(
+                    values,
+                    cols,
+                    offsets,
+                    n_rows,
+                    slice_size,
+                    compute_dtype=compute_dtype,
+                    conjugate=trans_mode == "C",
+                )
             if trans_analysis_key is not None:
                 _spsv_cache_put(
                     _SPSV_SELL_TRANS_ANALYSIS_CACHE,
@@ -7489,9 +7743,13 @@ def flagsparse_spsv_analysis_sell(
                     trans_analysis,
                     _SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE,
                 )
-        solve_kind = "sell_trans_queue"
+        solve_kind = (
+            "sell_trans_queue"
+            if trans_alg_num == SPSV_SELL_ALG1
+            else "sell_trans_csc"
+        )
     layout = _build_spsv_workspace_layout(
-        n_rows, solve_kind, value_dtype=values.dtype
+        n_rows, solve_kind, value_dtype=compute_dtype
     )
     if workspace is not None:
         _resolve_spsv_workspace(workspace, layout, values.device)
@@ -7503,12 +7761,23 @@ def flagsparse_spsv_analysis_sell(
     if trans_mode == "N":
         solve_plan["alg_num"] = int(alg_num)
         solve_plan["alg2_worker_count"] = resolved_workers
-    else:
+    elif solve_kind == "sell_trans_queue":
         solve_plan["trans_indegree_init32"] = trans_analysis["indegree_init32"]
         solve_plan["trans_diag_offsets"] = trans_analysis["diag_offsets"]
         solve_plan["trans_row_widths32"] = trans_analysis["row_widths32"]
         solve_plan["trans_block_slots"] = int(trans_analysis["block_slots"])
         solve_plan["trans_worker_count"] = int(trans_analysis["worker_count"])
+        solve_plan["alg_num"] = int(trans_alg_num)
+    else:
+        solve_plan["trans_csc_data"] = trans_analysis["data"]
+        solve_plan["trans_csc_indices"] = trans_analysis["indices"]
+        solve_plan["trans_csc_indptr"] = trans_analysis["indptr"]
+        solve_plan["trans_worker_count"] = int(trans_analysis["worker_count"])
+        solve_plan["alg_num"] = int(trans_alg_num)
+        if torch.is_complex(trans_analysis["data"]):
+            solve_plan["trans_csc_data_ri"] = _complex_interleaved_view(
+                trans_analysis["data"]
+            )
     _attach_spsv_complex_plan_views(solve_plan)
     return FlagSparseSpSVDescr(
         format="sell",
@@ -7522,7 +7791,7 @@ def flagsparse_spsv_analysis_sell(
         index_base=0,
         transpose_mode=trans_mode,
         value_dtype=values.dtype,
-        compute_dtype=values.dtype,
+        compute_dtype=compute_dtype,
         index_dtype=cols.dtype,
         solve_kind=solve_kind,
         route_name=solve_kind,
@@ -7579,9 +7848,23 @@ def flagsparse_spsv_solve_sell(
     )
     plan = descr.solve_plan
     if descr.transpose_mode in ("T", "C"):
+        if descr.solve_kind == "sell_trans_csc":
+            return _launch_spsv_sell_trans_csc(
+                plan["trans_csc_data"],
+                plan["trans_csc_indices"],
+                plan["trans_csc_indptr"],
+                _as_strided_contiguous(b),
+                n_rows,
+                worker_count=int(plan["trans_worker_count"]),
+                out=out,
+                ready=buffers["ready"],
+                row_counter=buffers["row_counter"],
+                unit_diagonal=bool(descr.unit_diagonal),
+                data_ri_in=plan.get("trans_csc_data_ri"),
+            )
         if descr.solve_kind != "sell_trans_queue":
             raise RuntimeError(
-                "SELL TRANS/CONJ must use the direct ready-queue route"
+                f"unsupported SELL transpose route: {descr.solve_kind}"
             )
         return _launch_spsv_sell_trans_queue(
             descr.data,
