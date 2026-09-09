@@ -328,6 +328,18 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent
 > 注意：DCU 上 `--alg_num 3` 映射到 `csr_nnz_balance`；旧 `csr_roc`、`csr_smblk`、
 > `alg4`、`alg8` 会被明确拒绝，避免误跑 CUDA-only route。
 
+SpSV CSR/COO 普通 runner 在 ROCm 上会把 hipSPARSE vendor baseline 拆成
+`bufferSize + analysis + solve` 三段记录。CSV 中新增 `FlagSparse_bufferSize_ms`、
+`FlagSparse_analysis_ms`、`FlagSparse_solve_ms` 以及对应的 `hipSPARSE_*` 字段；
+终端里的 `HS.S.spd` 使用 solve 阶段对比，`*_all_speedup` 仍保留完整总耗时对比。
+CUDA/MACA 路径继续使用原来的总耗时字段，避免 ROCm 分阶段口径污染其它后端。
+
+SELL SpSV 的 TRANS/CONJ 路径现在允许显式选择 `--alg_num 1|2`：
+
+- `ALG1`：`sell_trans_queue`，沿用原始 SELL scatter queue；
+- `ALG2`：`sell_trans_csc`，analysis 阶段构造 CSC gather 视图，`float32/complex64`
+  会分别提升到 `float64/complex128` 做 transpose-family solve。
+
 ---
 
 ## 5. 正确性套件

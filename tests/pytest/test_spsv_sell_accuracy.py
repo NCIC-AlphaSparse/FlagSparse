@@ -187,8 +187,9 @@ def test_spsv_sell_matches_dense_and_supports_inplace(
 @pytest.mark.parametrize(
     "unit_diagonal", (False, True), ids=("non_unit", "unit")
 )
+@pytest.mark.parametrize("alg_num", (1, 2), ids=("scatter", "csc_gather"))
 def test_spsv_sell_trans_matches_dense_and_supports_inplace(
-    n, dtype, index_dtype, slice_size, unit_diagonal
+    n, dtype, index_dtype, slice_size, unit_diagonal, alg_num
 ):
     """TRANS uses the SELL layout and solves A^T x=b accurately."""
 
@@ -217,12 +218,23 @@ def test_spsv_sell_trans_matches_dense_and_supports_inplace(
         offsets,
         (n, n),
         slice_size=slice_size,
+        alg_num=alg_num,
         unit_diagonal=unit_diagonal,
         transpose=True,
     )
     assert descr.transpose_mode == "T"
-    assert descr.solve_kind == "sell_trans"
+    expected_route = "sell_trans_queue" if alg_num == 1 else "sell_trans_csc"
+    assert descr.solve_kind == expected_route
     workspace = flagsparse_spsv_create_workspace(descr)
+    expected_compute_dtype = {
+        torch.float32: torch.float64,
+        torch.complex64: torch.complex128,
+    }.get(dtype, dtype)
+    assert descr.compute_dtype == expected_compute_dtype
+    if alg_num == 1:
+        assert workspace.buffers["residual"].dtype == expected_compute_dtype
+    else:
+        assert descr.solve_plan["trans_csc_data"].dtype == expected_compute_dtype
     result = flagsparse_spsv_solve_sell(descr, b, workspace=workspace)
     inplace = b.clone()
     flagsparse_spsv_solve_sell(
@@ -238,7 +250,8 @@ def test_spsv_sell_trans_matches_dense_and_supports_inplace(
 
 @pytest.mark.parametrize("dtype", (torch.complex64, torch.complex128))
 @pytest.mark.parametrize("transpose", ("T", "C"), ids=("trans", "conj"))
-def test_spsv_sell_conj_trans_complex(dtype, transpose):
+@pytest.mark.parametrize("alg_num", (1, 2), ids=("scatter", "csc_gather"))
+def test_spsv_sell_conj_trans_complex(dtype, transpose, alg_num):
     device = torch.device("cuda")
     values, columns, offsets, dense = _lower_triangular_sell(
         37, dtype, torch.int64, 8, device
@@ -258,6 +271,7 @@ def test_spsv_sell_conj_trans_complex(dtype, transpose):
         offsets,
         (37, 37),
         slice_size=8,
+        alg_num=alg_num,
         transpose=transpose,
     )
     result = flagsparse_spsv_solve_sell(

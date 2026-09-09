@@ -715,9 +715,9 @@ def _benchmark_triton(
         "slice_size": slice_size,
         "unit_diagonal": unit_diagonal,
         "transpose": op_mode,
+        "alg_num": alg_num,
     }
     if op_mode == "NON":
-        analysis_kwargs["alg_num"] = alg_num
         if alg2_worker_count is not None:
             analysis_kwargs["alg2_worker_count"] = alg2_worker_count
     else:
@@ -790,9 +790,9 @@ def _run_case(
         "slice_size": slice_size,
         "unit_diagonal": unit_diagonal,
         "transpose": op_mode,
+        "alg_num": alg_num,
     }
     if op_mode == "NON":
-        analysis_kwargs["alg_num"] = alg_num
         if alg2_worker_count is not None:
             analysis_kwargs["alg2_worker_count"] = alg2_worker_count
     public_descr = fs.flagsparse_spsv_analysis_sell(
@@ -919,7 +919,7 @@ def _print_header(
 ):
     op_label = op_mode
     if op_mode != "NON":
-        algorithm_label = op_mode
+        algorithm_label = f"ALG{alg_num}"
         worker_label = "N/A"
     elif alg_num == 2:
         algorithm_label = f"ALG{alg_num}"
@@ -1049,7 +1049,7 @@ def test_spsv_sell_matches_cusparse(
 
 
 def test_spsv_sell_trans_matches_cusparse(
-    value_dtype, index_dtype, slice_size, unit_diagonal, op_mode
+    value_dtype, index_dtype, slice_size, alg_num, unit_diagonal, op_mode
 ):
     if not spsv_impl._ACCEL.is_available():
         pytest.skip("GPU runtime is unavailable")
@@ -1082,6 +1082,7 @@ def test_spsv_sell_trans_matches_cusparse(
             b,
             expected,
             slice_size,
+            alg_num,
             unit_diagonal=unit_diagonal,
             op_mode=op_mode,
         )
@@ -1096,6 +1097,7 @@ def test_spsv_sell_trans_matches_cusparse(
         slice_size,
         value_dtype,
         index_dtype,
+        alg_num,
         unit_diagonal=unit_diagonal,
         op_mode=op_mode,
     )
@@ -1181,9 +1183,11 @@ if __name__ != "__main__":
     )(
         pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))(
             pytest.mark.parametrize("slice_size", (8, 32))(
-                pytest.mark.parametrize("unit_diagonal", (False, True))(
-                    pytest.mark.parametrize("op_mode", ("TRANS", "CONJ"))(
-                        test_spsv_sell_trans_matches_cusparse
+                pytest.mark.parametrize("alg_num", SELL_ALG_NUMS)(
+                    pytest.mark.parametrize("unit_diagonal", (False, True))(
+                        pytest.mark.parametrize("op_mode", ("TRANS", "CONJ"))(
+                            test_spsv_sell_trans_matches_cusparse
+                        )
                     )
                 )
             )
@@ -1226,8 +1230,8 @@ def main():
         choices=SELL_ALG_NUMS,
         default=None,
         help=(
-            "SELL kernel: 1=original persistent row solver, "
-            "2=slice-cooperative solver"
+            "SELL kernel: NON uses 1=original/2=slice-cooperative; "
+            "TRANS/CONJ uses 1=scatter queue/2=CSC gather"
         ),
     )
     parser.add_argument(
@@ -1260,8 +1264,6 @@ def main():
     parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
 
-    if args.ops != "NON" and args.alg_num is not None:
-        parser.error("TRANS/CONJ do not accept --alg_num")
     if args.ops != "NON" and args.alg2_workers is not None:
         parser.error("TRANS/CONJ do not accept --alg2-workers")
     if args.scipy_check_mip1 and args.ops == "NON":
@@ -1286,7 +1288,7 @@ def main():
                 args.slice_size,
                 value_dtype,
                 index_dtype,
-                None if op_mode != "NON" else alg_num,
+                alg_num,
                 None if op_mode != "NON" else args.alg2_workers,
                 args.unit_diagonal,
                 op_mode,
@@ -1340,7 +1342,7 @@ def main():
                         b,
                         expected,
                         args.slice_size,
-                        None if op_mode != "NON" else alg_num,
+                        alg_num,
                         None if op_mode != "NON" else args.alg2_workers,
                         args.unit_diagonal,
                         op_mode,
