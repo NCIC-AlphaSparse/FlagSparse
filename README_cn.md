@@ -164,47 +164,33 @@ python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matr
 DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
 已知限制、排查速查表）见 [docs/DCU_TESTING.md](docs/DCU_TESTING.md)。
 
-### 在 MetaX（C550）上跑测试
+### 在 MetaX / MACA C550 上跑测试
 
-已在 MetaX C550（`warp_size=64`、104 MP、64 GB）实机验证，环境为 MACA SDK 3.8.2.6、
-torch `2.10.0+metax3.8.1.0`、triton `3.6.0+metax3.8.1.0`。后端探测**不需要**设环境变量
-（`torch.version.maca` 存在，设备名是 `MetaX C550`），但厂商基线要关掉 —— 本机没有 CuPy：
-
-```bash
-export PYTHONPATH=$PWD/src
-export FLAGSPARSE_MACA_VENDOR=none
-
-python -c "import flagsparse; print(flagsparse.__file__)"   # 必须指向 <仓库>/src/
-python -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model())"
-# 期望：metax c550
-```
-
-SpMV（CSR/COO/CSC/BSR）、SpMM（CSR/COO/CSC/BSR）、SpGEMM、SDDMM、gather/scatter
-共 **921 个用例全部通过**：
+在 C550 环境中，同时执行精度和性能阶段，性能基线使用 PyTorch。本轮使用 30 个
+MatrixMarket 矩阵，热身 5 次、迭代 20 次。由于当前内核在该平台可能卡住，暂不包含
+SpSV 和 SpSM：
 
 ```bash
-timeout -s KILL 3600 python -m pytest tests/pytest -q \
-  -m "spmv_csr or spmv_coo or spmv_csc or spmv_bsr or spmv_coo_tocsr or \
-      spmm_csr or spmm_coo or spmm_csc or spmm_bsr or \
-      spgemm_csr or sddmm_csr or gather or scatter"
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr \
+  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
+  --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
 ```
 
-本后端的已知限制：
+`--benchmark-args` 会追加到所有性能脚本；仅某个算子支持的参数使用可重复的
+`--op-benchmark-args=算子名=参数`。上例只向 BSR 脚本传入 `--resume`，不会影响其他算子；
+参数部分含空格时再整体引用，例如 `--op-benchmark-args="spmv_bsr=--dtypes float64"`。
+BSR 脚本会保留已完成的 `PASS`/`FAIL` case、重试此前的 `ERROR` case，
+并且只对精度为 `PASS` 的行给出 `bsr_speedup_vs_pytorch`。
 
-- **SpSV/SpSM 不可用。** `_spsv_csr_cw_kernel` 在所有 `lower` + `unit_diagonal` 的求解上
-  非法访存 —— 连从不进入依赖分支的纯对角矩阵也崩；它的 ready-flag 自旋也推不动，
-  和 DCU/gfx936 是同一个故障模式。跑求解器算子**永远套 `timeout -s KILL`**：
-  内核挂死后 Ctrl-C 送不进去，代价是整个容器要重开。
-- **`alpha_spmm_alg1` 用不了**：沐曦的 Triton 构建没有 `triton.experimental.tle`，
-  而带 TLE 的 FlagTree wheel 要 GLIBC 2.38，本机镜像是 2.31。其余算子都不依赖 TLE。
-- **复数 SpMM COO 需要钳制启动参数**（已修复）：rowrun 内核会展开
-  `tl.static_range(0, BLOCK_NNZ)`，公开默认值 256 下复数内核要 8 KB/线程私有内存，
-  超过驱动 4 KB 上限直接拒绝启动。MACA+复数钳到 `BLOCK_NNZ=4` 后 24 个失败全部消失，
-  整组耗时从 23m48s 降到 11.8s。
+结果目录包含各算子的精度、性能文件和合并汇总。后端检查、基线说明和 C550 已知限制见
+[docs/METAX_TESTING.md](docs/METAX_TESTING.md)。
 
-日常操作手册（逐 marker 命令、SpSV 最小复现、私有内存问题的定位过程、排查速查表）见
-[docs/METAX_RUNNING.md](docs/METAX_RUNNING.md)；首次 bring-up（装 SDK、选 wheel、
-厂商 pip 源、采集指纹）见 [docs/METAX_TESTING.md](docs/METAX_TESTING.md)。
+在 MetaX 上，`test_spmm_csc.py` 使用 PyTorch 原生 CSC 作为性能基线：直接构造
+`torch.sparse_csc_tensor` 后调用 `torch.sparse.mm`。CSC 格式构造不计入计时，CSV 中记录为
+`pytorch_ms`，并计算 `triton_speedup_vs_pytorch`。`--no-cusparse` 只关闭可选的厂商基线，
+不会关闭 PyTorch CSC 基线；COO 路径仍只用于精度参考。
 
 ## 目录说明
 
@@ -382,3 +368,50 @@ python tests/test_spsm.py <目录/> --csv-coo spsm_coo.csv --rhs 1024
 ## 授权许可
 
 本项目采用 [Apache (Version 2.0) license](./LICENSE) 许可证授权。
+
+### Ascend 910B 专用基线
+
+在已安装匹配版本 `torch_npu`、Triton Ascend 后端和 SciPy 的 910B 主机上，
+可使用 Ascend-only benchmark 入口。该入口使用 SciPy 做 CPU 精度校验，优先探测
+`ops-sparse` Python bridge 或 `libaclsparse.so`；当前仓库未内置 C/Python bridge 时，
+对 CSR SpMV/SpMM/SDDMM 使用 PyTorch-NPU fallback，并对 gather/scatter 给出 PyTorch
+indexing 对照。脚本会在输出中区分“ops-sparse 已发现”与“实际已调用”，不会把
+PyTorch-NPU 结果冒充 ops-sparse：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=ascend
+export FLAGSPARSE_ASCEND_VENDOR=ops_sparse
+python benchmark/benchmark_ascend.py --m 4096 --n 4096 --nnz 131072 \
+  --dense-cols 64 --warmup 20 --iters 100
+```
+
+结果中的 `scipy_max_abs_error` 仅用于精度检查；`flagsparse` 和 `pytorch` 的
+`median_ms`/`p95_ms` 才是 NPU 性能数据。当前环境若缺少 `torch_npu` 或 NPU，
+该命令会明确报错，不会伪造性能结果。
+
+### Ascend 910B 统一 runner
+
+项目性能测试只使用 6、7 号 NPU。设置 `FLAGSPARSE_BACKEND=ascend` 后，
+`run_flagsparse_pytest.py` 会对以下五个算子调用 Ascend 专用 benchmark，其他后端保持
+原有执行路径：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=ascend
+export FLAGSPARSE_ASCEND_VENDOR=ops_sparse
+
+run_id=$(date -u +%Y%m%dT%H%M%SZ)
+setsid python3 -u run_flagsparse_pytest.py \
+  --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
+  --phase performance --gpus 6,7 \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir "pytest_results_ascend_${run_id}" \
+  > "pytest_ascend_${run_id}.log" 2>&1 < /dev/null &
+```
+
+日志写入 `pytest_ascend_<时间戳>.log`，结果写入
+`pytest_results_ascend_<时间戳>/`。完整说明见
+[docs/ASCEND_TESTING.md](docs/ASCEND_TESTING.md)。

@@ -618,6 +618,24 @@ def _spd(base, other):
     return f"{base / other:.2f}x"
 
 
+def _speedup_ratio(base, other):
+    if base is None or other is None or other <= 0:
+        return None
+    return base / other
+
+
+def _csv_case_key(row):
+    """The stable identity of one matrix/dtype/algorithm benchmark case."""
+    return (
+        str(row.get("matrix", "")),
+        str(row.get("value_dtype", "")),
+        str(row.get("index_dtype", "")),
+        str(row.get("op", "")),
+        str(row.get("algorithm", "")),
+        str(row.get("block_dim", "")),
+    )
+
+
 def _status(ok):
     return "PASS" if ok else "FAIL"
 
@@ -718,6 +736,7 @@ def _base_row(
         "process_gpu_ms": None,
         "compute_ms": None,
         "pytorch_ms": None,
+        "bsr_speedup_vs_pytorch": None,
         "pytorch_error": None,
         "pytorch_padded_ms": None,
         "pytorch_padded_error": None,
@@ -776,6 +795,7 @@ def _skip_row(matrix_name, dtype, index_dtype, op, shape, block_dim, logical_nnz
         "process_gpu_ms": None,
         "compute_ms": None,
         "pytorch_ms": None,
+        "bsr_speedup_vs_pytorch": None,
         "pytorch_error": None,
         "pytorch_padded_ms": None,
         "pytorch_padded_error": None,
@@ -949,6 +969,9 @@ def _run_one_case(
         except Exception as exc:
             row["cusparse_error"] = str(exc)
     ok = (not math.isnan(err)) and err <= 1.0
+    row["bsr_speedup_vs_pytorch"] = (
+        _speedup_ratio(row.get("pytorch_ms"), row.get("bsr_ms")) if ok else None
+    )
     row["status"] = _status(ok)
     row["error"] = None if ok else "correctness check failed"
     return row
@@ -1024,7 +1047,7 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
                     print()
 
 
-def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True, fail_fast=False):
+def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True, fail_fast=False, resume=False):
     if not torch.cuda.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
@@ -1058,6 +1081,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         "process_gpu_ms",
         "compute_ms",
         "pytorch_ms",
+        "bsr_speedup_vs_pytorch",
         "pytorch_error",
         "pytorch_err",
         "pytorch_padded_ms",
@@ -1087,14 +1111,41 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
     csv_parent = Path(csv_path).parent
     if str(csv_parent) not in ("", "."):
         csv_parent.mkdir(parents=True, exist_ok=True)
+    completed = set()
+    csv_path = Path(csv_path)
+    resumed_existing_csv = resume and csv_path.exists()
+    if resumed_existing_csv:
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            existing_rows = list(csv.DictReader(handle))
+        # An ERROR row did not complete its case, so drop it and retry.  FAIL is kept
+        # deliberately: it is a completed accuracy result and must not be rerun merely
+        # because it has no eligible speedup.
+        rows = [
+            row
+            for row in existing_rows
+            if str(row.get("status", "")).upper() != "ERROR"
+        ]
+        for row in rows:
+            if str(row.get("status", "")).upper() != "PASS":
+                row["bsr_speedup_vs_pytorch"] = ""
+            completed.add(_csv_case_key(row))
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Resuming {csv_path}: retained {len(rows)} completed rows.")
+
     # Stream each row to disk as it is produced.  The BSR sweeps are the ones
     # that outrun --timeout, and a killed process used to leave an empty CSV
     # because every row was buffered until the very end.
-    csv_handle = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_handle = csv_path.open(
+        "a" if resumed_existing_csv else "w", newline="", encoding="utf-8"
+    )
     csv_writer = csv.DictWriter(
         csv_handle, fieldnames=fieldnames, extrasaction="ignore"
     )
-    csv_writer.writeheader()
+    if not resumed_existing_csv:
+        csv_writer.writeheader()
     csv_handle.flush()
 
     def _emit(row):
@@ -1105,6 +1156,8 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
         # flush is enough here: the failure mode is the process being killed,
         # not the node going down, so the OS still owns the buffered bytes.
         csv_handle.flush()
+        if str(row.get("status", "")).upper() != "ERROR":
+            completed.add(_csv_case_key(row))
 
     _print_baseline_notes(run_cusparse=run_cusparse)
     for dtype in value_dtypes:
@@ -1125,6 +1178,16 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                                 entries, shape, dtype, index_dtype, int(block_dim), device
                             )
                             for alg in op_algs:
+                                case_key = (
+                                    os.path.basename(path),
+                                    _dtype_name(dtype),
+                                    _dtype_name(index_dtype),
+                                    op,
+                                    alg,
+                                    str(int(block_dim)),
+                                )
+                                if case_key in completed:
+                                    continue
                                 row = _run_one_case(
                                     data,
                                     indices,
@@ -1172,6 +1235,7 @@ def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dim
                             "process_gpu_ms": None,
                             "compute_ms": None,
                             "pytorch_ms": None,
+                            "bsr_speedup_vs_pytorch": None,
                             "pytorch_error": None,
                             "pytorch_padded_ms": None,
                             "pytorch_padded_error": None,
@@ -1218,6 +1282,11 @@ def main():
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume --csv-bsr output, retaining completed PASS/FAIL cases and retrying ERROR cases.",
+    )
     args = parser.parse_args()
     try:
         value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
@@ -1265,6 +1334,7 @@ def main():
             timing=args.timing,
             run_cusparse=not args.no_cusparse,
             fail_fast=args.fail_fast,
+            resume=args.resume,
         )
         return
     if not paths:
@@ -1283,6 +1353,7 @@ def main():
         timing=args.timing,
         run_cusparse=not args.no_cusparse,
         fail_fast=args.fail_fast,
+        resume=args.resume,
     )
 
 

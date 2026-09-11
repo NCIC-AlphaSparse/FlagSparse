@@ -29,6 +29,19 @@ SUPPORTED_SPMV_VALUE_DTYPES = (
     torch.complex64,
     torch.complex128,
 )
+_ASCEND_ROW_IDS_CACHE = {}
+
+
+def _ascend_csr_row_ids(indptr, n_rows):
+    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
+    cached = _ASCEND_ROW_IDS_CACHE.get(key)
+    if cached is None:
+        cached = torch.repeat_interleave(
+            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
+            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
+        )
+        _ASCEND_ROW_IDS_CACHE[key] = cached
+    return cached
 
 SPMV_OP_NON = 0
 SPMV_OP_TRANS = 1
@@ -1199,6 +1212,46 @@ def flagsparse_spmv_csr(
         and bool(transpose) != _spmv_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
+
+    # Ascend 910B Triton currently fails lowering the segmented-scan kernel.
+    # Use an equivalent torch_npu index_add implementation only for Ascend;
+    # CUDA/ROCm/MetaX/MUSA retain the existing Triton path below.
+    if _is_ascend_runtime():
+        if prepared is not None:
+            raise NotImplementedError("Ascend fallback does not accept prepared SpMV metadata")
+        if any(arg is None for arg in (data, indices, indptr, shape, x)):
+            raise ValueError("data, indices, indptr, x, and shape are required")
+        if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
+            raise ValueError("data, indices, indptr, and x must be 1D tensors")
+        n_rows, n_cols = int(shape[0]), int(shape[1])
+        if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+            raise ValueError("invalid CSR dimensions")
+        if x.numel() != (n_rows if _spmv_op_transposes(op_code) else n_cols):
+            raise ValueError("x shape does not match CSR operation")
+        row_ids = _ascend_csr_row_ids(indptr, n_rows)
+        cols = indices.to(torch.int64)
+        timed = bool(return_time or return_meta)
+        if timed:
+            _ACCEL.synchronize()
+        t0 = time.perf_counter()
+        if _spmv_op_transposes(op_code):
+            y = torch.zeros((n_cols,), device=data.device, dtype=data.dtype)
+            y.index_add_(0, cols, data * x[row_ids])
+        else:
+            y = torch.zeros((n_rows,), device=data.device, dtype=data.dtype)
+            y.index_add_(0, row_ids, data * x[cols])
+        if out is not None:
+            out.copy_(y)
+            y = out
+        if timed:
+            _ACCEL.synchronize()
+            elapsed = (time.perf_counter() - t0) * 1000.0
+        else:
+            elapsed = None
+        if return_meta:
+            meta = {"symbolic_ms": 0.0 if timed else None, "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return (y, elapsed) if return_time else y
     if prepared is None:
         if any(arg is None for arg in (data, indices, indptr, shape)):
             raise ValueError(

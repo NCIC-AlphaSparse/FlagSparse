@@ -1314,8 +1314,58 @@ def flagsparse_gather(
     if mode != "raise":
         raise NotImplementedError("Only mode='raise' is currently supported")
 
-    dense_vector, dense_backend = _to_torch_tensor(a, "a")
-    indices_tensor, _ = _to_torch_tensor(indices, "indices")
+    # Hot path used by Ascend performance runs: validated Torch tensors can go
+    # straight to the native NPU gather primitive. Native operators still
+    # enforce shape/device/index errors; all non-Torch inputs and timed/output
+    # calls use the fully validated path below.
+    if (
+        _is_ascend_runtime()
+        and not return_time
+        and out is None
+        and torch.is_tensor(a)
+        and torch.is_tensor(indices)
+    ):
+        gather_indices = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
+        return torch.gather(a, 0, gather_indices)
+
+    if _is_ascend_runtime() and torch.is_tensor(a) and torch.is_tensor(indices):
+        dense_vector, dense_backend = a, "torch"
+        indices_tensor = indices
+    else:
+        dense_vector, dense_backend = _to_torch_tensor(a, "a")
+        indices_tensor, _ = _to_torch_tensor(indices, "indices")
+
+    # Fast Ascend path: avoid the generic Triton preparation (range scans,
+    # dtype conversion and repeated synchronizations) when native NPU indexing
+    # is used below. Other backends continue through the original path.
+    if _is_ascend_runtime():
+        if dense_vector.ndim != 1 or indices_tensor.ndim != 1:
+            raise ValueError("a and indices must be 1D tensors")
+        if not _is_accel_tensor(dense_vector) or not _is_accel_tensor(indices_tensor):
+            raise ValueError("a and indices must both be accelerator tensors")
+        if indices_tensor.dtype not in SUPPORTED_INDEX_DTYPES:
+            raise TypeError("indices dtype must be torch.int32 or torch.int64")
+        if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
+            raise TypeError("a has an unsupported dtype")
+        out_tensor = None
+        if out is not None:
+            out_tensor, _ = _to_torch_tensor(out, "out")
+            if out_tensor.shape != (int(indices_tensor.numel()),) or out_tensor.dtype != dense_vector.dtype:
+                raise ValueError("out shape/dtype must match gather output")
+        gather_indices = indices_tensor if indices_tensor.dtype == torch.int64 else indices_tensor.to(torch.int64)
+        if return_time:
+            _ACCEL.synchronize()
+        start_time = time.perf_counter() if return_time else None
+        if out_tensor is not None:
+            torch.index_select(dense_vector, 0, gather_indices, out=out_tensor)
+            gathered = out_tensor
+        else:
+            gathered = torch.gather(dense_vector, 0, gather_indices)
+        if return_time:
+            _ACCEL.synchronize()
+            return (out if dense_backend == "cupy" else gathered), (time.perf_counter() - start_time) * 1000.0
+        return out if out is not None and dense_backend == "cupy" else gathered
+
     dense_vector, indices_tensor, kernel_indices = _prepare_inputs(
         dense_vector, indices_tensor
     )
@@ -1327,6 +1377,24 @@ def flagsparse_gather(
             raise ValueError("out shape must match gather output shape")
         if out_tensor.dtype != dense_vector.dtype:
             raise TypeError("out dtype must match gather output dtype")
+
+    # Ascend 910B's Triton backend does not provide the ``shmem`` extension
+    # used by the generic gather kernel.  Native indexing is equivalent and is
+    # supported by torch_npu, so keep this fallback strictly on Ascend.
+    if _is_ascend_runtime():
+        if return_time:
+            _ACCEL.synchronize()
+        start_time = time.perf_counter() if return_time else None
+        gathered = dense_vector.index_select(0, indices_tensor.to(torch.int64))
+        if out_tensor is not None:
+            out_tensor.copy_(gathered)
+            gathered = out_tensor
+        execution_time_ms = (time.perf_counter() - start_time) * 1000.0 if return_time else None
+        result = out if out is not None and dense_backend == "cupy" else gathered
+        if return_time:
+            _ACCEL.synchronize()
+            return result, execution_time_ms
+        return result
 
     _ACCEL.synchronize()
     start_time = time.perf_counter()
@@ -1364,9 +1432,31 @@ def flagsparse_scatter(
     if mode != "raise":
         raise NotImplementedError("Only mode='raise' is currently supported")
 
-    dense_tensor, dense_backend = _to_torch_tensor(a, "a")
-    values_tensor, _ = _to_torch_tensor(values, "values")
-    indices_tensor, _ = _to_torch_tensor(indices, "indices")
+    if _is_ascend_runtime() and all(torch.is_tensor(v) for v in (a, values, indices)):
+        dense_tensor, dense_backend = a, "torch"
+        values_tensor, indices_tensor = values, indices
+    else:
+        dense_tensor, dense_backend = _to_torch_tensor(a, "a")
+        values_tensor, _ = _to_torch_tensor(values, "values")
+        indices_tensor, _ = _to_torch_tensor(indices, "indices")
+
+    if _is_ascend_runtime():
+        if dense_tensor.ndim != 1 or values_tensor.ndim != 1 or indices_tensor.ndim != 1:
+            raise ValueError("a, values, and indices must be 1D tensors")
+        if values_tensor.numel() != indices_tensor.numel():
+            raise ValueError("values and indices must have the same number of elements")
+        if dense_tensor.device != values_tensor.device or dense_tensor.device != indices_tensor.device:
+            raise ValueError("a, values, and indices must be on the same device")
+        fast_indices = indices_tensor if indices_tensor.dtype == torch.int64 else indices_tensor.to(torch.int64)
+        start_time = time.perf_counter() if return_time else None
+        if reset_output:
+            dense_tensor.zero_()
+        dense_tensor.index_copy_(0, fast_indices, values_tensor)
+        if return_time:
+            _ACCEL.synchronize()
+            return (time.perf_counter() - start_time) * 1000.0
+        return None
+
     values_tensor, _, kernel_indices, dense_size, _ = _prepare_scatter_inputs(
         values_tensor,
         indices_tensor,
@@ -1375,6 +1465,14 @@ def flagsparse_scatter(
         dtype_policy=dtype_policy,
         return_metadata=True,
     )
+
+    if _is_ascend_runtime():
+        start_time = time.perf_counter() if return_time else None
+        dense_tensor.index_copy_(0, indices_tensor.to(torch.int64), values_tensor)
+        if return_time:
+            _ACCEL.synchronize()
+            return (time.perf_counter() - start_time) * 1000.0
+        return None
 
     _ACCEL.synchronize()
     start_time = time.perf_counter()
