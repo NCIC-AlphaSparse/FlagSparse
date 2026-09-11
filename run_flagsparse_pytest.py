@@ -122,6 +122,13 @@ PERFORMANCE_METRIC_COLUMNS = {
 PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("speedup", "latency_base", "latency"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "triton_ms"),
+    # spmm_coo and spmm_csc reuse the same speedup name with their own column layout:
+    # spmm_coo's baseline is torch_ms and its latency is "ms"; spmm_csc uses pytorch_ms
+    # with "ms".  Both are listed so a row resolves whichever pair it actually carries --
+    # pointing the name at only one pair makes the other operator's rows fail the
+    # completeness check and drop out of the aggregate entirely.
+    ("triton_speedup_vs_pytorch", "pytorch_ms", "ms"),
+    ("triton_speedup_vs_pytorch", "torch_ms", "ms"),
     ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
     # After vs_cusparse on purpose: the runner reports the first non-empty match, so on
     # CUDA the vendor metric keeps winning (same measurement, historical label), while a
@@ -141,6 +148,7 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("torch_vs_alg1_speedup", "torch_ms", "alg1_ms"),
     ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
     ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
+    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
     ("pytorch_speedup_solve", "pytorch_ms", "solve_ms"),
     ("cusparse_speedup_solve", "cusparse_ms", "solve_ms"),
     ("pytorch_speedup_total", "pytorch_ms", "triton_total_ms"),
@@ -1477,9 +1485,22 @@ def _performance_metric_record(row: dict[str, str]) -> dict[str, object]:
 
 
 def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | None]:
+    # Two passes.  A speedup name can appear more than once with different column
+    # layouts -- spmm_coo reports triton_speedup_vs_pytorch over torch_ms/ms while
+    # spmm_csc reports it over pytorch_ms/ms -- so prefer an entry whose measurement
+    # columns the row actually carries.  Without this the first entry always wins and
+    # the other operator's rows fail the completeness check and vanish from aggregates.
+    for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
+        if not row.get(speedup_key):
+            continue
+        if all(key is None or row.get(key) for key in (base_key, latency_key)):
+            return speedup_key, base_key, latency_key
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
         if row.get(speedup_key):
             return speedup_key, base_key, latency_key
+    for key, value in row.items():
+        if "speedup" in key.lower() and value:
+            return key, None, None
     for key in row:
         if "speedup" in key.lower():
             return key, None, None

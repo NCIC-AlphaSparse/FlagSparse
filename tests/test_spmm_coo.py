@@ -72,7 +72,7 @@ PERF_FIELDS = [
     "process_cpu_ms",
     "torch_ms",
     "cusparse_ms",
-    "torch_vs_alg_speedup",
+    "triton_speedup_vs_pytorch",
     "cusparse_vs_alg_speedup",
     "err_vs_torch",
     "err_vs_cusparse",
@@ -119,7 +119,7 @@ BEST_FIELDS = [
     "best_alg",
     "best_ms",
     "best_gpu_ms",
-    "best_torch_speedup",
+    "best_triton_speedup_vs_pytorch",
     "best_cusparse_speedup",
 ]
 TEST_CASES = [
@@ -418,7 +418,7 @@ def _best_rows(rows):
                 "best_alg": selected["alg"],
                 "best_ms": selected["ms"],
                 "best_gpu_ms": selected["gpu_ms"],
-                "best_torch_speedup": selected["torch_vs_alg_speedup"],
+                "best_triton_speedup_vs_pytorch": selected["triton_speedup_vs_pytorch"],
                 "best_cusparse_speedup": selected["cusparse_vs_alg_speedup"],
             }
         )
@@ -655,7 +655,7 @@ def _skip_alg_row(
         "process_cpu_ms": None,
         "torch_ms": torch_ms,
         "cusparse_ms": cusparse_ms,
-        "torch_vs_alg_speedup": None,
+        "triton_speedup_vs_pytorch": None,
         "cusparse_vs_alg_speedup": None,
         "err_vs_torch": None,
         "err_vs_cusparse": None,
@@ -940,7 +940,7 @@ def run_one_alg_case(
             "process_cpu_ms": result["process_cpu_ms"],
             "torch_ms": torch_ms,
             "cusparse_ms": cusparse_ms,
-            "torch_vs_alg_speedup": _ratio(torch_ms, result["ms"]),
+            "triton_speedup_vs_pytorch": _ratio(torch_ms, result["ms"]),
             "cusparse_vs_alg_speedup": _ratio(cusparse_ms, result["ms"]),
             "err_vs_torch": torch_profile["global_err"],
             "err_vs_cusparse": cusparse_profile["global_err"],
