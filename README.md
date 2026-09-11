@@ -441,9 +441,16 @@ setsid python3 -u run_flagsparse_pytest.py \
   --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
   --phase performance --gpus 6,7 \
   --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args="--dtypes float16,bfloat16,float32,float64" \
   --results-dir "pytest_results_ascend_${run_id}" \
   > "pytest_ascend_${run_id}.log" 2>&1 < /dev/null &
 ```
+
+The Ascend benchmark defaults to `float32`. Use `--benchmark-args="--dtypes ..."` to
+run a comma-separated dtype sweep; each dtype is written as a separate performance CSV
+row. The supported values are `float16`, `bfloat16`, `float32`, and `float64` (individual
+operator support is reported in each row).
+
 
 For a direct single-card smoke test:
 

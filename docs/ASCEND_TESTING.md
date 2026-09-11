@@ -36,6 +36,20 @@ python3 benchmark/benchmark_ascend.py \
   --dense-cols 64 --warmup 5 --iters 20
 ```
 
+默认只测试 `float32`。需要多 dtype 时，可直接通过统一 runner 的
+`--benchmark-args` 透传 `--dtypes`（逗号分隔）；每个 dtype 会写入独立的 CSV 行：
+
+```bash
+PYTHONPATH=src python3 -u run_flagsparse_pytest.py \
+  --phase performance --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
+  --gpus 6,7 --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args="--dtypes float16,bfloat16,float32,float64" \
+  --results-dir pytest_results_ascend_dtypes
+```
+
+当前 benchmark 接受 `float16`、`bfloat16`、`float32`、`float64`；具体算子是否能在
+910B/CANN 上执行仍以对应 CSV 行的状态和错误字段为准。
+
 7 号卡使用相同命令，将 `--device 6` 改为 `--device 7`。输出包含 FlagSparse 和
 PyTorch-NPU 的 mean/median/min/p95 延迟，以及 SciPy CPU 最大绝对误差。
 
