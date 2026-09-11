@@ -123,6 +123,10 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("speedup", "latency_base", "latency"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "triton_ms"),
     ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
+    # After vs_cusparse on purpose: the runner reports the first non-empty match, so on
+    # CUDA the vendor metric keeps winning (same measurement, historical label), while a
+    # backend with no vendor column falls through to the PyTorch API metric.
+    ("triton_speedup_vs_pytorch_api", "pytorch_api_ms", "triton_ms"),
     ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
     ("csc_speedup_vs_pytorch", "pytorch_ms", "csc_ms"),
     ("csc_speedup_vs_cusparse", "cusparse_ms", "csc_ms"),
@@ -141,6 +145,11 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("cusparse_speedup_solve", "cusparse_ms", "solve_ms"),
     ("pytorch_speedup_total", "pytorch_ms", "triton_total_ms"),
     ("cusparse_speedup_total", "cusparse_ms", "triton_total_ms"),
+    ("torch_vs_alg_speedup", "torch_ms", "ms"),
+    ("scipy_vs_alg_speedup", "scipy_cpu_ms", "ms"),
+    ("prepared_speedup_vs_pytorch", "pytorch_ms", "prepared_ms"),
+    ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_cuSPARSE_speedup", "cusparse_ms", "flagsparse_ms"),
 )
 
 
@@ -397,6 +406,22 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+}
+
+
+# Ascend uses the dedicated NPU benchmark instead of the CUDA-oriented per-operator
+# scripts.  Selected only when FLAGSPARSE_BACKEND=ascend; every other backend keeps
+# PERFORMANCE_COMMANDS untouched.
+ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
+    op: (
+        "benchmark/benchmark_ascend.py",
+        "--op", "{op}",
+        "--device", "{device}",
+        "--csv-summary", "{csv}",
+        "--warmup", "{warmup}",
+        "--iters", "{iters}",
+    )
+    for op in ("gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr")
 }
 
 
@@ -1302,6 +1327,24 @@ def _resolve_path(project_root: Path, value: str | None) -> Path | None:
     return path
 
 
+def parse_op_benchmark_args(values: list[str]) -> dict[str, list[str]]:
+    """Parse repeatable ``OP=ARGS`` performance-script argument overrides."""
+    parsed: dict[str, list[str]] = {}
+    for value in values:
+        op, separator, args = str(value).partition("=")
+        op = op.strip()
+        if not separator or not op:
+            raise ValueError(
+                f"invalid --op-benchmark-args value {value!r}; expected OP=ARGS"
+            )
+        if not args.strip():
+            raise ValueError(
+                f"invalid --op-benchmark-args value {value!r}; ARGS must not be empty"
+            )
+        parsed.setdefault(op, []).extend(shlex.split(args))
+    return parsed
+
+
 def render_performance_command(
     template: tuple[str, ...],
     *,
@@ -1310,6 +1353,8 @@ def render_performance_command(
     benchmark_input: Path | None,
     warmup: int,
     iters: int,
+    op: str,
+    device: int,
     extra_args: list[str],
 ) -> tuple[list[str], Path]:
     csv_path = op_dir / "performance.csv"
@@ -1325,6 +1370,8 @@ def render_performance_command(
                 input=str(benchmark_input) if benchmark_input is not None else "",
                 warmup=warmup,
                 iters=iters,
+                op=op,
+                device=device,
             )
         )
     rendered.extend(extra_args)
@@ -1439,6 +1486,91 @@ def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | Non
     return "speedup", None, None
 
 
+def _performance_matrix_key(row: dict[str, str]) -> str | None:
+    """The matrix/case identifier used to remove interrupted work."""
+
+    for key in ("matrix", "path", "name", "case_id", "case"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return Path(value).name.lower()
+    return None
+
+
+def _interrupted_matrix_key(output: str, rows: list[dict[str, str]]) -> str | None:
+    """Identify a process's in-flight matrix, falling back to the final CSV row."""
+
+    patterns = (
+        r"(?m)^\s*RUNNING:\s*([^|\r\n]+)",
+        r"(?m)^\[SpGEMM\]\s+\(\d+/\d+\)\s+(.+?)\s*$",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, output)
+        if matches:
+            return Path(str(matches[-1]).strip()).name.lower()
+    return _performance_matrix_key(rows[-1]) if rows else None
+
+
+def filter_interrupted_performance_rows(
+    rows: list[dict[str, str]],
+    *,
+    output: str,
+    returncode: int,
+    timed_out: bool,
+) -> tuple[list[dict[str, str]], dict[str, object]]:
+    """Drop an in-flight matrix from a partial performance artifact.
+
+    Benchmark scripts stream completed rows so a killed subprocess still leaves a useful
+    CSV, but a row from the active matrix may survive when the process dies between
+    algorithms or operation modes.  Exclude that whole matrix from summaries while
+    leaving the source CSV untouched.
+    """
+
+    metadata: dict[str, object] = {
+        "raw_row_count": len(rows),
+        "excluded_row_count": 0,
+        "excluded_matrix_keys": [],
+    }
+    if not (timed_out or returncode < 0) or not rows:
+        return rows, metadata
+
+    matrix_key = _interrupted_matrix_key(output, rows)
+    if matrix_key is None:
+        return rows, metadata
+    filtered = [row for row in rows if _performance_matrix_key(row) != matrix_key]
+    metadata["excluded_row_count"] = len(rows) - len(filtered)
+    metadata["excluded_matrix_keys"] = [matrix_key]
+    return filtered, metadata
+
+
+def _performance_row_status_is_usable(row: dict[str, str]) -> bool:
+    """Whether a benchmark row is eligible for aggregate metrics."""
+
+    status = str(row.get("status") or row.get("matrix_status") or "").strip()
+    return not status or status.upper() in {"PASS", "PASSED", "OK", "SUCCESS"}
+
+
+def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
+    """Require a passing row and both measurements behind its speedup value.
+
+    A speedup alone is not enough: FAIL rows and rows whose baseline is missing were
+    being folded into the per-dtype totals.
+    """
+
+    if not _performance_row_status_is_usable(row):
+        return False
+    speedup_key, base_key, latency_key = _performance_schema(row)
+    speedup = _to_float(row.get(speedup_key))
+    if speedup is None or speedup <= 0:
+        return False
+    for key in (base_key, latency_key):
+        if key is None:
+            continue
+        measurement = _to_float(row.get(key))
+        if measurement is None or measurement <= 0:
+            return False
+    return True
+
+
 def _benchmark_json_detail(row: dict[str, str], index: int) -> dict[str, object]:
     speedup_key, base_key, latency_key = _performance_schema(row)
     base = _to_float(row.get(base_key)) if base_key else None
@@ -1464,10 +1596,16 @@ def _benchmark_json_detail(row: dict[str, str], index: int) -> dict[str, object]
 
 
 def benchmark_json_from_csv(
-    op: str, csv_path: Path, *, status: str = "passed", test_case: str = "csv"
+    op: str,
+    csv_path: Path,
+    *,
+    status: str = "passed",
+    test_case: str = "csv",
+    rows: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
-    with csv_path.open("r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+    if rows is None:
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
 
     by_dtype: dict[str, list[dict[str, object]]] = {}
     for index, row in enumerate(rows):
@@ -1482,9 +1620,17 @@ def benchmark_json_from_csv(
     return {op: {"result": status, "test_case": test_case, "details": details}}
 
 
-def write_benchmark_json_from_csv(op: str, csv_path: Path, json_path: Path) -> None:
+def write_benchmark_json_from_csv(
+    op: str,
+    csv_path: Path,
+    json_path: Path,
+    *,
+    rows: list[dict[str, str]] | None = None,
+) -> None:
     json_path.write_text(
-        json.dumps(benchmark_json_from_csv(op, csv_path), indent=2, sort_keys=True),
+        json.dumps(
+            benchmark_json_from_csv(op, csv_path, rows=rows), indent=2, sort_keys=True
+        ),
         encoding="utf-8",
     )
 
@@ -1515,7 +1661,7 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
                 if row[key].upper() in {"FAIL", "ERROR"}:
                     dtype_entry["result"] = "Failed"
         dtype_entry["details"][shape] = detail  # type: ignore[index]
-        if speedup is not None:
+        if _performance_row_has_complete_speedup(row):
             totals.setdefault(dtype, []).append(speedup)
 
     for dtype, values in totals.items():
@@ -1620,13 +1766,26 @@ def _performance_records_by_dtype_shape(
     return grouped
 
 
-def summarize_performance_csv(path: Path) -> dict[str, object]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+def summarize_performance_csv(
+    path: Path,
+    *,
+    rows: list[dict[str, str]] | None = None,
+    raw_row_count: int | None = None,
+    excluded_row_count: int = 0,
+    excluded_matrix_keys: list[str] | None = None,
+) -> dict[str, object]:
+    if rows is None:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    if raw_row_count is None:
+        raw_row_count = len(rows)
     summary: dict[str, object] = {
         "data_path": str(path),
         "csv_file": str(path),
         "row_count": len(rows),
+        "raw_row_count": raw_row_count,
+        "excluded_row_count": excluded_row_count,
+        "excluded_matrix_keys": excluded_matrix_keys or [],
         "records": rows,
         "records_by_dtype_shape": _performance_records_by_dtype_shape(rows),
         "benchmark": performance_records_by_dtype_shape(rows),
@@ -1636,17 +1795,23 @@ def summarize_performance_csv(path: Path) -> dict[str, object]:
     if not rows:
         return summary
 
-    if all({"dtype", "shape", "speedup"} <= set(row) for row in rows):
+    # Aggregate only over rows that passed and carry both measurements behind their
+    # speedup: FAIL rows and rows with a missing baseline used to be folded in.
+    speedup_rows = [row for row in rows if _performance_row_has_complete_speedup(row)]
+    summary["speedup_row_count"] = len(speedup_rows)
+    if speedup_rows and all(
+        {"dtype", "shape", "speedup"} <= set(row) for row in speedup_rows
+    ):
         try:
             from benchmark.performance_utils import two_level_average_speedup
 
-            summary["two_level_speedup"] = two_level_average_speedup(rows)
+            summary["two_level_speedup"] = two_level_average_speedup(speedup_rows)
             summary["speedup"] = summary["two_level_speedup"].get("overall")
         except Exception as exc:
             summary["speedup_summary_error"] = str(exc)
 
     speedup_values: dict[str, list[float]] = {}
-    for row in rows:
+    for row in speedup_rows:
         for key, value in row.items():
             if "speedup" not in key.lower():
                 continue
@@ -1692,6 +1857,8 @@ def run_performance(
     extra_args: list[str],
     timeout: int,
 ) -> dict[str, object]:
+    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
+        template = ASCEND_PERFORMANCE_COMMANDS.get(op)
     if not template:
         return _not_configured(op, "performance", "no performance command mapping")
 
@@ -1705,6 +1872,8 @@ def run_performance(
         benchmark_input=benchmark_input,
         warmup=warmup,
         iters=iters,
+        op=op,
+        device=gpu_id,
         extra_args=extra_args,
     )
     returncode, stdout, stderr, duration, timed_out = run_subprocess(
@@ -1747,8 +1916,18 @@ def run_performance(
     }
     if csv_path.exists():
         try:
-            write_benchmark_json_from_csv(op, csv_path, result_path)
-            result.update(summarize_performance_csv(csv_path))
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                raw_rows = list(csv.DictReader(handle))
+            rows, filter_metadata = filter_interrupted_performance_rows(
+                raw_rows,
+                output=output,
+                returncode=returncode,
+                timed_out=timed_out,
+            )
+            write_benchmark_json_from_csv(op, csv_path, result_path, rows=rows)
+            result.update(
+                summarize_performance_csv(csv_path, rows=rows, **filter_metadata)
+            )
             parsed = parse_performance_json(op, result_path)
             parsed["status"] = resolve_status_with_parsed(
                 status,
@@ -1783,6 +1962,7 @@ def run_one_op(
     timeout: int,
     extra_pytest_args: list[str],
     extra_benchmark_args: list[str],
+    op_benchmark_args: dict[str, list[str]],
 ) -> dict[str, object]:
     op_dir = results_dir / op
     ensure_dir(op_dir)
@@ -1812,7 +1992,7 @@ def run_one_op(
                 benchmark_input=benchmark_input,
                 warmup=benchmark_warmup,
                 iters=benchmark_iters,
-                extra_args=extra_benchmark_args,
+                extra_args=[*extra_benchmark_args, *op_benchmark_args.get(op, [])],
                 timeout=timeout,
             )
             write_phase_result(op_dir, "performance", result["performance"])
@@ -1833,6 +2013,7 @@ def run_gpu_ops(
     timeout: int,
     extra_pytest_args: list[str],
     extra_benchmark_args: list[str],
+    op_benchmark_args: dict[str, list[str]],
     env_info: dict[str, object],
     operator_metadata: dict[str, dict[str, object]],
     results: list[dict[str, object]],
@@ -1851,6 +2032,7 @@ def run_gpu_ops(
             timeout=timeout,
             extra_pytest_args=extra_pytest_args,
             extra_benchmark_args=extra_benchmark_args,
+            op_benchmark_args=op_benchmark_args,
         )
         result.update(operator_metadata.get(op, {"customized": True, "labels": []}))
         with SUMMARY_LOCK:
@@ -2715,6 +2897,13 @@ def main(
             default="",
             help="Extra args appended to every performance invocation.",
         )
+        parser.add_argument(
+            "--op-benchmark-args",
+            action="append",
+            default=[],
+            metavar="OP=ARGS",
+            help="Extra args appended only to one performance script; repeatable.",
+        )
         parser.add_argument("--benchmark-warmup", type=int, default=5)
         parser.add_argument("--benchmark-iters", type=int, default=20)
     parser.add_argument(
@@ -2775,6 +2964,20 @@ def main(
         if include_accuracy_args and args.pytest_args
         else []
     )
+    try:
+        op_benchmark_args = (
+            parse_op_benchmark_args(args.op_benchmark_args)
+            if include_performance_args
+            else {}
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    unknown_op_args = sorted(set(op_benchmark_args) - set(ops))
+    if unknown_op_args:
+        parser.error(
+            "--op-benchmark-args names an operator not selected by --ops: "
+            + ", ".join(unknown_op_args)
+        )
     extra_benchmark_args = (
         shlex.split(args.benchmark_args)
         if include_performance_args and args.benchmark_args
@@ -2803,6 +3006,7 @@ def main(
                 timeout=args.timeout,
                 extra_pytest_args=extra_pytest_args,
                 extra_benchmark_args=extra_benchmark_args,
+            op_benchmark_args=op_benchmark_args,
                 env_info=env_info,
                 operator_metadata=operator_metadata,
                 results=results,

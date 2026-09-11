@@ -372,7 +372,41 @@ _SPGEMM_HASH_BUCKETS = (
     (3072, 4096, 128, 8),
     (6144, 8192, 256, 16),
 )
+# Wider product blocks amortise the per-block binary search into ``a_pref``, which costs
+# log2(row_len) scattered loads regardless of BLOCK.  Measured on CUDA only: the larger
+# blocks raise register pressure, and the other backends differ in warp size and
+# occupancy, so they keep the original tiling.
+if _backend_name() == "cuda":
+    _SPGEMM_HASH_BUCKETS = (
+        (48, 64, 32, 2),
+        (192, 256, 32, 2),
+        (768, 1024, 128, 4),
+        (3072, 4096, 512, 8),
+        (6144, 8192, 1024, 16),
+    )
+
+# The fill phase is sized from the *exact* per-row nnz, not the row-work bound, so it
+# can use finer and much smaller tables than the count phase.  Its per-row cost is
+# O(CAP) regardless of the row's real width -- CAP stores to init keys, CAP to init
+# accum, then CAP loads + a cumsum + CAP masked stores to emit -- so a table sized for
+# 48 entries serving a 6-entry row wastes ~10x.  That is why fill measured 92.5% of GPU
+# time on wheel_601 (p50 nnz 5) and 89.8% on ASIC_680ks while the count kernel, which
+# has no accum array and no O(CAP) emit, took 4.6% and 7.1%.
+# The count table is deliberately left alone: starting rows at a smaller table there was
+# measured ~8x slower, because the wasted escalation passes land on the widest rows.
+if _backend_name() == "cuda":
+    _SPGEMM_HASH_FILL_BUCKETS = (
+        (6, 8, 8, 1),
+        (12, 16, 16, 1),
+    ) + _SPGEMM_HASH_BUCKETS
+else:
+    _SPGEMM_HASH_FILL_BUCKETS = _SPGEMM_HASH_BUCKETS
+
 _SPGEMM_HASH_LOAD = 0.75  # max hash-table load factor
+# Per-row slot-equivalents charged for each extra fill launch (its kernel launch plus the
+# torch.nonzero scan that builds its row list).  Calibrated between mac_econ_fwd500
+# (58/launch, loses) and TF19 (697/launch, wins 1.57x).
+_SPGEMM_FILL_LAUNCH_COST = 150
 _SPGEMM_HASH_SMEM_BUDGET = 96 * 1024  # per-program shared-memory budget
 _SPGEMM_SINGLE_PASS_MAX_BYTES = 512 * 1024 * 1024  # over-allocation cap
 _SPGEMM_ESC_CHUNK_PRODUCTS = 8_000_000  # peak-memory bound for chunked ESC
@@ -962,13 +996,84 @@ def _spgemm_hash_hybrid_compute(prepared):
         keep[pend] = False
         hashed = hashed & keep
     if bool(hashed.any()):
-        max_nnz = int(row_nnz[hashed].max().item())
-        single = None
-        if pend.numel() == 0:
-            for _mr, cap, blk, warps in _SPGEMM_HASH_BUCKETS[:ncaps]:
-                if max_nnz <= cap * _SPGEMM_HASH_LOAD:
+        # Launch-shape selection for the fill pass.  The CUDA branch sizes tables from the
+        # exact per-row nnz using the finer _SPGEMM_HASH_FILL_BUCKETS and decides
+        # uniform-vs-partitioned by cost; every other backend keeps upstream's
+        # max-based gate over the original bucket table, unchanged.
+        if _backend_name() == "cuda":
+            fill_ncaps = len(_SPGEMM_HASH_FILL_BUCKETS)
+            while (
+                fill_ncaps > 1
+                and _SPGEMM_HASH_FILL_BUCKETS[fill_ncaps - 1][1] * (4 + acc_bytes)
+                > _SPGEMM_HASH_SMEM_BUDGET
+            ):
+                fill_ncaps -= 1
+            fill_buckets = _SPGEMM_HASH_FILL_BUCKETS[:fill_ncaps]
+            his = torch.tensor(
+                [int(cap * _SPGEMM_HASH_LOAD) for _mr, cap, _b, _w in fill_buckets],
+                device=device,
+                dtype=row_nnz.dtype,
+            )
+            # Per-row table level: the first bucket whose load-adjusted capacity holds it.
+            level_fill = torch.searchsorted(his, row_nnz)
+            in_range = hashed & (level_fill < len(fill_buckets))
+            # Histogram of per-row levels in one transfer.  Counted over all rows rather
+            # than masking with in_range first: boolean indexing is itself a sync and an
+            # n_rows allocation, and this only feeds a launch-shape heuristic.
+            nb = len(fill_buckets)
+            raw_counts = torch.bincount(level_fill, minlength=nb + 1).tolist()
+            counts = raw_counts[:nb]
+            # rows wider than the largest table go to ESC, not to a fill launch
+            counts[nb - 1] += sum(raw_counts[nb:])
+            # Per-row fill cost tracks table size, but only down to the program's thread
+            # count: init/emit is a vector op over num_warps*32 lanes, which is why cap 32
+            # with 2 warps measured *slower* than cap 64 on ecology1 (rows all 13 nnz).
+            eff = [max(cap, warps * 32) for _mr, cap, _b, warps in fill_buckets]
+            nonempty = [i for i, c in enumerate(counts) if c > 0]
+            single = None
+            if nonempty:
+                lvl_hi = nonempty[-1]
+                total = sum(counts)
+                uniform_cost = total * eff[lvl_hi]
+                part_cost = sum(counts[i] * eff[i] for i in nonempty)
+                extra = len(nonempty) - 1
+                # Partition only when each extra launch buys more than a fixed per-row
+                # cost.  Table size alone is not enough: mac_econ_fwd500 promises a 10x
+                # smaller mean table yet loses, because five launches and their
+                # torch.nonzero scans outweigh the saving on a 2 ms matrix, while TF19 and
+                # engine with similar ratios win 1.5x.
+                worth_it = extra > 0 and (
+                    (uniform_cost - part_cost)
+                    > _SPGEMM_FILL_LAUNCH_COST * extra * total
+                )
+                if pend.numel() == 0 and not worth_it:
+                    _mr, cap, blk, warps = fill_buckets[lvl_hi]
                     single = (cap, blk, warps)
-                    break
+            parts = [
+                (
+                    fill_buckets[i][1],
+                    fill_buckets[i][2],
+                    fill_buckets[i][3],
+                    in_range & (level_fill == i),
+                )
+                for i in nonempty
+            ]
+        else:
+            max_nnz = int(row_nnz[hashed].max().item())
+            single = None
+            if pend.numel() == 0:
+                for _mr, cap, blk, warps in _SPGEMM_HASH_BUCKETS[:ncaps]:
+                    if max_nnz <= cap * _SPGEMM_HASH_LOAD:
+                        single = (cap, blk, warps)
+                        break
+            parts = []
+            lo = 0
+            for _mr, cap, blk, warps in _SPGEMM_HASH_BUCKETS[:ncaps]:
+                hi = int(cap * _SPGEMM_HASH_LOAD)
+                parts.append(
+                    (cap, blk, warps, hashed & (row_nnz > lo) & (row_nnz <= hi))
+                )
+                lo = hi
         if single is not None:
             cap, blk, warps = single
             fill_kernel[(n_rows,)](
@@ -994,17 +1099,10 @@ def _spgemm_hash_hybrid_compute(prepared):
                 REPORT=False,
             )
         else:
-            lo = 0
-            for _mr, cap, blk, warps in _SPGEMM_HASH_BUCKETS[:ncaps]:
-                hi = int(cap * _SPGEMM_HASH_LOAD)
+            for cap, blk, warps, mask in parts:
                 sel = (
-                    torch.nonzero(
-                        hashed & (row_nnz > lo) & (row_nnz <= hi), as_tuple=False
-                    )
-                    .flatten()
-                    .to(torch.int32)
+                    torch.nonzero(mask, as_tuple=False).flatten().to(torch.int32)
                 )
-                lo = hi
                 if sel.numel() == 0:
                     continue
                 fill_kernel[(sel.numel(),)](
@@ -1029,7 +1127,6 @@ def _spgemm_hash_hybrid_compute(prepared):
                     USE_ROWS=True,
                     REPORT=False,
                 )
-
     if crow is not None and crow.numel():
         starts = c_indptr[crow]
         first = torch.searchsorted(crow, crow)

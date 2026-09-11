@@ -228,6 +228,34 @@ def _apply_torch_sparse_op(sparse_matrix, B, op):
 
 def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
     op = ast_ops._spmm_op_to_name(op)
+    if fs_common._is_maca_runtime():
+        # MACA picks int32 CSR or COO per matrix (its fp32 CSR kernel is unstable with
+        # int64 indices).  Accuracy is still taken at a promoted dtype while timing stays
+        # at the operator's own, so the baseline is like-for-like.
+        if data.dtype in (torch.float16, torch.bfloat16):
+            ref_data, ref_B = data.to(torch.float32), B.to(torch.float32)
+        elif data.dtype == torch.float32:
+            ref_data, ref_B = data.to(torch.float64), B.to(torch.float64)
+        elif data.dtype == torch.complex64:
+            ref_data, ref_B = data.to(torch.complex128), B.to(torch.complex128)
+        else:
+            ref_data, ref_B = data, B
+        ref, reference_format = fs_common._pytorch_sparse_mm(
+            ref_data, indices, indptr, shape, ref_B, op=op
+        )
+        _, timing_format = fs_common._pytorch_sparse_mm(
+            data, indices, indptr, shape, B, op=op
+        )
+        if timing_format == "COO":
+            timing_matrix = fs_common._pytorch_sparse_coo_matrix(
+                data, indices, indptr, shape
+            )
+        else:
+            timing_matrix, _ = fs_common._pytorch_sparse_matrix(
+                data, indices, indptr, shape
+            )
+        timing_op = lambda: _apply_torch_sparse_op(timing_matrix, B, op)
+        return ref.to(data.dtype), timing_op, timing_format or reference_format
     device = data.device
     n_rows = shape[0]
     indptr64 = indptr.to(torch.int64)

@@ -418,6 +418,33 @@ def _cupy_csc_unavailable_reason():
     return None
 
 
+def _torch_csc_for_op(data, indices, indptr, shape, op):
+    csc = torch.sparse_csc_tensor(
+        indptr.to(torch.int64),
+        indices.to(torch.int64),
+        data,
+        size=shape,
+        device=data.device,
+    )
+    if op == "non":
+        return csc
+    csr = csc.to_sparse_csr()
+    if op == "trans":
+        return csr.transpose(0, 1)
+    if op == "conj":
+        return csr.conj().transpose(0, 1)
+    raise ValueError(f"unsupported op: {op}")
+
+def _time_pytorch_csc(data, indices, indptr, B, shape, op, warmup, iters):
+    A = _torch_csc_for_op(data, indices, indptr, shape, op)
+    out, ms = _cuda_event_benchmark(
+        lambda: torch.sparse.mm(A, B),
+        warmup,
+        iters,
+    )
+    return ms, out
+
+
 def _time_cusparse_csc(data, indices, indptr, B, shape, op, layout, warmup, iters):
     backend, backend_reason = spmm_ops._spmm_csc_sparse_ref_backend(
         data.dtype, indices.dtype, indptr.dtype
@@ -568,6 +595,18 @@ def _run_case(
             row["reason"] = "correctness check failed"
     except Exception as exc:
         row["reason"] = str(exc)
+    if row["status"] != "ERROR" and fs_common._is_maca_runtime():
+        # torch.sparse.mm documents CSC @ Dense as unsupported, but MACA's PyTorch
+        # accepts it, so it is a real baseline there and nowhere else.
+        try:
+            pytorch_ms, pytorch_out = _time_pytorch_csc(
+                data, indices, indptr, B, shape, op, warmup, iters
+            )
+            row["pytorch_ms"] = pytorch_ms
+            row["triton_speedup_vs_pytorch"] = _ratio(pytorch_ms, row["ms"])
+            row["err_vs_pytorch"] = _error_ratio(pytorch_out, csc["out"], dtype)
+        except Exception as exc:
+            row["pytorch_reason"] = str(exc)
     if row["status"] != "ERROR" and run_cusparse:
         try:
             cu_ms, cu_reason, cu_out = _time_cusparse_csc(
@@ -608,7 +647,10 @@ def _print_notes(run_cusparse):
         print(line)
     print("FlagSparse CSC SpMM supports native op=non/trans/conj without CSR/COO conversion.")
     print("Accuracy reference: Ref=torch_spmm_coo expands the same CSC arrays to COO and runs torch.sparse.mm; this is correctness-only, not the FlagSparse compute path.")
-    print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
+    if fs_common._is_maca_runtime():
+        print("PyTorch CSC SpMM baseline: PT(ms) uses torch.sparse_csc_tensor + torch.sparse.mm directly; format construction is outside timing.")
+    else:
+        print("PyTorch CSC SpMM baseline: unavailable; torch.sparse.mm documents CSC @ Dense as unsupported, so no PyTorch CSC fallback is used.")
     if run_cusparse:
         vendor_short = fs_common._expected_vendor_sparse_short()
         if vendor_backend == "hipsparse":

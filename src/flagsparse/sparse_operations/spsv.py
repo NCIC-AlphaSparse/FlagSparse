@@ -1826,27 +1826,78 @@ def _cw_rhs_bucket(n_rhs):
     return 32
 
 
+_CW_MAX_WORKERS_CACHE = {}
+
+
+def _cw_device_max_workers(device=None, num_warps=4):
+    """Column-wave workers needed to fill the device once.
+
+    The single-RHS target was a hardcoded 32.  On a 170-SM card that runs the solve at
+    about 1% of the machine, and the column-wave kernel scales almost linearly with
+    workers because rows are handed out dynamically through ``row_counter``: a sweep at
+    fixed worker counts improved monotonically from 4 up to ~2048, where it saturates
+    (ecology1 59.2 -> 2.4 ms, roadNet-TX 81.5 -> 3.3 ms), with bit-identical results at
+    every setting.
+
+    Over-subscribing is safe: a program only ever waits on rows with a *lower* index, and
+    a lower index can only have been claimed by a program that already executed its
+    ``atomic_add`` -- i.e. one that is resident.  Non-resident programs start later and
+    find the counter exhausted.
+    """
+    key = (
+        None if device is None else (getattr(device, "type", None), getattr(device, "index", None)),
+        int(num_warps),
+    )
+    cached = _CW_MAX_WORKERS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if _backend_name() != "cuda":
+        # Measured and tuned on CUDA only.  ROCm/gfx936 in particular cannot rely on
+        # cross-program ready-flag polling making forward progress (the csr_cw path is
+        # already forced serial there), and MetaX/MUSA/Ascend have different warp sizes
+        # and occupancy limits, so they keep the original conservative target.
+        _CW_MAX_WORKERS_CACHE[key] = 32
+        return 32
+    try:
+        from ._common import _get_device_backend_info
+
+        info = _get_device_backend_info(device)
+        sm_count = int(info.get("multi_processor_count") or 0)
+        warp_size = int(info.get("device_warp_size") or 32)
+        max_threads_per_sm = int(info.get("max_threads_per_multi_processor") or 0)
+        block_threads = max(1, int(num_warps) * warp_size)
+        blocks_per_sm = max(1, max_threads_per_sm // block_threads) if max_threads_per_sm else 1
+        workers = sm_count * blocks_per_sm
+    except Exception:
+        workers = 0
+    if workers <= 0:
+        workers = 1024
+    _CW_MAX_WORKERS_CACHE[key] = workers
+    return workers
+
+
 def _snap_cw_worker_count(target, n_rows):
     if n_rows <= 0:
         return 1
     target = max(1, min(int(target), int(n_rows)))
     snapped = 1
     tier = 1
-    while tier < target and tier < 4096:
+    while tier < target and tier < 65536:
         tier *= 2
         if tier <= target:
             snapped = tier
     return int(max(1, min(snapped, int(n_rows))))
 
 
-def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
+def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs, device=None):
     if n_rows <= 0:
         return 1
     rhs_bucket = _cw_rhs_bucket(n_rhs)
+    device_max = _cw_device_max_workers(device)
     if rhs_bucket == 1:
-        target = min(n_rows, 32)
+        target = min(n_rows, device_max)
     else:
-        target = max(32, min(n_rows, 512))
+        target = max(32, min(n_rows, max(512, device_max)))
     if max_frontier > 0:
         target = min(target, max(4, min(n_rows, max_frontier * 2)))
     if avg_nnz_per_row > 8192:
@@ -1867,7 +1918,7 @@ def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
         target = max(4, (target * 3) // 4)
     return _snap_cw_worker_count(target, n_rows)
 
-def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None):
+def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None, device=None):
     rhs_bucket = _cw_rhs_bucket(n_rhs)
     max_frontier = int(matrix_stats.get("max_frontier", n_rows))
     avg_frontier = float(matrix_stats.get("avg_frontier", float(max_frontier)))
@@ -1882,6 +1933,7 @@ def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=No
             max_frontier,
             avg_nnz_per_row,
             rhs_bucket,
+            device=device,
         )
     if frontier_ratio < 0.01 or avg_frontier < 4.0:
         target = min(target, max(1, min(n_rows, 4)))
@@ -4009,6 +4061,7 @@ def _spsv_csr_transpose_cw_kernel(
     residual_ptr,
     x_ptr,
     row_counter_ptr,
+    diag_ptr,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
@@ -4017,6 +4070,7 @@ def _spsv_csr_transpose_cw_kernel(
     UNIT_DIAG: tl.constexpr,
     DIAG_EPS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
+    CUDA_TUNED: tl.constexpr,
 ):
     logical_row = (
         0
@@ -4036,6 +4090,8 @@ def _spsv_csr_transpose_cw_kernel(
         rhs = tl.load(residual_ptr + row)
         if UNIT_DIAG:
             diag = rhs * 0 + 1.0
+        elif CUDA_TUNED:
+            diag = tl.load(diag_ptr + row)
         else:
             diag = rhs * 0
             for seg in range(MAX_SEGMENTS):
@@ -4051,22 +4107,44 @@ def _spsv_csr_transpose_cw_kernel(
         x_row = tl.where(x_row == x_row, x_row, 0.0)
         tl.store(x_ptr + row, x_row)
 
-        for seg in range(MAX_SEGMENTS):
-            idx = start + seg * BLOCK_NNZ
-            offsets = idx + tl.arange(0, BLOCK_NNZ)
-            mask = offsets < end
-            a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
-            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
-            if LOWER:
-                target_mask = mask & (col > row)
-            else:
-                target_mask = mask & (col < row)
-            if SERIAL_EXECUTION:
-                _propagate_real(residual_ptr, col, -a * x_row, target_mask)
-            else:
-                _propagate_then_release_real(
-                    residual_ptr, indegree_ptr, col, -a * x_row, target_mask
-                )
+        # Trip count from this row rather than MAX_SEGMENTS, which is
+        # ceil(max_row_nnz / BLOCK_NNZ) for the whole matrix and reaches 1207 on
+        # Stanford: every row used to run that many masked passes however short it is.
+        if CUDA_TUNED:
+            n_seg = tl.cdiv(end - start, BLOCK_NNZ)
+            for seg in tl.range(0, n_seg):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                if SERIAL_EXECUTION:
+                    _propagate_real(residual_ptr, col, -a * x_row, target_mask)
+                else:
+                    _propagate_then_release_real(
+                        residual_ptr, indegree_ptr, col, -a * x_row, target_mask
+                    )
+        else:
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                if SERIAL_EXECUTION:
+                    _propagate_real(residual_ptr, col, -a * x_row, target_mask)
+                else:
+                    _propagate_then_release_real(
+                        residual_ptr, indegree_ptr, col, -a * x_row, target_mask
+                    )
         if SERIAL_EXECUTION:
             logical_row += 1
         else:
@@ -4082,6 +4160,7 @@ def _spsv_csr_transpose_cw_kernel_complex(
     residual_ri_ptr,
     x_ri_ptr,
     row_counter_ptr,
+    diag_ri_ptr,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
@@ -4092,6 +4171,7 @@ def _spsv_csr_transpose_cw_kernel_complex(
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
+    CUDA_TUNED: tl.constexpr,
 ):
     logical_row = (
         0
@@ -4121,6 +4201,19 @@ def _spsv_csr_transpose_cw_kernel_complex(
         if UNIT_DIAG:
             diag_re = rhs_re * 0 + 1.0
             diag_im = rhs_im * 0
+        elif CUDA_TUNED:
+            # diag_ri_ptr holds the unconjugated diagonal, so one cached array serves
+            # both T and C; the conjugate is a single scalar negate here.
+            diag_re = tl.load(diag_ri_ptr + row * 2)
+            diag_im = tl.load(diag_ri_ptr + row * 2 + 1)
+            if CONJ_TRANS:
+                diag_im = -diag_im
+            if USE_FP64_ACC:
+                diag_re = diag_re.to(tl.float64)
+                diag_im = diag_im.to(tl.float64)
+            else:
+                diag_re = diag_re.to(tl.float32)
+                diag_im = diag_im.to(tl.float32)
         else:
             if USE_FP64_ACC:
                 diag_re = tl.zeros((), dtype=tl.float64)
@@ -4157,44 +4250,86 @@ def _spsv_csr_transpose_cw_kernel_complex(
         out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
 
-        for seg in range(MAX_SEGMENTS):
-            idx = start + seg * BLOCK_NNZ
-            offsets = idx + tl.arange(0, BLOCK_NNZ)
-            mask = offsets < end
-            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
-            a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
-            a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
-            if CONJ_TRANS:
-                a_im = -a_im
-            if USE_FP64_ACC:
-                a_re = a_re.to(tl.float64)
-                a_im = a_im.to(tl.float64)
-            else:
-                a_re = a_re.to(tl.float32)
-                a_im = a_im.to(tl.float32)
-            if LOWER:
-                target_mask = mask & (col > row)
-            else:
-                target_mask = mask & (col < row)
-            prod_re = a_re * x_re_out - a_im * x_im_out
-            prod_im = a_re * x_im_out + a_im * x_re_out
-            if SERIAL_EXECUTION:
-                _propagate_complex(
-                    residual_ri_ptr,
-                    col,
-                    -prod_re,
-                    -prod_im,
-                    target_mask,
-                )
-            else:
-                _propagate_then_release_complex(
-                    residual_ri_ptr,
-                    indegree_ptr,
-                    col,
-                    -prod_re,
-                    -prod_im,
-                    target_mask,
-                )
+        # Per-row trip count instead of the matrix-wide MAX_SEGMENTS bound.
+        if CUDA_TUNED:
+            n_seg = tl.cdiv(end - start, BLOCK_NNZ)
+            for seg in tl.range(0, n_seg):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+                a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+                if CONJ_TRANS:
+                    a_im = -a_im
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                prod_re = a_re * x_re_out - a_im * x_im_out
+                prod_im = a_re * x_im_out + a_im * x_re_out
+                if SERIAL_EXECUTION:
+                    _propagate_complex(
+                        residual_ri_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
+                else:
+                    _propagate_then_release_complex(
+                        residual_ri_ptr,
+                        indegree_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
+        else:
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+                a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+                if CONJ_TRANS:
+                    a_im = -a_im
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                prod_re = a_re * x_re_out - a_im * x_im_out
+                prod_im = a_re * x_im_out + a_im * x_re_out
+                if SERIAL_EXECUTION:
+                    _propagate_complex(
+                        residual_ri_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
+                else:
+                    _propagate_then_release_complex(
+                        residual_ri_ptr,
+                        indegree_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
         if SERIAL_EXECUTION:
             logical_row += 1
         else:
@@ -6435,6 +6570,7 @@ def _triton_spsv_csr_transpose_cw_vector(
     residual_in=None,
     indegree_in=None,
     row_counter_in=None,
+    diag_in=None,
     preprocessed=False,
 ):
     x = torch.zeros_like(b_vec)
@@ -6475,6 +6611,13 @@ def _triton_spsv_csr_transpose_cw_vector(
     if serial_execution:
         worker_count = 1
     grid = (worker_count,)
+    cuda_tuned = _backend_name() == "cuda"
+    if diag_in is not None:
+        diag = diag_in
+    elif unit_diagonal or not cuda_tuned:
+        diag = data
+    else:
+        diag = _compute_csr_diagonal(data, indices, indptr, n_rows)
     _spsv_csr_transpose_cw_kernel[grid](
         data,
         indices,
@@ -6483,6 +6626,7 @@ def _triton_spsv_csr_transpose_cw_vector(
         residual,
         x,
         row_counter,
+        diag,
         n_rows,
         BLOCK_NNZ=block_nnz_use,
         MAX_SEGMENTS=max_segments_use,
@@ -6491,6 +6635,7 @@ def _triton_spsv_csr_transpose_cw_vector(
         UNIT_DIAG=unit_diagonal,
         DIAG_EPS=diag_eps,
         SERIAL_EXECUTION=serial_execution,
+        CUDA_TUNED=cuda_tuned,
     )
     return x
 
@@ -6515,6 +6660,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
     residual_in=None,
     indegree_in=None,
     row_counter_in=None,
+    diag_in=None,
     preprocessed=False,
 ):
     x = torch.zeros_like(b_vec)
@@ -6568,6 +6714,15 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
     if serial_execution:
         worker_count = 1
     grid = (worker_count,)
+    cuda_tuned = _backend_name() == "cuda"
+    if diag_in is not None:
+        diag_ri = diag_in
+    elif unit_diagonal or not cuda_tuned:
+        diag_ri = data_ri
+    else:
+        diag_ri = _complex_interleaved_view(
+            _compute_csr_diagonal(data, indices, indptr, n_rows)
+        )
     _spsv_csr_transpose_cw_kernel_complex[grid](
         data_ri,
         indices,
@@ -6576,6 +6731,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
         residual_ri,
         x_ri,
         row_counter,
+        diag_ri,
         n_rows,
         BLOCK_NNZ=block_nnz_use,
         MAX_SEGMENTS=max_segments_use,
@@ -6586,6 +6742,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
         SERIAL_EXECUTION=serial_execution,
+        CUDA_TUNED=cuda_tuned,
     )
     if component_dtype == torch.float16:
         return torch.view_as_complex(x_ri_work.contiguous())
@@ -6606,6 +6763,27 @@ def _choose_transpose_family_launch_config(indptr, block_nnz=None, max_segments=
     cand = 2048
     req = max((max_nnz_per_row + cand - 1) // cand, 1)
     return cand, req
+
+
+def _compute_csr_diagonal(data, indices, indptr, n_rows):
+    """Per-row diagonal entries of a CSR matrix.
+
+    The transpose_cw kernels used to rediscover the diagonal with a full masked scan of
+    the row before every division.  That scan sits on the critical path of the column-wave
+    dependency chain, so hoisting it into the analysis phase pays for itself on any matrix
+    solved more than once.  Duplicate on-diagonal entries are summed, matching what the
+    in-kernel scan did.
+    """
+    diag = torch.zeros(n_rows, dtype=data.dtype, device=data.device)
+    if n_rows == 0 or indices.numel() == 0:
+        return diag
+    counts = (indptr[1:] - indptr[:-1]).to(torch.int64)
+    rows = torch.repeat_interleave(
+        torch.arange(n_rows, device=indptr.device, dtype=torch.int64), counts
+    )
+    on_diag = rows == indices.to(torch.int64)
+    diag.index_add_(0, rows[on_diag], data[on_diag])
+    return diag
 
 
 def _run_spsv_csc_preprocess(
@@ -7071,6 +7249,7 @@ def _execute_spsv_csr_plan(
         and _is_rocm_runtime()
         and worker_count_use == 1
     )
+    transpose_diag = None
     if solve_kind == "csr_nnz_balance":
         if tmp_sum_buf is None or ready_buf is None or indegree_buf is None:
             raise RuntimeError("csr_nnz_balance workspace is missing required buffers")
@@ -7101,6 +7280,20 @@ def _execute_spsv_csr_plan(
                 max_segments_use=max_segments_use,
             )
         transpose_preprocessed = True
+        if not unit_diagonal and _backend_name() == "cuda":
+            # Cached on the plan the way kernel_data_ri is, so a reused descriptor pays
+            # the O(nnz) gather once instead of once per solve.
+            diag_cacheable = compute_dtype == solve_plan["kernel_data"].dtype
+            if diag_cacheable:
+                transpose_diag = solve_plan.get("kernel_diag")
+            if transpose_diag is None:
+                transpose_diag = _compute_csr_diagonal(
+                    data_in, kernel_indices, kernel_indptr, n_rows
+                )
+                if torch.is_complex(data_in):
+                    transpose_diag = _complex_interleaved_view(transpose_diag)
+                if diag_cacheable:
+                    solve_plan["kernel_diag"] = transpose_diag
         if isinstance(workspace, FlagSparseSpSVWorkspace):
             workspace.prepared_solve_kind = "transpose_cw"
             workspace.prepared_signature = transpose_sig
@@ -7134,6 +7327,7 @@ def _execute_spsv_csr_plan(
                 residual_in=residual_buf,
                 indegree_in=indegree_buf,
                 row_counter_in=row_counter_buf,
+                diag_in=transpose_diag,
                 preprocessed=transpose_preprocessed,
                 )
             else:
@@ -7226,6 +7420,7 @@ def _execute_spsv_csr_plan(
                 residual_in=residual_buf,
                 indegree_in=indegree_buf,
                 row_counter_in=row_counter_buf,
+                diag_in=transpose_diag,
                 preprocessed=transpose_preprocessed,
                 )
             elif solve_kind == "csr_roc":

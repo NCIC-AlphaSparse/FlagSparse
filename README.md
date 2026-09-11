@@ -157,53 +157,66 @@ For the full DCU bring-up procedure — environment checks, the stale-install tr
 confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
 [docs/DCU_TESTING.md](docs/DCU_TESTING.md).
 
-### Running the tests on MetaX (C550)
+### Running the tests on MetaX / MACA C550
 
-Verified on a MetaX C550 (`warp_size=64`, 104 MPs, 64 GB) with MACA SDK 3.8.2.6, torch
-`2.10.0+metax3.8.1.0` and triton `3.6.0+metax3.8.1.0`. Backend detection needs no
-environment variable there — `torch.version.maca` is set and the device reports itself as
-`MetaX C550` — but the vendor baseline does, since CuPy is not available:
-
-```bash
-export PYTHONPATH=$PWD/src
-export FLAGSPARSE_MACA_VENDOR=none
-
-python -c "import flagsparse; print(flagsparse.__file__)"   # must be <repo>/src/...
-python -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model())"
-# expect: metax c550
-```
-
-**921 tests pass** across SpMV (CSR/COO/CSC/BSR), SpMM (CSR/COO/CSC/BSR), SpGEMM, SDDMM
-and gather/scatter:
+On a C550 host, run accuracy and performance together with the PyTorch baseline. This sweep
+uses 30 MatrixMarket inputs, five warmup iterations, and twenty timed iterations. SpSV and
+SpSM are excluded because their current kernels can hang on this platform:
 
 ```bash
-timeout -s KILL 3600 python -m pytest tests/pytest -q \
-  -m "spmv_csr or spmv_coo or spmv_csc or spmv_bsr or spmv_coo_tocsr or \
-      spmm_csr or spmm_coo or spmm_csc or spmm_bsr or \
-      spgemm_csr or sddmm_csr or gather or scatter"
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr \
+  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
+  --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
 ```
 
-Known limits on this backend:
+`--benchmark-args` is split and appended to every selected performance script. Use the
+repeatable `--op-benchmark-args=OP=ARGS` for an argument only one script supports; the
+command above sends `--resume` to BSR alone. Quote `ARGS` when it contains spaces. For a
+BSR-only resume, reuse the same result directory with:
 
-- **SpSV/SpSM are broken.** `_spsv_csr_cw_kernel` faults with an illegal memory access on
-  every `lower` + `unit_diagonal` solve — including a diagonal-only matrix that never
-  enters the dependency branch — and its ready-flag spin fails to make progress, the same
-  way it does on DCU/gfx936. Always wrap solver runs in `timeout -s KILL`: a wedged kernel
-  cannot be interrupted with Ctrl-C and otherwise costs the whole container.
-- **`alpha_spmm_alg1` is unavailable**: MetaX's Triton build has no
-  `triton.experimental.tle`, and the FlagTree wheel that does requires GLIBC 2.38 while
-  the image ships 2.31. No other operator depends on TLE.
-- **Complex SpMM COO needs a launch clamp** (already applied): the rowrun kernels unroll
-  `tl.static_range(0, BLOCK_NNZ)`, so at the public default of 256 a complex kernel asks
-  for 8 KB of per-thread private memory against the driver's 4 KB cap and the launch is
-  rejected outright. Clamping MACA+complex to `BLOCK_NNZ=4` fixed all 24 failures and cut
-  the suite from 23m48s to 11.8s.
+```bash
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase performance --gpus 0 \
+  --ops spmv_bsr --benchmark-input /root/gcx/matrix \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args="--no-cusparse --resume" --timeout 7200 \
+  --results-dir pytest_results_metax_spmv_bsr
+```
 
-For the operating manual — per-marker commands, the SpSV minimal repro, the private-memory
-diagnosis and a troubleshooting table — see
-[docs/METAX_RUNNING.md](docs/METAX_RUNNING.md); for first-time bring-up (SDK install, wheel
-selection, the vendor pip index, fingerprint collection) see
+The BSR script retains completed `PASS`/`FAIL` cases, retries prior `ERROR` cases, and
+reports `bsr_speedup_vs_pytorch` only for accuracy `PASS` rows.
+
+The result directory contains per-operator accuracy and performance files plus the combined
+summary. For backend checks, baseline details, and known C550 limitations, see
 [docs/METAX_TESTING.md](docs/METAX_TESTING.md).
+
+For MetaX SDDMM, run only the currently supported `float32,float64` value dtypes. The
+MACA build's `torch.sparse.sampled_addmm` returns incorrect sampled-dot values, so the
+SDDMM runner uses `--no-cusparse` and benchmarks the independent PyTorch sampled-dot
+reference (`sum(X[row] * Y[col])`), recorded as `pytorch_ms`.
+
+That reference plays two roles, split by dtype on every backend: it is **timed at the
+operator's own dtype**, so `pytorch_ms` is a like-for-like baseline, while **fp32
+correctness is still checked against an fp64 evaluation** run outside the timed window --
+an oracle at the same precision as the code under test cannot separate a real
+accumulation bug from rounding both sides share. `triton_speedup_vs_pytorch` is filled on
+MetaX only; on CUDA and ROCm it is left empty so the vendor metric stays the reported
+one (this reference materialises nnz x K temporaries and is not an optimised SDDMM).
+A dedicated full C550 SDDMM run is:
+
+```bash
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --gpus 0 \
+  --ops sddmm_csr --benchmark-input /root/gcx/matrix \
+  --benchmark-warmup 5 --benchmark-iters 20 --benchmark-args=--no-cusparse \
+  --timeout 7200 --results-dir pytest_results_metax_sddmm_csr_pytorch_full_w5_i20
+```
+
+On MetaX, `test_spmm_csc.py` uses a direct PyTorch CSC baseline:
+`torch.sparse_csc_tensor` followed by `torch.sparse.mm`. CSC format construction is outside
+the timed window; the CSV records the baseline as `pytorch_ms` and reports
+`triton_speedup_vs_pytorch`. The `--no-cusparse` option disables only the optional vendor
+baseline, not this PyTorch CSC baseline. The COO path remains a correctness reference.
 
 ## Layout
 
@@ -270,6 +283,7 @@ python tests/test_spmv_bsr.py --synthetic --ops non,trans,conj
 python tests/test_spmv_bsr.py <dir/> --csv-bsr out.csv --block-dims 2,4 --ops non,trans,conj --alg compare
 # correctness uses BSR-expanded COO as the exact reference; PyTorch BSR is a baseline only.
 # --alg blockrow_reduce runs the non-only block-row tile reduction path; compare keeps trans/conj on base.
+# --resume retains completed PASS/FAIL CSV cases and retries prior ERROR cases.
 ```
 
 **test_spmm.py** - CSR SpMM (`.mtx` batch, synthetic, or `--csv`):
@@ -311,8 +325,9 @@ python tests/test_spmm_bsr.py <dir/> --csv-bsr out.csv --block-dims 2 --ops non 
 
 ```bash
 python tests/test_sddmm.py <dir_or_file.mtx> --k 64
-python tests/test_sddmm.py <dir/> --csv out.csv          # optional: --dtype float32|float64, --acc_mode f32|f64, --k 64
-# common options: --dtype, --index-dtype, --acc_mode, --k, --alpha, --beta, --warmup, --iters, --no-cupy-ref, --skip-api-checks
+python tests/test_sddmm.py <dir/> --csv out.csv --no-cusparse  # dtype defaults: float32,float64
+# common options: --dtype float32|float64, --index-dtype, --acc_mode f32|f64, --k,
+# --alpha, --beta, --warmup, --iters, --no-cusparse, --skip-api-checks
 ```
 
 **test_spgemm.py** - CSR SpGEMM (`.mtx` batch or `--csv`):
@@ -404,3 +419,39 @@ outputs compare against CPU int32 references.
 ## License
 
 This project is licensed under the [Apache (Version 2.0) license](./LICENSE).
+
+### Running the tests on Ascend 910B
+
+Ascend runs use CANN and `torch_npu`. Performance testing is restricted to NPU cards 6 and
+7. Source the CANN environment and select the Ascend backend:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=ascend
+export FLAGSPARSE_ASCEND_VENDOR=ops_sparse
+```
+
+In Ascend mode, the unified runner uses `benchmark/benchmark_ascend.py` for the five
+supported operators and leaves all other backend paths unchanged:
+
+```bash
+run_id=$(date -u +%Y%m%dT%H%M%SZ)
+setsid python3 -u run_flagsparse_pytest.py \
+  --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
+  --phase performance --gpus 6,7 \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir "pytest_results_ascend_${run_id}" \
+  > "pytest_ascend_${run_id}.log" 2>&1 < /dev/null &
+```
+
+For a direct single-card smoke test:
+
+```bash
+python benchmark/benchmark_ascend.py --device 6 \
+  --m 4096 --n 4096 --nnz 131072 --dense-cols 64 \
+  --warmup 5 --iters 20
+```
+
+See [docs/ASCEND_TESTING.md](docs/ASCEND_TESTING.md) for environment checks, result
+format, known limitations, and troubleshooting.

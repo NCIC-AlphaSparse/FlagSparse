@@ -208,6 +208,62 @@ python tests/test_scatter.py  --value-dtypes float32
 在 MetaX 上它装的是 CuPy 兼容路径的数，或在 `FLAGSPARSE_MACA_VENDOR=none` 时为 `N/A`。
 `N/A` 不代表失败，去 `reason` / `cusparse_reason` 字段看原因。
 
+## 6.1. C550 runner 全量测试
+
+在当前 C550 环境中，对已有性能入口的算子同时执行精度和性能测试。性能基线使用
+PyTorch，热身 5 次、迭代 20 次；SpSV、SpSM 以及没有性能入口的算子不包含在本轮：
+
+```bash
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr \
+  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
+  --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
+```
+
+结果写入 `pytest_results_metax_runner_both_w5_i20/`，包括各算子的精度结果、性能 CSV、
+规范化性能 JSON 和根目录汇总文件。
+
+其中 `spmm_csc` 在 MACA 上使用直接 PyTorch CSC 作为性能 baseline：
+`torch.sparse_csc_tensor` + `torch.sparse.mm`，CSC 格式构造不计入计时，CSV 字段为
+`pytorch_ms` 和 `triton_speedup_vs_pytorch`。精度参考仍是同一 CSC 数据转 COO 后的
+`torch.sparse.mm`；`--no-cusparse` 只禁用 CuPy/厂商 CSC baseline，不影响 PyTorch CSC baseline。
+`trans/conj` 的有效 CSC 准备过程同样在计时窗口之外。
+
+`--benchmark-args` 是传给所有性能脚本的字符串，runner 通过 `shlex.split()` 展开。只由
+单个性能脚本支持的参数使用可重复的 `--op-benchmark-args=算子名=参数`；参数部分含空格时
+才需要整体引用。上面的全量命令只向 BSR 传入 `--resume`。`spmv_bsr` 若被 7200 秒超时中断，
+可复用同一结果目录续跑：
+
+```bash
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase performance --gpus 0 \
+  --ops spmv_bsr --benchmark-input /root/gcx/matrix \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args="--no-cusparse --resume" --timeout 7200 \
+  --results-dir pytest_results_metax_spmv_bsr
+```
+
+`--resume` 保留 CSV 中已经完成的 `PASS`/`FAIL` case，丢弃并重试 `ERROR` case；仅精度
+`PASS` 且 PyTorch 与 FlagSparse 时延完整的行会写入和汇总 `bsr_speedup_vs_pytorch`。
+
+### 6.2. C550 SDDMM（fp32 / fp64）全量测试
+
+`sddmm_csr` 当前只支持 `float32`、`float64`，全量性能范围是 30 个矩阵、两种 dtype
+及 `K=32,64,128,256`。MACA PyTorch 的 `torch.sparse.sampled_addmm` 虽能调用，但其
+sampled-dot 输出不正确，不能作为 SDDMM 的精度参考或性能 baseline。因此 C550 上必须传入
+`--no-cusparse`，SDDMM 脚本会使用独立的、同 dtype PyTorch 参考
+`sum(X[row] * Y[col])`：它同时是精度 oracle 和性能 baseline。CSV 的有效字段为
+`pytorch_ms` 与 `triton_speedup_vs_pytorch`；仅精度 `PASS` 且两侧时延有效的行参与加速比汇总。
+
+```bash
+PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --gpus 0 \
+  --ops sddmm_csr --benchmark-input /root/gcx/matrix \
+  --benchmark-warmup 5 --benchmark-iters 20 --benchmark-args=--no-cusparse \
+  --timeout 7200 --results-dir pytest_results_metax_sddmm_csr_pytorch_full_w5_i20
+```
+
+该命令在前台运行；如需脱离终端，可由调用方以 `setsid` 或 `tmux` 包裹，命令本身不依赖后台参数。
+
 ---
 
 ## 7. 调优 A/B —— 这一步才是 metax 后端的价值所在

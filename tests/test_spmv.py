@@ -273,7 +273,48 @@ def _pytorch_spmv_reference(
     return _cast_reference_output(y_ref, out_dtype)
 
 
+def _scipy_spmv_reference(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype,
+    op="non",
+    return_compute=False,
+):
+    import numpy as np
+    import scipy.sparse as sp
+
+    op = _normalize_op(op)
+    ref_dtype = _reference_dtype(out_dtype)
+    matrix = sp.csr_matrix(
+        (
+            data.to(ref_dtype).detach().cpu().numpy(),
+            indices.detach().cpu().numpy().astype(np.int64, copy=False),
+            indptr.detach().cpu().numpy().astype(np.int64, copy=False),
+        ),
+        shape=shape,
+    )
+    x_ref = x.to(ref_dtype).detach().cpu().numpy()
+    if op == "non":
+        result = matrix @ x_ref
+    elif op == "trans":
+        result = matrix.transpose() @ x_ref
+    else:
+        result = matrix.conj().transpose() @ x_ref
+    y_ref = torch.as_tensor(np.asarray(result), dtype=ref_dtype, device=data.device)
+    if return_compute:
+        return y_ref
+    return _cast_reference_output(y_ref, out_dtype)
+
+
 def _build_pytorch_sparse_matrix(data, indices, indptr, shape):
+    if ast_common._is_maca_runtime():
+        # MACA's CSR float32 kernel is unstable with int64 indices; the helper picks
+        # int32 CSR or COO accordingly.
+        matrix, _ = ast_common._pytorch_sparse_matrix(data, indices, indptr, shape)
+        return matrix
     device = data.device
     try:
         return torch.sparse_csr_tensor(
@@ -310,7 +351,25 @@ def _time_pytorch_spmv(data, indices, indptr, x, shape, warmup, iters, op="non")
     if data.numel() == 0:
         return 0.0
     x_2d = x.unsqueeze(1)
-    if op == "non":
+    if ast_common._is_maca_runtime():
+        # MACA picks int32 CSR or COO per matrix, so materialise the transposed operand
+        # up front and time whichever format the helper selected.
+        data_op, indices_op, indptr_op, shape_op = _materialize_csr_op_for_timing(
+            data, indices, indptr, shape, op
+        )
+        _, sparse_format = ast_common._pytorch_sparse_mm(
+            data_op, indices_op, indptr_op, shape_op, x_2d
+        )
+        if sparse_format == "COO":
+            matrix = ast_common._pytorch_sparse_coo_matrix(
+                data_op, indices_op, indptr_op, shape_op
+            )
+        else:
+            matrix = _build_pytorch_sparse_matrix(
+                data_op, indices_op, indptr_op, shape_op
+            )
+        spmv_op = lambda: torch.sparse.mm(matrix, x_2d).squeeze(1)
+    elif op == "non":
         matrix = _build_pytorch_sparse_matrix(data, indices, indptr, shape)
         spmv_op = lambda: torch.sparse.mm(matrix, x_2d).squeeze(1)
     else:
@@ -386,16 +445,33 @@ def run_one_mtx(
     err_pt = None
     triton_ok_pt = False
     pt_error_reason = None
+    # MACA's PyTorch sparse reference is unreliable (non-finite output on the fp32 CSR
+    # path), so correctness there is checked against SciPy on the CPU instead.  Timing
+    # still uses the PyTorch path below.
+    reference_name = (
+        "SciPy reference" if ast_common._is_maca_runtime() else "PyTorch reference"
+    )
     try:
-        pt_ref_y = _pytorch_spmv_reference(
-            data,
-            indices,
-            indptr,
-            x,
-            shape,
-            value_dtype,
-            op=op,
-        )
+        if ast_common._is_maca_runtime():
+            pt_ref_y = _scipy_spmv_reference(
+                data,
+                indices,
+                indptr,
+                x,
+                shape,
+                value_dtype,
+                op=op,
+            )
+        else:
+            pt_ref_y = _pytorch_spmv_reference(
+                data,
+                indices,
+                indptr,
+                x,
+                shape,
+                value_dtype,
+                op=op,
+            )
         pytorch_ms = _time_pytorch_spmv(
             data,
             indices,
@@ -408,7 +484,7 @@ def run_one_mtx(
         )
         if y_size:
             pt_error_reason = _non_finite_error_reason(
-                triton_y, pt_ref_y, "PyTorch reference"
+                triton_y, pt_ref_y, reference_name
             )
             if pt_error_reason is None:
                 err_pt = _allclose_error_ratio(triton_y, pt_ref_y, atol, rtol)

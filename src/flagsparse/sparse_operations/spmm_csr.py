@@ -22,6 +22,21 @@ from ._common import *
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
+_ASCEND_ROW_IDS_CACHE = {}
+
+
+def _ascend_csr_row_ids(indptr, n_rows):
+    """Per-nonzero row index for the Ascend fallbacks (repeat_interleave, not Triton)."""
+    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
+    cached = _ASCEND_ROW_IDS_CACHE.get(key)
+    if cached is None:
+        cached = torch.repeat_interleave(
+            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
+            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
+        )
+        _ASCEND_ROW_IDS_CACHE[key] = cached
+    return cached
+
 HipPointer = _common_mod.HipPointer
 
 
@@ -730,6 +745,8 @@ class PreparedCsrSpmmRoute:
         "avg_nnz_per_row",
         "op",
         "alg",
+        "materialized_op",
+        "materialized_route",
     )
 
     def __init__(
@@ -757,6 +774,9 @@ class PreparedCsrSpmmRoute:
         self.avg_nnz_per_row = float(self.nnz) / float(max(1, self.n_rows))
         self.op = str(op)
         self.alg = str(alg)
+        # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
+        self.materialized_op = None
+        self.materialized_route = None
 
 
 def _normalize_spmm_csr_alg(alg):
@@ -898,6 +918,9 @@ def _spmm_csr_route_from_materialized(prepared, data, indices, indptr, shape, op
 def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     if op_name == "non":
         return prepared, 0.0 if timing else None
+    cached = prepared.materialized_route
+    if cached is not None and prepared.materialized_op == op_name:
+        return cached, 0.0 if timing else None
 
     start = _ACCEL.Event(enable_timing=True) if timing else None
     end = _ACCEL.Event(enable_timing=True) if timing else None
@@ -2688,7 +2711,7 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
     resolved_alg = _normalize_spmm_csr_alg(alg)
     if resolved_alg != "auto":
         resolve_spmm_csr_algorithm(resolved_alg, op_name, data.dtype)
-    return PreparedCsrSpmmRoute(
+    route = PreparedCsrSpmmRoute(
         data=data,
         kernel_indices=kernel_indices,
         kernel_indptr=kernel_indptr,
@@ -2700,6 +2723,25 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         op=op_name,
         alg=resolved_alg,
     )
+    if op_name != "non" and _backend_name() == "cuda":
+        # Materialise A.T (A.conj().T for conj) here instead of on every run.  The
+        # transpose is a sort + bincount + cumsum over nnz, and it used to run inside
+        # flagsparse_spmm_csr_run -- i.e. once per timed iteration -- while the cuSPARSE
+        # baseline materialises ``A_csr.transpose().tocsr()`` once outside its timed
+        # window (see tests/test_spmm.py).  Caching it here makes the two sides
+        # symmetric; a run-time ``op=`` override still re-materialises below.
+        t_data, t_indices, t_indptr, t_shape = _materialize_spmm_csr_op(
+            data,
+            kernel_indices,
+            kernel_indptr,
+            shape,
+            op_code,
+        )
+        route.materialized_route = _spmm_csr_route_from_materialized(
+            route, t_data, t_indices, t_indptr, t_shape, op_name
+        )
+        route.materialized_op = op_name
+    return route
 
 
 def flagsparse_spmm_csr_run(
@@ -4178,6 +4220,53 @@ def flagsparse_spmm_csr(
         and bool(transpose) != _spmm_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
+
+    # Ascend 910B does not lower the Triton CSR kernels reliably (and its SparseCSR addmm
+    # dispatcher is unavailable).  Same CSR reduction via torch_npu index_add, Ascend only.
+    if _is_ascend_runtime():
+        if any(arg is None for arg in (data, indices, indptr, B, shape)):
+            raise ValueError("data, indices, indptr, B, and shape are required")
+        if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or B.ndim != 2:
+            raise ValueError("data, indices, and indptr must be 1D; B must be 2D")
+        n_rows, n_cols = int(shape[0]), int(shape[1])
+        if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+            raise ValueError("invalid CSR dimensions")
+        if B.dtype != data.dtype or B.device != data.device:
+            raise ValueError("B must match sparse input dtype and device")
+        row_ids = _ascend_csr_row_ids(indptr, n_rows)
+        cols = indices.to(torch.int64)
+        transposed = _spmm_op_transposes(op_code)
+        expected = n_rows if transposed else n_cols
+        if B.shape[0] != expected:
+            raise ValueError(f"B.shape[0] must be {expected}, got {B.shape[0]}")
+        ascend_timed = bool(return_time or return_meta)
+        if ascend_timed:
+            _ACCEL.synchronize()
+        t0 = time.perf_counter()
+        if transposed:
+            out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
+            out_mat.index_add_(0, cols, data[:, None] * B[row_ids])
+        else:
+            out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
+            out_mat.index_add_(0, row_ids, data[:, None] * B[cols])
+        if out is not None:
+            out.copy_(out_mat)
+            out_mat = out
+        if ascend_timed:
+            _ACCEL.synchronize()
+            elapsed = (time.perf_counter() - t0) * 1000.0
+        else:
+            elapsed = None
+        if return_meta:
+            meta = {
+                "symbolic_ms": 0.0 if ascend_timed else None,
+                "compute_ms": elapsed,
+                "op_total_ms": elapsed,
+                "op": _spmm_op_to_name(op_code),
+            }
+            return (out_mat, elapsed, meta) if return_time else (out_mat, meta)
+        return (out_mat, elapsed) if return_time else out_mat
+
     if block_n is not None and block_n <= 0:
         raise ValueError("block_n must be positive when provided")
     if block_nnz is not None and block_nnz <= 0:
@@ -4587,6 +4676,12 @@ def _spmm_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None):
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor in ("ops_sparse", "torch") and _is_ascend_runtime():
+        if value_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return None, f"PyTorch-NPU CSR SpMM fallback does not support {value_dtype}"
+        if index_dtype != torch.int32 or indptr_dtype != torch.int32:
+            return None, "PyTorch-NPU CSR SpMM fallback requires int32 CSR indices"
+        return "torch_npu", "ops-sparse CSR SpMM is unavailable on 910B; using PyTorch-NPU sparse.mm"
     if vendor != "cupy_cusparse":
         return (
             None,
@@ -5023,29 +5118,51 @@ def _spmm_csr_reference(
     indices64 = indices.to(torch.int64)
     fallback_reason = None
     pytorch_format = "CSR"
-    try:
-        sparse_ref = torch.sparse_csr_tensor(
-            indptr64,
-            indices64,
-            data_ref,
-            size=shape,
-            device=device,
-        )
-        expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
-    except Exception as exc:
-        pytorch_format = "COO"
-        fallback_reason = f"CSR fallback: {exc}"
-        row_indices = torch.repeat_interleave(
-            torch.arange(int(shape[0]), device=device, dtype=torch.int64),
-            indptr64[1:] - indptr64[:-1],
-        )
-        sparse_ref = torch.sparse_coo_tensor(
-            torch.stack([row_indices, indices64]),
-            data_ref,
-            shape,
-            device=device,
-        ).coalesce()
-        expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+    if _is_maca_runtime():
+        # MACA's fp32 CSR kernel is unstable with int64 indices, and can return
+        # non-finite values; the helper picks int32 CSR or COO and retries as COO.
+        try:
+            expected, pytorch_format = _pytorch_sparse_mm(
+                data_ref, indices, indptr, shape, B_ref, op="non"
+            )
+        except Exception as exc:
+            pytorch_format = "COO"
+            fallback_reason = f"CSR fallback: {exc}"
+            row_indices = torch.repeat_interleave(
+                torch.arange(int(shape[0]), device=device, dtype=torch.int64),
+                indptr64[1:] - indptr64[:-1],
+            )
+            sparse_ref = torch.sparse_coo_tensor(
+                torch.stack([row_indices, indices64]),
+                data_ref,
+                shape,
+                device=device,
+            ).coalesce()
+            expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+    else:
+        try:
+            sparse_ref = torch.sparse_csr_tensor(
+                indptr64,
+                indices64,
+                data_ref,
+                size=shape,
+                device=device,
+            )
+            expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
+        except Exception as exc:
+            pytorch_format = "COO"
+            fallback_reason = f"CSR fallback: {exc}"
+            row_indices = torch.repeat_interleave(
+                torch.arange(int(shape[0]), device=device, dtype=torch.int64),
+                indptr64[1:] - indptr64[:-1],
+            )
+            sparse_ref = torch.sparse_coo_tensor(
+                torch.stack([row_indices, indices64]),
+                data_ref,
+                shape,
+                device=device,
+            ).coalesce()
+            expected = _apply_torch_sparse_matmul_op(sparse_ref, B_ref, "non")
     expected = _cast_sparse_reference_output(expected, out_dtype)
     metadata = {
         "backend": "torch",
@@ -5099,6 +5216,37 @@ def _benchmark_spmm_csr_sparse_ref(
         result["ms"] = ms
         result["reason"] = None
         return result
+
+    if backend == "torch_npu":
+        if not _is_ascend_runtime():
+            result["reason"] = "PyTorch-NPU baseline requires Ascend runtime"
+            return result
+        try:
+            if dense_layout != "row":
+                result["reason"] = "PyTorch-NPU sparse.mm fallback currently requires row-major B"
+                return result
+            matrix = torch.sparse_csr_tensor(
+                indptr.to(torch.int32),
+                indices.to(torch.int32),
+                data,
+                size=shape,
+                device=data.device,
+            )
+            npu_op = _normalize_sparse_reference_op(op)
+            if npu_op == "non":
+                fn = lambda: torch.sparse.mm(matrix, B)
+            elif npu_op == "trans":
+                fn = lambda: torch.sparse.mm(matrix.transpose(0, 1), B)
+            else:
+                fn = lambda: torch.sparse.mm(matrix.conj().transpose(0, 1), B)
+            values, ms = _benchmark_cuda_op(fn, warmup, iters)
+            result["values"] = values
+            result["ms"] = ms
+            result["reason"] = "ops-sparse bridge unavailable; PyTorch-NPU fallback"
+            return result
+        except Exception as exc:
+            result["reason"] = f"PyTorch-NPU sparse CSR SpMM unavailable: {exc}"
+            return result
 
     op_name = _normalize_sparse_reference_op(op)
     dense_layout = str(dense_layout).strip().lower()

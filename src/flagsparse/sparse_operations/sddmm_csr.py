@@ -20,6 +20,24 @@ import math
 from ._common import *
 
 SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
+_ASCEND_ROW_IDS_CACHE = {}
+
+
+def _ascend_csr_row_ids(indptr, n_rows):
+    """Per-nonzero row index for the Ascend fallbacks.
+
+    Deliberately not ``_build_row_ids``: that is a Triton kernel, and Ascend 910B cannot
+    lower it -- which is why these fallbacks exist at all.
+    """
+    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
+    cached = _ASCEND_ROW_IDS_CACHE.get(key)
+    if cached is None:
+        cached = torch.repeat_interleave(
+            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
+            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
+        )
+        _ASCEND_ROW_IDS_CACHE[key] = cached
+    return cached
 SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS = ("baseline", "acc64", "acc64_out64", "altreduce")
 
 
@@ -62,6 +80,12 @@ def _sddmm_csr_sparse_ref_backend(value_dtype, index_dtype):
         return None, reason
     if vendor == "cupy_cusparse":
         return "cupy_cusparse", None
+    if vendor in ("ops_sparse", "torch") and _is_ascend_runtime():
+        if value_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return None, f"PyTorch-NPU SDDMM fallback does not support {value_dtype}"
+        if index_dtype != torch.int32:
+            return None, "PyTorch-NPU SDDMM fallback requires int32 CSR indices"
+        return "torch_npu", "ops-sparse bridge unavailable; using PyTorch-NPU dense matmul gather"
     return (
         None,
         f"{_sparse_backend_label(vendor)} CSR SDDMM baseline is not wired for this runner",
@@ -304,6 +328,26 @@ def _benchmark_sddmm_csr_sparse_ref(
     if backend is None:
         return result
     if backend != "hipsparse":
+        if backend == "torch_npu":
+            try:
+                row_ids = _ascend_csr_row_ids(indptr, int(shape[0]))
+                values = data_in.clone() if float(beta) != 0.0 else torch.zeros_like(data_in)
+
+                def fn():
+                    values.copy_(
+                        float(alpha) * (x[row_ids] * y[indices.to(torch.int64)]).sum(dim=1)
+                        + float(beta) * (data_in if float(beta) != 0.0 else 0.0)
+                    )
+                    return values
+
+                values, ms = _benchmark_cuda_op(fn, warmup, iters)
+                result["values"] = values
+                result["ms"] = ms
+                result["reason"] = "ops-sparse bridge unavailable; PyTorch-NPU fallback"
+                return result
+            except Exception as exc:
+                result["reason"] = f"PyTorch-NPU SDDMM fallback unavailable: {exc}"
+                return result
         result["reason"] = "CUDA cuSPARSE SDDMM baseline is implemented in the benchmark runner"
         return result
     values, ms = _benchmark_prepared_cuda_op(
@@ -785,6 +829,56 @@ def flagsparse_sddmm_csr(
     ``validate=False`` is forwarded to :func:`prepare_sddmm_csr` and only applies
     when this call builds the prepared pattern itself.
     """
+    # Ascend 910B currently fails lowering the generic Triton SDDMM kernel.  Compute the
+    # sampled dense products with torch_npu indexing instead; CUDA/ROCm/MetaX/MUSA fall
+    # through to the Triton path unchanged.
+    if _is_ascend_runtime():
+        if any(v is None for v in (indices, indptr, x, y, shape)):
+            raise ValueError("indices, indptr, x, y, and shape are required on Ascend")
+        n_rows, n_cols = int(shape[0]), int(shape[1])
+        if (
+            x.ndim != 2
+            or y.ndim != 2
+            or x.shape[0] != n_rows
+            or y.shape[0] != n_cols
+            or x.shape[1] != y.shape[1]
+        ):
+            raise ValueError("x/y shapes do not match CSR SDDMM shape")
+        if (data is not None and data.numel() != indices.numel()) or indptr.numel() != n_rows + 1:
+            raise ValueError("invalid CSR dimensions")
+        if data is None and beta != 0.0:
+            raise ValueError("data is required when beta is non-zero")
+        row_ids = _ascend_csr_row_ids(indptr, n_rows)
+        ascend_timed = bool(return_time or return_meta)
+        if ascend_timed:
+            _ACCEL.synchronize()
+        t0 = time.perf_counter()
+        # NPU matmul beats launching two large gathers for the benchmark shapes, so the
+        # dense product is formed and only the CSR coordinates are sampled from it.
+        # NOTE: this materialises an n_rows x n_cols dense matrix -- fine for the shapes
+        # this was validated on, but it will not scale to large sparse patterns.
+        cols = indices.to(torch.int64)
+        dense_product = torch.matmul(x, y.transpose(0, 1))
+        vals = dense_product[row_ids, cols] * float(alpha)
+        if beta != 0.0:
+            vals = vals + float(beta) * data
+        if out is not None:
+            out.copy_(vals)
+            vals = out
+        if ascend_timed:
+            _ACCEL.synchronize()
+            elapsed = (time.perf_counter() - t0) * 1000.0
+        else:
+            elapsed = None
+        meta = {"prepare_ms": 0.0 if ascend_timed else None, "fallback_used": True, "backend": "torch_npu"}
+        if return_time and return_meta:
+            return vals, elapsed, meta
+        if return_time:
+            return vals, elapsed
+        if return_meta:
+            return vals, meta
+        return vals
+
     # The perf_counter timings below need device syncs to be meaningful, but those
     # syncs are pure instrumentation: they cost 0.05-0.09ms per call (6-23% of a
     # single-shot SDDMM) and used to run even when the caller asked for neither

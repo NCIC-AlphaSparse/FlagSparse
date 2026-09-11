@@ -209,6 +209,9 @@ __all__ = (
     "_accel_device_type",
     "_ACCEL",
     "_ACCEL_DEVICE_TYPE",
+    "_pytorch_sparse_coo_matrix",
+    "_pytorch_sparse_matrix",
+    "_pytorch_sparse_mm",
     "_accel_oom_error",
     "_accel_graph_available",
     "_is_accel_tensor",
@@ -635,6 +638,72 @@ def _accel_fallback_reason():
 def _is_accel_tensor(t):
     """Backend-neutral replacement for Tensor.is_cuda."""
     return getattr(t, "device", None) is not None and t.device.type == _ACCEL_DEVICE_TYPE
+
+
+def _pytorch_sparse_coo_matrix(data, indices, indptr, shape):
+    """CSR arrays -> a coalesced PyTorch sparse COO tensor."""
+    n_rows = int(shape[0])
+    offsets = indptr.to(torch.int64)
+    row_indices = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        offsets[1:] - offsets[:-1],
+    )
+    return torch.sparse_coo_tensor(
+        torch.stack((row_indices, indices.to(torch.int64))),
+        data,
+        size=shape,
+        device=data.device,
+    ).coalesce()
+
+
+def _pytorch_sparse_matrix(data, indices, indptr, shape):
+    """Create the portable PyTorch sparse baseline matrix for this runtime.
+
+    MACA PyTorch's CSR float32 kernel is unstable with int64 CSR indices, so use int32
+    CSR when the matrix fits and COO with int64 coordinates when it does not.  Other
+    backends keep the historical int64 CSR path.
+    """
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    fits_int32 = (
+        n_rows <= _INDEX_LIMIT_INT32
+        and n_cols <= _INDEX_LIMIT_INT32
+        and int(data.numel()) <= _INDEX_LIMIT_INT32
+    )
+    if _IS_MACA_RUNTIME and not fits_int32:
+        return _pytorch_sparse_coo_matrix(data, indices, indptr, shape), "COO"
+    index_dtype = torch.int32 if _IS_MACA_RUNTIME else torch.int64
+    return (
+        torch.sparse_csr_tensor(
+            indptr.to(index_dtype),
+            indices.to(index_dtype),
+            data,
+            size=shape,
+            device=data.device,
+        ),
+        "CSR",
+    )
+
+
+def _pytorch_sparse_mm(data, indices, indptr, shape, rhs, op="non"):
+    """Run a PyTorch sparse baseline, retrying MACA's non-finite CSR output as COO."""
+    token = str(op).lower()
+
+    def run(matrix):
+        if token == "non":
+            return torch.sparse.mm(matrix, rhs)
+        if token == "trans":
+            return torch.sparse.mm(matrix.transpose(0, 1), rhs)
+        if token == "conj":
+            matrix = matrix.conj() if torch.is_complex(matrix) else matrix
+            return torch.sparse.mm(matrix.transpose(0, 1), rhs)
+        raise ValueError(f"unsupported sparse operation: {op}")
+
+    matrix, sparse_format = _pytorch_sparse_matrix(data, indices, indptr, shape)
+    result = run(matrix)
+    if _IS_MACA_RUNTIME and not bool(torch.isfinite(result).all()):
+        result = run(_pytorch_sparse_coo_matrix(data, indices, indptr, shape))
+        sparse_format = "COO"
+    return result, sparse_format
 
 
 def _accel_oom_error():
@@ -1701,28 +1770,35 @@ def _spmv_csr_ref_pytorch(
     data_ref = data.to(compute_dtype)
     x_ref = x.to(compute_dtype)
     op_name = _normalize_spmv_reference_op(op)
-    try:
-        csr_ref = torch.sparse_csr_tensor(
-            indptr.to(torch.int64),
-            indices.to(torch.int64),
-            data_ref,
-            size=shape,
-            device=device,
+    if _IS_MACA_RUNTIME:
+        # MACA's fp32 CSR kernel is unstable with int64 indices; the helper picks
+        # int32 CSR or COO and retries non-finite output as COO.
+        y_ref, _ = _pytorch_sparse_mm(
+            data_ref, indices, indptr, shape, x_ref.unsqueeze(1), op=op_name
         )
-        y_ref = _apply_torch_sparse_spmv_op(csr_ref, x_ref.unsqueeze(1), op_name)
-    except Exception:
-        n_rows = int(shape[0])
-        row_ind = torch.repeat_interleave(
-            torch.arange(n_rows, device=device, dtype=torch.int64),
-            indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
-        )
-        coo_ref = torch.sparse_coo_tensor(
-            torch.stack([row_ind, indices.to(torch.int64)]),
-            data_ref,
-            shape,
-            device=device,
-        ).coalesce()
-        y_ref = _apply_torch_sparse_spmv_op(coo_ref, x_ref.unsqueeze(1), op_name)
+    else:
+        try:
+            csr_ref = torch.sparse_csr_tensor(
+                indptr.to(torch.int64),
+                indices.to(torch.int64),
+                data_ref,
+                size=shape,
+                device=device,
+            )
+            y_ref = _apply_torch_sparse_spmv_op(csr_ref, x_ref.unsqueeze(1), op_name)
+        except Exception:
+            n_rows = int(shape[0])
+            row_ind = torch.repeat_interleave(
+                torch.arange(n_rows, device=device, dtype=torch.int64),
+                indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+            )
+            coo_ref = torch.sparse_coo_tensor(
+                torch.stack([row_ind, indices.to(torch.int64)]),
+                data_ref,
+                shape,
+                device=device,
+            ).coalesce()
+            y_ref = _apply_torch_sparse_spmv_op(coo_ref, x_ref.unsqueeze(1), op_name)
     if return_compute:
         return y_ref
     return _cast_spmv_reference_output(y_ref, out_dtype)

@@ -20,6 +20,7 @@ from flagsparse import (
     flagsparse_spmm_csr_opt,
     prepare_spmm_csr_opt,
 )
+from flagsparse.sparse_operations import _common as common
 
 from tests.pytest.param_shapes import (
     MNK_SHAPES,
@@ -105,7 +106,14 @@ def test_spmm_csr_matches_torch(M, N, K, dtype):
     indices = Asp.col_indices()
     indptr = Asp.crow_indices()
     B = _random_dense((K, N), dtype, device)
-    if dtype == torch.float32:
+    if dtype == torch.float32 and common._is_maca_runtime():
+        # MACA's fp32 CSR path is unstable with int64 indices, so build the fp64
+        # reference through the helper that picks int32 CSR or COO.
+        ref, _ = common._pytorch_sparse_mm(
+            data.double(), indices, indptr, (M, K), B.double()
+        )
+        ref = ref.float()
+    elif dtype == torch.float32:
         Asp64 = torch.sparse_csr_tensor(
             crow_indices=indptr,
             col_indices=indices,

@@ -19,6 +19,10 @@ from ._common import *
 import triton
 import triton.language as tl
 
+# Resolved once at import: the runtime cannot change under a live process, and
+# prepare_spmv_csc sits on the per-call path.
+_SPMV_CSC_CUDA = _backend_name() == "cuda"
+
 SUPPORTED_SPMV_CSC_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -92,6 +96,7 @@ class PreparedCscSpmv:
         "col_lengths",
         "max_col_nnz",
         "col_ids",
+        "csr_delegate",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -116,6 +121,7 @@ class PreparedCscSpmv:
         op=None,
         transpose=False,
         col_ids=None,
+        csr_delegate=None,
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
@@ -135,6 +141,7 @@ class PreparedCscSpmv:
             col_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
         self.col_lengths = col_lengths
         self.col_ids = col_ids
+        self.csr_delegate = csr_delegate
         self.max_col_nnz = int(max_col_nnz)
         self.op = _normalize_spmv_csc_op(op, transpose=transpose)
         self.transpose = _spmv_csc_op_transposes(self.op)
@@ -383,6 +390,43 @@ def prepare_spmv_csc(
             col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
         except Exception:
             col_ids = None
+    # op="trans"/"conj": CSC(A) and CSR(A.T) are the same three arrays, so the
+    # transposed product is a plain CSR SpMV -- and spmv_csr has the tuned CSR-Vector
+    # bucket machinery this module never grew.  The bespoke CSC trans kernel runs one
+    # program per column with a serial segment loop, which on a mean-8-nnz matrix is
+    # mostly masked-off loads; delegating measured 4.39x geomean over 240 cases
+    # (fp64 5.73x, complex128 8.22x) with 16 mild regressions, worst 0.75x.
+    # prepare_spmv_csr already uses this same transpose-in-prepare technique for its own
+    # trans/conj, so the timing convention matches the cuSPARSE baseline, which
+    # materialises A.conj().T once outside the timed window.
+    # CUDA only: this swaps which kernel actually runs, and the CSR-Vector bucket tiers
+    # it lands on were tuned per backend separately.  Elsewhere the original CSC
+    # transpose kernel is kept.
+    csr_delegate = None
+    if (
+        _SPMV_CSC_CUDA
+        and _spmv_csc_op_transposes(op_code)
+        and int(data.numel()) > 0
+    ):
+        try:
+            from .spmv_csr import prepare_spmv_csr
+
+            delegate_values = data
+            if op_code == SPMV_CSC_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+                delegate_values = data.conj()
+                if hasattr(delegate_values, "resolve_conj"):
+                    delegate_values = delegate_values.resolve_conj()
+                delegate_values = delegate_values.contiguous()
+            csr_delegate = prepare_spmv_csr(
+                delegate_values,
+                indices,
+                indptr,
+                (n_cols, n_rows),
+                op="non",
+                index_fallback_policy=index_fallback_policy,
+            )
+        except Exception:
+            csr_delegate = None
     return PreparedCscSpmv(
         data=data,
         kernel_indices=indices,
@@ -395,6 +439,7 @@ def prepare_spmv_csc(
         max_col_nnz=max_col_nnz,
         col_lengths=col_lengths,
         col_ids=col_ids,
+        csr_delegate=csr_delegate,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
         launch_backend=launch_backend,
@@ -488,6 +533,16 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if trans and prepared.nnz != 0:
+        csr_delegate = getattr(prepared, "csr_delegate", None)
+        if csr_delegate is not None:
+            from .spmv_csr import flagsparse_spmv_csr
+
+            # Let spmv_csr allocate: it fills the whole vector, so zeroing first is a
+            # wasted memset -- that alone moved the operator 0.765 -> 0.940.
+            # use_opt=False deliberately: the bucketed path measured 0.39x on fp32,
+            # while the default matches the oracle over both (4.39x vs 4.41x).
+            return flagsparse_spmv_csr(prepared=csr_delegate, x=x, use_opt=False)
     y = torch.zeros(out_len, dtype=dtype, device=prepared.data.device)
     if prepared.nnz == 0:
         return y
