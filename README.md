@@ -161,11 +161,13 @@ confirm hipSPARSE was actually selected, known limits, and a troubleshooting tab
 
 On a C550 host, run accuracy and performance together with the PyTorch baseline. This sweep
 uses 30 MatrixMarket inputs, five warmup iterations, and twenty timed iterations. SpSV and
-SpSM are excluded because their current kernels can hang on this platform:
+SpSM are excluded because their current kernels can hang on this platform, and SpMM BELL
+is excluded for now because a single matrix can take much longer than the rest of the
+sweep put together:
 
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
-  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
   --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20

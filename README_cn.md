@@ -168,11 +168,11 @@ DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认�
 
 在 C550 环境中，同时执行精度和性能阶段，性能基线使用 PyTorch。本轮使用 30 个
 MatrixMarket 矩阵，热身 5 次、迭代 20 次。由于当前内核在该平台可能卡住，暂不包含
-SpSV 和 SpSM：
+SpSV 和 SpSM；SpMM BELL 也暂时排除——单个矩阵的耗时可能超过其余算子之和：
 
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
-  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr \
+  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
   --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
