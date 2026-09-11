@@ -63,10 +63,12 @@ def _make_csr(torch, case: Case, device):
     rng = np.random.default_rng(20260909 + case.m + case.n + case.nnz)
     rows = rng.integers(0, case.m, size=case.nnz, dtype=np.int64)
     cols = rng.integers(0, case.n, size=case.nnz, dtype=np.int64)
-    vals = rng.standard_normal(case.nnz).astype(np.float32)
+    dtype = getattr(torch, case.dtype_name)
+    np_dtype = np.float64 if dtype == torch.float64 else np.float32
+    vals = rng.standard_normal(case.nnz).astype(np_dtype)
     matrix = sp.coo_matrix((vals, (rows, cols)), shape=(case.m, case.n)).tocsr()
     matrix.sum_duplicates()
-    data = torch.tensor(matrix.data, device=device, dtype=torch.float32)
+    data = torch.tensor(matrix.data, device=device, dtype=dtype)
     indices = torch.tensor(matrix.indices, device=device, dtype=torch.int32)
     indptr = torch.tensor(matrix.indptr, device=device, dtype=torch.int32)
     return matrix, data, indices, indptr
@@ -74,6 +76,14 @@ def _make_csr(torch, case: Case, device):
 
 def _scipy_spmv(matrix, x):
     return matrix @ x
+
+
+def _scipy_numpy(tensor):
+    """Convert NPU tensors to NumPy; NumPy has no bfloat16 dtype."""
+    value = tensor.detach().cpu()
+    if str(value.dtype) == "torch.bfloat16":
+        value = value.float()
+    return value.numpy()
 
 
 def _scipy_spmm(matrix, b):
@@ -150,19 +160,21 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0):
     else:
         ops_status += "; libaclsparse.so not found"
     matrix, data, indices, indptr = _make_csr(torch, case, device)
-    x = torch.randn(case.n, device=device, dtype=torch.float32)
-    b = torch.randn(case.n, case.dense_cols, device=device, dtype=torch.float32)
-    sx = torch.randn(case.m, 32, device=device, dtype=torch.float32)
-    sy = torch.randn(case.n, 32, device=device, dtype=torch.float32)
+    dtype = getattr(torch, case.dtype_name)
+    x = torch.randn(case.n, device=device, dtype=dtype)
+    b = torch.randn(case.n, case.dense_cols, device=device, dtype=dtype)
+    sx = torch.randn(case.m, 32, device=device, dtype=dtype)
+    sy = torch.randn(case.n, 32, device=device, dtype=dtype)
     row_ids = _torch_npu_csr_row_ids(indptr, case.m)
 
     rows = np.repeat(np.arange(case.m, dtype=np.int64), np.diff(matrix.indptr))
-    scipy_spmv = _scipy_spmv(matrix, x.cpu().numpy())
-    scipy_spmm = _scipy_spmm(matrix, b.cpu().numpy())
-    scipy_sddmm = _scipy_sddmm(matrix, sx.cpu().numpy(), sy.cpu().numpy())
+    scipy_spmv = _scipy_spmv(matrix, _scipy_numpy(x))
+    scipy_spmm = _scipy_spmm(matrix, _scipy_numpy(b))
+    scipy_sddmm = _scipy_sddmm(matrix, _scipy_numpy(sx), _scipy_numpy(sy))
 
     results = [{
         "device": f"npu:{int(device_id)}",
+        "dtype": case.dtype_name,
         "ops_sparse": ops_status,
         "ops_sparse_910b_supported": ["spmv_csr", "sddmm_csr", "scatter"],
         "tested_ops": ["spmv_csr", "spmm_csr", "sddmm_csr", "gather", "scatter"],
@@ -190,40 +202,40 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0):
             status_parts.append("PyTorch-NPU: PASS")
         except Exception as exc:
             status_parts.append(f"PyTorch-NPU: {exc}")
-        results.append({"op": name, "flagsparse": fs_time, "pytorch": pt_time,
+        results.append({"op": name, "dtype": case.dtype_name, "flagsparse": fs_time, "pytorch": pt_time,
                         "scipy_max_abs_error": {"flagsparse": fs_err, "pytorch": pt_err},
                         "status": "; ".join(status_parts) if status_parts else "unknown"})
 
     record("spmv_csr", lambda: fs.flagsparse_spmv_csr(data, indices, indptr, x, (case.m, case.n)),
            lambda: _torch_npu_csr_spmv(data, indices, row_ids, x, case.m), scipy_spmv,
-           lambda t: t.detach().cpu().numpy())
+           _scipy_numpy)
     record("spmm_csr", lambda: fs.flagsparse_spmm_csr(data, indices, indptr, b, (case.m, case.n)),
            lambda: _torch_npu_csr_spmm(data, indices, row_ids, b, case.m), scipy_spmm,
-           lambda t: t.detach().cpu().numpy())
+           _scipy_numpy)
     record("sddmm_csr", lambda: fs.flagsparse_sddmm_csr(data, indices, indptr, sx, sy, (case.m, case.n)),
            lambda: (sx @ sy.T)[torch.tensor(rows, device=device), indices.to(torch.int64)],
-           scipy_sddmm, lambda t: t.detach().cpu().numpy())
+           scipy_sddmm, _scipy_numpy)
 
     # Gather/scatter are PyTorch indexing baselines; they are not advertised as
     # equivalent to a dedicated ops-sparse kernel.
     gather_idx = torch.arange(min(case.nnz, case.n), device=device, dtype=torch.int64)
-    dense = torch.randn(case.n, device=device)
-    values = torch.randn(gather_idx.numel(), device=device)
+    dense = torch.randn(case.n, device=device, dtype=dtype)
+    values = torch.randn(gather_idx.numel(), device=device, dtype=dtype)
     record("gather", lambda: fs.flagsparse_gather(dense, gather_idx),
            lambda: torch.gather(dense, 0, gather_idx),
-           dense.detach().cpu().numpy()[gather_idx.cpu().numpy()],
-           lambda t: t.detach().cpu().numpy())
+           _scipy_numpy(dense)[gather_idx.cpu().numpy()],
+           _scipy_numpy)
     # Keep independent buffers: flagsparse_scatter mutates its input in place,
     # while index_copy returns a new tensor.  Sharing one buffer would make the
     # second baseline depend on the first benchmark and invalidate correctness.
     scatter_fs = dense.detach().clone()
     scatter_pt = dense.detach().clone()
     scatter_initial = scatter_fs.detach().clone()
-    scatter_ref = scatter_initial.detach().cpu().numpy().copy()
-    scatter_ref[gather_idx.cpu().numpy()] = values.detach().cpu().numpy()
+    scatter_ref = _scipy_numpy(scatter_initial).copy()
+    scatter_ref[gather_idx.cpu().numpy()] = _scipy_numpy(values)
     record("scatter", lambda: (fs.flagsparse_scatter(scatter_fs, gather_idx, values) or scatter_fs),
            lambda: scatter_pt.index_copy(0, gather_idx, values), scatter_ref,
-           lambda t: t.detach().cpu().numpy())
+           _scipy_numpy)
     return results
 
 
@@ -237,23 +249,22 @@ def main():
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--device", type=int, default=0, help="Ascend NPU device ordinal")
     p.add_argument("--op", choices=("spmv_csr", "spmm_csr", "sddmm_csr", "gather", "scatter"), default=None)
+    p.add_argument("--dtypes", default="float32", help="Comma-separated value dtypes")
     p.add_argument("--csv-summary", default=None, help="Write a runner-compatible one-row CSV summary")
     args = p.parse_args()
-    case = Case(args.m, args.n, args.nnz, args.dense_cols, "float32")
+    dtype_names = [item.strip() for item in args.dtypes.split(",") if item.strip()]
+    allowed_dtypes = {"float16", "bfloat16", "float32", "float64"}
+    unknown = sorted(set(dtype_names) - allowed_dtypes)
+    if not dtype_names or unknown:
+        p.error("--dtypes must contain names from: " + ", ".join(sorted(allowed_dtypes)))
     import json
-    try:
-        payload = run(case, args.warmup, args.iters, device_id=args.device)
-    except (ImportError, RuntimeError) as exc:
-        # Keep dependency/runtime failures machine-readable so a host without
-        # torch_npu can still be checked in CI and the exact blocker is visible.
-        payload = {
-            "status": "blocked",
-            "runtime": "Ascend/CANN",
-            "reason": str(exc),
-            "hint": "Install a matching torch + torch_npu + Triton environment and source CANN set_env.sh.",
-        }
-        print(json.dumps(payload, indent=2))
-        raise SystemExit(2)
+    payload = []
+    for dtype_name in dtype_names:
+        try:
+            dtype_payload = run(Case(args.m, args.n, args.nnz, args.dense_cols, dtype_name), args.warmup, args.iters, device_id=args.device)
+        except (ImportError, RuntimeError) as exc:
+            dtype_payload = [{"dtype": dtype_name, "status": "blocked", "reason": str(exc)}]
+        payload.extend(dtype_payload)
     if args.op is not None:
         payload = [item for item in payload if item.get("op") == args.op] if isinstance(payload, list) else payload
     if args.csv_summary:
@@ -267,8 +278,8 @@ def main():
             fs_ms = fs.get("mean_ms")
             pt_ms = pt.get("mean_ms")
             rows.append({
-                "dtype": "float32",
-                "shape": args.op or "ascend",
+                "dtype": item.get("dtype", "float32"),
+                "shape": item.get("op", args.op or "ascend"),
                 "triton_ms": "" if fs_ms is None else fs_ms,
                 "pytorch_ms": "" if pt_ms is None else pt_ms,
                 "speedup": "" if fs_ms is None or not fs_ms else (pt_ms / fs_ms if pt_ms is not None else ""),
