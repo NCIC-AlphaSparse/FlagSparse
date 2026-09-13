@@ -196,7 +196,7 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog python -m pytest tests/pytest -q -m "spsv_c
 
 ```bash
 M=tests/data/trdheim.mtx
-python tests/test_spmv.py    $M --warmup 2 --iters 5
+python tests/test_spmv_csr.py    $M --warmup 2 --iters 5
 python tests/test_spmm.py    $M --warmup 2 --iters 5
 python tests/test_spgemm.py  $M --warmup 2 --iters 5
 python tests/test_spmm_coo.py $M --warmup 2 --iters 5
@@ -216,8 +216,8 @@ python tests/test_scatter.py  --value-dtypes float32
 
 ```bash
 # SpMV：CUDA 的 segbin vs DCU 的 rowpar，哪个更适合 C550
-FLAGSPARSE_SPMV_CSR_KERNEL=segbin python tests/test_spmv.py <dir/> --csv-csr c550_segbin.csv
-FLAGSPARSE_SPMV_CSR_KERNEL=rowpar python tests/test_spmv.py <dir/> --csv-csr c550_rowpar.csv
+FLAGSPARSE_SPMV_CSR_KERNEL=segbin python tests/test_spmv_csr.py <dir/> --csv-csr c550_segbin.csv
+FLAGSPARSE_SPMV_CSR_KERNEL=rowpar python tests/test_spmv_csr.py <dir/> --csv-csr c550_rowpar.csv
 
 # SpSV ALG4：一行一 program vs 持久化 worker
 FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog    python tests/test_spsv.py --synthetic

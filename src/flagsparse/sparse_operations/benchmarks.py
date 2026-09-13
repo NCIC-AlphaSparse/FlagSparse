@@ -519,21 +519,35 @@ def benchmark_spmv_case(
     transpose=False,
     op=None,
     index_fallback_policy="auto",
+    *,
+    alg="auto",
+    config=None,
+    timing=False,
 ):
-    """Benchmark Triton CSR SpMV vs cuSPARSE (CuPy CSR @ x)."""
-    device = torch.device("cuda")
+    """Synthetic CSR case using the same timing engine as test_spmv_csr.py.
+
+    The historical result keys remain aliases; vendor_* names identify the
+    actual baseline, and failed outputs never receive a performance ranking.
+    """
+    from ._spmv_csr_benchmark import (
+        measure_route,
+        measure_vendor,
+        golden_csr,
+        check_result,
+    )
+
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
     op_code = _normalize_spmv_op(op, transpose=transpose)
     if op is not None and bool(transpose) and op_code == SPMV_OP_NON:
         raise ValueError("transpose=True conflicts with op=non")
-    transpose = _spmv_op_transposes(op_code)
     op_name = _spmv_op_to_name(op_code)
-    x_size = n_rows if transpose else n_cols
-    y_size = n_cols if transpose else n_rows
-    x = _build_random_dense(x_size, value_dtype, device)
     shape = (n_rows, n_cols)
+    x = _build_random_dense(
+        n_rows if _spmv_op_transposes(op_code) else n_cols, value_dtype, device
+    )
     prepared = prepare_spmv_csr(
         data,
         indices,
@@ -543,146 +557,74 @@ def benchmark_spmv_case(
         max_segments=max_segments,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
+        alg=alg,
+        config=config,
     )
-    triton_op = lambda: flagsparse_spmv_csr(
-        x=x,
-        prepared=prepared,
-        return_time=False,
+    expected = golden_csr(data, indices, indptr, x, shape, op_name)
+    triton_y, meta = measure_route(prepared, x, warmup, iters, timing)
+    tol = {
+        torch.float32: 1.3e-6,
+        torch.float64: 1e-7,
+        torch.complex64: 1.3e-6,
+        torch.complex128: 1e-7,
+        torch.float16: 1e-3,
+        torch.bfloat16: 0.016,
+    }[value_dtype]
+    triton_match, triton_error = check_result(triton_y, expected, tol, tol)
+    vendor = dict(
+        vendor_ms=None, vendor_backend="N/A", vendor_alg="N/A", vendor_reason="disabled"
     )
-    triton_y, triton_ms = _benchmark_cuda_op(triton_op, warmup=warmup, iters=iters)
-    _cupy_supported_dtypes = (
-        torch.float32,
-        torch.float64,
-        torch.complex64,
-        torch.complex128,
-    )
-    spmv_ref_backend, _spmv_ref_reason = _spmv_csr_sparse_ref_backend(
-        value_dtype, indices.dtype, op=op_code
-    )
-    if spmv_ref_backend == "hipsparse":
-        # DCU/ROCm: hipSPARSE is the vendor reference.
-        expected = spmv_csr_ref_hipsparse(data, indices, indptr, x, shape, op=op_code)
-    elif (
-        cp is not None
-        and cpx_sparse is not None
-        and value_dtype in _cupy_supported_dtypes
-    ):
-        data_cp = _cupy_from_torch(data)
-        indices_cp = _cupy_from_torch(indices.to(torch.int64))
-        indptr_cp = _cupy_from_torch(indptr)
-        x_cp = _cupy_from_torch(x)
-        A_csr = cpx_sparse.csr_matrix((data_cp, indices_cp, indptr_cp), shape=shape)
-        ref_y = _apply_cupy_spmv_op(A_csr, x_cp, op_code)
-        expected = _torch_from_cupy(ref_y)
-    else:
-        row_indices = torch.repeat_interleave(
-            torch.arange(n_rows, device=device, dtype=torch.int64),
-            indptr[1:] - indptr[:-1],
-        )
-        col_ind = indices.to(torch.int64)
-        coo = torch.sparse_coo_tensor(
-            torch.stack([row_indices, col_ind]),
-            data,
-            shape,
-            device=device,
-        ).coalesce()
-        x_2d = x.unsqueeze(1)
-        if value_dtype in (torch.float16, torch.bfloat16):
-            coo_f32 = coo.to(torch.float32)
-            x_2d_f32 = x_2d.to(torch.float32)
-            expected = _apply_torch_sparse_spmv_op(coo_f32, x_2d_f32, op_code).to(
-                value_dtype
-            )
-        else:
-            expected = _apply_torch_sparse_spmv_op(coo, x_2d, op_code)
-    atol, rtol = _tolerance_for_dtype(value_dtype)
-    triton_match = torch.allclose(triton_y, expected, atol=atol, rtol=rtol)
-    triton_max_error = (
-        float(torch.max(torch.abs(triton_y - expected)).item()) if y_size > 0 else 0.0
-    )
-    cusparse_ms = None
-    cusparse_match = None
-    cusparse_max_error = None
-    cusparse_reason = None
-    if run_cusparse and spmv_ref_backend == "hipsparse":
+    vendor_match = vendor_error = None
+    if run_cusparse:
         try:
-            cusparse_values, cusparse_ms = _benchmark_prepared_cuda_op(
-                lambda: _prepare_spmv_csr_ref_hipsparse(
-                    data, indices, indptr, x, shape, op=op_code
-                ),
-                _run_spmv_csr_ref_hipsparse_prepared,
-                _destroy_spmv_csr_ref_hipsparse_prepared,
-                warmup=warmup,
-                iters=iters,
+            vendor = measure_vendor(
+                data, indices, indptr, x, shape, op_name, warmup, iters
             )
-            cusparse_match = torch.allclose(
-                cusparse_values, expected, atol=atol, rtol=rtol
-            )
-            cusparse_max_error = (
-                float(torch.max(torch.abs(cusparse_values - expected)).item())
-                if y_size > 0
-                else 0.0
-            )
+            value = vendor.pop("values", None)
+            if value is not None:
+                vendor_match, vendor_error = check_result(value, expected, tol, tol)
+                if not vendor_match:
+                    vendor["vendor_reason"] = "vendor correctness check failed"
         except Exception as exc:
-            cusparse_reason = str(exc)
-    elif (
-        run_cusparse
-        and cp is not None
-        and cpx_sparse is not None
-        and value_dtype in _cupy_supported_dtypes
-    ):
-        skip_reason = _cusparse_baseline_skip_reason(value_dtype)
-        if skip_reason:
-            cusparse_reason = skip_reason
-        else:
-            try:
-                A_op = _cupy_spmv_op_matrix(A_csr, op_code)
-                cusparse_op = lambda: _torch_from_cupy(A_op @ _cupy_from_torch(x))
-                cusparse_values, cusparse_ms = _benchmark_cuda_op(
-                    cusparse_op, warmup=warmup, iters=iters
-                )
-                cusparse_match = torch.allclose(
-                    cusparse_values, expected, atol=atol, rtol=rtol
-                )
-                cusparse_max_error = (
-                    float(torch.max(torch.abs(cusparse_values - expected)).item())
-                    if y_size > 0
-                    else 0.0
-                )
-            except Exception as exc:
-                cusparse_reason = str(exc)
-    elif run_cusparse and value_dtype not in _cupy_supported_dtypes:
-        cusparse_reason = "float16/bfloat16 not supported by CuPy sparse; skipped"
-    triton_speedup_vs_cusparse = (
-        cusparse_ms / triton_ms if (cusparse_ms is not None and triton_ms > 0) else None
+            vendor["vendor_reason"] = str(exc)
+    speedup = (
+        vendor["vendor_ms"] / meta["ms"]
+        if triton_match and vendor_match and meta["ms"] > 0
+        else None
     )
     return {
-        "parameters": {
-            "n_rows": n_rows,
-            "n_cols": n_cols,
-            "nnz": nnz,
-            "value_dtype": str(value_dtype),
-            "index_dtype": str(index_dtype),
-            "op": op_name,
-            "transpose": transpose,
-            "index_fallback_policy": str(index_fallback_policy).lower(),
-            "warmup": warmup,
-            "iters": iters,
-        },
-        "performance": {
-            "triton_ms": triton_ms,
-            "cusparse_ms": cusparse_ms,
-            "triton_speedup_vs_cusparse": triton_speedup_vs_cusparse,
-        },
-        "verification": {
-            "triton_match_reference": triton_match,
-            "triton_max_error": triton_max_error,
-            "cusparse_match_reference": cusparse_match,
-            "cusparse_max_error": cusparse_max_error,
-        },
-        "backend_status": {
-            "cusparse_unavailable_reason": cusparse_reason,
-        },
+        "parameters": dict(
+            n_rows=n_rows,
+            n_cols=n_cols,
+            nnz=nnz,
+            value_dtype=str(value_dtype),
+            index_dtype=str(index_dtype),
+            op=op_name,
+            transpose=_spmv_op_transposes(op_code),
+            index_fallback_policy=index_fallback_policy,
+            alg=prepared.alg,
+            config=prepared.config,
+            warmup=warmup,
+            iters=iters,
+        ),
+        "performance": dict(
+            meta,
+            **vendor,
+            triton_ms=meta["ms"],
+            cusparse_ms=vendor["vendor_ms"],
+            speedup_vs_vendor=speedup,
+            triton_speedup_vs_cusparse=speedup,
+        ),
+        "verification": dict(
+            triton_match_reference=triton_match,
+            triton_max_error=triton_error,
+            vendor_match_reference=vendor_match,
+            vendor_max_error=vendor_error,
+            cusparse_match_reference=vendor_match,
+            cusparse_max_error=vendor_error,
+            ref="CPU FP64/complex128 scatter (correctness only)",
+        ),
+        "backend_status": dict(cusparse_unavailable_reason=vendor["vendor_reason"]),
         "samples": {"triton": triton_y, "reference": expected},
     }
 

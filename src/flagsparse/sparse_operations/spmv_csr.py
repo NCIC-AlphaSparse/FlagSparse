@@ -12,14 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CSR SpMV: Triton baseline kernels + optimised CSR-Vector buckets."""
+"""CSR SpMV: fixed native algorithms and per-invocation GPU execution plans."""
 
 from ._common import *
 
 import os
-import time
 import triton
 import triton.language as tl
+from copy import copy, deepcopy
+from contextlib import nullcontext
+from dataclasses import asdict
+from . import _spmv_csr_config as _csr_config
+
+SPMV_CSR_NEW_ALGORITHMS = (
+    "row_tile",
+    "row_vector",
+    "row_split_reduce",
+    "row_adaptive_split",
+)
+SPMV_CSR_SUPPORTED_ALGORITHMS = _csr_config.ALGORITHMS
+SPMV_CSR_NEW_VALUE_DTYPES = (torch.float32, torch.float64)
+SPMV_CSR_NEW_OPS = ("non",)
 
 SUPPORTED_SPMV_VALUE_DTYPES = (
     torch.float16,
@@ -91,6 +104,12 @@ class PreparedCsrSpmv:
         "index_fallback_reason",
         "_baseline_compute_dtype",
         "_baseline_data",
+        "alg_requested",
+        "alg",
+        "config",
+        "config_source",
+        "backend_caps",
+        "config_rejections",
     )
 
     def __init__(
@@ -143,6 +162,12 @@ class PreparedCsrSpmv:
         else:
             self._baseline_compute_dtype = data.dtype
         self._baseline_data = None
+        self.alg_requested = "auto"
+        self.alg = None
+        self.config = {}
+        self.config_source = "legacy"
+        self.backend_caps = None
+        self.config_rejections = []
 
 
 # Performance-first CSR-Vector buckets.  num_warps*32 >= block_size.
@@ -281,6 +306,7 @@ def _clip_spmv_opt_launch_spec(spec, device_props):
 # One program per row with an in-row segment loop. This is the DCU branch's
 # kernel; CUDA keeps the nnz-partitioned segbin path below. Selected by
 # _spmv_csr_default_backend().
+
 
 @triton.jit
 def _spmv_csr_real_kernel(
@@ -654,10 +680,14 @@ def _build_spmv_opt_runtime_buckets(prepared):
     )
 
 
-def _triton_spmv_csr_impl_opt_prepared(prepared, x, opt_buckets=None):
+def _triton_spmv_csr_impl_opt_prepared(prepared, x, opt_buckets=None, out=None):
     # First bucket includes nnz==0 rows; every row gets exactly one store.
     dtype = prepared.data.dtype
-    y = torch.empty(prepared.n_rows, dtype=dtype, device=prepared.data.device)
+    y = (
+        out
+        if out is not None
+        else torch.empty(prepared.n_rows, dtype=dtype, device=prepared.data.device)
+    )
     if prepared.n_rows == 0:
         return y
     if opt_buckets is None:
@@ -842,14 +872,23 @@ def prepare_spmv_csr(
     shape,
     block_nnz=256,
     max_segments=None,
-    transpose=False,
+    transpose=None,
     op=None,
     index_fallback_policy="auto",
+    alg="auto",
+    config=None,
 ):
     index_fallback_policy = _normalize_spmv_index_fallback_policy(index_fallback_policy)
     op_code = _normalize_spmv_op(op, transpose=transpose)
-    if op is not None and bool(transpose) and op_code == SPMV_OP_NON:
-        raise ValueError("transpose=True conflicts with op=non")
+    requested_alg = _csr_config.normalize_alg(alg)
+    if requested_alg in SPMV_CSR_NEW_ALGORITHMS and op_code != SPMV_OP_NON:
+        raise NotImplementedError(f"CSR SpMV {requested_alg} only supports op=non")
+    if (
+        op is not None
+        and transpose is not None
+        and bool(transpose) != _spmv_op_transposes(op_code)
+    ):
+        raise ValueError("transpose conflicts with op")
     transpose = _spmv_op_transposes(op_code)
     if transpose:
         data, indices, indptr, *_ = _prepare_spmv_csr_matrix(
@@ -892,7 +931,7 @@ def prepare_spmv_csr(
             )
     else:
         max_segments_use = max_segments
-    return PreparedCsrSpmv(
+    prepared = PreparedCsrSpmv(
         data=data,
         kernel_indices=kernel_indices,
         kernel_indptr=kernel_indptr,
@@ -909,6 +948,7 @@ def prepare_spmv_csr(
         op=op_code,
         index_fallback_policy=index_fallback_policy,
     )
+    return _configure_spmv_route(prepared, requested_alg, config)
 
 
 def _get_spmv_baseline_data(prepared):
@@ -938,7 +978,9 @@ _MACA_SPMV_DEFAULT_PROFILE = "c550"
 def _maca_spmv_knob(name):
     """Read one MetaX SpMV tuning knob for the current model."""
     model = _maca_device_model() or _MACA_SPMV_DEFAULT_PROFILE
-    profile = _MACA_SPMV_PROFILES.get(model, _MACA_SPMV_PROFILES[_MACA_SPMV_DEFAULT_PROFILE])
+    profile = _MACA_SPMV_PROFILES.get(
+        model, _MACA_SPMV_PROFILES[_MACA_SPMV_DEFAULT_PROFILE]
+    )
     return profile[name]
 
 
@@ -968,16 +1010,22 @@ def _spmv_csr_default_backend():
     return "segbin"
 
 
-def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
+def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
     """DCU/ROCm row-parallel SpMV: one program per row, in-row segment loop."""
     device = prepared.data.device
     dtype = prepared.data.dtype
-    y = torch.empty(prepared.n_rows, dtype=dtype, device=device)
+    y = (
+        out
+        if out is not None
+        else torch.empty(prepared.n_rows, dtype=dtype, device=device)
+    )
+    if not prepared.n_rows:
+        return y
     _, data_in = _get_spmv_baseline_data(prepared)
     x_in = x if compute_dtype == x.dtype else x.to(compute_dtype)
     grid = (prepared.n_rows,)
     if not _is_complex_dtype(compute_dtype):
-        y_out = torch.empty(prepared.n_rows, dtype=compute_dtype, device=device)
+        y_out = y
         _spmv_csr_real_kernel[grid](
             data_in,
             prepared.kernel_indices,
@@ -988,11 +1036,10 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
             BLOCK_NNZ=prepared.block_nnz,
             MAX_SEGMENTS=prepared.max_segments,
         )
-        y.copy_(y_out if dtype == compute_dtype else y_out.to(dtype))
         return y
     data_ri = torch.view_as_real(data_in).reshape(-1)
     x_ri = torch.view_as_real(x_in).reshape(-1)
-    y_ri = torch.empty(prepared.n_rows * 2, dtype=data_ri.dtype, device=device)
+    y_ri = torch.view_as_real(y).reshape(-1)
     _spmv_csr_complex_kernel[grid](
         data_ri,
         prepared.kernel_indices,
@@ -1003,18 +1050,19 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
         BLOCK_NNZ=prepared.block_nnz,
         MAX_SEGMENTS=prepared.max_segments,
     )
-    y.copy_(torch.view_as_complex(y_ri.reshape(prepared.n_rows, 2)))
     return y
 
 
-def _triton_spmv_csr_impl_prepared(prepared, x):
+def _triton_spmv_csr_impl_prepared(prepared, x, out=None):
     device = prepared.data.device
     dtype = prepared.data.dtype
     if prepared.n_rows == 0:
-        return torch.empty(0, dtype=dtype, device=device)
+        return out if out is not None else torch.empty(0, dtype=dtype, device=device)
     compute_dtype = prepared._baseline_compute_dtype
-    if _spmv_csr_default_backend() == "rowpar":
-        return _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype)
+    if prepared.alg == "legacy_rowpar" or (
+        prepared.alg is None and _spmv_csr_default_backend() == "rowpar"
+    ):
+        return _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=out)
     # Fast path: preprocessing-free, load-balanced segmented nnz-split. Real dtype
     # only; native fp32/fp64 accumulation (fp16/bf16 accumulate in fp32). No
     # per-nonzero row-id or long-row metadata is needed — the row is found by an
@@ -1027,7 +1075,11 @@ def _triton_spmv_csr_impl_prepared(prepared, x):
         # (not the fp64-then-cast accuracy of the former baseline).
         acc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
         nnz = int(prepared.data.numel())
-        y_out = torch.zeros(prepared.n_rows, dtype=acc_dtype, device=device)
+        y_out = (
+            out.zero_()
+            if out is not None and out.dtype == acc_dtype
+            else torch.zeros(prepared.n_rows, dtype=acc_dtype, device=device)
+        )
         if nnz > 0:
             acc_tl = tl.float64 if acc_dtype == torch.float64 else tl.float32
             steps = max(1, (prepared.n_rows + 1).bit_length())
@@ -1045,6 +1097,10 @@ def _triton_spmv_csr_impl_prepared(prepared, x):
                 ACC=acc_tl,
                 BLOCK=BLOCK,
             )
+        if out is not None:
+            if y_out is not out:
+                out.copy_(y_out)
+            return out
         return y_out if acc_dtype == dtype else y_out.to(dtype)
     # Complex path: same preprocessing-free segmented nnz-split on interleaved
     # real/imag values, accumulating in native component precision (fp32 for
@@ -1054,7 +1110,11 @@ def _triton_spmv_csr_impl_prepared(prepared, x):
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1)
     comp_dtype = data_ri.dtype
     nnz = int(prepared.data.numel())
-    y_ri = torch.zeros(prepared.n_rows * 2, dtype=comp_dtype, device=device)
+    y_ri = (
+        torch.view_as_real(out).reshape(-1).zero_()
+        if out is not None
+        else torch.zeros(prepared.n_rows * 2, dtype=comp_dtype, device=device)
+    )
     if nnz > 0:
         acc_tl = tl.float64 if comp_dtype == torch.float64 else tl.float32
         steps = max(1, (prepared.n_rows + 1).bit_length())
@@ -1116,7 +1176,7 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
     kernel_indptr = prepared.kernel_indptr.to(torch.int32)
     row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
     max_row_nnz = int(row_lengths.max().item()) if prepared.n_rows > 0 else 0
-    return PreparedCsrSpmv(
+    result = PreparedCsrSpmv(
         data=prepared.data,
         kernel_indices=kernel_indices,
         kernel_indptr=kernel_indptr,
@@ -1135,6 +1195,13 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
         index_fallback_applied=True,
         index_fallback_reason=str(reason),
     )
+    result.alg_requested = prepared.alg_requested
+    result.alg = prepared.alg
+    result.config = deepcopy(prepared.config)
+    result.config_source = prepared.config_source
+    result.backend_caps = prepared.backend_caps
+    result.config_rejections = deepcopy(prepared.config_rejections)
+    return result
 
 
 def _run_spmv_prepared(prepared, x, use_opt=False, opt_buckets=None):
@@ -1147,8 +1214,10 @@ def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False, opt_buckets=Non
     try:
         return _run_spmv_prepared(prepared, x, use_opt=use_opt, opt_buckets=opt_buckets)
     except Exception as exc:
-        if prepared.index_fallback_policy != "auto" or not _spmv_uses_int64_indices(
-            prepared
+        if (
+            not _csr_config.is_index_compatibility_error(exc)
+            or prepared.index_fallback_policy != "auto"
+            or not _spmv_uses_int64_indices(prepared)
         ):
             raise
         fallback_prepared = _spmv_prepared_with_int32_indices(prepared, exc)
@@ -1163,6 +1232,269 @@ def _run_spmv_prepared_with_fallback(prepared, x, use_opt=False, opt_buckets=Non
         )
 
 
+def _spmv_device_context(device):
+    device_context = getattr(_ACCEL, "device", None)
+    return device_context(device) if callable(device_context) else nullcontext()
+
+
+def _spmv_backend_caps(device):
+    backend = _backend_name()
+    arch, target_name, width = "unknown", "unknown", 0
+    max_threads = 0
+    try:
+        with _spmv_device_context(device):
+            target = triton.runtime.driver.active.get_current_target()
+            target_name = str(target.backend)
+            arch = str(target.arch)
+            width = int(target.warp_size)
+            props = _ACCEL.get_device_properties(device)
+            max_threads = int(getattr(props, "max_threads_per_block", 1024))
+    except (AttributeError, RuntimeError, ImportError):
+        pass
+    verified = (backend == "cuda" and target_name == "cuda" and arch.isdigit()) or (
+        backend == "rocm" and target_name == "hip" and arch.startswith("gfx")
+    )
+    return _csr_config.BackendCaps(
+        backend, arch, target_name, width, max_threads, verified, verified, verified
+    )
+
+
+def list_spmv_csr_algorithms(op=None, dtype=None, backend=None):
+    op_name = None if op is None else _spmv_op_to_name(op)
+    return _csr_config.list_algorithms(op_name, dtype, backend)
+
+
+def get_spmv_csr_algorithm_spec(alg):
+    return _csr_config.algorithm_spec(alg)
+
+
+def _configure_spmv_route(prepared, alg, config=None):
+    requested = _csr_config.normalize_alg(alg)
+    resolved = requested
+    if resolved == "auto":
+        resolved = "legacy_" + _spmv_csr_default_backend()
+    caps = _spmv_backend_caps(prepared.data.device)
+    _csr_config.validate_support(
+        resolved,
+        _spmv_op_to_name(prepared.op),
+        prepared.data.dtype,
+        prepared.kernel_indices.dtype,
+        prepared.kernel_indptr.dtype,
+        caps,
+    )
+    actual, source, rejections = _csr_config.resolve_config(
+        resolved, caps, config, return_rejections=True
+    )
+    prepared.alg_requested, prepared.alg = requested, resolved
+    prepared.config, prepared.config_source, prepared.backend_caps = (
+        actual,
+        source,
+        caps,
+    )
+    prepared.config_rejections = rejections
+    return prepared
+
+
+def _spmv_check_output(out, prepared, x):
+    if out is None:
+        return
+    if not torch.is_tensor(out) or not _is_accel_tensor(out):
+        raise ValueError("out must be an accelerator tensor")
+    if (
+        out.device != prepared.data.device
+        or out.dtype != prepared.data.dtype
+        or out.shape != (prepared.n_rows,)
+    ):
+        raise ValueError("out shape/dtype/device must match the CSR SpMV result")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if out.numel():
+        storage = out.untyped_storage().data_ptr()
+        for value in (
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            x,
+        ):
+            if value.numel() and storage == value.untyped_storage().data_ptr():
+                raise ValueError("out must not overlap input storage")
+
+
+def _spmv_phase(fn, timing):
+    if not timing:
+        return fn(), None
+    start, end = _ACCEL.Event(enable_timing=True), _ACCEL.Event(enable_timing=True)
+    start.record()
+    result = fn()
+    end.record()
+    end.synchronize()
+    return result, start.elapsed_time(end)
+
+
+def _execute_spmv_route(prepared, x, out=None, timing=False):
+    alg = prepared.alg
+    process_ms = 0.0 if timing else None
+    if alg in SPMV_CSR_NEW_ALGORITHMS:
+        from . import _spmv_csr_kernels as kernels
+
+        plan = None
+        if prepared.n_rows and alg in ("row_split_reduce", "row_adaptive_split"):
+            plan, process_ms = _spmv_phase(
+                lambda: kernels.build_plan(
+                    prepared, prepared.config, alg == "row_adaptive_split"
+                ),
+                timing,
+            )
+
+        def compute():
+            y = (
+                out
+                if out is not None
+                else torch.empty(
+                    prepared.n_rows,
+                    dtype=prepared.data.dtype,
+                    device=prepared.data.device,
+                )
+            )
+            return kernels.compute(prepared, x, y, alg, prepared.config, plan)
+
+        y, compute_ms = _spmv_phase(compute, timing)
+    else:
+        buckets = None
+        if alg == "legacy_bucket_vector":
+            buckets, process_ms = _spmv_phase(
+                lambda: _build_spmv_opt_runtime_buckets(prepared), timing
+            )
+
+        def compute():
+            if out is None:
+                return _run_spmv_prepared(
+                    prepared,
+                    x,
+                    use_opt=alg == "legacy_bucket_vector",
+                    opt_buckets=buckets,
+                )
+            if alg == "legacy_bucket_vector":
+                return _triton_spmv_csr_impl_opt_prepared(
+                    prepared, x, opt_buckets=buckets, out=out
+                )
+            if alg == "legacy_rowpar":
+                return _triton_spmv_csr_impl_rowpar(
+                    prepared, x, prepared._baseline_compute_dtype, out=out
+                )
+            return _triton_spmv_csr_impl_prepared(prepared, x, out=out)
+
+        y, compute_ms = _spmv_phase(compute, timing)
+    return y, {
+        "process_cpu_ms": 0.0,
+        "process_gpu_ms": process_ms,
+        "compute_ms": compute_ms,
+    }
+
+
+def _execute_spmv_route_with_fallback(prepared, x, out=None, timing=False):
+    try:
+        y, meta = _execute_spmv_route(prepared, x, out, timing)
+        return y, meta, prepared
+    except Exception as exc:
+        if (
+            prepared.index_fallback_policy != "auto"
+            or not _spmv_uses_int64_indices(prepared)
+            or not _csr_config.is_index_compatibility_error(exc)
+        ):
+            raise
+        fallback = _spmv_prepared_with_int32_indices(prepared, exc)
+        y, meta = _execute_spmv_route(fallback, x, out, timing)
+        return y, meta, fallback
+
+
+def flagsparse_spmv_csr_run(
+    prepared,
+    x,
+    *,
+    alg=None,
+    config=None,
+    op=None,
+    out=None,
+    timing=False,
+    return_time=False,
+    return_meta=False,
+):
+    """Run a fixed CSR route; per-call process is included in the full event time.
+
+    timing adds diagnostics from a separate run. It never changes ms = cpu + gpu.
+    No segmented execution plan is retained between calls.
+    """
+    if not isinstance(prepared, PreparedCsrSpmv):
+        raise TypeError("prepared must be PreparedCsrSpmv")
+    with _spmv_device_context(prepared.data.device):
+        if prepared.alg is None:
+            prepared = _configure_spmv_route(copy(prepared), "auto")
+        if op is not None and _normalize_spmv_op(op) != prepared.op:
+            raise ValueError("op does not match prepared.op")
+        _csr_config.assert_route_match(
+            prepared.alg, prepared.config, alg, config, prepared.backend_caps
+        )
+        # Check overlap before contiguous materialization can hide an aliased x view.
+        checked_x = _validate_spmv_x(x, prepared)
+        _spmv_check_output(out, prepared, x)
+        x = checked_x
+        if not (return_time or return_meta or timing):
+            return _execute_spmv_route_with_fallback(prepared, x, out)[0]
+        _ACCEL.synchronize()
+        result, gpu_ms = _spmv_phase(
+            lambda: _execute_spmv_route_with_fallback(prepared, x, out), True
+        )
+        y, phases, actual = result
+        if timing:
+            _, phases, _ = _execute_spmv_route_with_fallback(
+                actual, x, out, timing=True
+            )
+        spec = get_spmv_csr_algorithm_spec(actual.alg)
+        if actual.alg in SPMV_CSR_NEW_ALGORITHMS or actual.alg == "legacy_rowpar":
+            compute_dtype = str(actual._baseline_compute_dtype).removeprefix("torch.")
+        else:
+            compute_dtype = str(actual.data.dtype).removeprefix("torch.")
+            if compute_dtype in ("float16", "bfloat16"):
+                compute_dtype = "float32"
+        ms = phases["process_cpu_ms"] + gpu_ms
+        meta = {
+            "alg_requested": prepared.alg_requested,
+            "alg_resolved": actual.alg,
+            "alg": actual.alg,
+            "implementation": actual.alg,
+            "implementation_version": spec["implementation_version"],
+            "config": deepcopy(actual.config),
+            "config_source": actual.config_source,
+            "config_rejections": deepcopy(actual.config_rejections),
+            **asdict(actual.backend_caps),
+            "indices_dtype": str(actual.kernel_indices.dtype).removeprefix("torch."),
+            "indptr_dtype": str(actual.kernel_indptr.dtype).removeprefix("torch."),
+            "input_indices_dtype": str(prepared.kernel_indices.dtype).removeprefix(
+                "torch."
+            ),
+            "input_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix(
+                "torch."
+            ),
+            "compute_dtype": compute_dtype,
+            "output_dtype": str(actual.data.dtype).removeprefix("torch."),
+            "index_fallback_applied": actual.index_fallback_applied,
+            "index_fallback_reason": actual.index_fallback_reason,
+            "ms": ms,
+            "gpu_ms": gpu_ms,
+            "op_gpu_ms": gpu_ms,
+            "op_total_ms": ms,
+            "process_cpu_ms": phases["process_cpu_ms"],
+        }
+        if timing:
+            meta.update(
+                process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
+            )
+        if return_meta:
+            return (y, ms, meta) if return_time else (y, meta)
+        return (y, ms) if return_time else y
+
+
 def flagsparse_spmv_csr(
     data=None,
     indices=None,
@@ -1174,35 +1506,38 @@ def flagsparse_spmv_csr(
     out=None,
     return_time=False,
     return_meta=False,
-    use_opt=False,
+    use_opt=None,
     prepared=None,
     transpose=None,
     op=None,
     index_fallback_policy="auto",
+    *,
+    alg=None,
+    config=None,
+    timing=False,
 ):
-    """
-    CSR SpMV using Triton.
-    data, indices, indptr: CSR arrays; x: dense vector; shape: (n_rows, n_cols).
-    prepared: cached CSR metadata from prepare_spmv_csr for steady-state runs.
-    op: 0/'non' for A @ x, 1/'trans' for A.T @ x, 2/'conj' for A.conj().T @ x.
-    max_segments: None = auto-compute from indptr so all NNZ per row are covered.
-    use_opt: if True, use the faster CSR-Vector bucketed path (fp32/fp64 native accum).
-    """
-    op_explicit = op is not None
-    op_code = _normalize_spmv_op(
-        op,
-        transpose=False if transpose is None else bool(transpose),
-    )
+    """Native CSR SpMV; auto preserves the existing backend default algorithm."""
+    requested = _csr_config.normalize_alg(alg)
+    if use_opt is not None:
+        compatibility_alg = (
+            "legacy_bucket_vector"
+            if use_opt
+            else "legacy_" + _spmv_csr_default_backend()
+        )
+        if alg is not None and requested not in ("auto", compatibility_alg):
+            raise ValueError("use_opt conflicts with alg")
+        requested = compatibility_alg
+    op_code = _normalize_spmv_op(op, transpose=bool(transpose))
     if (
-        op_explicit
+        op is not None
         and transpose is not None
         and bool(transpose) != _spmv_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
     if prepared is None:
-        if any(arg is None for arg in (data, indices, indptr, shape)):
+        if any(value is None for value in (data, indices, indptr, shape)):
             raise ValueError(
-                "data, indices, indptr, and shape are required when prepared is not provided"
+                "data, indices, indptr, shape are required without prepared"
             )
         prepared = prepare_spmv_csr(
             data,
@@ -1213,65 +1548,35 @@ def flagsparse_spmv_csr(
             max_segments=max_segments,
             op=op_code,
             index_fallback_policy=index_fallback_policy,
+            alg=requested,
+            config=config,
         )
     else:
-        if op_explicit and op_code != prepared.op:
-            raise ValueError(
-                f"op={_spmv_op_to_name(op_code)} does not match prepared.op={_spmv_op_to_name(prepared.op)}"
+        if op is not None and op_code != prepared.op:
+            raise ValueError("op does not match prepared.op")
+        if transpose is not None and bool(transpose) != prepared.transpose:
+            raise ValueError("transpose does not match prepared.transpose")
+        if shape is not None and tuple(shape) != prepared.shape:
+            raise ValueError("shape does not match prepared.shape")
+        # Historical callers prepare once and select use_opt on invocation.
+        if use_opt is not None and prepared.alg_requested == "auto" and alg is None:
+            prepared = _configure_spmv_route(copy(prepared), requested, config)
+        else:
+            _csr_config.assert_route_match(
+                prepared.alg,
+                prepared.config,
+                requested if alg is not None or use_opt is not None else None,
+                config,
+                prepared.backend_caps,
             )
-        if (
-            not op_explicit
-            and transpose is not None
-            and bool(transpose) != prepared.transpose
-        ):
-            raise ValueError(
-                f"transpose={bool(transpose)} does not match prepared.transpose={prepared.transpose}"
-            )
-    x = _validate_spmv_x(x, prepared)
-    do_timing = bool(return_time or return_meta)
-    symbolic_ms = 0.0 if do_timing else None
-    compute_ms = None
-    op_total_ms = None
-    opt_buckets = None
-    if do_timing:
-        _ACCEL.synchronize()
-        t0 = time.perf_counter()
-    if use_opt and prepared.supports_opt:
-        opt_buckets = _build_spmv_opt_runtime_buckets(prepared)
-    if do_timing:
-        _ACCEL.synchronize()
-        t1 = time.perf_counter()
-        symbolic_ms = (t1 - t0) * 1000.0 if use_opt and prepared.supports_opt else 0.0
-    y = _run_spmv_prepared_with_fallback(
-        prepared, x, use_opt=use_opt, opt_buckets=opt_buckets
+    return flagsparse_spmv_csr_run(
+        prepared,
+        x,
+        out=out,
+        timing=timing,
+        return_time=return_time,
+        return_meta=return_meta,
     )
-    if do_timing:
-        _ACCEL.synchronize()
-        t2 = time.perf_counter()
-        compute_ms = (t2 - t1) * 1000.0
-        op_total_ms = symbolic_ms + compute_ms
-    if out is not None:
-        if not _is_accel_tensor(out):
-            raise ValueError("out must be a CUDA tensor")
-        if out.device != y.device:
-            raise ValueError("out must be on the same CUDA device as the result")
-        if out.shape != y.shape or out.dtype != y.dtype:
-            raise ValueError("out shape/dtype must match result")
-        out.copy_(y)
-        y = out
-    if return_meta:
-        meta = {
-            "symbolic_ms": symbolic_ms,
-            "compute_ms": compute_ms,
-            "op_total_ms": op_total_ms,
-            "bucket_count": int(len(opt_buckets)) if opt_buckets is not None else 0,
-        }
-        if return_time:
-            return y, op_total_ms, meta
-        return y, meta
-    if return_time:
-        return y, op_total_ms
-    return y
 
 
 def _coo_is_sorted_lex(row_i64, col_i64, n_cols):
@@ -1385,7 +1690,7 @@ def flagsparse_spmv_coo_tocsr(
             max_segments=max_segments,
             out=out,
             return_time=return_time,
-            use_opt=use_opt,
+            use_opt=bool(use_opt and prepared.supports_opt),
             prepared=prepared,
         )
 
@@ -1416,5 +1721,5 @@ def flagsparse_spmv_coo_tocsr(
         max_segments=max_segments,
         out=out,
         return_time=return_time,
-        use_opt=use_opt,
+        use_opt=bool(use_opt and data.dtype in (torch.float32, torch.float64)),
     )

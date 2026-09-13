@@ -135,7 +135,7 @@ python -m pytest tests/ci -q     # 期望 39 passed / 3 skipped
 
 ```bash
 M=matrix   # 任意 .mtx 目录
-python tests/test_spmv.py     $M --warmup 2 --iters 5
+python tests/test_spmv_csr.py     $M --warmup 2 --iters 5
 python tests/test_spmm.py     $M --warmup 2 --iters 5
 python tests/test_spgemm.py   $M --warmup 2 --iters 5
 python tests/test_spmm_coo.py $M --warmup 2 --iters 5
@@ -239,27 +239,33 @@ pytest tests/pytest --mode quick -m "spmv_coo_tocsr"
 
 新增或修改算子测试项时，需要同步维护算子实现/API 注册、`conf/operators.yaml` 注册、`pytest.ini` marker、精度测试、性能命令以及公开替换/导出注册。
 
-**test_spmv.py** - CSR SpMV（SuiteSparse `.mtx`、合成数据或 CSR CSV）：
+**test_spmv_csr.py** - CSR SpMV（SuiteSparse `.mtx`、合成数据或 CSR CSV）：
 
 ```bash
-python tests/test_spmv.py <目录或文件.mtx>               # 批量跑，默认 float32
-python tests/test_spmv.py <目录/> --dtype float64        # 可选：--index-dtype int32|int64、--warmup、--iters、--no-cusparse
-python tests/test_spmv.py --synthetic                    # 合成基准
-python tests/test_spmv.py <目录/> --csv-csr results.csv  # 全部 value×index dtype 写入一个 CSV（运行过程中逐矩阵打印）
+python tests/test_spmv_csr.py <目录或文件.mtx>               # 批量跑，默认 float32/float64
+python tests/test_spmv_csr.py <目录/> --dtype float64        # 可选：--index-dtype int32|int64、--warmup、--iters、--no-cusparse
+python tests/test_spmv_csr.py --synthetic                    # 合成基准
+python tests/test_spmv_csr.py <目录/> --csv-csr results.csv  # 默认 FP32/FP64 × 索引类型；--dtypes all 扩展全部类型
 ```
+
+新增 `row_tile`、`row_vector`、`row_split_reduce`、`row_adaptive_split` 四个显式算法，
+首版支持 FP32/FP64、`op=non`，统一 FP64 计算，提供 CUDA/ROCm 保守配置。
+`auto` 保留原默认路径，`compare` 使用同一输入比较支持的算法；实机验证仍待完成。
+
+```bash
+python tests/test_spmv_csr.py --synthetic --alg compare --timing --csv-csr spmv.csv
+python tests/test_spmv_csr.py <目录/> --dtypes float32,float64 --alg compare --timing --csv-csr results.csv
+```
+
+有无 `--timing` 均使用 `ms = process_cpu_ms + gpu_ms`，分段诊断另行运行。
+分段/自适应算法每次执行都在 GPU 上重建计划；CSV 记录实际厂商、算法、索引类型、配置和正确性。
+`test_spmv.py` 保留兼容转发。详见 [CSR 算法与计时契约](docs/SPMV_CSR.md)。
 
 **test_spmv_coo.py** - COO SpMV（需 `--synthetic` 或 `--csv-coo`，不能单独批量跑 .mtx）：
 
 ```bash
 python tests/test_spmv_coo.py --synthetic
 python tests/test_spmv_coo.py <目录/> --csv-coo out.csv
-```
-
-**test_spmv_opt.py** - SpMV 基线 vs 优化对比（仅 `float32` / `float64`）：
-
-```bash
-python tests/test_spmv_opt.py <目录或文件.mtx> [...]
-python tests/test_spmv_opt.py <目录/> --csv out.csv
 ```
 
 **test_spmv_bsr.py** - 原生 BSR SpMV，输出按 block-grid padding：

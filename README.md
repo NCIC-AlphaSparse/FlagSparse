@@ -125,7 +125,7 @@ python -m pytest tests/ci -q     # expect 39 passed / 3 skipped
 
 ```bash
 M=matrix   # any directory of .mtx files
-python tests/test_spmv.py     $M --warmup 2 --iters 5
+python tests/test_spmv_csr.py     $M --warmup 2 --iters 5
 python tests/test_spmm.py     $M --warmup 2 --iters 5
 python tests/test_spgemm.py   $M --warmup 2 --iters 5
 python tests/test_spmm_coo.py $M --warmup 2 --iters 5
@@ -240,27 +240,35 @@ pytest tests/pytest --mode quick -m "spmv_coo_tocsr"
 
 When adding or changing an operator test entry, keep the implementation/API registration, `conf/operators.yaml` entry, pytest marker in `pytest.ini`, accuracy test, performance command, and public replacement/export registration in sync.
 
-**test_spmv.py** - CSR SpMV (SuiteSparse `.mtx`, synthetic, or CSR CSV export):
+**test_spmv_csr.py** - CSR SpMV (SuiteSparse `.mtx`, synthetic, or CSR CSV export):
 
 ```bash
-python tests/test_spmv.py <dir_or_file.mtx>              # batch run, default float32
-python tests/test_spmv.py <dir/> --dtype float64         # optional: --index-dtype int32|int64, --warmup, --iters, --no-cusparse
-python tests/test_spmv.py --synthetic                    # synthetic benchmark
-python tests/test_spmv.py <dir/> --csv-csr results.csv   # all value×index dtypes -> one CSV (per-matrix lines while running)
+python tests/test_spmv_csr.py <dir_or_file.mtx>              # batch run, default float32/float64
+python tests/test_spmv_csr.py <dir/> --dtype float64         # optional: --index-dtype int32|int64, --warmup, --iters, --no-cusparse
+python tests/test_spmv_csr.py --synthetic                    # synthetic benchmark
+python tests/test_spmv_csr.py <dir/> --csv-csr results.csv   # FP32/FP64 × index dtypes; use --dtypes all for every dtype
 ```
+
+CSR algorithms: `row_tile`, `row_vector`, `row_split_reduce`, and `row_adaptive_split`
+are explicit FP32/FP64 `op=non` routes with FP64 computation and CUDA/ROCm
+conservative profiles. `auto` preserves the existing default; `compare` runs all
+supported candidates on the same input. GPU validation is still pending.
+
+```bash
+python tests/test_spmv_csr.py --synthetic --alg compare --timing --csv-csr spmv.csv
+python tests/test_spmv_csr.py <dir/> --dtypes float32,float64 --alg compare --timing --csv-csr results.csv
+```
+
+`ms = process_cpu_ms + gpu_ms` with and without `--timing`; phase diagnostics run
+separately. Every split/adaptive invocation rebuilds its GPU plan. CSV rows name
+the actual vendor, algorithm, index types, profile and correctness result.
+`test_spmv.py` remains a forwarding entry point. See [CSR algorithm and timing contract](docs/SPMV_CSR.md).
 
 **test_spmv_coo.py** - COO SpMV (requires `--synthetic` or `--csv-coo`; no standalone `.mtx` batch):
 
 ```bash
 python tests/test_spmv_coo.py --synthetic
 python tests/test_spmv_coo.py <dir/> --csv-coo out.csv
-```
-
-**test_spmv_opt.py** - SpMV baseline vs optimised A/B (`float32` / `float64` only):
-
-```bash
-python tests/test_spmv_opt.py <dir_or_file.mtx> [...]
-python tests/test_spmv_opt.py <dir/> --csv out.csv
 ```
 
 **test_spmv_bsr.py** - native BSR SpMV with padded block-grid output:

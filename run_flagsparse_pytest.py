@@ -120,6 +120,7 @@ PERFORMANCE_METRIC_COLUMNS = {
     "max_rel_err",
 }
 PERFORMANCE_SPEEDUP_SCHEMAS = (
+    ("speedup_vs_vendor", "vendor_ms", "ms"),
     ("speedup", "latency_base", "latency"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "triton_ms"),
     ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
@@ -170,7 +171,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{iters}",
     ),
     "spmv_csr": (
-        "tests/test_spmv.py",
+        "tests/test_spmv_csr.py",
         "{input}",
         "--csv-csr",
         "{csv}",
@@ -1364,6 +1365,15 @@ def _row_dtype(row: dict[str, str]) -> str:
 
 
 def _row_shape(row: dict[str, str], index: int) -> str:
+    if row.get("alg_resolved") and row.get("matrix"):
+        return "|".join(
+            [str(row["matrix"])]
+            + [
+                f"{key}={row[key]}"
+                for key in ("index_dtype", "indptr_dtype", "op", "alg_resolved")
+                if row.get(key)
+            ]
+        )
     for key in ("shape", "matrix", "name", "case", "m,n,k", "M,N,K"):
         value = row.get(key)
         if value:
@@ -1661,6 +1671,7 @@ def summarize_performance_csv(path: Path) -> dict[str, object]:
         summary["speedup_by_column"] = by_column
         if "speedup" not in summary:
             preferred = [
+                "speedup_vs_vendor",
                 "speedup",
                 "triton_speedup_vs_pytorch",
                 "opt_speedup_vs_pytorch",
