@@ -15,6 +15,7 @@
 """Shared imports, dtypes, and helpers for FlagSparse sparse ops."""
 
 import ctypes
+import importlib
 import os
 import statistics
 import time
@@ -66,8 +67,71 @@ _SUPPORTED_VALUE_DTYPES = [
 SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
+# ---------------------------------------------------------------------------
+# Backend registry.
+#
+# CUDA plus the domestic accelerators.  This used to be a hardcoded tuple with a
+# matching if-chain in _backend_name(); adding a vendor meant editing both, and
+# the two could disagree.  It is a table now, so a new platform is one entry.
+#
+# Each entry carries the signals that identify it, most explicit first:
+#
+#   plugin_modules   the vendor's PyTorch plugin.  The STRONGEST signal, and for
+#                    some vendors the only honest one -- see xpu below.
+#   torch_namespace  the ``torch.<name>`` namespace the plugin installs.
+#   device_tokens    substrings of the device name, for stacks that install no
+#                    namespace of their own (MetaX ships a CUDA-compatible one).
+#
+# ``reserved`` marks the spare slot: it is routed by FLAGSPARSE_BACKEND alone and
+# never auto-detected, so a vendor with no entry of its own can be driven through
+# it without touching this file.
+# ---------------------------------------------------------------------------
+
+
+class _BackendSpec:
+    __slots__ = ("name", "vendor", "torch_namespace", "plugin_modules",
+                 "device_tokens", "reserved")
+
+    def __init__(self, name, vendor, torch_namespace=None, plugin_modules=(),
+                 device_tokens=(), reserved=False):
+        self.name = name
+        self.vendor = vendor
+        self.torch_namespace = torch_namespace
+        self.plugin_modules = tuple(plugin_modules)
+        self.device_tokens = tuple(device_tokens)
+        self.reserved = bool(reserved)
+
+    def __repr__(self):
+        return f"_BackendSpec({self.name!r}, {self.vendor!r})"
+
+
+_BACKEND_SPECS = (
+    _BackendSpec("cuda", "NVIDIA"),
+    # ROCm/DCU is probed from torch.version.hip below, before this table is used.
+    _BackendSpec("rocm", "Hygon DCU / AMD ROCm"),
+    # MetaX ships a CUDA-compatible stack: torch.version.cuda is set and
+    # torch.version.hip is None, so only the device name tells it apart.
+    _BackendSpec("metax", "MetaX MACA", device_tokens=("metax", "maca", "mxc", "xcore")),
+    _BackendSpec("mthreads", "Moore Threads MUSA", "musa", ("torch_musa",),
+                 ("mthreads", "musa")),
+    _BackendSpec("ascend", "Huawei Ascend CANN", "npu", ("torch_npu",),
+                 ("ascend", "910")),
+    # Kunlunxin. The plugin module is REQUIRED and torch.xpu alone is not enough:
+    # upstream PyTorch ships a torch.xpu namespace for Intel GPUs, so accepting
+    # the namespace would claim an Intel card as Kunlunxin silicon.
+    _BackendSpec("xpu", "Kunlunxin XPU", "xpu", ("torch_xmlir", "torch_xpu"),
+                 ("kunlun", "xpu")),
+    _BackendSpec("gcu", "Enflame GCU", "gcu", ("torch_gcu",), ("enflame", "gcu")),
+    # The spare. Named for Cambricon because that is the slot the C++ side
+    # already reserves (BACKEND=MLU), but its contract is "generic reserve":
+    # env-routed only, so any vendor without an entry can be driven through it.
+    _BackendSpec("mlu", "Cambricon MLU (generic reserve slot)", "mlu",
+                 ("torch_mlu",), ("cambricon", "mlu"), reserved=True),
+)
+
+_BACKEND_SPEC_BY_NAME = {spec.name: spec for spec in _BACKEND_SPECS}
 # Defined here (before the runtime probes) because the ROCm probe below needs it.
-_BACKEND_NAMES = ("cuda", "rocm", "metax", "mthreads", "ascend")
+_BACKEND_NAMES = tuple(spec.name for spec in _BACKEND_SPECS)
 # torch.version.hip is set only by ROCm/DCU builds of PyTorch, so it is the cheapest
 # reliable way to pick the vendor backend without touching a device.
 _IS_ROCM_RUNTIME = getattr(torch.version, "hip", None) is not None
@@ -151,6 +215,57 @@ _IS_MACA_RUNTIME = _detect_maca_runtime()
 # Unlike CUDA/ROCm/MACA these are NOT CUDA-compatible: torch exposes them as a
 # separate device type ('musa' / 'npu') through an out-of-tree extension, so
 # torch.cuda.* and Tensor.is_cuda do not apply. See _accel_* below.
+def _vendor_plugin_present(spec):
+    """Is this vendor's PyTorch plugin actually installed?
+
+    The namespace alone is NOT evidence, and torch.xpu is why: upstream PyTorch
+    ships one for Intel GPUs, so a build with no Kunlunxin plugin still answers
+    getattr(torch, "xpu").  Taking it would run on Intel silicon while reporting
+    Kunlunxin -- or, on a box with the namespace but no device, fail at the first
+    allocation with an error that names neither.
+    """
+    if not spec.plugin_modules:
+        return False
+    for module_name in spec.plugin_modules:
+        try:
+            importlib.import_module(module_name)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _detect_backend_by_spec(name):
+    """Is `name` the backend this process is running on?
+
+    The override wins outright -- that is what makes every slot, including the
+    reserve, reachable on hardware that cannot be probed for.  Otherwise the
+    plugin module decides: a vendor namespace on its own is not proof (upstream
+    PyTorch installs torch.xpu for Intel GPUs), while an importable vendor
+    plugin is.
+    """
+    spec = _BACKEND_SPEC_BY_NAME.get(name)
+    if spec is None:
+        return False
+    override = _backend_override()
+    if override:
+        return override == name
+    if spec.reserved:
+        # The reserve is never claimed by accident: only the override selects it.
+        return False
+    if not _vendor_plugin_present(spec):
+        return False
+    namespace = (getattr(torch, spec.torch_namespace, None)
+                 if spec.torch_namespace else None)
+    if namespace is None:
+        # Plugin present but no namespace: still this vendor's build.
+        return True
+    try:
+        return bool(namespace.is_available())
+    except Exception:
+        return True
+
+
 def _detect_mthreads_runtime():
     override = _backend_override()
     if override:
@@ -177,6 +292,9 @@ def _detect_ascend_runtime():
 
 _IS_MTHREADS_RUNTIME = _detect_mthreads_runtime()
 _IS_ASCEND_RUNTIME = _detect_ascend_runtime()
+_IS_XPU_RUNTIME = _detect_backend_by_spec("xpu")
+_IS_GCU_RUNTIME = _detect_backend_by_spec("gcu")
+_IS_MLU_RUNTIME = _detect_backend_by_spec("mlu")
 _CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -190,6 +308,7 @@ __all__ = (
     "SUPPORTED_INDEX_DTYPES",
     "_INDEX_LIMIT_INT32",
     "_is_complex_dtype",
+    "_gather_values",
     "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
@@ -325,6 +444,27 @@ __all__ = (
 
 def _is_complex_dtype(value_dtype):
     return value_dtype in (torch.complex64, torch.complex128)
+
+
+def _gather_values(values, order):
+    """Gather ``values`` along dim 0 by ``order``; complex-safe on every backend.
+
+    Moore Threads has no complex kernel for advanced indexing -- ``values[order]``
+    raises ``RuntimeError: "IndexMusa" not implemented for 'ComplexFloat'`` -- which
+    breaks every reorder a transposed or COO-sorted operator has to do, while the
+    real dtypes go through fine.  Complex values are therefore gathered through
+    ``view_as_real``: the same bytes in the same order, and the real-dtype index
+    kernel exists everywhere.
+
+    The branch is on **dtype, not backend**, so CUDA/ROCm/MACA keep the exact path
+    they always took for real data and get an equivalent one for complex.  The same
+    split is already how the complex Triton kernels consume these arrays
+    (``view_as_real`` -> interleaved real/imag), so this adds no new concept.
+    """
+    if not _is_complex_dtype(values.dtype):
+        return values[order]
+    real_view = torch.view_as_real(values if values.is_contiguous() else values.contiguous())
+    return torch.view_as_complex(real_view[order].contiguous())
 
 
 def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
@@ -579,36 +719,75 @@ def _is_ascend_runtime():
     return bool(_IS_ASCEND_RUNTIME)
 
 
+def _is_xpu_runtime():
+    """True on Kunlunxin XPU."""
+    return bool(_IS_XPU_RUNTIME)
+
+
+def _is_gcu_runtime():
+    """True on Enflame GCU."""
+    return bool(_IS_GCU_RUNTIME)
+
+
+def _is_mlu_runtime():
+    """True on the reserve slot (Cambricon MLU, or whatever is routed there)."""
+    return bool(_IS_MLU_RUNTIME)
+
+
+def backend_specs():
+    """The backend registry, for tooling that needs to enumerate platforms.
+
+    Test runners use this instead of their own copy of the list, so a platform
+    added here reaches the accuracy and performance harnesses without a second
+    edit.
+    """
+    return _BACKEND_SPECS
+
+
+# Probe order matters and is not alphabetical: the most specific signal first.
+# CUDA is last because it is the fallthrough -- a MetaX or Kunlunxin stack also
+# answers to torch.version.cuda, so claiming CUDA early would shadow them.
+_BACKEND_PROBES = (
+    ("rocm", lambda: _IS_ROCM_RUNTIME),
+    ("metax", lambda: _IS_MACA_RUNTIME),
+    ("mthreads", lambda: _IS_MTHREADS_RUNTIME),
+    ("ascend", lambda: _IS_ASCEND_RUNTIME),
+    ("xpu", lambda: _IS_XPU_RUNTIME),
+    ("gcu", lambda: _IS_GCU_RUNTIME),
+    ("mlu", lambda: _IS_MLU_RUNTIME),
+)
+
+
 def _backend_name():
-    """Canonical runtime: 'rocm'|'metax'|'mthreads'|'ascend'|'cuda'."""
-    if _IS_ROCM_RUNTIME:
-        return "rocm"
-    if _IS_MACA_RUNTIME:
-        return "metax"
-    if _IS_MTHREADS_RUNTIME:
-        return "mthreads"
-    if _IS_ASCEND_RUNTIME:
-        return "ascend"
+    """Canonical runtime name; one of _BACKEND_NAMES, defaulting to 'cuda'."""
+    for name, probe in _BACKEND_PROBES:
+        if probe():
+            return name
     return "cuda"
 
 
 def _resolve_accel():
     """Resolve (module, device_type) together, so they can never disagree.
 
-    CUDA, ROCm and MACA all present themselves as torch.cuda. MUSA and Ascend are
-    separate device types supplied by an out-of-tree torch extension; when that
-    extension is not importable we fall back to torch.cuda/"cuda" *as a pair* —
-    returning torch.cuda while claiming device type "musa" would make
-    _is_accel_tensor() reject every tensor.
+    CUDA, ROCm and MACA all present themselves as torch.cuda. Every other backend
+    in the registry is a separate device type supplied by an out-of-tree torch
+    extension; when that extension is not importable we fall back to
+    torch.cuda/"cuda" *as a pair* — returning torch.cuda while claiming device
+    type "musa" would make _is_accel_tensor() reject every tensor.
+
+    Driven from the registry rather than an if-chain, so a backend added there
+    does not end up reporting its own name while running on torch.cuda.
     """
-    if _IS_MTHREADS_RUNTIME:
-        mod = getattr(torch, "musa", None)
+    name = _backend_name()
+    spec = _BACKEND_SPEC_BY_NAME.get(name)
+    # cuda / rocm / metax carry no namespace of their own: they all answer to
+    # torch.cuda, which is why the registry leaves torch_namespace unset for them.
+    if spec is not None and spec.torch_namespace and _vendor_plugin_present(spec):
+        mod = getattr(torch, spec.torch_namespace, None)
         if mod is not None:
-            return mod, "musa"
-    if _IS_ASCEND_RUNTIME:
-        mod = getattr(torch, "npu", None)
-        if mod is not None:
-            return mod, "npu"
+            # The namespace name doubles as the torch device type for every
+            # out-of-tree backend here (musa, npu, xpu, gcu, mlu).
+            return mod, spec.torch_namespace
     return torch.cuda, "cuda"
 
 
@@ -748,11 +927,29 @@ def _maca_vendor_sparse_library():
 
 
 def _mthreads_vendor_sparse_library():
-    """Baseline library on Moore Threads.
+    """Baseline library on Moore Threads: none by default.
 
-    Deliberately the portable torch.sparse path for now: it runs on MUSA today
-    and gives a real reference, whereas musparse has no Python binding wired up
-    here. Override with FLAGSPARSE_MTHREADS_VENDOR=torch|musparse|none.
+    This used to default to "torch" on the assumption that torch.sparse "runs on
+    MUSA today and gives a real reference".  Measured on an MTT S5000
+    (torch 2.7.1 / torch_musa 2.7.1, muDNN v3105) with
+    ``tools/probe_accel_capabilities.py``, that is false -- torch.sparse has no
+    working matmul on MUSA in any layout or dtype, float32 included:
+
+        CSR: NotImplementedError: Could not run 'aten::empty.memory_format'
+             with arguments from the 'SparseCsrmusa' backend
+        COO: NotImplementedError: Could not run 'aten::addmm'
+             with arguments from the 'Sparsemusa' backend
+
+    Building a sparse tensor succeeds, which is why the gap survived review; only
+    the multiply is missing.  Returning "torch" therefore produced a baseline column
+    that raises rather than one that measures, so the default is now no vendor
+    baseline: the vendor columns report N/A with a reason, and FlagSparse timings
+    are still collected.
+
+    muSPARSE remains unwired (no Python binding here).  Override with
+    FLAGSPARSE_MTHREADS_VENDOR=torch|musparse|none -- "torch" stays available so the
+    default can be flipped back by measurement once torch_musa registers the ops,
+    rather than by assumption.
     """
     override = os.environ.get("FLAGSPARSE_MTHREADS_VENDOR", "").strip().lower()
     if override in ("torch", "musparse", "none"):
@@ -762,7 +959,7 @@ def _mthreads_vendor_sparse_library():
             "FLAGSPARSE_MTHREADS_VENDOR must be 'torch', 'musparse' or 'none'; "
             f"got {override!r}"
         )
-    return "torch"
+    return None
 
 
 _OPS_SPARSE_IMPORT_ERROR = None
@@ -3132,3 +3329,110 @@ def _benchmark_cuda_graph_op(
         samples_ms.append(float(start.elapsed_time(end)) / graph_batch)
 
     return statistics.median(samples_ms)
+
+
+# ---------------------------------------------------------------------------
+# Dense prologue for the accumulate-style sparse routes.
+#
+# Several routes (CSC op="non", BSR both directions, the COO atomic variants)
+# build their result with tl.atomic_add, which requires the destination to hold
+# the right starting value. This module's own callers allocate a zeroed output
+# and never need more than that, so nothing here uses this kernel today -- it
+# exists for the C API, which has to express cuSPARSE's
+# ``y = alpha*op(A)*x + beta*y`` on those same routes and therefore needs
+# ``y = beta*y`` (or a true zero) applied first.
+#
+# It lives here rather than in the C wrapper for the reason every other kernel
+# does: one source of truth. The C++ dispatch layer re-exports it.
+#
+# HAS_BETA is constexpr and False must store a LITERAL zero, never
+# ``load(...) * 0``: cuSPARSE defines beta == 0 as "do not read the output", and
+# an uninitialised buffer holding NaN would survive the multiply.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dense_scale_kernel(
+    ptr,
+    beta_re,
+    beta_im,
+    n_rows,
+    n_cols,
+    stride_m,
+    stride_n,
+    stride_r,
+    BLOCK_N: tl.constexpr,
+    IS_COMPLEX: tl.constexpr,
+    HAS_BETA: tl.constexpr,
+):
+    """out = beta * out, over an n_rows x n_cols strided dense block.
+
+    A vector is the n_rows == 1 case with stride_m = 0, which keeps the loads
+    contiguous instead of giving every element its own program.
+
+    Complex operands are interleaved real/imag pairs of the component dtype;
+    ``stride_r`` is the step from a real part to its imaginary part.
+    """
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if row >= n_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_cols
+    p_re = ptr + row * stride_m + offs_n * stride_n
+
+    if IS_COMPLEX:
+        p_im = p_re + stride_r
+        if HAS_BETA:
+            prev_re = tl.load(p_re, mask=mask_n, other=0.0)
+            prev_im = tl.load(p_im, mask=mask_n, other=0.0)
+            out_re = beta_re * prev_re - beta_im * prev_im
+            out_im = beta_re * prev_im + beta_im * prev_re
+        else:
+            out_re = tl.zeros([BLOCK_N], dtype=ptr.dtype.element_ty)
+            out_im = out_re
+        tl.store(p_re, out_re, mask=mask_n)
+        tl.store(p_im, out_im, mask=mask_n)
+    else:
+        if HAS_BETA:
+            out = beta_re * tl.load(p_re, mask=mask_n, other=0.0)
+        else:
+            out = tl.zeros([BLOCK_N], dtype=ptr.dtype.element_ty)
+        tl.store(p_re, out, mask=mask_n)
+
+
+@triton.jit
+def _dense_copy_kernel(
+    src_ptr,
+    dst_ptr,
+    n_rows,
+    n_cols,
+    src_stride_m,
+    src_stride_n,
+    src_stride_r,
+    dst_stride_m,
+    dst_stride_n,
+    dst_stride_r,
+    BLOCK_N: tl.constexpr,
+    IS_COMPLEX: tl.constexpr,
+):
+    """dst = src, over an n_rows x n_cols strided block.
+
+    Like _dense_scale_kernel this exists for the C API rather than for this
+    module. SpSM's solver works in place on a packed row-major work array, while
+    cuSPARSE hands it a separate right-hand side and destination with arbitrary
+    order and leading dimension; this is what moves between the two, and being
+    strided on both sides it needs no layout special-casing.
+    """
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if row >= n_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_cols
+    s_re = src_ptr + row * src_stride_m + offs_n * src_stride_n
+    d_re = dst_ptr + row * dst_stride_m + offs_n * dst_stride_n
+    tl.store(d_re, tl.load(s_re, mask=mask_n, other=0.0), mask=mask_n)
+    if IS_COMPLEX:
+        tl.store(d_re + dst_stride_r,
+                 tl.load(s_re + src_stride_r, mask=mask_n, other=0.0), mask=mask_n)

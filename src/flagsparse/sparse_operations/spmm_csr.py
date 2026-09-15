@@ -172,6 +172,8 @@ def _spmm_csr_real_kernel(
     indptr_ptr,
     b_ptr,
     c_ptr,
+    alpha,
+    beta,
     n_rows,
     n_dense_cols,
     stride_bk,
@@ -182,7 +184,19 @@ def _spmm_csr_real_kernel(
     BLOCK_NNZ: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
     ACCURACY: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """C = alpha * A @ B + beta * C.
+
+    ``alpha``/``beta`` exist so the C API can express cuSPARSE's SpMM in one
+    launch; this module's own callers pass 1 and 0, for which the generated code
+    is the plain ``C = A @ B`` it has always been.  Keeping them here rather than
+    in a second copy of the kernel is deliberate -- the C++ dispatch layer
+    re-exports THIS function, so there is exactly one kernel to tune or fix.
+
+    ``HAS_BETA`` is constexpr because cuSPARSE defines beta == 0 as "ignore C":
+    reading an uninitialised output would turn into NaN through 0 * NaN.
+    """
     row = tl.program_id(0)
     pid_n = tl.program_id(1)
     if row >= n_rows:
@@ -221,7 +235,12 @@ def _spmm_csr_real_kernel(
                 )
                 acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
 
-    tl.store(c_ptr + row * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+    c_ptrs = c_ptr + row * stride_cm + offs_n * stride_cn
+    out = alpha * acc
+    if HAS_BETA:
+        prev = tl.load(c_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+        out = out + beta * prev
+    tl.store(c_ptrs, out, mask=mask_n)
 
 
 # Complex-path variant of the same Triton-native CSR base mapping.
@@ -232,6 +251,10 @@ def _spmm_csr_complex_kernel(
     indptr_ptr,
     b_ri_ptr,
     c_ri_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_rows,
     n_dense_cols,
     stride_bk,
@@ -243,7 +266,15 @@ def _spmm_csr_complex_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """C = alpha * A @ B + beta * C, with complex alpha/beta.
+
+    Triton has no complex type, so the scalars arrive split into real and
+    imaginary components of the interleaved buffers' element dtype -- the same
+    representation the operands themselves already use.  This module's callers
+    pass alpha = 1 + 0j and beta = 0, which folds back to the plain product.
+    """
     row = tl.program_id(0)
     pid_n = tl.program_id(1)
     if row >= n_rows:
@@ -285,12 +316,17 @@ def _spmm_csr_complex_kernel(
                 + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
             )
 
-    tl.store(c_ri_ptr + row * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
-    tl.store(
-        c_ri_ptr + row * stride_cm + offs_n * stride_cn + stride_cr,
-        acc_im,
-        mask=mask_n,
-    )
+    c_re_ptrs = c_ri_ptr + row * stride_cm + offs_n * stride_cn
+    c_im_ptrs = c_re_ptrs + stride_cr
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(c_re_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+        prev_im = tl.load(c_im_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(c_re_ptrs, out_re, mask=mask_n)
+    tl.store(c_im_ptrs, out_im, mask=mask_n)
 
 
 @triton.jit
@@ -454,7 +490,7 @@ def _transpose_csr_for_spmm(data, indices, indptr, shape):
         order = torch.argsort(col_ids)
     sorted_cols = col_ids[order]
     sorted_rows = row_ids[order]
-    transposed_data = data[order].contiguous()
+    transposed_data = _gather_values(data, order).contiguous()
 
     nnz_per_transposed_row = torch.bincount(sorted_cols, minlength=n_cols)
     transposed_indptr64 = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
@@ -3474,6 +3510,13 @@ def _triton_spmm_csr_complex_impl(
         indptr,
         B_ri,
         C_ri,
+        # This operator computes C = A @ B; alpha/beta exist for the C API's
+        # cuSPARSE-compatible signature. HAS_BETA=False makes the beta term
+        # vanish at compile time, so the generated kernel is unchanged.
+        1,
+        0,
+        0,
+        0,
         n_rows,
         n_dense_cols,
         B_ri.stride(0),
@@ -3485,6 +3528,7 @@ def _triton_spmm_csr_complex_impl(
         BLOCK_N=block_n,
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
+        HAS_BETA=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -3590,6 +3634,11 @@ def _triton_spmm_csr_impl(
             indptr,
             B_in,
             C_compute,
+            # C = A @ B here; alpha/beta exist for the C API's cuSPARSE-compatible
+            # signature, and HAS_BETA=False folds the beta term away at compile
+            # time, leaving exactly the code this path always generated.
+            1,
+            0,
             n_rows,
             n_dense_cols,
             B_in.stride(0),
@@ -3600,6 +3649,7 @@ def _triton_spmm_csr_impl(
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
             ACCURACY=bool(accuracy and compute_dtype == torch.float32),
+            HAS_BETA=False,
             num_warps=num_warps,
             num_stages=num_stages,
         )

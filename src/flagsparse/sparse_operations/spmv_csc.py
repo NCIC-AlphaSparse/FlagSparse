@@ -164,9 +164,17 @@ def _spmv_csc_non_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
 ):
+    """y += alpha * A @ x, accumulated with atomics.
+
+    Only alpha lives here: this route scatters into y, so ``beta * y`` cannot be
+    folded into the store and the C API applies it with a separate prologue
+    (``_dense_scale_kernel``) before launching. This module's callers pass
+    alpha = 1 into a zeroed y, which is the code this kernel always generated.
+    """
     col = tl.program_id(0)
     seg = tl.program_id(1)
     if col >= n_cols:
@@ -178,7 +186,7 @@ def _spmv_csc_non_real_kernel(
     rows = tl.load(indices_ptr + offs, mask=mask, other=0)
     vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
     x_val = tl.load(x_ptr + col)
-    tl.atomic_add(y_ptr + rows, vals * x_val, mask=mask, sem="relaxed")
+    tl.atomic_add(y_ptr + rows, alpha * vals * x_val, mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -188,9 +196,12 @@ def _spmv_csc_non_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
 ):
+    """Complex counterpart; see _spmv_csc_non_real_kernel for why beta is absent."""
     col = tl.program_id(0)
     seg = tl.program_id(1)
     if col >= n_cols:
@@ -206,8 +217,10 @@ def _spmv_csc_non_complex_kernel(
     x_im = tl.load(x_ri_ptr + col * 2 + 1)
     prod_re = a_re * x_re - a_im * x_im
     prod_im = a_re * x_im + a_im * x_re
-    tl.atomic_add(y_ri_ptr + rows * 2, prod_re, mask=mask, sem="relaxed")
-    tl.atomic_add(y_ri_ptr + rows * 2 + 1, prod_im, mask=mask, sem="relaxed")
+    out_re = alpha_re * prod_re - alpha_im * prod_im
+    out_im = alpha_re * prod_im + alpha_im * prod_re
+    tl.atomic_add(y_ri_ptr + rows * 2, out_re, mask=mask, sem="relaxed")
+    tl.atomic_add(y_ri_ptr + rows * 2 + 1, out_im, mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -217,10 +230,19 @@ def _spmv_csc_trans_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
+    beta,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y = alpha * op(A) * x + beta * y, one program per column.
+
+    Unlike the op="non" route this one is deterministic and writes every column
+    exactly once, so both scalars fold into the store; no prologue is needed and
+    an empty column still gets beta * y. This module's callers pass 1 and 0.
+    """
     col = tl.program_id(0)
     if col >= n_cols:
         return
@@ -244,7 +266,10 @@ def _spmv_csc_trans_real_kernel(
         vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + rows, mask=mask, other=0.0)
         acc = acc + tl.sum(tl.where(mask, vals * x_vals, 0.0))
-    tl.store(y_ptr + col, acc)
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(y_ptr + col)
+    tl.store(y_ptr + col, out)
 
 
 @triton.jit
@@ -254,11 +279,17 @@ def _spmv_csc_trans_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     CONJ: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """Complex counterpart; see _spmv_csc_trans_real_kernel."""
     col = tl.program_id(0)
     if col >= n_cols:
         return
@@ -284,8 +315,15 @@ def _spmv_csc_trans_complex_kernel(
         prod_im = a_re * x_im + a_im * x_re
         acc_re = acc_re + tl.sum(tl.where(mask, prod_re, 0.0))
         acc_im = acc_im + tl.sum(tl.where(mask, prod_im, 0.0))
-    tl.store(y_ri_ptr + col * 2, acc_re)
-    tl.store(y_ri_ptr + col * 2 + 1, acc_im)
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(y_ri_ptr + col * 2)
+        prev_im = tl.load(y_ri_ptr + col * 2 + 1)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(y_ri_ptr + col * 2, out_re)
+    tl.store(y_ri_ptr + col * 2 + 1, out_im)
 
 
 def _prepare_spmv_csc_matrix(data, indices, indptr, shape):
@@ -588,6 +626,10 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
                 prepared.kernel_indptr,
                 x_ri,
                 y_ri,
+            # y = op(A) @ x here; alpha/beta exist for the C API's
+            # cuSPARSE-compatible signature and fold away at 1 / 0.
+                1,
+                0,
                 prepared.n_cols,
                 BLOCK_NNZ=prepared.block_nnz,
             )
@@ -599,6 +641,7 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
             prepared.kernel_indptr,
             x,
             y,
+            1,                       # alpha; beta is a prologue on this route
             prepared.n_cols,
             BLOCK_NNZ=prepared.block_nnz,
         )
@@ -614,10 +657,15 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
             prepared.kernel_indptr,
             x_ri,
             y_ri,
+            1,
+            0,
+            0,
+            0,
             prepared.n_cols,
             BLOCK_NNZ=prepared.block_nnz,
             MAX_SEGMENTS=prepared.max_segments,
             CONJ=(op_code == SPMV_CSC_OP_CONJ_TRANS),
+            HAS_BETA=False,
         )
         y.copy_(torch.view_as_complex(y_ri.reshape(out_len, 2)))
         return y
@@ -627,9 +675,12 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
         prepared.kernel_indptr,
         x,
         y,
+        1,
+        0,
         prepared.n_cols,
         BLOCK_NNZ=prepared.block_nnz,
         MAX_SEGMENTS=prepared.max_segments,
+        HAS_BETA=False,
     )
     return y
 

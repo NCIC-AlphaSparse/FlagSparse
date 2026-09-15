@@ -17,7 +17,13 @@ import torch
 
 from flagsparse import flagsparse_sddmm_csr, flagsparse_spgemm_csr
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import (
     SDDMM_DTYPES,
     SDDMM_DTYPE_IDS,
@@ -27,12 +33,18 @@ from tests.pytest.param_shapes import (
     SPGEMM_MNK_SHAPES,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 _SYNTHETIC_VALUE_SCALE = 0.125
 
 
 def _random_csr(rows, cols, dtype, device, value_scale=_SYNTHETIC_VALUE_SCALE):
+    """Random sparse CSR matrix on ``device``.
+
+    Tests that build a reference pass ``golden_device()``: the SpGEMM reference is
+    ``torch.sparse.mm`` (no working implementation on MUSA) and the SDDMM reference
+    is advanced indexing (no complex kernel there).  See ``golden_device()``.
+    """
     denom = max(rows * cols, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
     mask = torch.rand(rows, cols, device=device) < p
@@ -69,28 +81,29 @@ def _tol(dtype):
     "indptr_dtype", [torch.int32, torch.int64], ids=["ptr32", "ptr64"]
 )
 def test_spgemm_csr_matches_torch(M, N, K, dtype, indptr_dtype):
-    device = torch.device("cuda")
-    A = _random_csr(M, K, dtype, device)
-    B = _random_csr(K, N, dtype, device)
+    device = accelerator_device()
+    golden = golden_device()
+    A = _random_csr(M, K, dtype, golden)
+    B = _random_csr(K, N, dtype, golden)
+    ref = torch.sparse.mm(A, B.to_dense())
     c_data, c_indices, c_indptr, c_shape = flagsparse_spgemm_csr(
-        A.values(),
-        A.col_indices().to(torch.int32),
-        A.crow_indices().to(indptr_dtype),
+        A.values().to(device),
+        A.col_indices().to(torch.int32).to(device),
+        A.crow_indices().to(indptr_dtype).to(device),
         (M, K),
-        B.values(),
-        B.col_indices().to(torch.int32),
-        B.crow_indices().to(indptr_dtype),
+        B.values().to(device),
+        B.col_indices().to(torch.int32).to(device),
+        B.crow_indices().to(indptr_dtype).to(device),
         (K, N),
     )
     got = _csr_to_dense(c_data, c_indices, c_indptr, c_shape)
-    ref = torch.sparse.mm(A, B.to_dense())
     rtol, atol = _tol(dtype)
-    assert torch.allclose(got, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(got.to(ref.device), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spgemm_csr
 def test_spgemm_csr_rejects_unsupported_index_and_value_dtypes():
-    device = torch.device("cuda")
+    device = accelerator_device()
     A = _random_csr(8, 10, torch.float32, device)
     B = _random_csr(10, 6, torch.float32, device)
     with pytest.raises(TypeError, match="a_indices dtype must be torch.int32"):
@@ -128,40 +141,41 @@ def test_spgemm_csr_rejects_unsupported_index_and_value_dtypes():
     "indptr_dtype", [torch.int32, torch.int64], ids=["ptr32", "ptr64"]
 )
 def test_sddmm_csr_matches_sampled_dense_reference(M, N, K, dtype, indptr_dtype):
-    device = torch.device("cuda")
-    pattern = _random_csr(M, N, dtype, device)
+    device = accelerator_device()
+    golden = golden_device()
+    pattern = _random_csr(M, N, dtype, golden)
     indices = pattern.col_indices().to(torch.int32)
     indptr = pattern.crow_indices().to(indptr_dtype)
     data = pattern.values()
-    x = torch.randn(M, K, dtype=dtype, device=device) * _SYNTHETIC_VALUE_SCALE
-    y = torch.randn(N, K, dtype=dtype, device=device) * _SYNTHETIC_VALUE_SCALE
+    x = torch.randn(M, K, dtype=dtype, device=golden) * _SYNTHETIC_VALUE_SCALE
+    y = torch.randn(N, K, dtype=dtype, device=golden) * _SYNTHETIC_VALUE_SCALE
     alpha = 1.25
     beta = 0.5
 
-    got = flagsparse_sddmm_csr(
-        data=data,
-        indices=indices,
-        indptr=indptr,
-        x=x,
-        y=y,
-        shape=(M, N),
-        alpha=alpha,
-        beta=beta,
-    )
     row_ids = torch.repeat_interleave(
-        torch.arange(M, dtype=torch.int64, device=device),
+        torch.arange(M, dtype=torch.int64, device=golden),
         indptr[1:] - indptr[:-1],
     )
     ref = (
         alpha * torch.sum(x[row_ids] * y[indices.to(torch.int64)], dim=1) + beta * data
     )
+    got = flagsparse_sddmm_csr(
+        data=data.to(device),
+        indices=indices.to(device),
+        indptr=indptr.to(device),
+        x=x.to(device),
+        y=y.to(device),
+        shape=(M, N),
+        alpha=alpha,
+        beta=beta,
+    )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(got, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(got.to(ref.device), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.sddmm_csr
 def test_sddmm_csr_rejects_unsupported_index_and_value_dtypes():
-    device = torch.device("cuda")
+    device = accelerator_device()
     pattern = _random_csr(8, 10, torch.float32, device)
     data = pattern.values()
     indptr = pattern.crow_indices()

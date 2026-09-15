@@ -1770,7 +1770,7 @@ def _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
         order = torch.argsort(key, stable=True)
     except TypeError:
         order = torch.argsort(key)
-    return data[order], indices64[order], indptr64
+    return _gather_values(data, order), indices64[order], indptr64
 
 
 def _spsv_csr_row_length_summary(indptr64, n_rows):
@@ -3090,6 +3090,7 @@ def _spsv_csr_cw_kernel(
     x_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha,
     n_rows,
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
@@ -3097,7 +3098,30 @@ def _spsv_csr_cw_kernel(
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
+    SCAN_BACKWARD: tl.constexpr,
 ):
+    """Solve op(A) y = alpha * x for a triangular A, chain-wave style.
+
+    ``alpha`` exists so the C API can express cuSPARSE's SpSV, whose right-hand
+    side is scaled; the solve is linear, so scaling the rhs at load is the whole
+    of it. This module's callers pass 1, for which the generated code is the
+    plain solve it has always been.
+
+    Over-subscribing workers is safe and cannot deadlock: a program only ever
+    waits on rows with a LOWER logical index, and a lower index can only have
+    been claimed by a program that already ran its ``atomic_add`` -- i.e. one
+    that is resident. Non-resident programs start later and find the counter
+    exhausted.
+
+    SCAN_BACKWARD says which end of a row the scan starts from, and it exists
+    because the two fill modes want opposite column orders. The scan walks a row
+    and stops at the diagonal, so it needs the diagonal LAST: ascending columns
+    give that for a lower triangle, descending for an upper one. This module
+    reorders rows per fill mode and keeps False. cuSPARSE callers cannot -- CSR
+    column indices are ascending by universal convention -- so the C API passes
+    True for an upper triangle and the scan runs from the far end instead, which
+    needs no reordered copy of the matrix.
+    """
     logical_row = (
         0
         if SERIAL_EXECUTION
@@ -3107,17 +3131,17 @@ def _spsv_csr_cw_kernel(
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
-        ptr = start
+        ptr = end - 1 if SCAN_BACKWARD else start
         if USE_FP64_ACC:
-            rhs = tl.load(b_ptr + row).to(tl.float64)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float64)
             tmp_sum = tl.zeros((), dtype=tl.float64)
         else:
-            rhs = tl.load(b_ptr + row).to(tl.float32)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float32)
             tmp_sum = tl.zeros((), dtype=tl.float32)
         row_done = 0
         while row_done == 0:
             if UNIT_DIAG:
-                if ptr >= end:
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
                     x_row = rhs - tmp_sum
                     x_row = tl.where(x_row == x_row, x_row, 0.0)
                     tl.store(x_ptr + row, x_row)
@@ -3142,9 +3166,9 @@ def _spsv_csr_cw_kernel(
                             a = tl.load(data_ptr + ptr).to(tl.float32)
                             y_dep = tl.load(x_ptr + col).to(tl.float32)
                         tmp_sum += a * y_dep
-                        ptr += 1
+                        ptr += -1 if SCAN_BACKWARD else 1
             else:
-                if ptr >= end:
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
                     x_row = rhs * 0
                     tl.store(x_ptr + row, x_row)
                     row_done = 1
@@ -3172,7 +3196,7 @@ def _spsv_csr_cw_kernel(
                             a = tl.load(data_ptr + ptr).to(tl.float32)
                             y_dep = tl.load(x_ptr + col).to(tl.float32)
                         tmp_sum += a * y_dep
-                        ptr += 1
+                        ptr += -1 if SCAN_BACKWARD else 1
         if SERIAL_EXECUTION:
             logical_row += 1
         else:
@@ -3189,6 +3213,8 @@ def _spsv_csr_cw_kernel_complex(
     x_ri_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
@@ -3196,7 +3222,10 @@ def _spsv_csr_cw_kernel_complex(
     USE_FP64_ACC: tl.constexpr,
     DIAG_EPS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
+    SCAN_BACKWARD: tl.constexpr,
 ):
+    """Complex counterpart; see _spsv_csr_cw_kernel for alpha and for why
+    over-subscribing workers cannot deadlock."""
     logical_row = (
         0
         if SERIAL_EXECUTION
@@ -3207,8 +3236,10 @@ def _spsv_csr_cw_kernel_complex(
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
-        rhs_re = tl.load(b_ri_ptr + row * 2)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        b_re = tl.load(b_ri_ptr + row * 2)
+        b_im = tl.load(b_ri_ptr + row * 2 + 1)
+        rhs_re = alpha_re * b_re - alpha_im * b_im
+        rhs_im = alpha_re * b_im + alpha_im * b_re
         if USE_FP64_ACC:
             rhs_re = rhs_re.to(tl.float64)
             rhs_im = rhs_im.to(tl.float64)
@@ -3219,11 +3250,11 @@ def _spsv_csr_cw_kernel_complex(
             rhs_im = rhs_im.to(tl.float32)
             tmp_re = tl.zeros((), dtype=tl.float32)
             tmp_im = tl.zeros((), dtype=tl.float32)
-        ptr = start
+        ptr = end - 1 if SCAN_BACKWARD else start
         row_done = 0
         while row_done == 0:
             if UNIT_DIAG:
-                if ptr >= end:
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
                     x_re_out = rhs_re - tmp_re
                     x_im_out = rhs_im - tmp_im
                     x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
@@ -3263,9 +3294,9 @@ def _spsv_csr_cw_kernel_complex(
                             a_im = a_im.to(tl.float32)
                         tmp_re += a_re * x_re - a_im * x_im
                         tmp_im += a_re * x_im + a_im * x_re
-                        ptr += 1
+                        ptr += -1 if SCAN_BACKWARD else 1
             else:
-                if ptr >= end:
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
                     out_vals = tl.where(lane2 == 0, rhs_re * 0, rhs_im * 0)
                     tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                     row_done = 1
@@ -3312,7 +3343,7 @@ def _spsv_csr_cw_kernel_complex(
                             a_im = a_im.to(tl.float32)
                         tmp_re += a_re * x_re - a_im * x_im
                         tmp_im += a_re * x_im + a_im * x_re
-                        ptr += 1
+                        ptr += -1 if SCAN_BACKWARD else 1
         if SERIAL_EXECUTION:
             logical_row += 1
         else:
@@ -3625,12 +3656,23 @@ def _spsv_sell_cw_kernel_alg1(
     x_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha,
     n_rows,
     SLICE_SIZE: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
 ):
-    """ALG1: original persistent scalar-row dependency solver."""
+    """ALG1: original persistent scalar-row dependency solver.
+
+    ``alpha`` exists so the C API can express cuSPARSE's SpSV, whose right-hand
+    side is scaled; the solve is linear, so scaling the rhs at load is all of it.
+    This module's callers pass 1, for which the generated code is unchanged.
+
+    LOWER TRIANGLES ONLY: the dependency test is a bare ``col < row`` with no
+    fill-mode constexpr, so an upper triangle would be solved as if its stored
+    entries were below the diagonal. The C API refuses UPPER here rather than
+    returning that.
+    """
 
     logical_row = tl.atomic_add(row_counter_ptr, 1)
     while logical_row < n_rows:
@@ -3641,11 +3683,11 @@ def _spsv_sell_cw_kernel_alg1(
         slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
         width = (slice_end - slice_start) // SLICE_SIZE
         if USE_FP64_ACC:
-            rhs = tl.load(b_ptr + row).to(tl.float64)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float64)
             tmp_sum = tl.zeros((), dtype=tl.float64)
             diag = tl.zeros((), dtype=tl.float64)
         else:
-            rhs = tl.load(b_ptr + row).to(tl.float32)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float32)
             tmp_sum = tl.zeros((), dtype=tl.float32)
             diag = tl.zeros((), dtype=tl.float32)
         if UNIT_DIAG:
@@ -3691,6 +3733,8 @@ def _spsv_sell_cw_kernel_alg1_complex(
     x_ri_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     SLICE_SIZE: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
@@ -3706,8 +3750,10 @@ def _spsv_sell_cw_kernel_alg1_complex(
         slice_start = tl.load(slice_offsets_ptr + slice_id)
         slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
         width = (slice_end - slice_start) // SLICE_SIZE
-        rhs_re = tl.load(b_ri_ptr + row * 2)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        b_re = tl.load(b_ri_ptr + row * 2)
+        b_im = tl.load(b_ri_ptr + row * 2 + 1)
+        rhs_re = alpha_re * b_re - alpha_im * b_im
+        rhs_im = alpha_re * b_im + alpha_im * b_re
         if USE_FP64_ACC:
             rhs_re = rhs_re.to(tl.float64)
             rhs_im = rhs_im.to(tl.float64)
@@ -3784,6 +3830,7 @@ def _spsv_sell_slice_kernel_alg2(
     x_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha,
     n_rows,
     n_slices,
     SLICE_SIZE: tl.constexpr,
@@ -3811,7 +3858,7 @@ def _spsv_sell_slice_kernel_alg2(
         width = (slice_end - slice_start) // SLICE_SIZE
         row = slice_id * SLICE_SIZE + lanes
         valid_row = (lanes < SLICE_SIZE) & (row < n_rows)
-        rhs = tl.load(b_ptr + row, mask=valid_row, other=0.0)
+        rhs = alpha * tl.load(b_ptr + row, mask=valid_row, other=0.0)
         if USE_FP64_ACC:
             rhs = rhs.to(tl.float64)
             tmp_sum = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
@@ -3911,6 +3958,8 @@ def _spsv_sell_slice_kernel_alg2_complex(
     x_ri_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     n_slices,
     SLICE_SIZE: tl.constexpr,
@@ -3930,8 +3979,10 @@ def _spsv_sell_slice_kernel_alg2_complex(
         width = (slice_end - slice_start) // SLICE_SIZE
         row = slice_id * SLICE_SIZE + lanes
         valid_row = (lanes < SLICE_SIZE) & (row < n_rows)
-        rhs_re = tl.load(b_ri_ptr + row * 2, mask=valid_row, other=0.0)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1, mask=valid_row, other=0.0)
+        b_re = tl.load(b_ri_ptr + row * 2, mask=valid_row, other=0.0)
+        b_im = tl.load(b_ri_ptr + row * 2 + 1, mask=valid_row, other=0.0)
+        rhs_re = alpha_re * b_re - alpha_im * b_im
+        rhs_im = alpha_re * b_im + alpha_im * b_re
         if USE_FP64_ACC:
             rhs_re = rhs_re.to(tl.float64)
             rhs_im = rhs_im.to(tl.float64)
@@ -5302,6 +5353,9 @@ def _triton_spsv_csr_cw_vector(
         x,
         ready,
         row_counter,
+        # y solves op(A) y = x here; alpha exists for the C API's
+        # cuSPARSE-compatible signature and folds away at 1.
+        1,
         n_rows,
         LOWER=lower,
         REVERSE_ORDER=not lower,
@@ -5309,6 +5363,7 @@ def _triton_spsv_csr_cw_vector(
         USE_FP64_ACC=use_fp64_acc,
         DIAG_EPS=diag_eps,
         SERIAL_EXECUTION=serial_execution,
+        SCAN_BACKWARD=False,
     )
     return x
 
@@ -5366,6 +5421,10 @@ def _triton_spsv_csr_cw_vector_complex(
         x_ri,
         ready,
         row_counter,
+        # y solves op(A) y = x here; alpha exists for the C API's
+        # cuSPARSE-compatible signature and folds away at 1.
+        1,
+        0,
         n_rows,
         LOWER=lower,
         REVERSE_ORDER=not lower,
@@ -5373,6 +5432,7 @@ def _triton_spsv_csr_cw_vector_complex(
         USE_FP64_ACC=use_fp64,
         DIAG_EPS=diag_eps,
         SERIAL_EXECUTION=serial_execution,
+        SCAN_BACKWARD=False,
     )
     return x
 
@@ -5410,7 +5470,16 @@ def _launch_spsv_sell(
         )
         b_ri = torch.view_as_real(_as_strided_contiguous(b_vec)).reshape(-1)
         out_ri = torch.view_as_real(out).reshape(-1)
-    if alg_num == SPSV_SELL_ALG1:
+    # MUSA's persistent slice-cooperative ALG2 can lose forward progress while
+    # polling ready flags.  The same input succeeds through the scalar-row ALG1
+    # path, so keep the requested ALG2 descriptor/API but use the safe launch
+    # locally on MUSA.  CUDA and the other backends retain ALG2 unchanged.
+    effective_alg_num = (
+        SPSV_SELL_ALG1
+        if _is_mthreads_runtime() and alg_num == SPSV_SELL_ALG2
+        else alg_num
+    )
+    if effective_alg_num == SPSV_SELL_ALG1:
         worker_count = _snap_cw_worker_count(min(n_rows, 32), n_rows)
         if is_complex:
             _spsv_sell_cw_kernel_alg1_complex[(int(worker_count),)](
@@ -5421,6 +5490,10 @@ def _launch_spsv_sell(
                 out_ri,
                 ready,
                 row_counter,
+                # y solves op(A) y = x here; alpha exists for the C API's
+                # cuSPARSE-compatible signature and folds away at 1.
+                1,
+                0,
                 n_rows,
                 SLICE_SIZE=int(slice_size),
                 UNIT_DIAG=bool(unit_diagonal),
@@ -5435,6 +5508,9 @@ def _launch_spsv_sell(
                 out,
                 ready,
                 row_counter,
+                # y solves op(A) y = x here; alpha exists for the C API's
+                # cuSPARSE-compatible signature and folds away at 1.
+                1,
                 n_rows,
                 SLICE_SIZE=int(slice_size),
                 UNIT_DIAG=bool(unit_diagonal),
@@ -5459,6 +5535,10 @@ def _launch_spsv_sell(
             out_ri,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
+            0,
             n_rows,
             n_slices,
             SLICE_SIZE=int(slice_size),
@@ -5476,6 +5556,9 @@ def _launch_spsv_sell(
             out,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
             n_rows,
             n_slices,
             SLICE_SIZE=int(slice_size),
@@ -5588,7 +5671,7 @@ def _build_spsv_sell_trans_csc_metadata(
     order = torch.argsort(key, stable=True)
     source_cols = source_cols[order]
     trans_indices = source_rows[order].to(index_dtype).contiguous()
-    trans_data = values.index_select(0, entry_offsets[order]).to(compute_dtype)
+    trans_data = _gather_values(values, entry_offsets[order]).to(compute_dtype)
     if conjugate and torch.is_complex(trans_data):
         trans_data = trans_data.conj().resolve_conj()
     trans_data = trans_data.contiguous()
@@ -5757,6 +5840,10 @@ def _launch_spsv_sell_trans_csc(
             out_ri,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
+            0,
             int(n_rows),
             LOWER=False,
             REVERSE_ORDER=True,
@@ -5764,6 +5851,7 @@ def _launch_spsv_sell_trans_csc(
             USE_FP64_ACC=data.dtype == torch.complex128,
             DIAG_EPS=diag_eps,
             SERIAL_EXECUTION=serial_execution,
+            SCAN_BACKWARD=False,
             num_warps=1,
         )
     else:
@@ -5775,6 +5863,9 @@ def _launch_spsv_sell_trans_csc(
             out,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
             int(n_rows),
             LOWER=False,
             REVERSE_ORDER=True,
@@ -5782,6 +5873,7 @@ def _launch_spsv_sell_trans_csc(
             USE_FP64_ACC=data.dtype == torch.float64,
             DIAG_EPS=diag_eps,
             SERIAL_EXECUTION=serial_execution,
+            SCAN_BACKWARD=False,
             num_warps=1,
         )
     return out
@@ -6895,7 +6987,7 @@ def _coo_order_for_spsv(data, row64, col64):
         order = torch.argsort(key, stable=True)
     except TypeError:
         order = torch.argsort(key)
-    return data[order], row64[order], col64[order]
+    return _gather_values(data, order), row64[order], col64[order]
 
 
 def _coo2csr_for_spsv(data, row64, col64, n_rows, assume_ordered=False):

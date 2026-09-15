@@ -17,10 +17,16 @@ import torch
 
 from flagsparse import flagsparse_spsm_coo, flagsparse_spsm_csr
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import SPSM_N_RHS
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 
 SPSM_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -28,6 +34,13 @@ SPSM_DTYPE_IDS = ("float32", "float64", "complex64", "complex128")
 
 
 def _build_triangular_dense(n, dtype, device, lower, unit_diagonal):
+    """Dense triangular matrix on ``device``.
+
+    Tests pass ``golden_device()``: the reference is ``torch.linalg.solve_triangular``
+    and the sparse conversions below are ``to_sparse_csr``/``to_sparse_coo``, none of
+    which is dependable on MUSA.  Only the operator's inputs are copied to the
+    accelerator.  See ``accuracy_utils.golden_device()``.
+    """
     base = torch.randn(n, n, dtype=dtype, device=device) * 0.02
     base = torch.tril(base) if lower else torch.triu(base)
     eye = torch.eye(n, dtype=dtype, device=device)
@@ -49,9 +62,9 @@ def _tol(dtype):
     "unit_diagonal", [False, True], ids=["explicit_diag", "unit_diag"]
 )
 def test_spsm_csr_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
-    device = torch.device("cuda")
-    A = _build_triangular_dense(n, dtype, device, lower, unit_diagonal)
-    B = torch.randn(n, n_rhs, dtype=dtype, device=device)
+    device = accelerator_device()
+    A = _build_triangular_dense(n, dtype, golden_device(), lower, unit_diagonal)
+    B = torch.randn(n, n_rhs, dtype=dtype, device=golden_device())
     ref = torch.linalg.solve_triangular(
         A,
         B,
@@ -60,16 +73,16 @@ def test_spsm_csr_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
     )
     Acsr = A.to_sparse_csr()
     out = flagsparse_spsm_csr(
-        Acsr.values(),
-        Acsr.col_indices().to(torch.int32),
-        Acsr.crow_indices().to(torch.int32),
-        B,
+        Acsr.values().to(device),
+        Acsr.col_indices().to(torch.int32).to(device),
+        Acsr.crow_indices().to(torch.int32).to(device),
+        B.to(device),
         (n, n),
         lower=lower,
         unit_diagonal=unit_diagonal,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsm
@@ -81,9 +94,9 @@ def test_spsm_csr_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
     "unit_diagonal", [False, True], ids=["explicit_diag", "unit_diag"]
 )
 def test_spsm_coo_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
-    device = torch.device("cuda")
-    A = _build_triangular_dense(n, dtype, device, lower, unit_diagonal)
-    B = torch.randn(n, n_rhs, dtype=dtype, device=device)
+    device = accelerator_device()
+    A = _build_triangular_dense(n, dtype, golden_device(), lower, unit_diagonal)
+    B = torch.randn(n, n_rhs, dtype=dtype, device=golden_device())
     ref = torch.linalg.solve_triangular(
         A,
         B,
@@ -93,34 +106,34 @@ def test_spsm_coo_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
     Acoo = A.to_sparse_coo().coalesce()
     indices = Acoo.indices()
     out = flagsparse_spsm_coo(
-        Acoo.values(),
-        indices[0].to(torch.int32).contiguous(),
-        indices[1].to(torch.int32).contiguous(),
-        B,
+        Acoo.values().to(device),
+        indices[0].to(torch.int32).contiguous().to(device),
+        indices[1].to(torch.int32).contiguous().to(device),
+        B.to(device),
         (n, n),
         lower=lower,
         unit_diagonal=unit_diagonal,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsm
 @pytest.mark.spsm_csr
 def test_spsm_csr_rejects_unsupported_index_dtype():
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 8
     A = _build_triangular_dense(
-        n, torch.float32, device, lower=True, unit_diagonal=False
+        n, torch.float32, golden_device(), lower=True, unit_diagonal=False
     )
-    B = torch.randn(n, 4, dtype=torch.float32, device=device)
+    B = torch.randn(n, 4, dtype=torch.float32, device=golden_device())
     Acsr = A.to_sparse_csr()
     with pytest.raises(TypeError, match="indices dtype must be torch.int32"):
         flagsparse_spsm_csr(
-            Acsr.values(),
-            Acsr.col_indices().to(torch.int64),
-            Acsr.crow_indices().to(torch.int64),
-            B,
+            Acsr.values().to(device),
+            Acsr.col_indices().to(torch.int64).to(device),
+            Acsr.crow_indices().to(torch.int64).to(device),
+            B.to(device),
             (n, n),
         )
 
@@ -128,20 +141,20 @@ def test_spsm_csr_rejects_unsupported_index_dtype():
 @pytest.mark.spsm
 @pytest.mark.spsm_coo
 def test_spsm_coo_rejects_unsupported_index_dtype():
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 8
     A = _build_triangular_dense(
-        n, torch.float32, device, lower=True, unit_diagonal=False
+        n, torch.float32, golden_device(), lower=True, unit_diagonal=False
     )
-    B = torch.randn(n, 4, dtype=torch.float32, device=device)
+    B = torch.randn(n, 4, dtype=torch.float32, device=golden_device())
     Acoo = A.to_sparse_coo().coalesce()
     indices = Acoo.indices()
     with pytest.raises(TypeError, match="row/col dtype must be torch.int32"):
         flagsparse_spsm_coo(
-            Acoo.values(),
-            indices[0].to(torch.int64).contiguous(),
-            indices[1].to(torch.int64).contiguous(),
-            B,
+            Acoo.values().to(device),
+            indices[0].to(torch.int64).contiguous().to(device),
+            indices[1].to(torch.int64).contiguous().to(device),
+            B.to(device),
             (n, n),
         )
 
@@ -158,19 +171,19 @@ def test_spsm_coo_rejects_unsupported_index_dtype():
     ids=["opA_trans", "opB_trans", "col_major"],
 )
 def test_spsm_csr_rejects_unsupported_ops_and_layout(kwargs, match):
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 8
     A = _build_triangular_dense(
-        n, torch.float32, device, lower=True, unit_diagonal=False
+        n, torch.float32, golden_device(), lower=True, unit_diagonal=False
     )
-    B = torch.randn(n, 4, dtype=torch.float32, device=device)
+    B = torch.randn(n, 4, dtype=torch.float32, device=golden_device())
     Acsr = A.to_sparse_csr()
     with pytest.raises(NotImplementedError, match=match):
         flagsparse_spsm_csr(
-            Acsr.values(),
-            Acsr.col_indices().to(torch.int32),
-            Acsr.crow_indices().to(torch.int32),
-            B,
+            Acsr.values().to(device),
+            Acsr.col_indices().to(torch.int32).to(device),
+            Acsr.crow_indices().to(torch.int32).to(device),
+            B.to(device),
             (n, n),
             **kwargs,
         )
@@ -188,20 +201,20 @@ def test_spsm_csr_rejects_unsupported_ops_and_layout(kwargs, match):
     ids=["opA_trans", "opB_trans", "col_major"],
 )
 def test_spsm_coo_rejects_unsupported_ops_and_layout(kwargs, match):
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 8
     A = _build_triangular_dense(
-        n, torch.float32, device, lower=True, unit_diagonal=False
+        n, torch.float32, golden_device(), lower=True, unit_diagonal=False
     )
-    B = torch.randn(n, 4, dtype=torch.float32, device=device)
+    B = torch.randn(n, 4, dtype=torch.float32, device=golden_device())
     Acoo = A.to_sparse_coo().coalesce()
     indices = Acoo.indices()
     with pytest.raises(NotImplementedError, match=match):
         flagsparse_spsm_coo(
-            Acoo.values(),
-            indices[0].to(torch.int32).contiguous(),
-            indices[1].to(torch.int32).contiguous(),
-            B,
+            Acoo.values().to(device),
+            indices[0].to(torch.int32).contiguous().to(device),
+            indices[1].to(torch.int32).contiguous().to(device),
+            B.to(device),
             (n, n),
             **kwargs,
         )

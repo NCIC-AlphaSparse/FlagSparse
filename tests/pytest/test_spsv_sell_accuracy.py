@@ -17,6 +17,13 @@
 import pytest
 import torch
 
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    golden_device,
+)
+
 from flagsparse import (
     flagsparse_spsv_analysis_sell,
     flagsparse_spsv_create_workspace,
@@ -27,13 +34,15 @@ from tests.pytest.param_shapes import CORE_DTYPES, CORE_DTYPE_IDS, SPSV_N
 
 pytestmark = [
     pytest.mark.spsv_sell,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED),
 ]
 
 
 def _sell_matches(actual, expected, dtype):
+    """Compare on the reference's device; ``expected`` is built on CPU."""
     if actual.shape != expected.shape:
         return False
+    actual = actual.to(expected.device)
     if not bool(torch.isfinite(actual).all().item()) or not bool(
         torch.isfinite(expected).all().item()
     ):
@@ -99,10 +108,11 @@ def _lower_triangular_sell(
     for width in widths:
         offsets_host.append(offsets_host[-1] + width * slice_size)
 
-    sell_values = torch.zeros(offsets_host[-1], dtype=dtype, device=device)
-    sell_columns = torch.full(
-        (offsets_host[-1],), -1, dtype=index_dtype, device=device
-    )
+    # Assembled on CPU and copied once: the loop below writes element by element,
+    # and ``dense`` feeds torch.linalg.solve_triangular, which is not dependable on
+    # MUSA.  See ``accuracy_utils.golden_device()``.
+    sell_values = torch.zeros(offsets_host[-1], dtype=dtype)
+    sell_columns = torch.full((offsets_host[-1],), -1, dtype=index_dtype)
     for slice_id in range(n_slices):
         row0 = slice_id * slice_size
         row1 = min(row0 + slice_size, n)
@@ -114,8 +124,13 @@ def _lower_triangular_sell(
                 sell_values[offset] = value
                 sell_columns[offset] = col
 
-    offsets = torch.tensor(offsets_host, dtype=index_dtype, device=device)
-    return sell_values, sell_columns, offsets, dense.to(device)
+    offsets = torch.tensor(offsets_host, dtype=index_dtype)
+    return (
+        sell_values.to(device),
+        sell_columns.to(device),
+        offsets.to(device),
+        dense,
+    )
 
 
 def _reference_solve(dense, b, dtype, *, upper=False):
@@ -142,19 +157,20 @@ def _reference_solve(dense, b, dtype, *, upper=False):
 def test_spsv_sell_matches_dense_and_supports_inplace(
     n, dtype, index_dtype, slice_size, alg_num
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     values, columns, offsets, dense = _lower_triangular_sell(
         n, dtype, index_dtype, slice_size, device
     )
     if dtype in (torch.complex64, torch.complex128):
         real_dtype = values.real.dtype
         b = torch.complex(
-            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=device),
-            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=device),
+            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=golden_device()),
+            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=golden_device()),
         )
     else:
-        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=device)
+        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=golden_device())
     expected = _reference_solve(dense, b, dtype)
+    b = b.to(device)
 
     descr = flagsparse_spsv_analysis_sell(
         values,
@@ -193,7 +209,7 @@ def test_spsv_sell_trans_matches_dense_and_supports_inplace(
 ):
     """TRANS uses the SELL layout and solves A^T x=b accurately."""
 
-    device = torch.device("cuda")
+    device = accelerator_device()
     values, columns, offsets, dense = _lower_triangular_sell(
         n,
         dtype,
@@ -205,12 +221,13 @@ def test_spsv_sell_trans_matches_dense_and_supports_inplace(
     if dtype in (torch.complex64, torch.complex128):
         real_dtype = values.real.dtype
         b = torch.complex(
-            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=device),
-            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=device),
+            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=golden_device()),
+            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=golden_device()),
         )
     else:
-        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=device)
+        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=golden_device())
     expected = _reference_solve(dense.transpose(0, 1), b, dtype, upper=True)
+    b = b.to(device)
 
     descr = flagsparse_spsv_analysis_sell(
         values,
@@ -252,19 +269,20 @@ def test_spsv_sell_trans_matches_dense_and_supports_inplace(
 @pytest.mark.parametrize("transpose", ("T", "C"), ids=("trans", "conj"))
 @pytest.mark.parametrize("alg_num", (1, 2), ids=("scatter", "csc_gather"))
 def test_spsv_sell_conj_trans_complex(dtype, transpose, alg_num):
-    device = torch.device("cuda")
+    device = accelerator_device()
     values, columns, offsets, dense = _lower_triangular_sell(
         37, dtype, torch.int64, 8, device
     )
     real_dtype = values.real.dtype
     b = torch.complex(
-        torch.linspace(0.25, 1.25, 37, dtype=real_dtype, device=device),
-        torch.linspace(-0.5, 0.5, 37, dtype=real_dtype, device=device),
+        torch.linspace(0.25, 1.25, 37, dtype=real_dtype, device=golden_device()),
+        torch.linspace(-0.5, 0.5, 37, dtype=real_dtype, device=golden_device()),
     )
     matrix = dense.transpose(0, 1)
     if transpose == "C":
         matrix = matrix.conj()
     expected = _reference_solve(matrix, b, dtype, upper=True)
+    b = b.to(device)
     descr = flagsparse_spsv_analysis_sell(
         values,
         columns,
@@ -294,7 +312,7 @@ def test_spsv_sell_conj_trans_complex(dtype, transpose, alg_num):
 def test_spsv_sell_unit_diagonal(
     n, dtype, index_dtype, alg_num, store_diagonal
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     values, columns, offsets, dense = _lower_triangular_sell(
         n,
         dtype,
@@ -307,12 +325,13 @@ def test_spsv_sell_unit_diagonal(
     if dtype in (torch.complex64, torch.complex128):
         real_dtype = values.real.dtype
         b = torch.complex(
-            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=device),
-            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=device),
+            torch.linspace(0.25, 1.25, n, dtype=real_dtype, device=golden_device()),
+            torch.linspace(-0.5, 0.5, n, dtype=real_dtype, device=golden_device()),
         )
     else:
-        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=device)
+        b = torch.linspace(0.25, 1.25, n, dtype=dtype, device=golden_device())
     expected = _reference_solve(dense, b, dtype)
+    b = b.to(device)
 
     descr = flagsparse_spsv_analysis_sell(
         values,
@@ -346,7 +365,7 @@ def test_spsv_sell_non_unit_zero_diagonal_is_not_silently_repaired(
 ):
     """A singular NON_UNIT row must keep its IEEE non-finite solve result."""
 
-    device = torch.device("cuda")
+    device = accelerator_device()
     slice_size = 8
     values = torch.zeros(slice_size, dtype=dtype, device=device)
     columns = torch.full(
@@ -383,7 +402,7 @@ def test_spsv_sell_non_unit_zero_diagonal_is_not_silently_repaired(
     ids=("missing_diagonal", "duplicate_diagonal", "middle_padding"),
 )
 def test_spsv_sell_non_unit_rejects_malformed_structure(columns, match):
-    device = torch.device("cuda")
+    device = accelerator_device()
     values = torch.ones(len(columns), dtype=torch.float32, device=device)
     col_indices = torch.tensor(columns, dtype=torch.int32, device=device)
     offsets = torch.tensor(
@@ -408,7 +427,7 @@ def test_spsv_sell_non_unit_rejects_malformed_structure(columns, match):
 def test_spsv_sell_nonfinite_input_is_not_silently_repaired(
     dtype, alg_num, nan_in_diagonal
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     slice_size = 8
     values = torch.zeros(slice_size, dtype=dtype, device=device)
     values[0] = float("nan") if nan_in_diagonal else 1

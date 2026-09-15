@@ -17,6 +17,7 @@
 from collections import OrderedDict
 
 import ctypes
+import os
 
 from . import _common as _common_mod
 from ._common import *
@@ -1161,7 +1162,7 @@ def _coo_to_csr_sorted_unique(data, row64, col64, n_rows, n_cols):
     except TypeError:
         order = torch.argsort(key)
     key_s = key[order]
-    data_s = data[order]
+    data_s = _gather_values(data, order)
     unique_key, inverse = torch.unique_consecutive(key_s, return_inverse=True)
     out_nnz = unique_key.numel()
     data_u = torch.zeros(out_nnz, dtype=data.dtype, device=data.device)
@@ -1252,6 +1253,83 @@ def _resolve_spsm_coo_runtime(
     return data, B, n_rows, n_cols, solve_plan
 
 
+# ---------------------------------------------------------------------------
+# Ascend dispatch.
+#
+# The polling solver spins on per-row ready flags in global memory and builds its
+# hash-free row sweep out of scratchpad traffic; CANN's Triton backend does not
+# lower that shape, so on Ascend the solve falls back to a torch-only row sweep.
+# Both SpSM entry points funnel through _run_spsm_csr_core, so this is the only
+# place the choice has to be made.
+#
+# The sweep is inherently sequential -- row r needs every row it depends on --
+# so this is one small launch per row rather than one launch for the matrix. It
+# is a correctness fallback, not a fast path, and it is vectorised over the RHS
+# dimension so the cost is O(n_rows) launches rather than O(n_rows * n_rhs).
+#
+# SPSM_ASCEND_DISPATCH is public so a caller can see which route it will get,
+# and FLAGSPARSE_SPSM_ASCEND_DISPATCH forces it on any backend -- which is how
+# the fallback is tested where no NPU is attached. The body is pure torch, so it
+# runs anywhere.
+# ---------------------------------------------------------------------------
+
+
+def _spsm_ascend_row_sweep(
+    data, indices32, indptr, rhs, n_rows, *, alpha=1.0, lower=True, unit_diagonal=False
+):
+    """Solve op(A) X = alpha * rhs one row at a time, with torch ops only."""
+    rhs = rhs.contiguous()
+    x = torch.empty_like(rhs)
+    if n_rows == 0 or rhs.shape[1] == 0:
+        return x
+
+    # One host sync for the structure, then no further syncs in the loop.
+    offsets = indptr.to(torch.int64).tolist()
+    cols_all = indices32.to(torch.int64)
+    scaled = rhs if _alpha_is_one(alpha) else rhs * alpha
+
+    order = range(n_rows) if lower else range(n_rows - 1, -1, -1)
+    for row in order:
+        begin, end = offsets[row], offsets[row + 1]
+        cols = cols_all[begin:end]
+        vals = data[begin:end]
+        # The diagonal is excluded from the sum and used as the divisor; with a
+        # unit diagonal it is not stored at all, so the mask simply keeps
+        # everything on the correct side of it.
+        off_diag = (cols < row) if lower else (cols > row)
+        acc = scaled[row]
+        if bool(off_diag.any()):
+            sel = off_diag.nonzero(as_tuple=True)[0]
+            acc = acc - vals[sel] @ x[cols[sel]]
+        if unit_diagonal:
+            x[row] = acc
+        else:
+            diag_pos = (cols == row).nonzero(as_tuple=True)[0]
+            if diag_pos.numel() == 0:
+                # No stored diagonal on a NON_UNIT matrix: the Triton kernel
+                # yields zero here rather than dividing by nothing, and the
+                # fallback must not disagree with it.
+                x[row] = torch.zeros_like(acc)
+            else:
+                x[row] = acc / vals[diag_pos[0]]
+    return x
+
+
+SPSM_ASCEND_DISPATCH: dict[str, object] = {
+    "spsm_csr": _spsm_ascend_row_sweep,
+    "spsm_coo": _spsm_ascend_row_sweep,
+}
+
+
+def _use_spsm_ascend_dispatch():
+    forced = os.environ.get("FLAGSPARSE_SPSM_ASCEND_DISPATCH", "").strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    if forced in ("0", "false", "no", "off"):
+        return False
+    return _is_ascend_runtime()
+
+
 def _run_spsm_csr_core(
     data,
     indices32,
@@ -1271,6 +1349,17 @@ def _run_spsm_csr_core(
     if rhs.shape[0] != n_rows:
         raise ValueError("rhs first dim must equal n_rows")
     n_rhs = int(rhs.shape[1])
+    if _use_spsm_ascend_dispatch():
+        return SPSM_ASCEND_DISPATCH["spsm_csr"](
+            data,
+            indices32,
+            indptr,
+            rhs,
+            n_rows,
+            alpha=alpha,
+            lower=lower,
+            unit_diagonal=unit_diagonal,
+        )
     rhs_work = _prepare_spsm_rhs_work_buffer(rhs)
     if n_rows == 0 or n_rhs == 0:
         return rhs_work

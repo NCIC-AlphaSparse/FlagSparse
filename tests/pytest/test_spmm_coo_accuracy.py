@@ -17,10 +17,16 @@ import torch
 
 from flagsparse import flagsparse_spmm_coo
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import MNK_SHAPES
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 
 def _value_dtype_cases():
@@ -58,6 +64,12 @@ def _reference_dtype(dtype):
 
 
 def _random_coo_mk(M, K, dtype, device):
+    """Sparse COO matrix built on ``device``.
+
+    Callers that need a reference pass ``golden_device()``: ``_reference`` runs
+    ``torch.sparse.mm``, which has no working implementation on MUSA, and complex
+    ``randn``/masking has no muDNN kernel either.  See ``golden_device()``.
+    """
     denom = max(M * K, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
     mask = torch.rand(M, K, device=device) < p
@@ -93,24 +105,34 @@ def _reference(Asp, B, op):
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmm_coo_matches_dense_reference(M, N, K, dtype_name, dtype, index_dtype, op):
-    device = torch.device("cuda")
-    Asp = _random_coo_mk(M, K, dtype, device)
+    device = accelerator_device()
+    golden = golden_device()
+    Asp = _random_coo_mk(M, K, dtype, golden)
     indices = Asp.indices()
     data = Asp.values()
     row = indices[0].to(index_dtype).contiguous()
     col = indices[1].to(index_dtype).contiguous()
     b_rows = M if op in ("trans", "conj") else K
-    B = _random_dense((b_rows, N), dtype, device)
+    B = _random_dense((b_rows, N), dtype, golden)
     ref_dtype = _reference_dtype(dtype)
     ref = _reference(Asp.to(ref_dtype), B.to(ref_dtype), op).to(dtype)
-    out = flagsparse_spmm_coo(data, row, col, B, (M, K), op=op)
+    out = flagsparse_spmm_coo(
+        data.to(device),
+        row.to(device),
+        col.to(device),
+        B.to(device),
+        (M, K),
+        op=op,
+    )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(out.to(ref_dtype), ref.to(ref_dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(
+        out.to(device=ref.device, dtype=ref_dtype), ref.to(ref_dtype), rtol=rtol, atol=atol
+    )
 
 
 @pytest.mark.spmm_coo
 def test_spmm_coo_return_meta_times_transpose_path():
-    device = torch.device("cuda")
+    device = accelerator_device()
     data = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=device)
     row = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
     col = torch.tensor([1, 2, 0], dtype=torch.int32, device=device)
@@ -137,7 +159,7 @@ def test_spmm_coo_return_meta_times_transpose_path():
 
 @pytest.mark.spmm_coo
 def test_spmm_coo_non_meta_has_zero_symbolic_time():
-    device = torch.device("cuda")
+    device = accelerator_device()
     data = torch.tensor([1.0, 2.0], dtype=torch.float32, device=device)
     row = torch.tensor([0, 1], dtype=torch.int32, device=device)
     col = torch.tensor([0, 1], dtype=torch.int32, device=device)
@@ -150,7 +172,7 @@ def test_spmm_coo_non_meta_has_zero_symbolic_time():
 
 @pytest.mark.spmm_coo
 def test_spmm_coo_rejects_invalid_ops_and_shapes():
-    device = torch.device("cuda")
+    device = accelerator_device()
     data = torch.tensor([1.0, 2.0], dtype=torch.float32, device=device)
     row = torch.tensor([0, 1], dtype=torch.int32, device=device)
     col = torch.tensor([0, 1], dtype=torch.int32, device=device)

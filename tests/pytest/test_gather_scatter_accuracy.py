@@ -18,13 +18,20 @@ import torch
 from flagsparse import flagsparse_gather, flagsparse_scatter
 from flagsparse.sparse_operations import gather_scatter as gather_scatter_ops
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    _accel_supports_bf16,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import (
     GATHER_SCATTER_FLOAT_DTYPES,
     GATHER_SCATTER_SHAPES,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 INDEX_DTYPES = [torch.int32, torch.int64]
 INDEX_DTYPE_IDS = ["int32", "int64"]
 RESET_OUTPUT_CASES = [True, False]
@@ -59,7 +66,7 @@ def _skip_unavailable_dtype(dtype_name, dtype):
     if dtype is None:
         pytest.skip(f"{dtype_name} dtype is unavailable in this torch build")
     if dtype == torch.bfloat16 and not (
-        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        accelerator_available() and _accel_supports_bf16()
     ):
         pytest.skip("bfloat16 not supported on this GPU")
 
@@ -84,29 +91,34 @@ def _build_random_values(size, dtype, device):
 @pytest.mark.parametrize("index_dtype", INDEX_DTYPES, ids=INDEX_DTYPE_IDS)
 def test_gather_matches_indexing(dense_size, nnz, dtype_name, dtype, index_dtype):
     _skip_unavailable_dtype(dtype_name, dtype)
-    device = torch.device("cuda")
+    device = accelerator_device()
+    golden = golden_device()
     nnz = min(nnz, dense_size)
-    dense = _build_random_values(dense_size, dtype, device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
+    # Reference on CPU: the indexing it is built from is the very thing MUSA has no
+    # complex kernel for ("IndexMusa" not implemented for 'ComplexFloat'), which is
+    # also why the operator needed _common._gather_values.
+    dense = _build_random_values(dense_size, dtype, golden)
+    indices = torch.randperm(dense_size, device=golden)[:nnz].to(index_dtype)
     ref = dense[indices.to(torch.int64)]
-    got = flagsparse_gather(dense, indices)
-    assert torch.equal(ref, got)
+    got = flagsparse_gather(dense.to(device), indices.to(device))
+    assert torch.equal(ref, got.to(ref.device))
 
 
 @pytest.mark.gather
 @pytest.mark.parametrize("index_dtype", INDEX_DTYPES, ids=INDEX_DTYPE_IDS)
 def test_gather_complex128_matches_indexing(index_dtype):
-    device = torch.device("cuda")
+    device = accelerator_device()
+    golden = golden_device()
     dense_size = 4096
     nnz = 1024
-    real = torch.randn(dense_size, dtype=torch.float64, device=device)
-    imag = torch.randn(dense_size, dtype=torch.float64, device=device)
+    real = torch.randn(dense_size, dtype=torch.float64, device=golden)
+    imag = torch.randn(dense_size, dtype=torch.float64, device=golden)
     dense = torch.complex(real, imag)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
+    indices = torch.randperm(dense_size, device=golden)[:nnz].to(index_dtype)
     ref = dense.index_select(0, indices.to(torch.int64))
-    got = flagsparse_gather(dense, indices)
+    got = flagsparse_gather(dense.to(device), indices.to(device))
     rtol, atol = close_tolerances(torch.complex128)
-    assert torch.allclose(got, ref, atol=atol, rtol=rtol)
+    assert torch.allclose(got.to(ref.device), ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.scatter
@@ -118,36 +130,41 @@ def test_scatter_matches_index_copy(
     dense_size, nnz, dtype_name, dtype, index_dtype, reset_output
 ):
     _skip_unavailable_dtype(dtype_name, dtype)
-    device = torch.device("cuda")
+    device = accelerator_device()
+    golden = golden_device()
     nnz = min(nnz, dense_size)
-    vals = _build_random_values(nnz, dtype, device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
-    dense_ref = _build_random_values(dense_size, dtype, device)
-    dense = dense_ref.clone()
+    # index_copy_ is the CPU-side reference for the same reason gather's is.
+    vals = _build_random_values(nnz, dtype, golden)
+    indices = torch.randperm(dense_size, device=golden)[:nnz].to(index_dtype)
+    dense_ref = _build_random_values(dense_size, dtype, golden)
+    dense = dense_ref.clone().to(device)
     if reset_output:
         dense_ref.zero_()
     dense_ref.index_copy_(0, indices.to(torch.int64), vals)
     flagsparse_scatter(
         dense,
-        indices,
-        vals,
+        indices.to(device),
+        vals.to(device),
         reset_output=reset_output,
         dtype_policy="auto",
     )
-    assert torch.equal(dense, dense_ref)
+    assert torch.equal(dense.to(dense_ref.device), dense_ref)
 
 
 @pytest.mark.scatter
 def test_scatter_int64_auto_fallback_to_int32(monkeypatch):
-    device = torch.device("cuda")
+    device = accelerator_device()
     dense_size = 257
     nnz = 129
-    vals = torch.randn(nnz, dtype=torch.float32, device=device)
-    indices = torch.randperm(dense_size, device=device)[:nnz].to(torch.int64)
-    dense = torch.randn(dense_size, dtype=torch.float32, device=device)
-    dense_ref = dense.clone()
+    golden = golden_device()
+    vals = torch.randn(nnz, dtype=torch.float32, device=golden)
+    indices = torch.randperm(dense_size, device=golden)[:nnz].to(torch.int64)
+    dense_ref = torch.randn(dense_size, dtype=torch.float32, device=golden)
+    dense = dense_ref.clone().to(device)
     dense_ref.zero_()
     dense_ref.index_copy_(0, indices.to(torch.int64), vals)
+    indices = indices.to(device)
+    vals = vals.to(device)
 
     original_launch = gather_scatter_ops._launch_triton_scatter_kernel
     state = {"forced_once": False}
@@ -177,12 +194,12 @@ def test_scatter_int64_auto_fallback_to_int32(monkeypatch):
         index_fallback_policy="auto",
     )
     assert state["forced_once"]
-    assert torch.equal(dense, dense_ref)
+    assert torch.equal(dense.to(dense_ref.device), dense_ref)
 
 
 @pytest.mark.scatter
 def test_scatter_int64_strict_no_fallback(monkeypatch):
-    device = torch.device("cuda")
+    device = accelerator_device()
     dense_size = 257
     nnz = 129
     vals = torch.randn(nnz, dtype=torch.float32, device=device)

@@ -417,19 +417,114 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
 }
 
 
-# Ascend uses the dedicated NPU benchmark instead of the CUDA-oriented per-operator
+# Ascend uses its own entry points instead of the CUDA-oriented per-operator
 # scripts.  Selected only when FLAGSPARSE_BACKEND=ascend; every other backend keeps
 # PERFORMANCE_COMMANDS untouched.
-ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
-    op: (
-        "benchmark/benchmark_ascend.py",
+#
+# Two of them, and the split is deliberate:
+#
+#   benchmark_ascend.py        measures against a torch-npu baseline, and only
+#                              these five operators have one.  Where a baseline
+#                              exists, a measured speedup beats a bare timing.
+#   benchmark_ascend_probe.py  runs every other operator over the 20-matrix
+#                              spread and classifies the outcome -- PASS,
+#                              REJECTED, TRITON_COMPILE, MISMATCH, ERROR.  On a
+#                              backend where kernels may not lower at all, "did
+#                              it run, and if not why" is the measurement that
+#                              matters, and the previous mapping simply had no
+#                              entry for these operators: every one of them came
+#                              back as "no performance command mapping", which
+#                              reads the same as a pass.
+# ---------------------------------------------------------------------------
+# Backend registry, read from the library rather than restated here.
+#
+# The harness has to run on CUDA and on every domestic accelerator, and the list
+# of those is the library's business, not the runner's.  Importing it means a
+# platform added to flagsparse reaches the accuracy and performance phases
+# without a second edit here -- and, more to the point, cannot silently disagree
+# with what the operators themselves detect.
+#
+# The fallback list exists so the runner still works against a checkout whose
+# library predates the registry; it is deliberately the same order.
+# ---------------------------------------------------------------------------
+def _load_backend_names() -> tuple[str, ...]:
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+        from flagsparse.sparse_operations._common import backend_specs
+
+        return tuple(spec.name for spec in backend_specs())
+    except Exception:
+        return ("cuda", "rocm", "metax", "mthreads", "ascend", "xpu", "gcu", "mlu")
+
+
+SUPPORTED_BACKENDS: tuple[str, ...] = _load_backend_names()
+
+# Backends whose operators go through the generic CUDA-oriented per-operator
+# benchmark scripts.  A backend absent from here needs its own entry below --
+# and the point of listing them is that "not yet wired up" becomes visible
+# instead of arriving as an empty result.
+GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metax", "mthreads")
+
+# Backends with no per-operator benchmark of their own yet.  They fall back to
+# the capability probe, which reports PASS / REJECTED / TRITON_COMPILE per
+# operator -- on a platform where a kernel may not lower at all, that is the
+# measurement that matters, and it beats reporting nothing.
+PROBE_ONLY_BACKENDS: tuple[str, ...] = ("xpu", "gcu", "mlu")
+
+
+ASCEND_BASELINE_OPS: tuple[str, ...] = (
+    "gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr",
+)
+
+ASCEND_PROBE_OPS: tuple[str, ...] = (
+    "spmv_coo", "spmv_csc", "spmv_bsr", "spmv_coo_tocsr",
+    "spmm_coo", "spmm_csc", "spmm_bsr", "spmm_bell",
+    "spmm_csr_opt", "spmm_csr_opt_alg1", "spmm_csr_opt_alg2", "alpha_spmm_alg1",
+    "spgemm_csr",
+    "spsv_csr", "spsv_coo", "spsv_sell",
+    "spsm_csr", "spsm_coo",
+)
+
+# Every operator, routed to the capability probe. Used by any backend that has
+# no per-operator benchmark of its own; the probe itself is backend-neutral and
+# resolves the device from the same registry.
+PROBE_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {}
+
+
+def _probe_command(op: str) -> tuple[str, ...]:
+    return (
+        "benchmark/benchmark_ascend_probe.py",
         "--op", "{op}",
         "--device", "{device}",
         "--csv-summary", "{csv}",
         "--warmup", "{warmup}",
         "--iters", "{iters}",
     )
-    for op in ("gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr")
+
+
+ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
+    **{
+        op: (
+            "benchmark/benchmark_ascend.py",
+            "--op", "{op}",
+            "--device", "{device}",
+            "--csv-summary", "{csv}",
+            "--warmup", "{warmup}",
+            "--iters", "{iters}",
+        )
+        for op in ASCEND_BASELINE_OPS
+    },
+    **{
+        op: (
+            "benchmark/benchmark_ascend_probe.py",
+            "--op", "{op}",
+            "--device", "{device}",
+            "--csv-summary", "{csv}",
+            "--warmup", "{warmup}",
+            "--iters", "{iters}",
+        )
+        for op in ASCEND_PROBE_OPS
+    },
 }
 
 
@@ -1335,6 +1430,11 @@ def _resolve_path(project_root: Path, value: str | None) -> Path | None:
     return path
 
 
+# Operators whose sweep is run one matrix per subprocess, so a single hung matrix is
+# skippable instead of killing the whole operator's results.
+PER_MATRIX_PERFORMANCE_OPS = frozenset({"spmm_bell"})
+
+
 def parse_op_benchmark_args(values: list[str]) -> dict[str, list[str]]:
     """Parse repeatable ``OP=ARGS`` performance-script argument overrides."""
     parsed: dict[str, list[str]] = {}
@@ -1878,10 +1978,49 @@ def run_performance(
     extra_args: list[str],
     timeout: int,
 ) -> dict[str, object]:
-    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
+    backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    if backend == "ascend":
+        # Every operator has an Ascend entry now, so a missing one is a real gap
+        # in the table rather than an operator that quietly gets skipped.
         template = ASCEND_PERFORMANCE_COMMANDS.get(op)
+        if template is None:
+            return _not_configured(
+                op, "performance",
+                "no Ascend performance/probe command mapping for this operator",
+            )
+    elif backend in PROBE_ONLY_BACKENDS:
+        # These platforms have no per-operator benchmark yet. Running the probe
+        # reports which operators work and why the rest do not, which is a real
+        # result; the alternative was an empty performance phase that reads the
+        # same as a pass.
+        template = _probe_command(op)
+    elif backend and backend not in GENERIC_BENCHMARK_BACKENDS:
+        return _not_configured(
+            op, "performance",
+            f"backend {backend!r} is in the registry but has no performance "
+            "routing yet: add it to GENERIC_BENCHMARK_BACKENDS or "
+            "PROBE_ONLY_BACKENDS",
+        )
     if not template:
         return _not_configured(op, "performance", "no performance command mapping")
+
+    if (
+        op in PER_MATRIX_PERFORMANCE_OPS
+        and benchmark_input is not None
+        and benchmark_input.is_dir()
+    ):
+        return _run_bell_per_matrix(
+            project_root=project_root,
+            op=op,
+            gpu_id=gpu_id,
+            template=template,
+            op_dir=op_dir,
+            benchmark_input=benchmark_input,
+            warmup=warmup,
+            iters=iters,
+            extra_args=extra_args,
+            timeout=timeout,
+        )
 
     result_path = op_dir / "performance_result.json"
     if result_path.exists():
@@ -1960,6 +2099,138 @@ def run_performance(
             result["data_file"] = str(result_path.relative_to(op_dir.parent))
         except Exception as exc:
             result["csv_parse_error"] = str(exc)
+    return result
+
+
+def _run_bell_per_matrix(
+    *,
+    project_root: Path,
+    op: str,
+    gpu_id: int,
+    template: tuple[str, ...],
+    op_dir: Path,
+    benchmark_input: Path,
+    warmup: int,
+    iters: int,
+    extra_args: list[str],
+    timeout: int,
+) -> dict[str, object]:
+    """Run BELL matrices in isolated processes so one hung case is skippable."""
+
+    result_path = op_dir / "performance_result.json"
+    case_dir = op_dir / "bell_cases"
+    ensure_dir(case_dir)
+    matrix_paths = sorted(benchmark_input.glob("*.mtx"))
+    if not matrix_paths:
+        return _not_configured(op, "performance", "no .mtx files found")
+
+    all_rows: list[dict[str, str]] = []
+    fieldnames: list[str] = []
+    commands: list[list[str]] = []
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    timed_out_matrices: list[str] = []
+    failed_matrices: list[str] = []
+    total_duration = 0.0
+
+    for index, matrix_path in enumerate(matrix_paths):
+        matrix_dir = case_dir / f"{index:04d}_{matrix_path.stem}"
+        ensure_dir(matrix_dir)
+        cmd, csv_path = render_performance_command(
+            template,
+            project_root=project_root,
+            op_dir=matrix_dir,
+            benchmark_input=matrix_path,
+            warmup=warmup,
+            iters=iters,
+            op=op,
+            device=gpu_id,
+            extra_args=extra_args,
+        )
+        commands.append(cmd)
+        returncode, stdout, stderr, duration, timed_out = run_subprocess(
+            cmd,
+            project_root=project_root,
+            env=_base_env(project_root, gpu_id),
+            timeout=timeout,
+        )
+        total_duration += duration
+        stdout_parts.append(f"===== {matrix_path.name} =====\n{stdout}")
+        stderr_parts.append(f"===== {matrix_path.name} =====\n{stderr}")
+        if timed_out:
+            timed_out_matrices.append(matrix_path.name)
+            continue
+        if returncode != 0:
+            failed_matrices.append(matrix_path.name)
+            continue
+        if not csv_path.exists():
+            failed_matrices.append(matrix_path.name)
+            continue
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames:
+                for field in reader.fieldnames:
+                    if field not in fieldnames:
+                        fieldnames.append(field)
+            all_rows.extend(reader)
+
+    csv_path = op_dir / "performance.csv"
+    if fieldnames:
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+    stdout = "\n".join(stdout_parts)
+    stderr = "\n".join(stderr_parts)
+    stdout_path = op_dir / "performance_stdout.log"
+    stderr_path = op_dir / "performance_stderr.log"
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
+
+    if timed_out_matrices:
+        status = "TIMEOUT"
+    elif failed_matrices:
+        status = "FAIL"
+    elif not csv_path.exists():
+        status = "NO_TESTS"
+    else:
+        status = "PASS"
+    result: dict[str, object] = {
+        "operator": op,
+        "phase": "performance",
+        "configured": True,
+        "status": status,
+        "returncode": TIMEOUT_RETURN_CODE if timed_out_matrices else (1 if failed_matrices else 0),
+        "exit_code": TIMEOUT_RETURN_CODE if timed_out_matrices else (1 if failed_matrices else 0),
+        "duration_sec": total_duration,
+        "duration": total_duration,
+        "command": commands[0] if commands else [],
+        "commands": commands,
+        "stdout_log_path": str(stdout_path),
+        "stderr_log_path": str(stderr_path),
+        "log_path": str(stdout_path),
+        "data_path": str(csv_path) if csv_path.exists() else None,
+        "timed_out_matrices": timed_out_matrices,
+        "failed_matrices": failed_matrices,
+        "matrix_count": len(matrix_paths),
+        "completed_matrix_count": len(matrix_paths) - len(timed_out_matrices) - len(failed_matrices),
+    }
+    if csv_path.exists():
+        # Each timed-out matrix ran in its own process, so rows from completed
+        # matrices are already independent and must not be filtered by the
+        # aggregate stdout's last matrix name.
+        rows = all_rows
+        filter_metadata = {
+            "excluded_row_count": 0,
+            "excluded_matrix_keys": [],
+        }
+        write_benchmark_json_from_csv(op, csv_path, result_path, rows=rows)
+        result.update(summarize_performance_csv(csv_path, rows=rows, **filter_metadata))
+        parsed = parse_performance_json(op, result_path)
+        result.update(parsed)
+        result["status"] = status
+        result["data_file"] = str(result_path.relative_to(op_dir.parent))
     return result
 
 

@@ -18,11 +18,17 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmv_csc, prepare_spmv_csc
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 spmv_csc_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csc")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 
 def _value_dtype_cases():
@@ -60,15 +66,16 @@ def _reference_dtype(dtype):
 
 
 def _random_csc_mn(M, N, dtype, index_dtype, device):
+    golden = golden_device()
     denom = max(M * N, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
-    mask = torch.rand(M, N, device=device) < p
+    mask = torch.rand(M, N, device=golden) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
     dense = torch.where(
         mask,
-        _random_values((M, N), dtype, device),
-        torch.zeros((), dtype=dtype, device=device),
+        _random_values((M, N), dtype, golden),
+        torch.zeros((), dtype=dtype, device=golden),
     )
     rows, cols = torch.nonzero(mask, as_tuple=True)
     order = torch.argsort(cols * max(1, M) + rows)
@@ -76,9 +83,14 @@ def _random_csc_mn(M, N, dtype, index_dtype, device):
     cols = cols[order]
     data = dense[rows, cols].contiguous()
     col_counts = torch.bincount(cols, minlength=N)
-    indptr = torch.zeros(N + 1, dtype=torch.int64, device=device)
+    indptr = torch.zeros(N + 1, dtype=torch.int64, device=golden)
     indptr[1:] = torch.cumsum(col_counts, dim=0)
-    return data, rows.to(index_dtype).contiguous(), indptr.to(index_dtype), dense
+    return (
+        data.to(device),
+        rows.to(index_dtype).contiguous().to(device),
+        indptr.to(index_dtype).to(device),
+        dense,
+    )
 
 
 def _make_x(length, dtype, device):
@@ -99,11 +111,26 @@ def _apply_dense_op(dense, op):
     raise ValueError(f"unsupported op: {op}")
 
 
+def _tol(dtype):
+    # Same policy as test_spmv_csr_accuracy: fp32 and complex64 accumulate in
+    # fp32-precision components and carry ordinary order-dependent fp32 SpMV error.
+    # The golden reference now runs on CPU in fp64, so it no longer happens to share
+    # the kernel's summation order -- a 1.3e-6 tolerance turned that into a flake at
+    # 160x1024. fp64 and complex128 accumulate in fp64 and keep the strict tolerance.
+    if dtype in (torch.float32, torch.float16, torch.bfloat16, torch.complex64):
+        return 1e-3, 1e-3
+    return close_tolerances(dtype)
+
+
 def _assert_close(actual, expected, dtype):
-    rtol, atol = close_tolerances(dtype)
+    rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
+    golden = golden_device()
     assert torch.allclose(
-        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+        actual.to(device=golden, dtype=ref_dtype),
+        expected.to(device=golden, dtype=ref_dtype),
+        rtol=rtol,
+        atol=atol,
     )
 
 
@@ -117,10 +144,10 @@ def _assert_close(actual, expected, dtype):
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_csc_matches_dense_reference(M, N, name, dtype, index_dtype, op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, dense = _random_csc_mn(M, N, dtype, index_dtype, device)
     x_len = M if _op_transposes(op) else N
-    x = _make_x(x_len, dtype, device)
+    x = _make_x(x_len, dtype, golden_device())
     ref_dtype = _reference_dtype(dtype)
     ref = (_apply_dense_op(dense, op).to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
 
@@ -128,7 +155,7 @@ def test_spmv_csc_matches_dense_reference(M, N, name, dtype, index_dtype, op):
         data,
         indices,
         indptr,
-        x,
+        x.to(device),
         shape=(M, N),
         op=op,
         index_fallback_policy="auto",
@@ -139,52 +166,53 @@ def test_spmv_csc_matches_dense_reference(M, N, name, dtype, index_dtype, op):
 @pytest.mark.spmv_csc
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_csc_prepared_path_matches_dense_reference(op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, N = 8, 10
     dtype = torch.complex64
     data, indices, indptr, dense = _random_csc_mn(M, N, dtype, torch.int32, device)
     prepared = prepare_spmv_csc(data, indices, indptr, (M, N), op=op)
     x_len = M if _op_transposes(op) else N
-    x = _make_x(x_len, dtype, device)
+    x = _make_x(x_len, dtype, golden_device())
     ref_dtype = _reference_dtype(dtype)
     ref = (_apply_dense_op(dense, op).to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
 
-    out = flagsparse_spmv_csc(x=x, prepared=prepared)
+    out = flagsparse_spmv_csc(x=x.to(device), prepared=prepared)
     _assert_close(out, ref, dtype)
 
 
 @pytest.mark.spmv_csc
 def test_spmv_csc_prepared_transpose_mismatch_rejected():
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, _dense = _random_csc_mn(
         8, 10, torch.float32, torch.int32, device
     )
     prepared = prepare_spmv_csc(data, indices, indptr, (8, 10), transpose=True)
-    x = torch.randn(10, dtype=torch.float32, device=device)
+    x = torch.randn(10, dtype=torch.float32, device=golden_device()).to(device)
     with pytest.raises(ValueError, match="does not match prepared.transpose"):
         flagsparse_spmv_csc(x=x, prepared=prepared, transpose=False)
 
 
 @pytest.mark.spmv_csc
 def test_spmv_csc_prepared_op_mismatch_rejected():
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, _dense = _random_csc_mn(
         8, 10, torch.complex64, torch.int32, device
     )
     prepared = prepare_spmv_csc(data, indices, indptr, (8, 10), op="conj")
-    x = _make_x(8, torch.complex64, device)
+    x = _make_x(8, torch.complex64, golden_device()).to(device)
     with pytest.raises(ValueError, match="does not match prepared.op"):
         flagsparse_spmv_csc(x=x, prepared=prepared, op="trans")
 
 
 @pytest.mark.spmv_csc
 def test_spmv_csc_int64_auto_fallback_to_int32(monkeypatch):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, dense = _random_csc_mn(
         12, 9, torch.float32, torch.int64, device
     )
-    x = torch.randn(9, dtype=torch.float32, device=device)
+    x = torch.randn(9, dtype=torch.float32, device=golden_device())
     ref = dense.to(torch.float64) @ x.to(torch.float64)
+    x = x.to(device)
     state = {"forced_once": False}
     original = spmv_csc_mod._triton_spmv_csc_kernel
 
@@ -209,11 +237,11 @@ def test_spmv_csc_int64_auto_fallback_to_int32(monkeypatch):
 
 @pytest.mark.spmv_csc
 def test_spmv_csc_int64_strict_no_fallback(monkeypatch):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, _dense = _random_csc_mn(
         12, 9, torch.float32, torch.int64, device
     )
-    x = torch.randn(9, dtype=torch.float32, device=device)
+    x = torch.randn(9, dtype=torch.float32, device=golden_device()).to(device)
     original = spmv_csc_mod._triton_spmv_csc_kernel
 
     def fail_int64(prepared, x_in, op_code):

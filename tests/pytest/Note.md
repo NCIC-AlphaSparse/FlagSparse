@@ -44,7 +44,9 @@ pytest tests/pytest --mode quick -m "spmv_csr or spmm_csr"
 
 ### 数据构造
 
-所有参数化正确性用例都在 `torch.device("cuda")` 上构造合成数据，不依赖 `.mtx`、ODPS 或外部矩阵文件。
+所有参数化正确性用例都构造合成数据，不依赖 `.mtx`、ODPS 或外部矩阵文件。
+
+设备分两层，不要混：**输入张量**在 `accuracy_utils.accelerator_device()` 上（CUDA/ROCm/MACA 为 `cuda`，摩尔线程为 `musa`，Ascend 为 `npu`）；**数据生成和 golden reference** 在 `accuracy_utils.golden_device()` 上，恒为 CPU。后者不是风格偏好——参考值算在加速器上等于在测厂商的稠密库：摩尔线程的 muDNN 没有 fp64/复数的 `where`、没有复数 `sum`、没有 fp64/复数的 2-D×1-D matmul，`torch.sparse` 没有可用的 matmul，advanced indexing 没有复数内核。详见 `docs/MUSA_TESTING.md` §4.5。
 
 - Gather/Scatter：使用 `GATHER_SCATTER_SHAPES` 和 `GATHER_SCATTER_FLOAT_DTYPES`，参考分别为 PyTorch indexing 与 `index_copy_`。
 - CSR/COO SpMV：使用合成稀疏矩阵，参考为 `torch.sparse.mm`。
@@ -90,7 +92,9 @@ When adding or changing an operator test entry, keep the minimum loop complete: 
 
 ### Data Construction
 
-All parametrized accuracy tests build synthetic tensors on `torch.device("cuda")`; they do not read `.mtx`, ODPS, or external matrix files.
+All parametrized accuracy tests build synthetic tensors; they do not read `.mtx`, ODPS, or external matrix files.
+
+Two devices are in play and must not be conflated: **operator inputs** live on `accuracy_utils.accelerator_device()` (`cuda` for CUDA/ROCm/MACA, `musa` for Moore Threads, `npu` for Ascend), while **data generation and the golden reference** live on `accuracy_utils.golden_device()`, which is always CPU. The latter is not a stylistic choice: a reference evaluated on the accelerator tests the vendor's dense library instead of FlagSparse. On Moore Threads, muDNN has no `where` for float64/complex, no complex `sum`, no 2-D-by-1-D matmul for float64/complex, `torch.sparse` has no working matmul, and advanced indexing has no complex kernel. See `docs/MUSA_TESTING.md` §4.5.
 
 - Gather/Scatter use `GATHER_SCATTER_SHAPES` and `GATHER_SCATTER_FLOAT_DTYPES`; references are PyTorch indexing and `index_copy_`.
 - CSR/COO SpMV use synthetic sparse matrices; references use `torch.sparse.mm`.

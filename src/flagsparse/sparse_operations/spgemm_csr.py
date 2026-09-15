@@ -1139,7 +1139,14 @@ def _spgemm_hash_hybrid_compute(prepared):
 
 def _spgemm_compute(prepared):
     """Dispatch: hybrid hash when worthwhile, otherwise memory-safe ESC."""
-    if _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
+    # The MUSA backend can compile and launch the TLE hash kernels, but the
+    # completion/synchronization of their shared-memory CAS path wedges on MTT
+    # S5000 for ordinary random CSR inputs.  The capability probes for the
+    # individual CAS and cross-lane while primitives pass, so keep this guard
+    # local to the algorithm and use the globally synchronized ESC path on MUSA.
+    # CUDA and other backends retain the optimized TLE route.
+    tle_hash_safe = not _is_mthreads_runtime()
+    if tle_hash_safe and _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
         try:
             result = _spgemm_hash_hybrid_compute(prepared)
         except (triton.runtime.errors.OutOfResources, _accel_oom_error()):
@@ -1311,7 +1318,7 @@ def _csr_to_sorted_pairs(data, indices, indptr, n_cols):
     if keys.numel() == 0:
         return keys, data
     order = torch.argsort(keys)
-    return keys[order], data[order]
+    return keys[order], _gather_values(data, order)
 
 
 def _spgemm_pairwise_summary(candidate, reference, value_dtype):
