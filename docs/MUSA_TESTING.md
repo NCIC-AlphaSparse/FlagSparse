@@ -85,6 +85,16 @@ PY
 **期望输出**：`backend = mthreads`、`accel device type = musa`、
 `vendor sparse lib = torch`、`fallback reason = None`。
 
+已在摩尔线程真机确认（torch 2.7.1 / torch_musa 2.7.1，1 张卡）：
+
+```
+backend            : mthreads
+is_mthreads_runtime: True
+accel device type  : musa
+vendor sparse lib  : torch
+fallback reason    : None
+```
+
 如果 `fallback reason` 出现下面这句，说明 `torch_musa` 没装好：
 
 ```
@@ -99,17 +109,30 @@ falling back to torch.cuda
 
 ## 3. 性能基线
 
-MUSA 上的基线是 **PyTorch（`torch.sparse`）**，不是厂商稀疏库。原因写在
-`_mthreads_vendor_sparse_library()` 的 docstring 里：muSPARSE 目前没有接好 Python
-binding，而 `torch.sparse` 在 MUSA 上能跑且能给出真实参照。
+MUSA 上**默认没有厂商基线**（`_mthreads_vendor_sparse_library()` 返回 `None`），
+厂商列报 `N/A` 并给出原因，FlagSparse 自己的耗时照常采集。
+
+这一点在 2026-09-11 改过。此前默认是 `torch`，依据是"`torch.sparse` 在 MUSA 上能跑
+且能给出真实参照"——**这句话在 MTT S5000 上实测为假**（torch 2.7.1 / torch_musa 2.7.1）：
+
+```
+CSR: NotImplementedError: Could not run 'aten::empty.memory_format'
+     with arguments from the 'SparseCsrmusa' backend
+COO: NotImplementedError: Could not run 'aten::addmm'
+     with arguments from the 'Sparsemusa' backend
+```
+
+**四个 dtype 全挂，float32 也挂**，与 dtype 无关。注意 `torch.sparse_csr_tensor()`
+**构造是成功的**，只有乘法缺失——这正是这个缺口能通过 review 的原因，光看"能不能建出
+稀疏张量"是看不出来的。
 
 可以用 `FLAGSPARSE_MTHREADS_VENDOR` 覆盖：
 
 | 取值 | 含义 |
 |---|---|
-| `torch` | 默认，用 `torch.sparse` 作基线 |
+| `none` | 默认。不使用厂商基线，相关列为 `N/A` |
+| `torch` | 用 `torch.sparse` 作基线——**当前真机上会报错**，保留是为了将来 torch_musa 补齐算子后可以用实测把默认翻回去，而不是靠假设 |
 | `musparse` | 声明使用 muSPARSE **【待验证】**——仓库里没有对应的 binding 实现，设置后能否真正生效需要在真机确认 |
-| `none` | 不使用任何厂商基线，相关列为 `N/A` |
 
 其他取值会抛 `ValueError`。
 
@@ -150,6 +173,94 @@ python tests/test_spmm.py <目录/> --csv out.csv
 **算子清单和超时值需要在真机上按实际情况调整【待验证】。** 参考 MetaX 的经验：
 C550 上 SpSV/SpSM 的内核会卡住、SpMM BELL 单矩阵耗时过长，都从默认清单里排除了。
 MUSA 上哪些算子需要同样处理，只能实测后确定。
+
+### pytest 精度套件（tests/pytest）
+
+这套用例原本对 CUDA 是硬编码的，在 MUSA 上会连续踩两个坑，**两个都已经修好**，
+但都是"在 CUDA 机器上看不出来"的那一类，所以记在这里：
+
+1. **全部 skip。** 每个文件顶上是
+   `pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), ...)`。
+   MUSA 上 `torch.cuda.is_available()` 为假，于是 2056 个用例全部静默跳过，
+   输出只有 `341 skipped`，看起来像"跑过了"。
+   现在换成 `accuracy_utils.accelerator_available()`，它探 `_ACCEL.is_available()`。
+
+2. **全部 fail。** 守卫放行之后，用例体里的 `torch.device("cuda")` 会抛
+   `NotImplementedError: Could not run 'aten::empty.memory_format' with arguments
+   from the 'CUDA' backend`。148 处设备字面量现在统一走
+   `accuracy_utils.accelerator_device()` / `ACCELERATOR_DEVICE_TYPE`，取自
+   `_common._ACCEL_DEVICE_TYPE`。
+
+3. **参考计算本身跑在加速器上。** 前两个坑填完之后，`test_spmv_csr_accuracy.py`
+   仍然 74 failed / 3 passed，而且**一个都没进到 FlagSparse 内核**——全死在测试自己的
+   数据生成和 dense 参考上：`_random_csr_mn` 的 `torch.where`（fp64/复数无 muDNN 内核）、
+   以及 `ref_mat.to(ref_dtype) @ x.to(ref_dtype)`（`_reference_dtype` 把 fp32 升到 fp64，
+   撞上上面那个 gemv 缺口）。
+   现在数据生成和 golden reference 统一走 `accuracy_utils.golden_device()`（恒为 CPU），
+   只有真正交给算子的张量才 `.to(accelerator_device())`。这本来就是 `accuracy_utils`
+   模块 docstring 写的 policy（"compare against a CPU float64 golden reference"），
+   只是这些文件没照做。
+
+三处在 CUDA/ROCm/MACA 上都是恒等变换（`_ACCEL is torch.cuda`、
+`_ACCEL_DEVICE_TYPE == "cuda"`；CPU 上的 fp64 oracle 只会比设备端更准），
+所以对其他后端零影响。
+
+```bash
+python -m pytest tests/pytest -q      # MUSA 上应当真的跑起来，不再是 skipped
+```
+
+> 已知 flaky（与 MUSA 无关，CUDA 上同样复现）：`test_spmv_csc_matches_dense_reference`
+> 的 `float32-160-1024` 参数、`test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct[csr_cw_levelschd]`、
+> `test_spsv_sell_non_unit_rejects_malformed_structure[duplicate_diagonal]`。
+> 随机输入未固定种子，单跑会过。
+
+## 4.5 实测能力矩阵（MTT S5000，2026-09-11）
+
+用 `tools/probe_accel_capabilities.py` 在真机上逐层测出来的。这张表的用处是**在读任何
+失败之前先知道它属于哪一层**——之前 `tests/pytest/test_spmv_csr_accuracy.py` 的 74 个
+失败全部发生在测试自己的参考计算里，一个都没进到 FlagSparse 内核。
+
+```bash
+export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads
+python tools/probe_accel_capabilities.py --json musa_caps.json
+```
+
+环境：torch 2.7.1 / torch_musa 2.7.1 / Triton 3.6.0 / muDNN v3105 / MTT S5000 ×1。
+
+| | fp32 | fp64 | c64 | c128 |
+|---|---|---|---|---|
+| 分配、H2D/D2H、`torch.complex` 构造 | ok | ok | ok | ok |
+| `add` / `mul`、`view_as_real/complex` | ok | ok | ok | ok |
+| `nonzero` / `bincount` / `cumsum`、`allclose`、dtype 升级 | ok | ok | ok | ok |
+| `where`（Ternary） | ok | **FAIL** | **FAIL** | **FAIL** |
+| `sum` | ok | ok | **FAIL** | **FAIL** |
+| `A @ x`（2-D × 1-D，gemv） | ok | **FAIL** | **FAIL** | **FAIL** |
+| `A @ B`（2-D × 2-D，gemm） | ok | ok | ok | ok |
+| Triton：load/store、where+sum、atomic_add、**associative_scan** | ok | ok | ok | ok |
+| `torch.sparse` matmul（CSR / COO） | **FAIL** | **FAIL** | **FAIL** | **FAIL** |
+| **FlagSparse `spmv_csr`（参考值在 CPU）** | **ok** | **ok** | **ok** | **ok** |
+
+三条结论：
+
+**1. Triton 是健康的，四个 dtype 全通。** 包括 `tl.associative_scan`——Ascend 的 Triton
+lower 不了它，所以那边 `spmv_csr` 退回了 torch_npu；摩尔线程不需要这个回退。
+`routing/spmv_csr uses triton` 也确认了算子真的走 Triton（`kernel=segbin`），没有静默
+回退到 torch，所以上面那行 `ok` 是内核的功劳而不是回退路径的。
+
+**2. muDNN 的 gemv 缺口 —— 值得报给厂商。** 同样的数学、同样的 dtype，只把 `x` 从
+`(N,)` 改成 `(N,1)` 就从 FAIL 变 ok：
+
+```
+torch/matvec (@)         fp32 ok   fp64 FAIL   c64 FAIL   c128 FAIL
+torch/matvec as 2D (@)   fp32 ok   fp64 ok     c64 ok     c128 ok
+```
+
+说明 torch_musa 的 2-D×1-D 走 muDNN 的 gemv（缺 fp64/复数），而 2-D×2-D 走了另一条有
+这些类型的路径。这是一个最小可复现的 dispatch 缺口，不是"MUSA 不支持 fp64"。
+同理"MUSA 不支持复数"也是过度概括——复数张量存得下、`add`/`mul`/`view_as_real` 都正常，
+muDNN 只在 ternary / reduce / gemv 上拒绝。
+
+**3. `torch.sparse` 在 MUSA 上没有可用的 matmul**，见第 3 节。
 
 ## 5. 算子层面的 MUSA 适配现状
 
