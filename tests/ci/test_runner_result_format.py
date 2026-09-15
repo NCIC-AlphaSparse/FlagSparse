@@ -546,9 +546,7 @@ def test_runner_excludes_interrupted_matrix_and_invalid_speedups(tmp_path):
         returncode=-15,
         timed_out=False,
     )
-    summary = runner.summarize_performance_csv(
-        csv_path, rows=filtered, **metadata
-    )
+    summary = runner.summarize_performance_csv(csv_path, rows=filtered, **metadata)
 
     assert summary["raw_row_count"] == 3
     assert summary["row_count"] == 2
@@ -563,9 +561,7 @@ def test_parse_op_benchmark_args_keeps_arguments_scoped_to_each_operator():
         ["spmv_bsr=--resume", "spmv_bsr=--dtypes float64,complex64"]
     )
 
-    assert parsed == {
-        "spmv_bsr": ["--resume", "--dtypes", "float64,complex64"]
-    }
+    assert parsed == {"spmv_bsr": ["--resume", "--dtypes", "float64,complex64"]}
 
 
 @pytest.mark.parametrize("value", ["spmv_bsr", "=--resume", "spmv_bsr="])
