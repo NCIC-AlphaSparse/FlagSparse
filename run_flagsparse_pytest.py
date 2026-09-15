@@ -476,6 +476,13 @@ ASCEND_BASELINE_OPS: tuple[str, ...] = (
     "gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr",
 )
 
+# The operators whose accuracy runs through benchmark_ascend_accuracy.py instead
+# of the pytest suite. Deliberately DERIVED from ASCEND_BASELINE_OPS rather than
+# repeating the same five names: the two sets have to move together, and the drop
+# this came from carried a second hardcoded copy that would drift the first time
+# either list changed.
+ASCEND_ACCURACY_OPS: frozenset[str] = frozenset(ASCEND_BASELINE_OPS)
+
 ASCEND_PROBE_OPS: tuple[str, ...] = (
     "spmv_coo", "spmv_csc", "spmv_bsr", "spmv_coo_tocsr",
     "spmm_coo", "spmm_csc", "spmm_bsr", "spmm_bell",
@@ -509,6 +516,7 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "--op", "{op}",
             "--device", "{device}",
             "--csv-summary", "{csv}",
+            "--dtypes", "float16,bfloat16,float32,float64",
             "--warmup", "{warmup}",
             "--iters", "{iters}",
         )
@@ -1341,6 +1349,69 @@ def run_accuracy(
     result_path = op_dir / "accuracy_result.json"
     if result_path.exists():
         result_path.unlink()
+
+    # Ascend routes five operators through a dedicated probe instead of the pytest
+    # suite. The reason is the one that governs this whole backend: on Ascend the
+    # usual failure is that CANN cannot lower the kernel, not that the answer is
+    # wrong, and the pytest suite's references (torch advanced indexing, torch
+    # .sparse) are themselves unavailable there for several dtypes. The probe uses
+    # SciPy/NumPy references instead, which run on the host and stay valid.
+    #
+    # It emits the SAME accuracy_result.json the pytest path does, so everything
+    # downstream -- parse_accuracy_json, the summary, the data_file field -- is
+    # unchanged. This branch swaps the producer, not the format.
+    if (
+        os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend"
+        and op in ASCEND_ACCURACY_OPS
+    ):
+        cmd = [
+            sys.executable,
+            "benchmark/benchmark_ascend_accuracy.py",
+            "--op",
+            op,
+            "--device",
+            str(gpu_id),
+            "--output",
+            str(result_path),
+        ]
+        returncode, stdout, stderr, duration, timed_out = run_subprocess(
+            cmd,
+            project_root=project_root,
+            env=_base_env(project_root, gpu_id),
+            timeout=timeout,
+        )
+        stdout_path = op_dir / "accuracy_stdout.log"
+        stderr_path = op_dir / "accuracy_stderr.log"
+        stdout_path.write_text(stdout, encoding="utf-8")
+        stderr_path.write_text(stderr, encoding="utf-8")
+        parsed = parse_accuracy_json(result_path) if result_path.exists() else {}
+        status = (
+            "TIMEOUT"
+            if timed_out
+            else (
+                "PASS"
+                if returncode == 0 and parsed.get("status") == "Passed"
+                else "FAIL"
+            )
+        )
+        return {
+            "operator": op,
+            "phase": "accuracy",
+            "configured": True,
+            "marker": marker,
+            "status": status,
+            "returncode": returncode,
+            "exit_code": returncode,
+            "duration_sec": duration,
+            "duration": duration,
+            "command": cmd,
+            "stdout_log_path": str(stdout_path),
+            "stderr_log_path": str(stderr_path),
+            "log_path": str(stdout_path),
+            "data_file": str(result_path.relative_to(op_dir.parent)),
+            **parsed,
+        }
+
     cmd = [
         sys.executable,
         "-m",
