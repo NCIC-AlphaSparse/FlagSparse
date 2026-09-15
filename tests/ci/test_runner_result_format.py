@@ -15,9 +15,10 @@
 """Checks for the unified FlagSparse pytest runner result format."""
 
 import csv
-import pytest
 import json
 import re
+
+import pytest
 
 import run_flagsparse_pytest as runner
 
