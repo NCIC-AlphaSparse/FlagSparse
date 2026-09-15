@@ -425,6 +425,7 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "benchmark/benchmark_ascend.py",
         "--op", "{op}",
         "--device", "{device}",
+        "--dtypes", "float16,bfloat16,float32,float64",
         "--csv-summary", "{csv}",
         "--warmup", "{warmup}",
         "--iters", "{iters}",
@@ -432,6 +433,7 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
     for op in ("gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr")
 }
 
+ASCEND_ACCURACY_OPS = {"gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr"}
 
 OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "gather": OperatorTestConfig("gather", PERFORMANCE_COMMANDS["gather"]),
@@ -468,6 +470,19 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "spsm_csr": OperatorTestConfig("spsm_csr", PERFORMANCE_COMMANDS["spsm_csr"]),
     "spsm_coo": OperatorTestConfig("spsm_coo", PERFORMANCE_COMMANDS["spsm_coo"]),
 }
+
+# Ascend probe covers the full operator catalog and reports unsupported APIs.
+ASCEND_PROBE_OPS = tuple(OP_TEST_CONFIGS)
+ASCEND_PROBE_OPS += ("spsv_descriptor_api", "sparse_format_constructors")
+for _op in ASCEND_PROBE_OPS:
+    if _op in ASCEND_PERFORMANCE_COMMANDS:
+        continue
+    ASCEND_PERFORMANCE_COMMANDS[_op] = (
+        "benchmark/benchmark_ascend_probe.py", "--op", "{op}",
+        "--device", "{device}", "--input", "{input}",
+        "--csv-summary", "{csv}", "--warmup", "{warmup}", "--iters", "{iters}",
+        "--max-matrices", "30",
+    )
 
 
 def now_ts() -> str:
@@ -1246,6 +1261,57 @@ def run_accuracy(
     result_path = op_dir / "accuracy_result.json"
     if result_path.exists():
         result_path.unlink()
+    if (
+        os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend"
+        and op in ASCEND_ACCURACY_OPS
+    ):
+        cmd = [
+            sys.executable,
+            "benchmark/benchmark_ascend_accuracy.py",
+            "--op",
+            op,
+            "--device",
+            str(gpu_id),
+            "--output",
+            str(result_path),
+        ]
+        returncode, stdout, stderr, duration, timed_out = run_subprocess(
+            cmd,
+            project_root=project_root,
+            env=_base_env(project_root, gpu_id),
+            timeout=timeout,
+        )
+        stdout_path = op_dir / "accuracy_stdout.log"
+        stderr_path = op_dir / "accuracy_stderr.log"
+        stdout_path.write_text(stdout, encoding="utf-8")
+        stderr_path.write_text(stderr, encoding="utf-8")
+        parsed = parse_accuracy_json(result_path) if result_path.exists() else {}
+        status = (
+            "TIMEOUT"
+            if timed_out
+            else (
+                "PASS"
+                if returncode == 0 and parsed.get("status") == "Passed"
+                else "FAIL"
+            )
+        )
+        return {
+            "operator": op,
+            "phase": "accuracy",
+            "configured": True,
+            "marker": marker,
+            "status": status,
+            "returncode": returncode,
+            "exit_code": returncode,
+            "duration_sec": duration,
+            "duration": duration,
+            "command": cmd,
+            "stdout_log_path": str(stdout_path),
+            "stderr_log_path": str(stderr_path),
+            "log_path": str(stdout_path),
+            "data_file": str(result_path.relative_to(op_dir.parent)),
+            **parsed,
+        }
     cmd = [
         sys.executable,
         "-m",
