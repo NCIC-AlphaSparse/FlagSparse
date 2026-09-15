@@ -23,14 +23,20 @@ from flagsparse import (
 )
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import (
     SPMV_COO_DTYPES,
     SPMV_COO_DTYPE_IDS,
     SPMV_MN_SHAPES,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 
 _TOCSR_DTYPES = (torch.float32, torch.float64)
@@ -60,20 +66,36 @@ def _reference_dtype(dtype):
 
 
 def _random_coo_mn(M, N, dtype, device):
+    """COO arrays on ``device``, dense oracle copy on CPU.
+
+    Built on the golden device with only the operator's inputs copied over:
+    ``torch.where`` has no muDNN kernel for float64/complex on Moore Threads.  The
+    sparse tensor stays on CPU too -- torch.sparse has no working matmul on MUSA, so
+    a reference that needs it (``test_spmv_coo_tocsr_*``) must evaluate there.
+    """
+    golden = golden_device()
     denom = max(M * N, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
-    mask = torch.rand(M, N, device=device) < p
+    mask = torch.rand(M, N, device=golden) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
     dense = torch.where(
         mask,
-        _random_dense((M, N), dtype, device),
-        torch.zeros((), dtype=dtype, device=device),
+        _random_dense((M, N), dtype, golden),
+        torch.zeros((), dtype=dtype, device=golden),
     )
-    return dense.to_sparse_coo().coalesce(), dense
+    sp = dense.to_sparse_coo().coalesce()
+    return sp.values().to(device), sp.indices().to(device), dense
 
 
 def _tol(dtype):
+    # Same policy as test_spmv_csr_accuracy: fp32 and complex64 accumulate in
+    # fp32-precision components and carry ordinary order-dependent fp32 SpMV error.
+    # The golden reference now runs on CPU in fp64, so it no longer happens to share
+    # the kernel's summation order -- a 1.3e-6 tolerance turned that into a flake at
+    # 160x1024. fp64 and complex128 accumulate in fp64 and keep the strict tolerance.
+    if dtype in (torch.float32, torch.float16, torch.bfloat16, torch.complex64):
+        return 1e-3, 1e-3
     return close_tolerances(dtype)
 
 
@@ -96,10 +118,15 @@ def _apply_dense_op(dense, op):
 
 
 def _assert_close(actual, expected, dtype):
+    """Compare on the golden device; the reference never leaves CPU."""
     rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
+    golden = golden_device()
     assert torch.allclose(
-        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+        actual.to(device=golden, dtype=ref_dtype),
+        expected.to(device=golden, dtype=ref_dtype),
+        rtol=rtol,
+        atol=atol,
     )
 
 
@@ -111,55 +138,49 @@ def _assert_close(actual, expected, dtype):
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
-    device = torch.device("cuda")
-    Asp, dense = _random_coo_mn(M, N, dtype, device)
-    data = Asp.values()
-    indices = Asp.indices()
+    device = accelerator_device()
+    data, indices, dense = _random_coo_mn(M, N, dtype, device)
     row = indices[0].to(index_dtype).contiguous()
     col = indices[1].to(index_dtype).contiguous()
     x_len = M if _op_transposes(op) else N
-    x = _make_x(x_len, dtype, device)
+    x = _make_x(x_len, dtype, golden_device())
     ref_dtype = _reference_dtype(dtype)
     ref = (_apply_dense_op(dense, op).to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
-    out = flagsparse_spmv_coo(data, row, col, x, shape=(M, N), op=op)
+    out = flagsparse_spmv_coo(data, row, col, x.to(device), shape=(M, N), op=op)
     _assert_close(out, ref, dtype)
 
 
 @pytest.mark.spmv_coo
 def test_spmv_coo_prepared_reuses_structure_across_ops():
-    device = torch.device("cuda")
-    Asp, dense = _random_coo_mn(8, 10, torch.complex64, device)
-    data = Asp.values()
-    indices = Asp.indices()
+    device = accelerator_device()
+    data, indices, dense = _random_coo_mn(8, 10, torch.complex64, device)
     row = indices[0].to(torch.int32).contiguous()
     col = indices[1].to(torch.int32).contiguous()
     prepared = prepare_spmv_coo(data, row, col, (8, 10))
 
-    x_non = _make_x(10, torch.complex64, device)
+    x_non = _make_x(10, torch.complex64, golden_device())
     ref_non = dense.to(torch.complex128) @ x_non.to(torch.complex128)
-    out_non = flagsparse_spmv_coo(x=x_non, prepared=prepared, op="non")
+    out_non = flagsparse_spmv_coo(x=x_non.to(device), prepared=prepared, op="non")
     _assert_close(out_non, ref_non.to(torch.complex64), torch.complex64)
 
-    x_trans = _make_x(8, torch.complex64, device)
+    x_trans = _make_x(8, torch.complex64, golden_device())
     ref_trans = dense.t().to(torch.complex128) @ x_trans.to(torch.complex128)
-    out_trans = flagsparse_spmv_coo(x=x_trans, prepared=prepared, op="trans")
+    out_trans = flagsparse_spmv_coo(x=x_trans.to(device), prepared=prepared, op="trans")
     _assert_close(out_trans, ref_trans.to(torch.complex64), torch.complex64)
 
     ref_conj = dense.conj().t().to(torch.complex128) @ x_trans.to(torch.complex128)
-    out_conj = flagsparse_spmv_coo(x=x_trans, prepared=prepared, op="conj")
+    out_conj = flagsparse_spmv_coo(x=x_trans.to(device), prepared=prepared, op="conj")
     _assert_close(out_conj, ref_conj.to(torch.complex64), torch.complex64)
 
 
 @pytest.mark.spmv_coo
 @pytest.mark.parametrize("op", ["trans", "conj"], ids=["trans", "conj"])
 def test_spmv_coo_runtime_launch_matches_public_api_for_ops(op):
-    device = torch.device("cuda")
-    Asp, _dense = _random_coo_mn(7, 9, torch.complex64, device)
-    data = Asp.values()
-    indices = Asp.indices()
+    device = accelerator_device()
+    data, indices, _dense = _random_coo_mn(7, 9, torch.complex64, device)
     row = indices[0].to(torch.int32).contiguous()
     col = indices[1].to(torch.int32).contiguous()
-    x = _make_x(7, torch.complex64, device)
+    x = _make_x(7, torch.complex64, golden_device()).to(device)
 
     expected = flagsparse_spmv_coo(data, row, col, x, shape=(7, 9), op=op)
     launch = spmv_coo_mod._prepare_spmv_coo_launch_from_raw(
@@ -182,28 +203,25 @@ def test_spmv_coo_runtime_launch_matches_public_api_for_ops(op):
 
 @pytest.mark.spmv_coo
 def test_spmv_coo_prepared_explicit_transpose_conflict_rejected():
-    device = torch.device("cuda")
-    Asp, _dense = _random_coo_mn(8, 10, torch.float32, device)
-    data = Asp.values()
-    indices = Asp.indices()
+    device = accelerator_device()
+    data, indices, _dense = _random_coo_mn(8, 10, torch.float32, device)
     row = indices[0].to(torch.int32).contiguous()
     col = indices[1].to(torch.int32).contiguous()
     prepared = prepare_spmv_coo(data, row, col, (8, 10), transpose=True)
-    x = torch.randn(10, dtype=torch.float32, device=device)
+    x = torch.randn(10, dtype=torch.float32, device=golden_device()).to(device)
     with pytest.raises(ValueError, match="transpose conflicts with op"):
         flagsparse_spmv_coo(x=x, prepared=prepared, op="non", transpose=True)
 
 
 @pytest.mark.spmv_coo
 def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
-    device = torch.device("cuda")
-    Asp, dense = _random_coo_mn(12, 9, torch.float32, device)
-    data = Asp.values()
-    indices = Asp.indices()
+    device = accelerator_device()
+    data, indices, dense = _random_coo_mn(12, 9, torch.float32, device)
     row = indices[0].to(torch.int64).contiguous()
     col = indices[1].to(torch.int64).contiguous()
-    x = torch.randn(9, dtype=torch.float32, device=device)
+    x = torch.randn(9, dtype=torch.float32, device=golden_device())
     ref = dense.to(torch.float64) @ x.to(torch.float64)
+    x = x.to(device)
     state = {"forced_once": False}
     original = spmv_coo_mod._triton_spmv_coo_kernel
 
@@ -224,41 +242,41 @@ def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
     )
     assert state["forced_once"]
     rtol, atol = _tol(torch.float32)
-    assert torch.allclose(out.to(torch.float64), ref, rtol=rtol, atol=atol)
+    assert torch.allclose(
+        out.to(device=ref.device, dtype=torch.float64), ref, rtol=rtol, atol=atol
+    )
 
 
 @pytest.mark.spmv_coo_tocsr
 @pytest.mark.parametrize("M, N", SPMV_MN_SHAPES)
 @pytest.mark.parametrize("dtype", _TOCSR_DTYPES, ids=_TOCSR_DTYPE_IDS)
 def test_spmv_coo_tocsr_matches_torch(M, N, dtype):
-    device = torch.device("cuda")
-    Asp, _dense = _random_coo_mn(M, N, dtype, device)
-    Asp = Asp.coalesce()
-    data = Asp.values()
-    indices = Asp.indices()
+    device = accelerator_device()
+    data, indices, dense = _random_coo_mn(M, N, dtype, device)
     row = indices[0].contiguous()
     col = indices[1].contiguous()
-    x = torch.randn(N, dtype=dtype, device=device)
+    x = _random_dense((N,), dtype, golden_device())
+    # torch.sparse stays the reference this test is named for, but evaluated on CPU:
+    # it has no working matmul on MUSA (aten::addmm is unregistered for Sparsemusa).
+    Asp = dense.to_sparse_coo().coalesce()
     ref = torch.sparse.mm(Asp, x.unsqueeze(1)).squeeze(1)
-    out = flagsparse_spmv_coo_tocsr(data, row, col, x, shape=(M, N))
+    out = flagsparse_spmv_coo_tocsr(data, row, col, x.to(device), shape=(M, N))
     rtol, atol = _tol(dtype)
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spmv_coo_tocsr
 def test_spmv_coo_tocsr_prepared_path_matches_torch():
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, N = 8, 10
     dtype = torch.float32
-    Asp, _dense = _random_coo_mn(M, N, dtype, device)
-    Asp = Asp.coalesce()
-    data = Asp.values()
-    indices = Asp.indices()
+    data, indices, dense = _random_coo_mn(M, N, dtype, device)
     row = indices[0].contiguous()
     col = indices[1].contiguous()
-    x = torch.randn(N, dtype=dtype, device=device)
+    x = _random_dense((N,), dtype, golden_device())
     prepared = prepare_spmv_coo_tocsr(data, row, col, (M, N))
+    Asp = dense.to_sparse_coo().coalesce()
     ref = torch.sparse.mm(Asp, x.unsqueeze(1)).squeeze(1)
-    out = flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
+    out = flagsparse_spmv_coo_tocsr(x=x.to(device), prepared=prepared)
     rtol, atol = _tol(torch.float32)
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)

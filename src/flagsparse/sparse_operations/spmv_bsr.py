@@ -472,13 +472,28 @@ def _spmv_bsr_non_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
     n_rows,
     n_cols,
     n_block_rows,
     BLOCK_DIM: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     SEG: tl.constexpr,
+    SEG_FROM_GRID: tl.constexpr,
 ):
+    """y += alpha * op(A) * x over one segment of each block row.
+
+    Only alpha lives here: this route scatters into y with atomics, so no
+    program owns an output element and ``beta * y`` cannot be folded into a
+    store -- the C API applies it first with ``_dense_scale_kernel``. This
+    module's callers pass alpha = 1 into a zeroed y.
+
+    SEG_FROM_GRID says where the segment index comes from. False (this module)
+    keeps SEG as a constexpr, so the host loops over segments and each value
+    compiles its own kernel. True reads it from program_id(2) instead, letting
+    one launch cover every segment -- one compile, one launch. The constexpr
+    folds either way, so False generates exactly the code it always did.
+    """
     brow = tl.program_id(0)
     inner_row = tl.program_id(1)
     if brow >= n_block_rows:
@@ -486,7 +501,11 @@ def _spmv_bsr_non_real_kernel(
     row = brow * BLOCK_DIM + inner_row
     start = tl.load(indptr_ptr + brow)
     end = tl.load(indptr_ptr + brow + 1)
-    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    if SEG_FROM_GRID:
+        seg = tl.program_id(2)
+    else:
+        seg = SEG
+    offs = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
     acc = tl.load(
@@ -504,7 +523,7 @@ def _spmv_bsr_non_real_kernel(
         )
         x_vals = tl.load(x_ptr + col, mask=valid, other=0.0)
         acc += tl.sum(tl.where(valid, vals * x_vals, 0.0))
-    tl.atomic_add(y_ptr + row, acc)
+    tl.atomic_add(y_ptr + row, alpha * acc)
 
 
 @triton.jit
@@ -514,13 +533,17 @@ def _spmv_bsr_non_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     n_cols,
     n_block_rows,
     BLOCK_DIM: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     SEG: tl.constexpr,
+    SEG_FROM_GRID: tl.constexpr,
 ):
+    """Complex counterpart; see _spmv_bsr_non_real_kernel."""
     brow = tl.program_id(0)
     inner_row = tl.program_id(1)
     if brow >= n_block_rows:
@@ -528,7 +551,11 @@ def _spmv_bsr_non_complex_kernel(
     row = brow * BLOCK_DIM + inner_row
     start = tl.load(indptr_ptr + brow)
     end = tl.load(indptr_ptr + brow + 1)
-    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    if SEG_FROM_GRID:
+        seg = tl.program_id(2)
+    else:
+        seg = SEG
+    offs = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
     acc_re = tl.load(
@@ -553,8 +580,10 @@ def _spmv_bsr_non_complex_kernel(
         prod_im = a_re * x_im + a_im * x_re
         acc_re += tl.sum(tl.where(valid, prod_re, 0.0))
         acc_im += tl.sum(tl.where(valid, prod_im, 0.0))
-    tl.atomic_add(y_ri_ptr + row * 2, acc_re)
-    tl.atomic_add(y_ri_ptr + row * 2 + 1, acc_im)
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    tl.atomic_add(y_ri_ptr + row * 2, out_re)
+    tl.atomic_add(y_ri_ptr + row * 2 + 1, out_im)
 
 
 @triton.jit
@@ -665,11 +694,14 @@ def _spmv_bsr_trans_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
     n_block_rows,
     BLOCK_DIM: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     SEG: tl.constexpr,
+    SEG_FROM_GRID: tl.constexpr,
 ):
+    """Transposed counterpart; see _spmv_bsr_non_real_kernel."""
     brow = tl.program_id(0)
     inner_row = tl.program_id(1)
     if brow >= n_block_rows:
@@ -678,7 +710,11 @@ def _spmv_bsr_trans_real_kernel(
     x_val = tl.load(x_ptr + row)
     start = tl.load(indptr_ptr + brow)
     end = tl.load(indptr_ptr + brow + 1)
-    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    if SEG_FROM_GRID:
+        seg = tl.program_id(2)
+    else:
+        seg = SEG
+    offs = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
     for inner_col in tl.static_range(0, BLOCK_DIM):
@@ -688,7 +724,7 @@ def _spmv_bsr_trans_real_kernel(
             mask=mask,
             other=0.0,
         )
-        tl.atomic_add(y_ptr + col, vals * x_val, mask=mask)
+        tl.atomic_add(y_ptr + col, alpha * vals * x_val, mask=mask)
 
 
 @triton.jit
@@ -698,12 +734,16 @@ def _spmv_bsr_trans_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
     n_block_rows,
     BLOCK_DIM: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     SEG: tl.constexpr,
     CONJ: tl.constexpr,
+    SEG_FROM_GRID: tl.constexpr,
 ):
+    """Complex transposed counterpart; see _spmv_bsr_non_real_kernel."""
     brow = tl.program_id(0)
     inner_row = tl.program_id(1)
     if brow >= n_block_rows:
@@ -713,7 +753,11 @@ def _spmv_bsr_trans_complex_kernel(
     x_im = tl.load(x_ri_ptr + row * 2 + 1)
     start = tl.load(indptr_ptr + brow)
     end = tl.load(indptr_ptr + brow + 1)
-    offs = start + SEG * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+    if SEG_FROM_GRID:
+        seg = tl.program_id(2)
+    else:
+        seg = SEG
+    offs = start + seg * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
     mask = offs < end
     bcols = tl.load(indices_ptr + offs, mask=mask, other=0)
     for inner_col in tl.static_range(0, BLOCK_DIM):
@@ -727,8 +771,10 @@ def _spmv_bsr_trans_complex_kernel(
             a_im = a_im_raw
         prod_re = a_re * x_re - a_im * x_im
         prod_im = a_re * x_im + a_im * x_re
-        tl.atomic_add(y_ri_ptr + col * 2, prod_re, mask=mask)
-        tl.atomic_add(y_ri_ptr + col * 2 + 1, prod_im, mask=mask)
+        out_re = alpha_re * prod_re - alpha_im * prod_im
+        out_im = alpha_re * prod_im + alpha_im * prod_re
+        tl.atomic_add(y_ri_ptr + col * 2, out_re, mask=mask)
+        tl.atomic_add(y_ri_ptr + col * 2 + 1, out_im, mask=mask)
 
 
 def _prepare_spmv_bsr_matrix(data, indices, indptr, shape, block_dim):
@@ -923,11 +969,17 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
                     prepared.kernel_indptr,
                     x_ri,
                     y_ri,
+                    # y = op(A) @ x here; alpha exists for the C API's
+                    # cuSPARSE-compatible signature, beta is a prologue on this
+                    # route, and SEG_FROM_GRID=False keeps the host-side loop.
+                    1,
+                    0,
                     prepared.n_block_rows,
                     BLOCK_DIM=prepared.block_dim,
                     BLOCK_NNZ=prepared.block_nnz,
                     SEG=seg,
                     CONJ=(op_code == SPMV_BSR_OP_CONJ_TRANS),
+                    SEG_FROM_GRID=False,
                 )
             else:
                 _spmv_bsr_non_complex_kernel[grid](
@@ -936,12 +988,15 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
                     prepared.kernel_indptr,
                     x_ri,
                     y_ri,
+                    1,
+                    0,
                     prepared.padded_n_rows,
                     prepared.padded_n_cols,
                     prepared.n_block_rows,
                     BLOCK_DIM=prepared.block_dim,
                     BLOCK_NNZ=prepared.block_nnz,
                     SEG=seg,
+                    SEG_FROM_GRID=False,
                 )
         else:
             if trans:
@@ -951,10 +1006,12 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
                     prepared.kernel_indptr,
                     x,
                     y,
+                    1,
                     prepared.n_block_rows,
                     BLOCK_DIM=prepared.block_dim,
                     BLOCK_NNZ=prepared.block_nnz,
                     SEG=seg,
+                    SEG_FROM_GRID=False,
                 )
             else:
                 _spmv_bsr_non_real_kernel[grid](
@@ -963,12 +1020,14 @@ def _triton_spmv_bsr_kernel(prepared, x, op_code):
                     prepared.kernel_indptr,
                     x,
                     y,
+                    1,
                     prepared.padded_n_rows,
                     prepared.padded_n_cols,
                     prepared.n_block_rows,
                     BLOCK_DIM=prepared.block_dim,
                     BLOCK_NNZ=prepared.block_nnz,
                     SEG=seg,
+                    SEG_FROM_GRID=False,
                 )
     return y
 

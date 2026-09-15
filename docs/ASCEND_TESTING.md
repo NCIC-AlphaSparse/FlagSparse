@@ -26,6 +26,61 @@ PY
 `ops_sparse` Python bridge 和 `libaclsparse.so` 是可选的；缺失时 baseline 明确使用
 PyTorch-NPU。
 
+## Ascend fallback 分发表
+
+有两个内核在 CANN 上编不出来，各自有一条 torch-only 的退路，并且都暴露成公共符号：
+
+| 符号 | 覆盖 | 退路 | 为什么 |
+|---|---|---|---|
+| `flagsparse.SPSM_ASCEND_DISPATCH` | `spsm_csr` / `spsm_coo` | 逐行 sweep | 轮询求解器自旋在全局内存的 ready 标志上，CANN 不 lower 这个形状 |
+| `flagsparse.SPMM_COO_ASCEND_DISPATCH` | `spmm_coo` | 单次 `index_add` | 两条 COO 路线都在内核里开 scratchpad，CANN 编译失败 |
+
+两者默认由运行时探测自动选择，也可以用环境变量强制：
+
+```bash
+FLAGSPARSE_SPSM_ASCEND_DISPATCH=1      # 强制走 SpSM fallback
+FLAGSPARSE_SPMM_COO_ASCEND_DISPATCH=1  # 强制走 SpMM COO fallback
+```
+
+**强制开关不是调试遗留物**：fallback 的实现是纯 torch，所以这两个开关让它能在任何后端上
+与 Triton 路径逐位对比验证——包括手边没有 NPU 的机器。改动 fallback 后应当先这样验证。
+
+SpSM 那条退路是**逐行**的（三角求解天生有依赖链），所以它是正确性兜底而不是快路；它在 RHS
+维度上是向量化的，代价是 O(n_rows) 次 launch 而不是 O(n_rows × n_rhs)。SpMM COO 那条没有
+依赖链，是一次 scatter-add，所以它本身就是条像样的路径。
+
+## 算子能力探测（benchmark_ascend_probe.py）
+
+在一个内核未必能被 CANN 编译出来的后端上，"跑没跑通、没通是为什么"比耗时更重要。
+探测脚本对**全部 23 个算子** × **20 个矩阵**逐个跑一遍，把结果分成五类：
+
+| 状态 | 含义 |
+|---|---|
+| `PASS` | 跑通，且与 CPU fp64 参考一致 |
+| `MISMATCH` | 跑通但数值不对——是错答案，不是缺功能 |
+| `TRITON_COMPILE` | Triton 后端无法 lower 这个内核。**这才是 Ascend 的典型故事**：内核本身没问题，CANN 编不出来 |
+| `REJECTED` | 算子自己拒绝了输入（dtype/布局/形状不支持）——是主动划的边界，不是缺陷 |
+| `ERROR` | 其余情况，单独分类以免与编译失败混淆 |
+
+```bash
+export FLAGSPARSE_BACKEND=ascend
+python3 benchmark/benchmark_ascend_probe.py \
+  --device 6 --dtype float32 --csv-summary probe.csv
+
+# 只看某几个算子 / 某几个矩阵
+python3 benchmark/benchmark_ascend_probe.py --op spsm_csr --op spmm_coo \
+  --matrix square_1k --matrix square_4k
+```
+
+**每个 case 默认清空 Triton 缓存再跑**。这不是洁癖：前一个 case 编出来的产物会让后一个
+case 的编译失败变成缓存命中，于是一个编不出来的内核报成 PASS。`--keep-cache` 可以关掉
+（快很多），但关掉之后这份结果就不能用来判断"能不能编译"。
+
+矩阵是按 seed 生成的合成矩阵，覆盖尺寸、长宽比、密度，以及退化端（单行、单列、全零），
+所以结果可复现，不需要随仓库分发矩阵集。BSR/Blocked-ELL/SELL/SpSV/SpSM 的输入由脚本
+按各自格式真实构造（分块、切片、三角且对角占优），不是硬凑的——否则算子拒绝一个畸形输入
+会被记成 Ascend 的限制。
+
 ## 直接 benchmark
 
 当前 Ascend benchmark 覆盖 `gather`、`scatter`、`spmv_csr`、`spmm_csr`、`sddmm_csr`：

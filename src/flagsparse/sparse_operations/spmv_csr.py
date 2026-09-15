@@ -302,10 +302,24 @@ def _spmv_csr_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
+    beta,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y = alpha * A @ x + beta * y.
+
+    ``alpha``/``beta`` exist so the C API can express cuSPARSE's SpMV in one
+    launch; this module's own callers pass 1 and 0, for which the generated code
+    is the plain ``y = A @ x`` it has always been.  Keeping them here rather than
+    in a second copy of the kernel is deliberate -- the C++ dispatch layer
+    re-exports THIS function, so there is exactly one kernel to tune or fix.
+
+    ``HAS_BETA`` is constexpr because cuSPARSE defines beta == 0 as "ignore y":
+    reading an uninitialised output would turn into NaN through 0 * NaN.
+    """
     row = tl.program_id(0)
     if row >= n_rows:
         return
@@ -321,7 +335,10 @@ def _spmv_csr_real_kernel(
         x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
         part = tl.where(mask, a * x_vals, 0.0)
         acc = acc + tl.sum(part)
-    tl.store(y_ptr + row, acc)
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(y_ptr + row)
+    tl.store(y_ptr + row, out)
 
 
 @triton.jit
@@ -331,10 +348,25 @@ def _spmv_csr_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y = alpha * A @ x + beta * y, with complex alpha/beta.
+
+    Complex counterpart of _spmv_csr_real_kernel and added for the same reason:
+    the C API expresses cuSPARSE's SpMV in one launch. This module's callers pass
+    alpha = 1 + 0j and beta = 0, which folds back to the plain product.
+
+    Triton has no complex type, so the scalars arrive split into real and
+    imaginary components of the interleaved buffers' element dtype -- the same
+    representation the operands themselves use.
+    """
     row = tl.program_id(0)
     if row >= n_rows:
         return
@@ -355,8 +387,15 @@ def _spmv_csr_complex_kernel(
         prod_im = tl.where(mask, a_re * x_im + a_im * x_re, 0.0)
         acc_re = acc_re + tl.sum(prod_re)
         acc_im = acc_im + tl.sum(prod_im)
-    tl.store(y_ri_ptr + row * 2, acc_re)
-    tl.store(y_ri_ptr + row * 2 + 1, acc_im)
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(y_ri_ptr + row * 2)
+        prev_im = tl.load(y_ri_ptr + row * 2 + 1)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(y_ri_ptr + row * 2, out_re)
+    tl.store(y_ri_ptr + row * 2 + 1, out_im)
 
 
 # ── Optimised SpMV (CSR-Vector, perf-oriented, no CuPy) ─────────────
@@ -758,7 +797,7 @@ def _transpose_csr_for_spmv(data, indices, indptr, shape):
         order = torch.argsort(col_ids)
     sorted_cols = col_ids[order]
     sorted_rows = row_ids[order]
-    transposed_data = data[order].contiguous()
+    transposed_data = _gather_values(data, order).contiguous()
 
     nnz_per_transposed_row = torch.bincount(sorted_cols, minlength=n_cols)
     transposed_indptr64 = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
@@ -997,9 +1036,15 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
             prepared.kernel_indptr,
             x_in,
             y_out,
+            # This operator computes y = A @ x; alpha/beta exist for the C API's
+            # cuSPARSE-compatible signature. HAS_BETA=False makes the beta term
+            # vanish at compile time, so the generated kernel is unchanged.
+            1,
+            0,
             n_rows=prepared.n_rows,
             BLOCK_NNZ=prepared.block_nnz,
             MAX_SEGMENTS=prepared.max_segments,
+            HAS_BETA=False,
         )
         y.copy_(y_out if dtype == compute_dtype else y_out.to(dtype))
         return y
@@ -1012,9 +1057,16 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
         prepared.kernel_indptr,
         x_ri,
         y_ri,
+        # y = A @ x here; alpha/beta exist for the C API's
+        # cuSPARSE-compatible signature and fold away at 1 + 0j / 0.
+        1,
+        0,
+        0,
+        0,
         n_rows=prepared.n_rows,
         BLOCK_NNZ=prepared.block_nnz,
         MAX_SEGMENTS=prepared.max_segments,
+        HAS_BETA=False,
     )
     y.copy_(torch.view_as_complex(y_ri.reshape(prepared.n_rows, 2)))
     return y
@@ -1353,7 +1405,7 @@ def coo_to_csr_for_spmv(data, row, col, shape, assume_sorted=False):
         order = torch.argsort(key)
         row_s = row64[order]
         col_s = col64[order]
-        data_s = data[order].to(data.dtype)
+        data_s = _gather_values(data, order).to(data.dtype)
 
     indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device)
     nnz = data_s.numel()

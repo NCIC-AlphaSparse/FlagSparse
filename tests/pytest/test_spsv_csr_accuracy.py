@@ -36,7 +36,13 @@ from flagsparse import (
 )
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import SPSV_N
 
 try:
@@ -50,7 +56,7 @@ except Exception:
 
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED),
     pytest.mark.spsv_csr,
 ]
 SUPPORTED_COMPLEX_DTYPES = [torch.complex64, torch.complex128]
@@ -113,10 +119,19 @@ def _skip_removed_rocm_route(solve_kind):
 
 
 def _dense_ref_spsv(A, b, *, lower, op_mode="NON", unit_diagonal=False):
-    A_eff = _apply_ref_op(A, op_mode)
+    """Dense triangular solve reference, always evaluated on the golden device.
+
+    Both operands are moved here rather than at the call sites: this is shared with
+    ``test_spsv_coo_accuracy.py`` and is reached at different points relative to
+    where a test copies its inputs to the accelerator.  ``torch.linalg`` is not
+    dependable on MUSA, so the reference must not run there.  The result stays on
+    the golden device; callers compare with ``x.to(x_ref.device)``.
+    """
+    golden = golden_device()
+    A_eff = _apply_ref_op(A.to(golden), op_mode)
     x = torch.linalg.solve_triangular(
         A_eff,
-        b.unsqueeze(-1),
+        b.to(golden).unsqueeze(-1),
         upper=_effective_upper(lower, op_mode),
         unitriangular=unit_diagonal,
     )
@@ -174,16 +189,18 @@ def _cupy_ref_spsv(A_cp, b_t, *, lower, unit_diagonal=False):
 )
 def test_spsv_csr_lower_matches_dense(n, dtype):
     # Keep the original baseline test case untouched in semantics.
-    device = torch.device("cuda")
+    device = accelerator_device()
     base = torch.tril(torch.randn(n, n, dtype=dtype, device=device))
     eye = torch.eye(n, dtype=dtype, device=device)
     A = base + eye * (float(n) * 0.5 + 2.0)
     b = torch.randn(n, dtype=dtype, device=device)
-    x_ref = torch.linalg.solve_triangular(A, b.unsqueeze(-1), upper=False).squeeze(-1)
+    x_ref = torch.linalg.solve_triangular(
+        A, b.to(A.device).unsqueeze(-1), upper=False
+    ).squeeze(-1)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices()
-    indptr = Asp.crow_indices().to(torch.int64)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(device)
+    indptr = Asp.crow_indices().to(torch.int64).to(device)
     x = flagsparse_spsv_csr(
         data,
         indices,
@@ -194,7 +211,7 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
         unit_diagonal=False,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -204,17 +221,17 @@ def test_spsv_csr_lower_matches_dense(n, dtype):
     "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
 )
 def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=True)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     x_ref = torch.linalg.solve_triangular(
-        A.to(dtype), b.to(dtype).unsqueeze(-1), upper=False
+        A.to(dtype), b.to(device=A.device, dtype=dtype).unsqueeze(-1), upper=False
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
 
     x = flagsparse_spsv_csr(
         data,
@@ -227,21 +244,21 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
         transpose=False,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 def test_spsv_csr_rejects_matrix_rhs():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float32
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = torch.randn(n, 2, dtype=dtype, device=device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
 
     with pytest.raises(ValueError, match="DnVec"):
         flagsparse_spsv_csr(
@@ -264,15 +281,15 @@ def test_spsv_csr_rejects_matrix_rhs():
 )
 @pytest.mark.parametrize("lower", [True, False], ids=["lower", "upper"])
 def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=lower)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=lower)
     b = _rand_like(dtype, (n,), device)
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=lower, unit_diagonal=True)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
 
     x = flagsparse_spsv_csr(
         data,
@@ -285,7 +302,7 @@ def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
         transpose=False,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -299,8 +316,8 @@ def test_spsv_csr_non_trans_unit_supported_combos(n, dtype, index_dtype, lower):
 def test_spsv_csr_unit_transpose_family_supported_combos(
     n, dtype, index_dtype, lower, op_mode
 ):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=lower)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=lower)
     b = _rand_like(dtype, (n,), device)
     x_ref = _dense_ref_spsv(
         A.to(dtype),
@@ -311,9 +328,9 @@ def test_spsv_csr_unit_transpose_family_supported_combos(
     )
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
 
     x = flagsparse_spsv_csr(
         data,
@@ -326,19 +343,19 @@ def test_spsv_csr_unit_transpose_family_supported_combos(
         transpose=_transpose_arg(op_mode),
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 def test_spsv_csr_complex_non_trans_defaults_to_smblk_route():
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = SPSV_N[0]
     dtype = torch.complex64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     b = _rand_like(dtype, (n,), device)
 
     _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
@@ -351,14 +368,14 @@ def test_spsv_csr_complex_non_trans_defaults_to_smblk_route():
 
 @pytest.mark.spsv
 def test_spsv_csr_complex_upper_non_trans_defaults_to_smblk_route():
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = SPSV_N[0]
     dtype = torch.complex128
-    A = _build_triangular(n, dtype, device, lower=False)
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     b = _rand_like(dtype, (n,), device)
 
     _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
@@ -372,14 +389,14 @@ def test_spsv_csr_complex_upper_non_trans_defaults_to_smblk_route():
 @pytest.mark.spsv
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_transpose_family_defaults_to_cw_route(op_mode):
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = SPSV_N[0]
     dtype = torch.complex128
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     b = _rand_like(dtype, (n,), device)
 
     _, _, _, trans_mode, _, _, solve_plan = fs_spsv_impl._resolve_spsv_csr_runtime(
@@ -446,7 +463,7 @@ def test_spsv_auto_route_promotes_dense_real_upper_to_nnz_balance():
 
 @pytest.mark.spsv
 def test_spsv_levelschd_analysis_builds_sorted_row_map():
-    device = torch.device("cuda")
+    device = accelerator_device()
     indices = torch.tensor([0, 0, 1, 0, 2, 1, 2, 3], dtype=torch.int64, device=device)
     indptr = torch.tensor([0, 1, 3, 5, 8], dtype=torch.int64, device=device)
     meta = fs_spsv_impl._build_spsv_level_schedule_metadata(
@@ -465,7 +482,7 @@ def test_spsv_levelschd_analysis_builds_sorted_row_map():
 
 @pytest.mark.spsv
 def test_spsv_nnz_balance_analysis_builds_row_idx_and_indegree():
-    device = torch.device("cuda")
+    device = accelerator_device()
     indices = torch.tensor([0, 0, 1, 0, 2, 1, 2, 3], dtype=torch.int64, device=device)
     indptr = torch.tensor([0, 1, 3, 5, 8], dtype=torch.int64, device=device)
     meta = fs_spsv_impl._build_spsv_nnz_balance_metadata(
@@ -481,7 +498,7 @@ def test_spsv_nnz_balance_analysis_builds_row_idx_and_indegree():
 
 @pytest.mark.spsv
 def test_spsv_levelschd_analysis_builds_upper_row_map():
-    device = torch.device("cuda")
+    device = accelerator_device()
     indices = torch.tensor([3, 2, 0, 3, 1, 3, 2, 3], dtype=torch.int64, device=device)
     indptr = torch.tensor([0, 3, 5, 7, 8], dtype=torch.int64, device=device)
     meta = fs_spsv_impl._build_spsv_level_schedule_metadata(
@@ -500,7 +517,7 @@ def test_spsv_levelschd_analysis_builds_upper_row_map():
 
 @pytest.mark.spsv
 def test_spsv_nnz_balance_analysis_builds_upper_row_idx_and_indegree():
-    device = torch.device("cuda")
+    device = accelerator_device()
     indices = torch.tensor([3, 2, 0, 3, 1, 3, 2, 3], dtype=torch.int64, device=device)
     indptr = torch.tensor([0, 3, 5, 7, 8], dtype=torch.int64, device=device)
     meta = fs_spsv_impl._build_spsv_nnz_balance_metadata(
@@ -516,7 +533,7 @@ def test_spsv_nnz_balance_analysis_builds_upper_row_idx_and_indegree():
 
 @pytest.mark.spsv
 def test_spsv_csr_row_sorted_check_respects_row_boundaries():
-    device = torch.device("cuda")
+    device = accelerator_device()
     indptr = torch.tensor([0, 3, 5, 8], dtype=torch.int64, device=device)
     lower_sorted = torch.tensor(
         [0, 1, 2, 0, 2, 0, 1, 2], dtype=torch.int64, device=device
@@ -581,14 +598,14 @@ def test_spsv_auto_route_promotes_wide_frontier_real_upper_to_levelschd():
 
 @pytest.mark.spsv
 def test_spsv_csr_transpose_descriptor_keeps_preprocess_metadata():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
 
     descr = flagsparse_spsv_analysis_csr(
         data,
@@ -610,14 +627,14 @@ def test_spsv_csr_transpose_descriptor_keeps_preprocess_metadata():
 @pytest.mark.spsv
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_transpose_public_solve_uses_transpose_kernel(monkeypatch, op_mode):
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.complex128
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     b = _rand_like(dtype, (n,), device)
 
     called = {"transpose_complex": False}
@@ -652,23 +669,23 @@ def test_spsv_csr_transpose_public_solve_uses_transpose_kernel(monkeypatch, op_m
     )
     rtol, atol = _tol(dtype)
     assert called["transpose_complex"]
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_roc_route_matches_dense():
     _skip_removed_rocm_route("csr_roc")
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -677,7 +694,7 @@ def test_spsv_csr_explicit_roc_route_matches_dense():
     )
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=True, unit_diagonal=False)
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -685,16 +702,16 @@ def test_spsv_csr_explicit_roc_route_matches_dense():
 @pytest.mark.parametrize("solve_kind", ["csr_roc", "csr_cw_levelschd", "alg2"])
 def test_spsv_csr_explicit_complex_level_routes_match_dense(dtype, solve_kind):
     _skip_removed_rocm_route(solve_kind)
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -703,23 +720,23 @@ def test_spsv_csr_explicit_complex_level_routes_match_dense(dtype, solve_kind):
     )
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=True, unit_diagonal=False)
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 @pytest.mark.parametrize("dtype", SUPPORTED_COMPLEX_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("solve_kind", ["csr_nnz_balance", "alg3"])
 def test_spsv_csr_explicit_complex_nnz_balance_routes_match_dense(dtype, solve_kind):
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -728,21 +745,21 @@ def test_spsv_csr_explicit_complex_nnz_balance_routes_match_dense(dtype, solve_k
     )
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=True, unit_diagonal=False)
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_roc_analysis_builds_only_level_metadata():
     _skip_removed_rocm_route("csr_roc")
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -757,17 +774,17 @@ def test_spsv_csr_explicit_roc_analysis_builds_only_level_metadata():
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_levelschd_route_matches_dense():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -776,20 +793,20 @@ def test_spsv_csr_explicit_levelschd_route_matches_dense():
     )
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=True, unit_diagonal=False)
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_levelschd_analysis_builds_only_level_metadata():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -804,7 +821,7 @@ def test_spsv_csr_explicit_levelschd_analysis_builds_only_level_metadata():
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 96
     A = torch.tril(torch.randn(n, n, dtype=dtype, device=device) * 0.02)
@@ -813,9 +830,9 @@ def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -824,21 +841,21 @@ def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
     )
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=True, unit_diagonal=False)
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
 def test_spsv_csr_explicit_nnz_balance_analysis_builds_backend_metadata():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 96
     A = torch.tril(torch.randn(n, n, dtype=dtype, device=device) * 0.02)
     A = A + torch.eye(n, dtype=dtype, device=device) * 3.0
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -862,16 +879,16 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_backend_metadata():
 def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind):
     if fs_spsv_impl._is_rocm_runtime():
         pytest.skip("DCU advanced SpSV routes currently target lower NON_TRANS")
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 96 if solve_kind == "csr_nnz_balance" else 64
-    A = _build_triangular(n, dtype, device, lower=False)
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     x = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=False,
@@ -880,7 +897,7 @@ def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind)
     )
     x_ref = _dense_ref_spsv(A.to(dtype), b.to(dtype), lower=False, unit_diagonal=False)
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -891,17 +908,17 @@ def test_spsv_csr_explicit_upper_optimized_routes_match_dense(dtype, solve_kind)
 def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_kind):
     if fs_spsv_impl._is_rocm_runtime():
         pytest.skip("DCU advanced SpSV routes currently target lower NON_TRANS")
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 96 if solve_kind == "csr_nnz_balance" else 64
-    A = _build_triangular(n, dtype, device, lower=False)
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=False,
         unit_diagonal=False,
@@ -913,9 +930,9 @@ def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=False,
@@ -929,17 +946,17 @@ def test_spsv_csr_upper_optimized_route_analysis_workspace_matches_direct(solve_
 @pytest.mark.spsv
 def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
     _skip_removed_rocm_route("csr_roc")
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -952,9 +969,9 @@ def test_spsv_csr_roc_analysis_workspace_solve_matches_direct():
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -972,16 +989,16 @@ def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(
     dtype, solve_kind
 ):
     _skip_removed_rocm_route(solve_kind)
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -993,9 +1010,9 @@ def test_spsv_csr_complex_level_route_analysis_workspace_matches_direct(
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -1013,16 +1030,16 @@ def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(
     dtype, solve_kind
 ):
     _skip_removed_rocm_route(solve_kind)
-    device = torch.device("cuda")
+    device = accelerator_device()
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -1035,9 +1052,9 @@ def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -1050,17 +1067,17 @@ def test_spsv_csr_complex_nnz_balance_analysis_workspace_matches_direct(
 
 @pytest.mark.spsv
 def test_spsv_csr_levelschd_analysis_workspace_solve_matches_direct():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 64
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -1073,9 +1090,9 @@ def test_spsv_csr_levelschd_analysis_workspace_solve_matches_direct():
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -1088,7 +1105,7 @@ def test_spsv_csr_levelschd_analysis_workspace_solve_matches_direct():
 
 @pytest.mark.spsv
 def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = 96
     A = torch.tril(torch.randn(n, n, dtype=dtype, device=device) * 0.02)
@@ -1097,9 +1114,9 @@ def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
     Asp = A.to_sparse_csr()
 
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -1112,9 +1129,9 @@ def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
     )
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -1127,14 +1144,14 @@ def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
 
 @pytest.mark.spsv
 def test_spsv_csr_analysis_workspace_solve_matches_direct():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     b = _rand_like(dtype, (n,), device)
 
     descr = flagsparse_spsv_analysis_csr(
@@ -1173,14 +1190,14 @@ def test_spsv_csr_analysis_workspace_solve_matches_direct():
 @pytest.mark.spsv
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_transpose_analysis_workspace_route(op_mode):
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.complex128
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     b = _rand_like(dtype, (n,), device)
 
     descr = flagsparse_spsv_analysis_csr(
@@ -1216,15 +1233,15 @@ def test_spsv_csr_transpose_analysis_workspace_route(op_mode):
 
 @pytest.mark.spsv
 def test_spsv_csr_descriptor_exposes_cuda_style_fields():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -1239,15 +1256,15 @@ def test_spsv_csr_descriptor_exposes_cuda_style_fields():
 
 @pytest.mark.spsv
 def test_spsv_csr_preprocess_initializes_workspace():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -1257,9 +1274,12 @@ def test_spsv_csr_preprocess_initializes_workspace():
     workspace = flagsparse_spsv_create_workspace(descr)
     workspace = flagsparse_spsv_preprocess_csr(descr, workspace=workspace)
     assert isinstance(workspace, FlagSparseSpSVWorkspace)
-    indegree_expected = torch.zeros(n, dtype=torch.int32, device=device)
+    # The expectation is derived from ``Asp``, which lives on the golden device, so
+    # it is built there too and the workspace buffer is brought over to compare.
+    golden = golden_device()
+    indegree_expected = torch.zeros(n, dtype=torch.int32, device=golden)
     row_ids = torch.repeat_interleave(
-        torch.arange(n, device=device, dtype=torch.int64),
+        torch.arange(n, device=golden, dtype=torch.int64),
         Asp.crow_indices().to(torch.int64)[1:]
         - Asp.crow_indices().to(torch.int64)[:-1],
     )
@@ -1269,23 +1289,25 @@ def test_spsv_csr_preprocess_initializes_workspace():
             Asp.col_indices().to(torch.int64)[mask], minlength=n
         ).to(torch.int32)
         indegree_expected.copy_(counts)
-    assert torch.equal(workspace.buffers["indegree"], indegree_expected)
+    assert torch.equal(
+        workspace.buffers["indegree"].to(golden), indegree_expected
+    )
 
 
 @pytest.mark.spsv
 def test_spsv_ex_interfaces_match_direct_route():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float64
     n = SPSV_N[0]
-    A = _build_triangular(n, dtype, device, lower=True)
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     Asp = A.to_sparse_csr()
     b = _rand_like(dtype, (n,), device)
 
     handle = flagsparse_create_spsv_handle(device=b.device)
     mat = flagsparse_create_spmat_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         (n, n),
         lower=True,
         unit_diagonal=False,
@@ -1318,9 +1340,9 @@ def test_spsv_ex_interfaces_match_direct_route():
         solve_kind="csr_cw",
     )
     x_direct = flagsparse_spsv_csr(
-        Asp.values().clone(),
-        Asp.col_indices().to(torch.int32),
-        Asp.crow_indices().to(torch.int32),
+        Asp.values().clone().to(device),
+        Asp.col_indices().to(torch.int32).to(device),
+        Asp.crow_indices().to(torch.int32).to(device),
         b,
         (n, n),
         lower=True,
@@ -1343,11 +1365,11 @@ def test_spsv_ex_interfaces_match_direct_route():
 )
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mode):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=True)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
     A_ref = A.to(dtype)
-    b_ref = b.to(dtype)
+    b_ref = b.to(device=A_ref.device, dtype=dtype)
     x_ref = torch.linalg.solve_triangular(
         _apply_ref_op(A_ref, op_mode),
         b_ref.unsqueeze(-1),
@@ -1355,9 +1377,9 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
 
     x = flagsparse_spsv_csr(
         data,
@@ -1370,7 +1392,7 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
         transpose=_transpose_arg(op_mode),
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -1381,14 +1403,14 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=True)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
 
     x_non = flagsparse_spsv_csr(
@@ -1419,14 +1441,14 @@ def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
 )
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
 def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mode):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=True)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
 
     x_trans = flagsparse_spsv_csr(
@@ -1457,17 +1479,17 @@ def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mo
     "index_dtype", [torch.int32, torch.int64], ids=["int32", "int64"]
 )
 def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=False)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
     x_ref = torch.linalg.solve_triangular(
-        A.to(dtype), b.to(dtype).unsqueeze(-1), upper=True
+        A.to(dtype), b.to(device=A.device, dtype=dtype).unsqueeze(-1), upper=True
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
 
     x = flagsparse_spsv_csr(
         data,
@@ -1480,7 +1502,7 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
         transpose=False,
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -1493,11 +1515,11 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
 def test_spsv_csr_upper_transpose_family_supported_combos(
     n, dtype, index_dtype, op_mode
 ):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=False)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
     A_ref = A.to(dtype)
-    b_ref = b.to(dtype)
+    b_ref = b.to(device=A_ref.device, dtype=dtype)
     x_ref = torch.linalg.solve_triangular(
         _apply_ref_op(A_ref, op_mode),
         b_ref.unsqueeze(-1),
@@ -1505,9 +1527,9 @@ def test_spsv_csr_upper_transpose_family_supported_combos(
     ).squeeze(-1)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
 
     x = flagsparse_spsv_csr(
         data,
@@ -1520,7 +1542,7 @@ def test_spsv_csr_upper_transpose_family_supported_combos(
         transpose=_transpose_arg(op_mode),
     )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x.to(x_ref.device), x_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -1531,14 +1553,14 @@ def test_spsv_csr_upper_transpose_family_supported_combos(
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=False)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(torch.int32)
-    indptr = Asp.crow_indices().to(torch.int32)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(torch.int32).to(device)
+    indptr = Asp.crow_indices().to(torch.int32).to(device)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
 
     x_non = flagsparse_spsv_csr(
@@ -1571,14 +1593,14 @@ def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
 def test_spsv_csr_matches_cusparse_upper_transpose_family(
     n, dtype, index_dtype, op_mode
 ):
-    device = torch.device("cuda")
-    A = _build_triangular(n, dtype, device, lower=False)
+    device = accelerator_device()
+    A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
 
     Asp = A.to_sparse_csr()
-    data = Asp.values().clone()
-    indices = Asp.col_indices().to(index_dtype)
-    indptr = Asp.crow_indices().to(index_dtype)
+    data = Asp.values().clone().to(device)
+    indices = Asp.col_indices().to(index_dtype).to(device)
+    indptr = Asp.crow_indices().to(index_dtype).to(device)
     A_cp = _cupy_csr_from_torch(data, indices, indptr, (n, n))
 
     x_trans = flagsparse_spsv_csr(

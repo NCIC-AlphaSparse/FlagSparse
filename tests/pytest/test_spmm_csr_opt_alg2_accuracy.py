@@ -20,10 +20,16 @@ from flagsparse import (
     prepare_spmm_csr_opt_alg2,
 )
 
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 from tests.pytest.param_shapes import MNK_SHAPES, SPMM_OPT_DTYPES, SPMM_OPT_DTYPE_IDS
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 
 _DENSE_COLS = (1, 8, 32, 96)
@@ -32,6 +38,11 @@ _INDEX_DTYPE_IDS = ("int32", "int64")
 
 
 def _random_csr_mk(M, K, dtype, device):
+    """Random sparse CSR matrix on ``device``.
+
+    Tests pass ``golden_device()``: ``_torch_reference`` uses ``torch.sparse.mm``,
+    which has no working implementation on MUSA.  See ``golden_device()``.
+    """
     denom = max(M * K, 1)
     p = min(0.35, max(0.08, 48.0 / denom))
     mask = torch.rand(M, K, device=device) < p
@@ -75,42 +86,48 @@ def _torch_reference(Asp, data, indices, indptr, B, shape, dtype, index_dtype):
 @pytest.mark.parametrize("dense_cols", _DENSE_COLS)
 @pytest.mark.parametrize("index_dtype", _INDEX_DTYPES, ids=_INDEX_DTYPE_IDS)
 def test_spmm_csr_opt_alg2_matches_torch(M, N, K, dtype, dense_cols, index_dtype):
-    device = torch.device("cuda")
-    Asp = _random_csr_mk(M, K, dtype, device)
+    device = accelerator_device()
+    golden = golden_device()
+    Asp = _random_csr_mk(M, K, dtype, golden)
     data = Asp.values()
     indices = Asp.col_indices().to(index_dtype)
     indptr = Asp.crow_indices().to(index_dtype)
-    B = torch.randn(K, dense_cols, dtype=dtype, device=device)
+    B = torch.randn(K, dense_cols, dtype=dtype, device=golden)
     ref = _torch_reference(Asp, data, indices, indptr, B, (M, K), dtype, index_dtype)
 
-    out = flagsparse_spmm_csr_opt_alg2(data, indices, indptr, B, (M, K))
+    out = flagsparse_spmm_csr_opt_alg2(
+        data.to(device), indices.to(device), indptr.to(device), B.to(device), (M, K)
+    )
     rtol, atol = _tol(dtype)
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spmm_csr_opt_alg2
 @pytest.mark.parametrize("dtype", SPMM_OPT_DTYPES, ids=SPMM_OPT_DTYPE_IDS)
 def test_spmm_csr_opt_alg2_prepared_out_and_meta(dtype):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 16, 32, 24
-    Asp = _random_csr_mk(M, K, dtype, device)
+    golden = golden_device()
+    Asp = _random_csr_mk(M, K, dtype, golden)
     data = Asp.values()
     indices = Asp.col_indices().to(torch.int64)
     indptr = Asp.crow_indices().to(torch.int64)
-    B = torch.randn(K, N, dtype=dtype, device=device)
-    prepared = prepare_spmm_csr_opt_alg2(data, indices, indptr, (M, K))
+    B = torch.randn(K, N, dtype=dtype, device=golden)
+    ref = _torch_reference(Asp, data, indices, indptr, B, (M, K), dtype, torch.int64)
+    prepared = prepare_spmm_csr_opt_alg2(
+        data.to(device), indices.to(device), indptr.to(device), (M, K)
+    )
 
     out_buf = torch.empty((M, N), dtype=dtype, device=device)
     out, meta = flagsparse_spmm_csr_opt_alg2(
-        B=B,
+        B=B.to(device),
         prepared=prepared,
         out=out_buf,
         return_meta=True,
     )
-    ref = _torch_reference(Asp, data, indices, indptr, B, (M, K), dtype, torch.int64)
     rtol, atol = _tol(dtype)
     assert out is out_buf
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol)
+    assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
     assert meta["device_name"]
     assert isinstance(meta["sm_count"], int)
     assert isinstance(meta["warp_size"], int)
@@ -122,7 +139,7 @@ def test_spmm_csr_opt_alg2_prepared_out_and_meta(dtype):
 
 @pytest.mark.spmm_csr_opt_alg2
 def test_spmm_csr_opt_alg2_return_time_and_meta_shapes():
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float32
     M, K, N = 8, 16, 7
     Asp = _random_csr_mk(M, K, dtype, device)

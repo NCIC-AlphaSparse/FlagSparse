@@ -18,13 +18,19 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmm_csc, prepare_spmm_csc_route
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 
 
 spmm_csc_mod = importlib.import_module("flagsparse.sparse_operations.spmm_csc")
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA/ROCm PyTorch device required",
+    not accelerator_available(),
+    reason=ACCELERATOR_REQUIRED,
 )
 
 SPMM_CSC_MKN_SHAPES = ((7, 5, 4), (16, 32, 8), (64, 96, 16))
@@ -103,24 +109,35 @@ def _dense_to_csc(dense, index_dtype):
 
 
 def _random_csc_mk(M, K, dtype, index_dtype, device):
+    """CSC arrays on ``device``, dense oracle copy on CPU.
+
+    Built on the golden device: ``torch.where`` has no muDNN kernel for
+    float64/complex on Moore Threads, so generating the matrix on the accelerator
+    failed before the operator under test ran.  See ``golden_device()``.
+    """
+    golden = golden_device()
     p = min(0.25, max(0.06, 32.0 / max(M * K, 1)))
-    mask = torch.rand(M, K, device=device) < p
+    mask = torch.rand(M, K, device=golden) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
     dense = torch.where(
         mask,
-        _random_values((M, K), dtype, device),
-        torch.zeros((), dtype=dtype, device=device),
+        _random_values((M, K), dtype, golden),
+        torch.zeros((), dtype=dtype, device=golden),
     )
     data, indices, indptr = _dense_to_csc(dense, index_dtype)
-    return data, indices, indptr, dense
+    return data.to(device), indices.to(device), indptr.to(device), dense
 
 
 def _assert_close(actual, expected, dtype):
     rtol, atol = close_tolerances(dtype)
     ref_dtype = _reference_dtype(dtype)
+    golden = golden_device()
     assert torch.allclose(
-        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+        actual.to(device=golden, dtype=ref_dtype),
+        expected.to(device=golden, dtype=ref_dtype),
+        rtol=rtol,
+        atol=atol,
     )
 
 
@@ -134,22 +151,25 @@ def _assert_close(actual, expected, dtype):
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmm_csc_matches_dense_reference(M, K, N, name, dtype, index_dtype, layout, op):
     del name
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, dense = _random_csc_mk(
         M, K, dtype, index_dtype, device
     )
     b_rows = _logical_b_rows(M, K, op)
-    B = _random_values((b_rows, N), dtype, device)
-    if layout == "col":
-        B_col = torch.empty_strided((b_rows, N), (1, max(1, b_rows)), dtype=dtype, device=device)
-        B_col.copy_(B)
-        B = B_col
+    B = _random_values((b_rows, N), dtype, golden_device())
     ref = _dense_reference(dense, B, dtype, op)
+    B_dev = B.to(device)
+    if layout == "col":
+        B_col = torch.empty_strided(
+            (b_rows, N), (1, max(1, b_rows)), dtype=dtype, device=device
+        )
+        B_col.copy_(B_dev)
+        B_dev = B_col
     out = flagsparse_spmm_csc(
         data,
         indices,
         indptr,
-        B,
+        B_dev,
         shape=(M, K),
         op=op,
         index_fallback_policy="auto",
@@ -160,7 +180,7 @@ def test_spmm_csc_matches_dense_reference(M, K, N, name, dtype, index_dtype, lay
 
 @pytest.mark.spmm_csc
 def test_spmm_csc_prepared_path_and_meta():
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 7, 5, 4
     dtype = torch.complex64
     data, indices, indptr, dense = _random_csc_mk(
@@ -168,11 +188,11 @@ def test_spmm_csc_prepared_path_and_meta():
     )
     op = "conj"
     prepared = prepare_spmm_csc_route(data, indices, indptr, (M, K), op=op)
-    B = _random_values((M, N), dtype, device)
+    B = _random_values((M, N), dtype, golden_device())
     ref = _dense_reference(dense, B, dtype, op)
     out, meta = spmm_csc_mod.flagsparse_spmm_csc_run(
         prepared,
-        B,
+        B.to(device),
         op=op,
         return_meta=True,
         timing=True,
@@ -190,25 +210,27 @@ def test_spmm_csc_prepared_path_and_meta():
 @pytest.mark.spmm_csc
 @pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
 def test_spmm_csc_B_length_mismatch_rejected(op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 8, 12, 4
     data, indices, indptr, _dense = _random_csc_mk(
         M, K, torch.float32, torch.int32, device
     )
     good_rows = _logical_b_rows(M, K, op)
-    B = torch.randn((good_rows - 1, N), dtype=torch.float32, device=device)
+    B = torch.randn(
+        (good_rows - 1, N), dtype=torch.float32, device=golden_device()
+    ).to(device)
     with pytest.raises(ValueError, match="B.shape\\[0\\] must be"):
         flagsparse_spmm_csc(data, indices, indptr, B, shape=(M, K), op=op)
 
 
 @pytest.mark.spmm_csc
 def test_spmm_csc_prepared_op_mismatch_rejected():
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, _dense = _random_csc_mk(
         8, 10, torch.float32, torch.int32, device
     )
     prepared = prepare_spmm_csc_route(data, indices, indptr, (8, 10), op="non")
-    B = torch.randn((8, 4), dtype=torch.float32, device=device)
+    B = torch.randn((8, 4), dtype=torch.float32, device=golden_device()).to(device)
     with pytest.raises(ValueError, match="does not match"):
         spmm_csc_mod.flagsparse_spmm_csc_run(prepared, B, op="trans")
 
@@ -216,13 +238,15 @@ def test_spmm_csc_prepared_op_mismatch_rejected():
 @pytest.mark.spmm_csc
 @pytest.mark.parametrize("op", ["trans", "conj"], ids=["trans", "conj"])
 def test_spmm_csc_transpose_family_high_level(op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, dense = _random_csc_mk(
         8, 12, torch.float32, torch.int32, device
     )
-    B = torch.randn((8, 4), dtype=torch.float32, device=device)
+    B = torch.randn((8, 4), dtype=torch.float32, device=golden_device())
     ref = _dense_reference(dense, B, torch.float32, op)
-    out = flagsparse_spmm_csc(data, indices, indptr, B, shape=(8, 12), op=op)
+    out = flagsparse_spmm_csc(
+        data, indices, indptr, B.to(device), shape=(8, 12), op=op
+    )
     assert out.shape == (12, 4)
     _assert_close(out, ref, torch.float32)
 
@@ -230,14 +254,15 @@ def test_spmm_csc_transpose_family_high_level(op):
 @pytest.mark.spmm_csc
 @pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
 def test_spmm_csc_int64_auto_fallback_to_int32(monkeypatch, op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 7, 5, 4
     dtype = torch.float32
     data, indices, indptr, dense = _random_csc_mk(
         M, K, dtype, torch.int64, device
     )
-    B = _random_values((_logical_b_rows(M, K, op), N), dtype, device)
+    B = _random_values((_logical_b_rows(M, K, op), N), dtype, golden_device())
     ref = _dense_reference(dense, B, dtype, op)
+    B = B.to(device)
     state = {"forced_once": False}
     original = spmm_csc_mod._triton_spmm_csc_base_kernel
 
@@ -263,7 +288,7 @@ def test_spmm_csc_int64_auto_fallback_to_int32(monkeypatch, op):
 
 @pytest.mark.spmm_csc
 def test_spmm_csc_int64_strict_no_fallback(monkeypatch):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 7, 5, 4
     data, indices, indptr, _dense = _random_csc_mk(
         M, K, torch.float32, torch.int64, device

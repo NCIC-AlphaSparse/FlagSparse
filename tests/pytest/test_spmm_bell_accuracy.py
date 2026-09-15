@@ -18,13 +18,13 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmm_bell, prepare_spmm_bell_route
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import ACCELERATOR_DEVICE_TYPE, ACCELERATOR_REQUIRED, accelerator_available, accelerator_device, close_tolerances, is_mthreads_backend, scipy_sparse_mm
 
 
 spmm_bell_mod = importlib.import_module("flagsparse.sparse_operations.spmm_bell")
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA/ROCm PyTorch device required",
+    not accelerator_available(),
+    reason=ACCELERATOR_REQUIRED,
 )
 
 SPMM_BELL_MKN_SHAPES = ((7, 5, 4), (16, 32, 8), (17, 19, 7))
@@ -108,23 +108,27 @@ def _entries_to_bell(entries, shape, dtype, index_dtype, block_dim, device):
 
 
 def _make_problem(M, K, N, dtype, index_dtype, block_dim):
-    device = torch.device("cuda")
-    mask = torch.rand((M, K), device=device) < 0.2
+    device = accelerator_device()
+    generation_device = torch.device("cpu") if is_mthreads_backend() else device
+    mask = torch.rand((M, K), device=generation_device) < 0.2
     mask[0, 0] = True
     if M > 4 and K > 4:
         mask[M - 1, K - 1] = True
     dense = torch.where(
         mask,
-        _random_values((M, K), dtype, device),
-        torch.zeros((), dtype=dtype, device=device),
+        _random_values((M, K), dtype, generation_device),
+        torch.zeros((), dtype=dtype, device=generation_device),
     )
     entries = _entries_from_dense(dense)
-    data, indices = _entries_to_bell(entries, (M, K), dtype, index_dtype, block_dim, device)
-    B = _random_values((K, N), dtype, device).contiguous()
-    return dense, data, indices, B
+    data, indices = _entries_to_bell(entries, (M, K), dtype, index_dtype, block_dim, generation_device)
+    B = _random_values((K, N), dtype, generation_device).contiguous()
+    return dense.to(device), data.to(device), indices.to(device), B.to(device)
 
 
 def _dense_reference(dense, B, dtype):
+    if is_mthreads_backend():
+        csr = dense.cpu().to_sparse_csr()
+        return scipy_sparse_mm(csr.values(), csr.col_indices(), csr.crow_indices(), tuple(dense.shape), B).to(dtype)
     ref_dtype = _reference_dtype(dtype)
     return (dense.to(ref_dtype) @ B.to(ref_dtype)).to(dtype)
 
@@ -140,7 +144,7 @@ def test_spmm_bell_matches_dense_reference(M, K, N, name, dtype, index_dtype, bl
     out = flagsparse_spmm_bell(data, indices, B, shape=(M, K), block_dim=block_dim, op="non")
     ref = _dense_reference(dense, B, dtype)
     rtol, atol = close_tolerances(dtype)
-    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out, ref.to(out.device), rtol=rtol, atol=atol)
     assert out.shape == (M, N)
 
 
@@ -159,7 +163,7 @@ def test_spmm_bell_prepared_path_and_meta():
     )
     ref = _dense_reference(dense, B, dtype)
     rtol, atol = close_tolerances(dtype)
-    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out, ref.to(out.device), rtol=rtol, atol=atol)
     assert meta["alg"] == "spmm_bell_base"
     assert meta["op"] == "non"
     assert meta["logical_shape"] == (M, K)
@@ -173,7 +177,7 @@ def test_spmm_bell_prepared_path_and_meta():
 def test_spmm_bell_empty_slots_are_index_minus_one():
     M, K, N = 5, 7, 2
     dtype = torch.float32
-    device = torch.device("cuda")
+    device = accelerator_device()
     data = torch.zeros((3, 2, 2, 2), dtype=dtype, device=device)
     indices = torch.full((3, 2), -1, dtype=torch.int64, device=device)
     data[0, 0, 0, 0] = 2.0
@@ -190,7 +194,7 @@ def test_spmm_bell_empty_slots_are_index_minus_one():
 def test_spmm_bell_B_length_mismatch_rejected():
     M, K, N = 8, 10, 3
     _dense, data, indices, _B = _make_problem(M, K, N, torch.float32, torch.int32, 2)
-    bad_B = torch.randn((K + 2, N), dtype=torch.float32, device="cuda")
+    bad_B = torch.randn((K + 2, N), dtype=torch.float32, device=ACCELERATOR_DEVICE_TYPE)
     with pytest.raises(ValueError, match="B must have shape"):
         flagsparse_spmm_bell(data, indices, bad_B, shape=(M, K), block_dim=2, op="non")
 
