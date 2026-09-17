@@ -78,7 +78,11 @@ def parser():
     p.add_argument(
         "--alg",
         default="auto",
-        help="auto, compare, or comma-separated concrete algorithms",
+        help=(
+            "auto, compare (all registered algorithms supported by the selected "
+            "dtype/op/backend/indices), or comma-separated concrete algorithms; "
+            "all is an alias for compare"
+        ),
     )
     p.add_argument(
         "--config",
@@ -105,6 +109,27 @@ def choices(value, allowed):
             f"expected a nonempty selection from {tuple(allowed)}, got {value!r}"
         )
     return names
+
+
+def compare_selection(specs, dtype, op, backend, index_dtype, indptr_dtype):
+    """Select declared support only; prepare still checks device capabilities."""
+    selected, excluded = [], {}
+    for spec in specs:
+        reasons = []
+        for value, key in (
+            (dtype, "value_dtypes"),
+            (op, "ops"),
+            (backend, "backends"),
+            (index_dtype, "index_dtypes"),
+            (indptr_dtype, "indptr_dtypes"),
+        ):
+            if value not in spec[key]:
+                reasons.append(f"{key}={value}; supported={','.join(spec[key])}")
+        if reasons:
+            excluded[spec["name"]] = "; ".join(reasons)
+        else:
+            selected.append(spec["name"])
+    return tuple(selected), excluded
 
 
 def load_mtx_to_csr_torch(file_path, dtype=None, device=None):
@@ -136,6 +161,9 @@ def synthetic_cases(torch, dtype, device):
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
+    args.alg = args.alg.strip()
+    if args.alg == "all":
+        args.alg = "compare"
     if args.warmup < 0 or args.iters < 1:
         p.error("require warmup >= 0 and iters >= 1")
     if not args.paths and not args.synthetic:
@@ -175,10 +203,16 @@ def main(argv=None):
         p.error("no .mtx files found")
     try:
         commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
         ).strip()
         if subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=ROOT, text=True
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
         ).strip():
             commit += "+dirty"
     except (OSError, subprocess.CalledProcessError):
@@ -198,6 +232,39 @@ def main(argv=None):
     print(
         "Native CSR SpMV; Ref=CPU FP64/complex128 (correctness only). ms=process_cpu_ms+gpu_ms; phase diagnostics run separately. Vendor=N/A when native same-device CSR is unavailable."
     )
+    registered = fs.list_spmv_csr_algorithms()
+    selections = {}
+    if args.alg == "compare":
+        specs = [fs.get_spmv_csr_algorithm_spec(alg) for alg in registered]
+        print(
+            "compare selects declared support per input combination; "
+            "device capabilities are checked at prepare (may produce SKIP)."
+        )
+        for dtype_name in dtypes:
+            for index_name in indices:
+                for ptr_name in ptrtypes or (index_name,):
+                    for op in ops:
+                        key = (dtype_name, index_name, ptr_name, op)
+                        selected, excluded = compare_selection(
+                            specs,
+                            dtype_name,
+                            op,
+                            common._backend_name(),
+                            index_name,
+                            ptr_name,
+                        )
+                        selections[key] = selected
+                        print(
+                            f"[compare] {dtype_name} {index_name}/{ptr_name} {op}: "
+                            f"selected={len(selected)}/{len(registered)} "
+                            f"{','.join(selected) or '(none)'}"
+                        )
+                        for alg, reason in excluded.items():
+                            print(f"  excluded {alg}: {reason}")
+        if not any(selections.values()):
+            p.error("no registered algorithms support the selected combinations")
+    else:
+        explicit_algorithms = choices(args.alg, ("auto",) + registered)
     fields = FIELDS + (["process_gpu_ms", "compute_ms"] if args.timing else [])
     csv_file = None
     writer = None
@@ -225,7 +292,7 @@ def main(argv=None):
             )
             csv_file.flush()
         print(
-            f"{row['matrix']} {row['dtype']} {row['index_dtype']}/{row['indptr_dtype']} {row['op']} {row['alg']}: {row['status']} ms={row.get('ms', 'N/A')} {row.get('reason') or ''}"
+            f"{row['matrix']} {row['dtype']} {row['index_dtype']}/{row['indptr_dtype']} {row['op']} {row['alg']}: {row['status']} ms={row.get('ms', 'N/A')} max_error={row.get('max_error', 'N/A')} {row.get('reason') or ''}"
         )
 
     try:
@@ -256,14 +323,12 @@ def main(argv=None):
                                 ref="CPU FP64/complex128 scatter (correctness only)",
                             )
                             algorithms = (
-                                fs.list_spmv_csr_algorithms(
-                                    op, dtype, common._backend_name()
-                                )
+                                selections[(dtype_name, index_name, ptr_name, op)]
                                 if args.alg == "compare"
-                                else choices(
-                                    args.alg, ("auto",) + fs.list_spmv_csr_algorithms()
-                                )
+                                else explicit_algorithms
                             )
+                            if not algorithms:
+                                continue
                             try:
                                 if isinstance(source, Exception):
                                     raise source
@@ -349,17 +414,6 @@ def main(argv=None):
                             for alg in algorithms:
                                 row = dict(base, alg=alg)
                                 try:
-                                    spec = (
-                                        fs.get_spmv_csr_algorithm_spec(alg)
-                                        if alg != "auto"
-                                        else None
-                                    )
-                                    if (
-                                        args.alg == "compare"
-                                        and spec
-                                        and index_name not in spec["index_dtypes"]
-                                    ):
-                                        continue
                                     prepared = fs.prepare_spmv_csr(
                                         data,
                                         ci,
