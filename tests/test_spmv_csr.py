@@ -91,8 +91,8 @@ def parser():
         help="explicit JSON launch configuration",
     )
     p.add_argument("--csv-csr", "--csv", dest="csv_csr")
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--iters", type=int, default=50)
     p.add_argument("--timing", action="store_true")
     p.add_argument(
         "--no-vendor", "--no-cusparse", dest="no_vendor", action="store_true"

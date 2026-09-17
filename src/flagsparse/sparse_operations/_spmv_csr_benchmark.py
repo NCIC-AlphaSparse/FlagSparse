@@ -6,6 +6,27 @@ from . import _common as common
 from .spmv_csr import flagsparse_spmv_csr_run, _spmv_device_context
 
 
+def _filtered_avg_ms(times):
+    if not times:
+        return None
+    values = [float(t) for t in times]
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    if median == 0.0:
+        kept = [t for t in ordered if t == 0.0]
+    else:
+        lo = median * 0.9
+        hi = median * 1.1
+        kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
 def event_benchmark(fn, warmup, iters):
     if warmup < 0 or iters < 1:
         raise ValueError("require warmup >= 0 and iters >= 1")
@@ -14,17 +35,19 @@ def event_benchmark(fn, warmup, iters):
     for _ in range(warmup):
         value = fn()
     common._ACCEL.synchronize()
-    start = common._ACCEL.Event(enable_timing=True)
-    end = common._ACCEL.Event(enable_timing=True)
-    start.record()
+    samples = []
     for _ in range(iters):
+        start = common._ACCEL.Event(enable_timing=True)
+        end = common._ACCEL.Event(enable_timing=True)
+        start.record()
         value = fn()
-    end.record()
-    end.synchronize()
-    return value, start.elapsed_time(end) / iters
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+    return value, _filtered_avg_ms(samples)
 
 
-def measure_route(prepared, x, warmup=5, iters=20, timing=False):
+def measure_route(prepared, x, warmup=10, iters=50, timing=False):
     with _spmv_device_context(prepared.data.device):
         value, gpu_ms = event_benchmark(
             lambda: flagsparse_spmv_csr_run(prepared, x), warmup, iters

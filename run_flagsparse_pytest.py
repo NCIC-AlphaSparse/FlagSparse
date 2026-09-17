@@ -2726,8 +2726,8 @@ def main(
             default="",
             help="Extra args appended to every performance invocation.",
         )
-        parser.add_argument("--benchmark-warmup", type=int, default=5)
-        parser.add_argument("--benchmark-iters", type=int, default=20)
+        parser.add_argument("--benchmark-warmup", type=int, default=10)
+        parser.add_argument("--benchmark-iters", type=int, default=50)
     parser.add_argument(
         "--timeout",
         type=int,

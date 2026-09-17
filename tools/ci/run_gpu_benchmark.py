@@ -54,10 +54,10 @@ def _parse_args() -> argparse.Namespace:
         help="Benchmark suite to execute.",
     )
     parser.add_argument(
-        "--warmup", type=int, default=5, help="Warmup iterations where supported."
+        "--warmup", type=int, default=10, help="Warmup iterations where supported."
     )
     parser.add_argument(
-        "--iters", type=int, default=20, help="Timed iterations where supported."
+        "--iters", type=int, default=50, help="Timed iterations where supported."
     )
     parser.add_argument(
         "--with-cusparse",

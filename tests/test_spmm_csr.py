@@ -36,6 +36,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spmm_csr as spmm_ops
+from utils import cuda_event_benchmark_filtered, cupy_event_benchmark_filtered
 
 from test_spmm import (
     _build_dense_matrix,
@@ -339,35 +340,11 @@ def _print_tle_availability(alg_names):
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(max(1, int(iters))):
-        out = op()
-    end.record()
-    torch.cuda.synchronize()
-    return out, start.elapsed_time(end) / max(1, int(iters))
+    return cuda_event_benchmark_filtered(op, warmup, iters)
 
 
 def _cupy_event_benchmark(op, warmup, iters):
-    import cupy as cp
-
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    start.record()
-    for _ in range(max(1, int(iters))):
-        out = op()
-    end.record()
-    end.synchronize()
-    return out, cp.cuda.get_elapsed_time(start, end) / max(1, int(iters))
+    return cupy_event_benchmark_filtered(op, warmup, iters)
 
 
 def _time_route(

@@ -40,6 +40,7 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as ast
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmm_coo as ast_ops
+from utils import cuda_event_benchmark_filtered, cupy_event_benchmark_filtered
 
 VALUE_DTYPES = [
     torch.float16,
@@ -562,19 +563,7 @@ def _build_pytorch_reference(
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out = op()
-    end.record()
-    torch.cuda.synchronize()
-    return out, start.elapsed_time(end) / count
+    return cuda_event_benchmark_filtered(op, warmup, iters)
 
 
 def _time_coo_algorithm(
@@ -742,21 +731,7 @@ def _time_cusparse_coo(prepared_case, ref_C, dtype, warmup, iters, layout="row")
 
 
 def _cupy_event_benchmark(op, arg, warmup, iters):
-    import cupy as cp
-
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op(arg)
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out = op(arg)
-    end.record()
-    end.synchronize()
-    return out, cp.cuda.get_elapsed_time(start, end) / count
+    return cupy_event_benchmark_filtered(lambda: op(arg), warmup, iters)
 
 
 def run_one_alg_case(
@@ -1568,18 +1543,12 @@ def run_one_mtx(
                 A_coo.sum_duplicates()
 
                 def _run_cusparse_timing(rhs):
-                    torch.cuda.synchronize()
-                    for _ in range(warmup):
-                        _ = cupyx.cusparse.spmm(A_coo, rhs)
-                    torch.cuda.synchronize()
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    for _ in range(iters):
-                        _ = cupyx.cusparse.spmm(A_coo, rhs)
-                    end.record()
-                    torch.cuda.synchronize()
-                    return start.elapsed_time(end) / iters
+                    _, elapsed = cupy_event_benchmark_filtered(
+                        lambda: cupyx.cusparse.spmm(A_coo, rhs),
+                        warmup,
+                        iters,
+                    )
+                    return elapsed
 
                 try:
                     result["cusparse_ms"] = _run_cusparse_timing(B_cp)

@@ -20,7 +20,6 @@ import glob
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -82,6 +81,7 @@ from test_spmv_bsr import (  # noqa: E402
     _entries_to_bsr_torch,
     load_mtx_entries,
 )
+from utils import cpu_wall_benchmark_filtered
 
 
 def _scipy_unavailable_reason():
@@ -112,14 +112,7 @@ def _time_scipy_bsr_cpu(data, indices, indptr, x, shape, block_dim, op, warmup, 
     else:
         fn = lambda: A @ x_padded
 
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = fn()
-    count = max(1, int(iters))
-    start = time.perf_counter()
-    for _ in range(count):
-        out = fn()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0 / count
+    out, elapsed_ms = cpu_wall_benchmark_filtered(fn, warmup, iters)
     return elapsed_ms, None, out
 
 
@@ -491,7 +484,7 @@ def run_synthetic(
     print("=" * 140)
     print("FLAGSPARSE SpMV BSR BENCHMARK WITH SCIPY CPU BSR BASELINE")
     print("=" * 140)
-    print("Timing policy: bsr_ms = process_cpu_ms + bsr_gpu_ms; SciPy construction is setup.")
+    print("Timing policy: bsr_ms = process_cpu_ms + filtered bsr_gpu_ms; SciPy construction is setup.")
     _print_scipy_notes(run_cusparse=run_cusparse)
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:
