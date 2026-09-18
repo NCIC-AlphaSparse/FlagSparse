@@ -388,7 +388,7 @@ def test_spsv_csr_complex_upper_non_trans_defaults_to_smblk_route():
 
 @pytest.mark.spsv
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
-def test_spsv_csr_transpose_family_defaults_to_alg2_route(op_mode):
+def test_spsv_csr_transpose_family_defaults_to_cw_route(op_mode):
     device = accelerator_device()
     n = SPSV_N[0]
     dtype = torch.complex128
@@ -403,7 +403,7 @@ def test_spsv_csr_transpose_family_defaults_to_alg2_route(op_mode):
         data, indices, indptr, b, (n, n), True, _transpose_arg(op_mode), False
     )
     selected = fs_spsv_impl._select_spsv_runtime_plan(solve_plan, trans_mode)
-    assert selected["solve_kind"] == "transpose_alg2"
+    assert selected["solve_kind"] == "transpose_cw"
 
 
 @pytest.mark.spsv
@@ -616,7 +616,7 @@ def test_spsv_csr_transpose_descriptor_keeps_preprocess_metadata():
         unit_diagonal=False,
         transpose="TRANS",
     )
-    assert descr.solve_kind == "transpose_alg2"
+    assert descr.solve_kind == "transpose_cw"
     assert descr.storage_view == "csr_as_csc"
     assert descr.solve_plan.get("transpose_indegree_init") is None
     assert descr.solve_plan.get("transpose_diag") is None
@@ -638,18 +638,17 @@ def test_spsv_csr_transpose_public_solve_uses_transpose_kernel(monkeypatch, op_m
     b = _rand_like(dtype, (n,), device)
 
     called = {"transpose_complex": False}
-    target_name = (
-        "_triton_spsv_csr_n_lo_nnz_balance_vector_complex"
-        if fs_spsv_impl._is_rocm_runtime()
-        else "_triton_spsv_csr_transpose_alg2_vector_complex"
-    )
-    real_impl = getattr(fs_spsv_impl, target_name)
+    real_impl = fs_spsv_impl._triton_spsv_csr_transpose_cw_vector_complex
 
     def _wrapped(*args, **kwargs):
         called["transpose_complex"] = True
         return real_impl(*args, **kwargs)
 
-    monkeypatch.setattr(fs_spsv_impl, target_name, _wrapped)
+    monkeypatch.setattr(
+        fs_spsv_impl,
+        "_triton_spsv_csr_transpose_cw_vector_complex",
+        _wrapped,
+    )
 
     x = flagsparse_spsv_csr(
         data,
@@ -1210,17 +1209,11 @@ def test_spsv_csr_transpose_analysis_workspace_route(op_mode):
         unit_diagonal=False,
         transpose=_transpose_arg(op_mode),
     )
-    assert descr.solve_kind == "transpose_alg2"
-    assert descr.route_name == "transpose_alg2"
+    assert descr.solve_kind == "transpose_cw"
+    assert descr.route_name == "transpose_cw"
     assert descr.solve_plan.get("lower_eff") is False
     layout_names = [entry["name"] for entry in descr.workspace_layout]
-    if fs_spsv_impl._is_rocm_runtime():
-        assert layout_names == ["tmp_sum", "ready", "indegree"]
-    else:
-        assert layout_names == ["residual", "ready", "indegree", "work_counter"]
-    assert descr.buffer_size == flagsparse_spsv_buffer_size(
-        (n, n), dtype, format="csr", transpose=_transpose_arg(op_mode)
-    )
+    assert layout_names == ["residual", "indegree", "row_counter"]
 
     workspace = flagsparse_spsv_create_workspace(descr)
     x_via_descr = flagsparse_spsv_solve_csr(descr, b, workspace=workspace)

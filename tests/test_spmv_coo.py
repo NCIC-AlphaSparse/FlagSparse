@@ -19,6 +19,7 @@ import glob
 import csv
 import math
 import os
+import time
 
 import torch
 import sys
@@ -32,7 +33,6 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
-from utils import cuda_event_benchmark_filtered
 
 VALUE_DTYPES = [torch.float32, torch.float64, torch.complex64, torch.complex128]
 INDEX_DTYPES = [torch.int32, torch.int64]
@@ -260,7 +260,19 @@ COO_SEG_BLOCK_INNER = 128
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    return cuda_event_benchmark_filtered(op, warmup, iters)
+    out = None
+    count = max(1, int(iters))
+    for _ in range(max(0, int(warmup))):
+        out = op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(enable_timing=True)
+    e1 = torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(count):
+        out = op()
+    e1.record()
+    torch.cuda.synchronize()
+    return out, e0.elapsed_time(e1) / count
 
 
 def _run_flagsparse_coo_launch(
@@ -395,7 +407,19 @@ def _timed_flagsparse_coo_tocsr_runtime(
         shape=shape,
         assume_sorted=False,
     )
-    return _cuda_event_benchmark(spmv_op, warmup, iters)
+    y = spmv_op()
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        y = spmv_op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    for _ in range(iters):
+        y = spmv_op()
+    e1.record()
+    torch.cuda.synchronize()
+    return y, e0.elapsed_time(e1) / iters
 
 
 def _timed_flagsparse_coo_tocsr_prepared(
@@ -405,7 +429,19 @@ def _timed_flagsparse_coo_tocsr_prepared(
     iters,
 ):
     spmv_op = lambda: fs.flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
-    return _cuda_event_benchmark(spmv_op, warmup, iters)
+    y = spmv_op()
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        y = spmv_op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    for _ in range(iters):
+        y = spmv_op()
+    e1.record()
+    torch.cuda.synchronize()
+    return y, e0.elapsed_time(e1) / iters
 
 
 def run_synthetic(
@@ -716,8 +752,18 @@ def _time_pytorch_coo(data, row, col, x, shape, op, warmup, iters):
             shape,
             op,
         )
-    _, elapsed_ms = _cuda_event_benchmark(spmv_op, warmup, iters)
-    return elapsed_ms
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        _ = spmv_op()
+    torch.cuda.synchronize()
+    e0 = torch.cuda.Event(True)
+    e1 = torch.cuda.Event(True)
+    e0.record()
+    for _ in range(iters):
+        _ = spmv_op()
+    e1.record()
+    torch.cuda.synchronize()
+    return e0.elapsed_time(e1) / iters
 
 
 def _run_torch_runtime_op(data, row, col, x_2d, shape, op):
@@ -900,7 +946,7 @@ def run_all_dtypes_coo_csv(
         "Vendor setup/conversion is hoisted out of the timed window; CUDA CuPy COO may convert through CSR internally."
     )
     print(
-        "Timing policy: Base/Opt ms = process_cpu_ms + filtered GPU event time. "
+        "Timing policy: Base/Opt ms = process_cpu_ms + GPU event time. "
         "Row-run sort + seg_starts are GPU process; atomic has no process. "
         "PyTorch/CuPy timings use original dtype."
     )

@@ -31,7 +31,6 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_bell as bell_ops
-from utils import cuda_event_benchmark_filtered
 
 
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -376,7 +375,19 @@ def _torch_spmm_coo_reference_from_original_coo(entries, B, shape, dtype):
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    return cuda_event_benchmark_filtered(op, warmup, iters)
+    out = None
+    for _ in range(max(0, int(warmup))):
+        out = op()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    count = max(1, int(iters))
+    start.record()
+    for _ in range(count):
+        out = op()
+    end.record()
+    torch.cuda.synchronize()
+    return out, start.elapsed_time(end) / count
 
 
 def _time_flagsparse_bell(data, indices, B, shape, block_dim, alg, op, warmup, iters, timing=False):
@@ -580,7 +591,7 @@ def _print_notes(run_vendor=True):
     print("FlagSparse BELL uses native Blocked-ELL arrays; empty slots are indices == -1.")
     print("Accuracy reference: Ref=torch_spmm_coo_from_original_coo builds torch sparse COO from the original matrix entries; this is correctness-only.")
     print("Vendor BELL baseline: CUDA high-level CuPy has no BELL format; ROCm/DCU uses hipSPARSE Blocked-ELL when supported.")
-    print("Timing policy: ms = process_cpu_ms + filtered gpu_ms; BELL SpMM v1 has no process phase.")
+    print("Timing policy: ms = process_cpu_ms + gpu_ms; BELL SpMM v1 has no process phase.")
     print("Memory guard: oversized BELL padded storage is reported as SKIP before tensor allocation.")
 
 

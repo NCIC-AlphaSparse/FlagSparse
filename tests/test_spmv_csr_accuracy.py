@@ -17,18 +17,20 @@ import importlib
 import pytest
 import torch
 
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _PROJECT_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
 from flagsparse import flagsparse_spmv_csr
-from tests.pytest.accuracy_utils import (
-    ACCELERATOR_REQUIRED,
-    accelerator_available,
-    accelerator_device,
-    close_tolerances,
-    golden_device,
-)
+from tests.pytest.accuracy_utils import close_tolerances
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
-pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _value_dtype_cases():
@@ -77,34 +79,22 @@ def _tol(dtype):
 
 
 def _random_csr_mn(M, N, dtype, index_dtype, device):
-    """Random CSR matrix: kernel inputs on ``device``, dense oracle copy on CPU.
-
-    Construction runs on CPU because ``torch.where`` has no muDNN kernel for float64
-    or complex on Moore Threads, so building the matrix on the accelerator failed
-    before the operator under test was ever reached.  See ``golden_device()``.
-    """
-    golden = golden_device()
     denom = max(M * N, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
-    mask = torch.rand(M, N, device=golden) < p
+    mask = torch.rand(M, N, device=device) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
     dense = torch.where(
         mask,
-        _random_dense((M, N), dtype, golden),
-        torch.zeros((), dtype=dtype, device=golden),
+        _random_dense((M, N), dtype, device),
+        torch.zeros((), dtype=dtype, device=device),
     )
     rows, cols = torch.nonzero(mask, as_tuple=True)
     data = dense[rows, cols].contiguous()
     row_counts = torch.bincount(rows, minlength=M)
-    indptr = torch.zeros(M + 1, dtype=torch.int64, device=golden)
+    indptr = torch.zeros(M + 1, dtype=torch.int64, device=device)
     indptr[1:] = torch.cumsum(row_counts, dim=0)
-    return (
-        data.to(device),
-        cols.to(index_dtype).contiguous().to(device),
-        indptr.to(index_dtype).to(device),
-        dense,
-    )
+    return data, cols.to(index_dtype).contiguous(), indptr.to(index_dtype), dense
 
 
 def _make_x(length, dtype, device):
@@ -126,15 +116,10 @@ def _apply_dense_op(dense, op):
 
 
 def _assert_close(actual, expected, dtype):
-    """Compare on the golden device; ``expected`` never leaves CPU."""
     rtol, atol = _tol(dtype)
     ref_dtype = _reference_dtype(dtype)
-    golden = golden_device()
     assert torch.allclose(
-        actual.to(device=golden, dtype=ref_dtype),
-        expected.to(device=golden, dtype=ref_dtype),
-        rtol=rtol,
-        atol=atol,
+        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
     )
 
 
@@ -148,11 +133,11 @@ def _assert_close(actual, expected, dtype):
 )
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
-    device = accelerator_device()
+    device = torch.device("cuda")
     data, indices, indptr, dense = _random_csr_mn(M, N, dtype, index_dtype, device)
     transpose = _op_transposes(op)
     x_len = M if transpose else N
-    x = _make_x(x_len, dtype, golden_device())
+    x = _make_x(x_len, dtype, device)
     ref_dtype = _reference_dtype(dtype)
     ref_mat = _apply_dense_op(dense, op)
     ref = (ref_mat.to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
@@ -160,7 +145,7 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
         data,
         indices,
         indptr,
-        x.to(device),
+        x,
         shape=(M, N),
         op=op,
         index_fallback_policy="auto",
@@ -170,7 +155,7 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
 
 @pytest.mark.spmv_csr
 def test_spmv_csr_prepared_transpose_mismatch_rejected():
-    device = accelerator_device()
+    device = torch.device("cuda")
     data, indices, indptr, _dense = _random_csr_mn(
         8, 10, torch.float32, torch.int32, device
     )
@@ -182,7 +167,7 @@ def test_spmv_csr_prepared_transpose_mismatch_rejected():
 
 @pytest.mark.spmv_csr
 def test_spmv_csr_prepared_op_mismatch_rejected():
-    device = accelerator_device()
+    device = torch.device("cuda")
     data, indices, indptr, _dense = _random_csr_mn(
         8, 10, torch.complex64, torch.int32, device
     )
@@ -194,11 +179,11 @@ def test_spmv_csr_prepared_op_mismatch_rejected():
 
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
-    device = accelerator_device()
+    device = torch.device("cuda")
     data, indices, indptr, dense = _random_csr_mn(
         12, 9, torch.float32, torch.int64, device
     )
-    x = torch.randn(9, dtype=torch.float32, device=golden_device())
+    x = torch.randn(9, dtype=torch.float32, device=device)
     ref = dense.to(torch.float64) @ x.to(torch.float64)
     state = {"forced_once": False}
     original = spmv_mod._triton_spmv_csr_impl_prepared
@@ -214,20 +199,18 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
         data,
         indices,
         indptr,
-        x.to(device),
+        x,
         shape=(12, 9),
         index_fallback_policy="auto",
     )
     assert state["forced_once"]
     rtol, atol = _tol(torch.float32)
-    assert torch.allclose(
-        out.to(device=golden_device(), dtype=torch.float64), ref, rtol=rtol, atol=atol
-    )
+    assert torch.allclose(out.to(torch.float64), ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
-    device = accelerator_device()
+    device = torch.device("cuda")
     data, indices, indptr, _dense = _random_csr_mn(
         12, 9, torch.float32, torch.int64, device
     )
@@ -252,7 +235,7 @@ def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
 
 @pytest.mark.spmv_csr
 def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypatch):
-    device = accelerator_device()
+    device = torch.device("cuda")
     limit = spmv_mod._INDEX_LIMIT_INT32
     data = torch.ones(1, dtype=torch.float32, device=device)
     prepared = spmv_mod.PreparedCsrSpmv(
