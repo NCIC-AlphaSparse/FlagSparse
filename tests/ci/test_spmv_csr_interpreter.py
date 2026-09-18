@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.pytest.accuracy_utils import close_tolerances
+
 if os.environ.get("TRITON_INTERPRET") != "1":
     pytest.skip(
         "requires an isolated TRITON_INTERPRET=1 process", allow_module_level=True
@@ -19,7 +21,6 @@ if os.environ.get("TRITON_INTERPRET") != "1":
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
-from tests.pytest.accuracy_utils import close_tolerances
 
 SOURCE = Path(__file__).resolve().parents[2] / "src/flagsparse/sparse_operations"
 
