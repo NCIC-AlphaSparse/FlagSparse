@@ -23,6 +23,10 @@ SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
 _ASCEND_ROW_IDS_CACHE = {}
 
 
+# Stored entries per chunk in the Ascend SDDMM fallback (see flagsparse_sddmm_csr).
+_ASCEND_SDDMM_CHUNK_NNZ = 262144
+
+
 def _ascend_csr_row_ids(indptr, n_rows):
     """Per-nonzero row index for the Ascend fallbacks.
 
@@ -853,13 +857,19 @@ def flagsparse_sddmm_csr(
         if ascend_timed:
             _ACCEL.synchronize()
         t0 = time.perf_counter()
-        # NPU matmul beats launching two large gathers for the benchmark shapes, so the
-        # dense product is formed and only the CSR coordinates are sampled from it.
-        # NOTE: this materialises an n_rows x n_cols dense matrix -- fine for the shapes
-        # this was validated on, but it will not scale to large sparse patterns.
+        # Sample dot(x[row], y[col]) per stored entry, in chunks of nonzeros. The
+        # earlier form built the full n_rows x n_cols torch.matmul(x, y.T) and
+        # sampled it, which exhausts NPU memory on million-row .mtx inputs; the
+        # chunk bounds the temporaries to _ASCEND_SDDMM_CHUNK_NNZ x K.
         cols = indices.to(torch.int64)
-        dense_product = torch.matmul(x, y.transpose(0, 1))
-        vals = dense_product[row_ids, cols] * float(alpha)
+        nnz = int(indices.numel())
+        vals = torch.empty((nnz,), device=x.device, dtype=x.dtype)
+        for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
+            end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
+            vals[begin:end] = torch.sum(
+                x[row_ids[begin:end]] * y[cols[begin:end]], dim=1
+            )
+        vals = vals * float(alpha)
         if beta != 0.0:
             vals = vals + float(beta) * data
         if out is not None:

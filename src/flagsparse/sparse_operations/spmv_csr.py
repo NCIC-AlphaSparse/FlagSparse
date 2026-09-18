@@ -308,6 +308,7 @@ def _spmv_csr_real_kernel(
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     HAS_BETA: tl.constexpr,
+    XPU_COMPAT: tl.constexpr,
 ):
     """y = alpha * A @ x + beta * y.
 
@@ -333,7 +334,12 @@ def _spmv_csr_real_kernel(
         a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
         col = tl.load(indices_ptr + offsets, mask=mask, other=0)
         x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
-        part = tl.where(mask, a * x_vals, 0.0)
+        if XPU_COMPAT:
+            # Masked loads already contribute zero. XPU's UnrollControl pass
+            # rejects the scalar/tensor type join emitted by tl.where here.
+            part = a * x_vals
+        else:
+            part = tl.where(mask, a * x_vals, 0.0)
         acc = acc + tl.sum(part)
     out = alpha * acc
     if HAS_BETA:
@@ -1009,7 +1015,8 @@ def _spmv_csr_default_backend():
             "FLAGSPARSE_SPMV_CSR_KERNEL must be 'segbin' or 'rowpar', "
             f"got {override!r}"
         )
-    if _is_rocm_runtime():
+    if _is_rocm_runtime() or _is_xpu_runtime():
+        # XPU lowering does not support segbin's associative scan encoding.
         return "rowpar"
     if _is_maca_runtime():
         # MetaX/MACA starts from the CUDA kernel; retune once C550 numbers exist.
@@ -1045,6 +1052,7 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype):
             BLOCK_NNZ=prepared.block_nnz,
             MAX_SEGMENTS=prepared.max_segments,
             HAS_BETA=False,
+            XPU_COMPAT=_is_xpu_runtime(),
         )
         y.copy_(y_out if dtype == compute_dtype else y_out.to(dtype))
         return y

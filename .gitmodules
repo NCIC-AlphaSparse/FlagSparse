@@ -1,0 +1,3 @@
+[submodule "capi/deps/libtriton_jit"]
+	path = capi/deps/libtriton_jit
+	url = https://github.com/Artlesbol/libtriton_jit.git

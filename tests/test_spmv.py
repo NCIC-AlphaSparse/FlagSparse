@@ -27,6 +27,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -184,17 +186,17 @@ def _benchmark_flagsparse_spmv(
         op,
     )
     y = spmv_op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         _ = spmv_op()
-    torch.cuda.synchronize()
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start_ev = ACCEL.Event(enable_timing=True)
+    end_ev = ACCEL.Event(enable_timing=True)
     start_ev.record()
     for _ in range(iters):
         y = spmv_op()
     end_ev.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return y, start_ev.elapsed_time(end_ev) / iters
 
 
@@ -378,14 +380,14 @@ def _time_pytorch_spmv(data, indices, indptr, x, shape, warmup, iters, op="non")
         )
     for _ in range(warmup):
         _ = spmv_op()
-    torch.cuda.synchronize()
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start_ev = ACCEL.Event(enable_timing=True)
+    end_ev = ACCEL.Event(enable_timing=True)
     start_ev.record()
     for _ in range(iters):
         _ = spmv_op()
     end_ev.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return start_ev.elapsed_time(end_ev) / iters
 
 
@@ -414,7 +416,7 @@ def run_one_mtx(
 ):
     """Run SpMV on one .mtx and return errors/timings."""
     op = _normalize_op(op)
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, shape = load_mtx_to_csr_torch(
         mtx_path, dtype=value_dtype, device=device
     )
@@ -445,14 +447,15 @@ def run_one_mtx(
     err_pt = None
     triton_ok_pt = False
     pt_error_reason = None
-    # MACA's PyTorch sparse reference is unreliable (non-finite output on the fp32 CSR
-    # path), so correctness there is checked against SciPy on the CPU instead.  Timing
-    # still uses the PyTorch path below.
-    reference_name = (
-        "SciPy reference" if ast_common._is_maca_runtime() else "PyTorch reference"
-    )
+    # Every backend except CUDA and ROCm checks correctness against SciPy on the
+    # CPU: torch.sparse there is not a reference, it is another thing under test
+    # (MACA returns non-finite output on the fp32 CSR path, MUSA registers no
+    # sparse matmul at all).  Timing still uses the PyTorch path below, so the
+    # baseline column is unaffected.
+    use_scipy_ref = ast_common._use_scipy_accuracy_reference()
+    reference_name = ast_common._accuracy_reference_label()
     try:
-        if ast_common._is_maca_runtime():
+        if use_scipy_ref:
             pt_ref_y = _scipy_spmv_reference(
                 data,
                 indices,
@@ -856,7 +859,7 @@ def run_comprehensive_synthetic(op="non"):
     """Synthetic benchmark with per-case table (like test_gather)."""
     op = _normalize_op(op)
     transpose = _op_transposes(op)
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
     vendor_label = ast_common._expected_vendor_sparse_label()
@@ -865,7 +868,7 @@ def run_comprehensive_synthetic(op="non"):
     print("FLAGSPARSE SpMV BENCHMARK (synthetic CSR)")
     print("=" * 110)
     print(
-        f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}"
+        f"GPU: {ACCEL.get_device_name(0)}  |  Warmup: {WARMUP}  Iters: {ITERS}  |  op: {op}  |  transpose: {bool(transpose)}"
     )
     print(
         f"Formats: FlagSparse=CSR, {vendor_label}=CSR when supported, Reference=vendor CSR or PyTorch COO"
@@ -1029,7 +1032,7 @@ def main():
         print("FLAGSPARSE SpMV (CSR) all dtypes, export to CSV")
         print("=" * 80)
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv_csr}  |  ops: {','.join(ops)}"
+            f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv_csr}  |  ops: {','.join(ops)}"
         )
         run_all_dtypes_export_csv(
             paths,
@@ -1049,7 +1052,7 @@ def main():
     print("=" * 120)
     print("FLAGSPARSE SpMV SuiteSparse .mtx batch (error + performance)")
     print("=" * 120)
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {value_dtype_name}  index_dtype: {index_dtype_name}  ops: {','.join(ops)}  warmup: {args.warmup}  iters: {args.iters}"
     )

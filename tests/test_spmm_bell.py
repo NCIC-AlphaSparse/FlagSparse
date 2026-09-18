@@ -23,6 +23,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -378,15 +380,15 @@ def _cuda_event_benchmark(op, warmup, iters):
     out = None
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
     start.record()
     for _ in range(count):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / count
 
 
@@ -449,7 +451,7 @@ def _run_case(
     run_vendor=True,
 ):
     M, K = shape
-    device = torch.device("cuda")
+    device = accelerator_device()
     plan = _estimate_bell_storage(entries, shape, dtype, index_dtype, block_dim)
     row = {
         "matrix": matrix_name,
@@ -567,8 +569,8 @@ def _run_case(
     except Exception as exc:
         row["reason"] = str(exc)
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if ACCEL.is_available():
+            ACCEL.empty_cache()
     return row
 
 
@@ -641,7 +643,7 @@ def main():
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         raise RuntimeError("A CUDA/ROCm PyTorch device is required for native BELL SpMM")
     dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
@@ -689,7 +691,7 @@ def main():
                         for case_name, path, synthetic_shape, synthetic_dense_cols in cases:
                             if path is None:
                                 entries_name, entries, shape = _make_synthetic_case(
-                                    synthetic_shape[0], synthetic_shape[1], dtype, block_dim, torch.device("cuda")
+                                    synthetic_shape[0], synthetic_shape[1], dtype, block_dim, accelerator_device()
                                 )
                                 matrix_name = entries_name
                                 default_dense_cols = synthetic_dense_cols

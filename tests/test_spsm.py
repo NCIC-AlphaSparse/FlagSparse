@@ -36,6 +36,7 @@ import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spsm as fs_spsm_impl
 from mtx_fast import NonSquareMatrixError
+import reference_utils
 
 FORMATS = ("csr", "coo")
 VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
@@ -313,7 +314,60 @@ def _stabilize_lower_triangular_csr(data, indices, indptr, shape):
     return data_stable, col.to(torch.int64), indptr_stable
 
 
+def _scipy_reference(data, indices, indptr, shape, B):
+    """Lower triangular solve with a matrix RHS, on CPU with SciPy.
+
+    Uses the same effective lower operand the PyTorch path builds, so the two
+    references differ only in who computes them.
+    """
+    data_eff, indices_eff, indptr_eff = _extract_effective_lower_csr(
+        data, indices, indptr, shape
+    )
+    ref_dtype = reference_utils.reference_dtype(B.dtype)
+    matrix = reference_utils.scipy_csr(
+        data_eff, indices_eff, indptr_eff, shape, ref_dtype
+    )
+    solved = reference_utils.triangular_solve(
+        matrix, B, ref_dtype, lower=True, unit_diagonal=False
+    )
+    return reference_utils.as_torch(solved, ref_dtype, B.device).to(B.dtype)
+
+
 def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
+    """(reference, reason), reference per backend policy.
+
+    torch.sparse.spsolve is unavailable on several of the non-CUDA stacks, where
+    this returns None today and the run has no correctness check at all. SciPy
+    gives it one.
+    """
+    X_ref, reason = _benchmark_torch_reference(data, indices, indptr, shape, B)
+    if not fs_common._use_scipy_accuracy_reference():
+        return X_ref, reason
+    try:
+        return _scipy_reference(data, indices, indptr, shape, B), reason
+    except Exception as exc:
+        return X_ref, f"SciPy reference unavailable ({exc})"
+
+
+def _record_vendor_ms(record):
+    """The vendor latency, from whichever canonical column holds it.
+
+    Records store it as cuSPARSE_ms or hipSPARSE_ms. The display label is
+    "CuPy/cuSPARSE" on CUDA and "N/A" on MUSA, so indexing a record with
+    f"{vendor_name}_ms" raised KeyError on EVERY backend. That print sat inside
+    the per-case try: after the good record had been appended, so every
+    successful case was followed by a phantom ERROR row with empty timings --
+    half of every spsm CSV was fake failures, which MUSA read as 11 of 15
+    matrices erroring when each had in fact passed one line earlier.
+    """
+    for key in ("cuSPARSE_ms", "hipSPARSE_ms"):
+        value = record.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _benchmark_torch_reference(data, indices, indptr, shape, B):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:
@@ -1075,6 +1129,7 @@ def _run_one_spsm_case(
         status = "FAIL"
 
     vendor_backend = _vendor_backend_name()
+    _vendor_key = str(vendor_backend or "").lower()
     return {
         "format": fmt,
         "n_rows": n_rows,
@@ -1084,8 +1139,13 @@ def _run_one_spsm_case(
         "FlagSparse_ms": flagsparse_ms,
         "vendor_backend": vendor_backend,
         "vendor_route": vendor_route,
-        "cuSPARSE_ms": vendor_ms if vendor_backend == "cuSPARSE" else None,
-        "hipSPARSE_ms": vendor_ms if vendor_backend == "hipSPARSE" else None,
+        # Match on the identifier, not on one exact label. `vendor_backend` is
+        # _expected_vendor_sparse_label(), which reads "CuPy/cuSPARSE" on CUDA --
+        # never equal to "cuSPARSE", so BOTH columns were always None while
+        # FlagSparse_vs_vendor_speedup carried a real ratio. The delivery report
+        # then showed a vendor speedup with a 0.00 ms baseline next to it.
+        "cuSPARSE_ms": vendor_ms if "cusparse" in _vendor_key else None,
+        "hipSPARSE_ms": vendor_ms if "hipsparse" in _vendor_key else None,
         "FlagSparse_vs_vendor_speedup": _safe_ratio(vendor_ms, flagsparse_ms),
         "status": status,
         "err_ref": err_ref,
@@ -1144,7 +1204,7 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                 print(
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
-                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(one[f'{vendor_name}_ms']):>10} "
+                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(_record_vendor_ms(one)):>10} "
                     f"{_fmt_ratio(one['FlagSparse_vs_vendor_speedup']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
                     f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_vendor']):>12}"
@@ -1235,7 +1295,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{record['n_rows']:>7} {record['n_rhs']:>6} {record['nnz']:>10} "
-                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(record[f'{vendor_name}_ms']):>10} "
+                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(_record_vendor_ms(record)):>10} "
                         f"{_fmt_ratio(record['FlagSparse_vs_vendor_speedup']):>10} "
                         f"{record['status']:>10} {_fmt_err(record['err_ref']):>12} {_fmt_err(record['err_res']):>12} "
                         f"{_fmt_err(record['err_pt']):>12} {_fmt_err(record['err_vendor']):>12}"

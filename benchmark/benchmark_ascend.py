@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from scipy.io import mmread
 import scipy.sparse as sp
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,7 @@ class Case:
     nnz: int
     dense_cols: int
     dtype_name: str
+    matrix_path: Path | None = None
 
 
 def _sync(torch):
@@ -60,18 +62,37 @@ def _bench(torch, fn, warmup: int, iters: int):
 
 
 def _make_csr(torch, case: Case, device):
-    rng = np.random.default_rng(20260909 + case.m + case.n + case.nnz)
-    rows = rng.integers(0, case.m, size=case.nnz, dtype=np.int64)
-    cols = rng.integers(0, case.n, size=case.nnz, dtype=np.int64)
-    dtype = getattr(torch, case.dtype_name)
-    np_dtype = np.float64 if dtype == torch.float64 else np.float32
-    vals = rng.standard_normal(case.nnz).astype(np_dtype)
-    matrix = sp.coo_matrix((vals, (rows, cols)), shape=(case.m, case.n)).tocsr()
-    matrix.sum_duplicates()
+    if case.matrix_path is not None:
+        loaded = mmread(case.matrix_path)
+        matrix = loaded.tocsr() if sp.issparse(loaded) else sp.csr_matrix(loaded)
+        matrix.sum_duplicates()
+        if np.iscomplexobj(matrix.data):
+            matrix = matrix.real.tocsr()
+        dtype = getattr(torch, case.dtype_name)
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        matrix = matrix.astype(np_dtype, copy=False)
+        actual_case = Case(
+            matrix.shape[0],
+            matrix.shape[1],
+            matrix.nnz,
+            case.dense_cols,
+            case.dtype_name,
+            case.matrix_path,
+        )
+    else:
+        actual_case = case
+        rng = np.random.default_rng(20260909 + case.m + case.n + case.nnz)
+        rows = rng.integers(0, case.m, size=case.nnz, dtype=np.int64)
+        cols = rng.integers(0, case.n, size=case.nnz, dtype=np.int64)
+        dtype = getattr(torch, case.dtype_name)
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        vals = rng.standard_normal(case.nnz).astype(np_dtype)
+        matrix = sp.coo_matrix((vals, (rows, cols)), shape=(case.m, case.n)).tocsr()
+        matrix.sum_duplicates()
     data = torch.tensor(matrix.data, device=device, dtype=dtype)
     indices = torch.tensor(matrix.indices, device=device, dtype=torch.int32)
     indptr = torch.tensor(matrix.indptr, device=device, dtype=torch.int32)
-    return matrix, data, indices, indptr
+    return matrix, data, indices, indptr, actual_case
 
 
 def _scipy_spmv(matrix, x):
@@ -90,12 +111,16 @@ def _scipy_spmm(matrix, b):
     return matrix @ b
 
 
-def _scipy_sddmm(matrix, x, y):
-    dense = x @ y.T
-    # SDDMM samples ``x @ y.T`` at the CSR nonzero coordinates; it does not
-    # multiply by the input CSR values (those only participate when beta != 0).
+def _scipy_sddmm(matrix, x, y, chunk_nnz=262144):
+    """Reference SDDMM without materializing the dense m-by-n product."""
     rows = np.repeat(np.arange(matrix.shape[0], dtype=np.int64), np.diff(matrix.indptr))
-    return np.asarray(dense[rows, matrix.indices])
+    result = np.empty(matrix.nnz, dtype=np.result_type(x.dtype, y.dtype))
+    for begin in range(0, matrix.nnz, chunk_nnz):
+        end = min(begin + chunk_nnz, matrix.nnz)
+        result[begin:end] = np.sum(
+            x[rows[begin:end]] * y[matrix.indices[begin:end]], axis=1
+        )
+    return result
 
 
 def _torch_npu_csr_row_ids(indptr, n_rows):
@@ -126,7 +151,19 @@ def _torch_npu_csr_spmm(data, indices, row_ids, B, n_rows):
     return out
 
 
-def run(case: Case, warmup: int, iters: int, device_id: int = 0):
+def _torch_npu_sddmm_sampled(x, y, row_ids, indices, chunk_nnz=262144):
+    """PyTorch-NPU SDDMM reference with bounded temporary memory."""
+    import torch
+
+    cols = indices.to(torch.int64)
+    out = torch.empty((indices.numel(),), device=x.device, dtype=x.dtype)
+    for begin in range(0, int(indices.numel()), chunk_nnz):
+        end = min(begin + chunk_nnz, int(indices.numel()))
+        out[begin:end] = torch.sum(x[row_ids[begin:end]] * y[cols[begin:end]], dim=1)
+    return out
+
+
+def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None = None):
     import torch
     import flagsparse as fs
 
@@ -159,22 +196,14 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0):
         ops_status += f"; C library found: {acl_lib} (C bridge required)"
     else:
         ops_status += "; libaclsparse.so not found"
-    matrix, data, indices, indptr = _make_csr(torch, case, device)
+    matrix, data, indices, indptr, case = _make_csr(torch, case, device)
     dtype = getattr(torch, case.dtype_name)
-    x = torch.randn(case.n, device=device, dtype=dtype)
-    b = torch.randn(case.n, case.dense_cols, device=device, dtype=dtype)
-    sx = torch.randn(case.m, 32, device=device, dtype=dtype)
-    sy = torch.randn(case.n, 32, device=device, dtype=dtype)
-    row_ids = _torch_npu_csr_row_ids(indptr, case.m)
-
-    rows = np.repeat(np.arange(case.m, dtype=np.int64), np.diff(matrix.indptr))
-    scipy_spmv = _scipy_spmv(matrix, _scipy_numpy(x))
-    scipy_spmm = _scipy_spmm(matrix, _scipy_numpy(b))
-    scipy_sddmm = _scipy_sddmm(matrix, _scipy_numpy(sx), _scipy_numpy(sy))
 
     results = [{
         "device": f"npu:{int(device_id)}",
         "dtype": case.dtype_name,
+        "matrix": case.matrix_path.name if case.matrix_path is not None else "synthetic",
+        "shape": f"{case.m}x{case.n};nnz={case.nnz}",
         "ops_sparse": ops_status,
         "ops_sparse_910b_supported": ["spmv_csr", "sddmm_csr", "scatter"],
         "tested_ops": ["spmv_csr", "spmm_csr", "sddmm_csr", "gather", "scatter"],
@@ -202,40 +231,55 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0):
             status_parts.append("PyTorch-NPU: PASS")
         except Exception as exc:
             status_parts.append(f"PyTorch-NPU: {exc}")
-        results.append({"op": name, "dtype": case.dtype_name, "flagsparse": fs_time, "pytorch": pt_time,
+        results.append({"op": name, "dtype": case.dtype_name,
+                        "matrix": case.matrix_path.name if case.matrix_path is not None else "synthetic",
+                        "shape": f"{case.m}x{case.n};nnz={case.nnz}",
+                        "flagsparse": fs_time, "pytorch": pt_time,
                         "scipy_max_abs_error": {"flagsparse": fs_err, "pytorch": pt_err},
                         "status": "; ".join(status_parts) if status_parts else "unknown"})
 
-    record("spmv_csr", lambda: fs.flagsparse_spmv_csr(data, indices, indptr, x, (case.m, case.n)),
-           lambda: _torch_npu_csr_spmv(data, indices, row_ids, x, case.m), scipy_spmv,
-           _scipy_numpy)
-    record("spmm_csr", lambda: fs.flagsparse_spmm_csr(data, indices, indptr, b, (case.m, case.n)),
-           lambda: _torch_npu_csr_spmm(data, indices, row_ids, b, case.m), scipy_spmm,
-           _scipy_numpy)
-    record("sddmm_csr", lambda: fs.flagsparse_sddmm_csr(data, indices, indptr, sx, sy, (case.m, case.n)),
-           lambda: (sx @ sy.T)[torch.tensor(rows, device=device), indices.to(torch.int64)],
-           scipy_sddmm, _scipy_numpy)
+    if op in (None, "spmv_csr"):
+        x = torch.randn(case.n, device=device, dtype=dtype)
+        row_ids = _torch_npu_csr_row_ids(indptr, case.m)
+        record("spmv_csr", lambda: fs.flagsparse_spmv_csr(data, indices, indptr, x, (case.m, case.n)),
+               lambda: _torch_npu_csr_spmv(data, indices, row_ids, x, case.m),
+               _scipy_spmv(matrix, _scipy_numpy(x)), _scipy_numpy)
+    if op in (None, "spmm_csr"):
+        b = torch.randn(case.n, case.dense_cols, device=device, dtype=dtype)
+        row_ids = _torch_npu_csr_row_ids(indptr, case.m)
+        record("spmm_csr", lambda: fs.flagsparse_spmm_csr(data, indices, indptr, b, (case.m, case.n)),
+               lambda: _torch_npu_csr_spmm(data, indices, row_ids, b, case.m),
+               _scipy_spmm(matrix, _scipy_numpy(b)), _scipy_numpy)
+    if op in (None, "sddmm_csr"):
+        sx = torch.randn(case.m, 32, device=device, dtype=dtype)
+        sy = torch.randn(case.n, 32, device=device, dtype=dtype)
+        row_ids = _torch_npu_csr_row_ids(indptr, case.m)
+        record("sddmm_csr", lambda: fs.flagsparse_sddmm_csr(data, indices, indptr, sx, sy, (case.m, case.n)),
+               lambda: _torch_npu_sddmm_sampled(sx, sy, row_ids, indices),
+               _scipy_sddmm(matrix, _scipy_numpy(sx), _scipy_numpy(sy)), _scipy_numpy)
 
     # Gather/scatter are PyTorch indexing baselines; they are not advertised as
     # equivalent to a dedicated ops-sparse kernel.
-    gather_idx = torch.arange(min(case.nnz, case.n), device=device, dtype=torch.int64)
-    dense = torch.randn(case.n, device=device, dtype=dtype)
-    values = torch.randn(gather_idx.numel(), device=device, dtype=dtype)
-    record("gather", lambda: fs.flagsparse_gather(dense, gather_idx),
-           lambda: torch.gather(dense, 0, gather_idx),
-           _scipy_numpy(dense)[gather_idx.cpu().numpy()],
-           _scipy_numpy)
+    if op in (None, "gather", "scatter"):
+        gather_idx = torch.arange(min(case.nnz, case.n), device=device, dtype=torch.int64)
+        dense = torch.randn(case.n, device=device, dtype=dtype)
+        values = torch.randn(gather_idx.numel(), device=device, dtype=dtype)
+    if op in (None, "gather"):
+        record("gather", lambda: fs.flagsparse_gather(dense, gather_idx),
+               lambda: torch.gather(dense, 0, gather_idx),
+               _scipy_numpy(dense)[gather_idx.cpu().numpy()], _scipy_numpy)
     # Keep independent buffers: flagsparse_scatter mutates its input in place,
     # while index_copy returns a new tensor.  Sharing one buffer would make the
     # second baseline depend on the first benchmark and invalidate correctness.
-    scatter_fs = dense.detach().clone()
-    scatter_pt = dense.detach().clone()
-    scatter_initial = scatter_fs.detach().clone()
-    scatter_ref = _scipy_numpy(scatter_initial).copy()
-    scatter_ref[gather_idx.cpu().numpy()] = _scipy_numpy(values)
-    record("scatter", lambda: (fs.flagsparse_scatter(scatter_fs, gather_idx, values) or scatter_fs),
-           lambda: scatter_pt.index_copy(0, gather_idx, values), scatter_ref,
-           _scipy_numpy)
+    if op in (None, "scatter"):
+        scatter_fs = dense.detach().clone()
+        scatter_pt = dense.detach().clone()
+        scatter_initial = scatter_fs.detach().clone()
+        scatter_ref = _scipy_numpy(scatter_initial).copy()
+        scatter_ref[gather_idx.cpu().numpy()] = _scipy_numpy(values)
+        record("scatter", lambda: (fs.flagsparse_scatter(scatter_fs, gather_idx, values) or scatter_fs),
+               lambda: scatter_pt.index_copy(0, gather_idx, values), scatter_ref,
+               _scipy_numpy)
     return results
 
 
@@ -250,6 +294,8 @@ def main():
     p.add_argument("--device", type=int, default=0, help="Ascend NPU device ordinal")
     p.add_argument("--op", choices=("spmv_csr", "spmm_csr", "sddmm_csr", "gather", "scatter"), default=None)
     p.add_argument("--dtypes", default="float32", help="Comma-separated value dtypes")
+    p.add_argument("--input", type=Path, default=None,
+                   help="MatrixMarket .mtx file or directory; every .mtx is benchmarked")
     p.add_argument("--csv-summary", default=None, help="Write a runner-compatible one-row CSV summary")
     args = p.parse_args()
     dtype_names = [item.strip() for item in args.dtypes.split(",") if item.strip()]
@@ -258,15 +304,31 @@ def main():
     if not dtype_names or unknown:
         p.error("--dtypes must contain names from: " + ", ".join(sorted(allowed_dtypes)))
     import json
+    if args.input is None:
+        matrix_paths: list[Path | None] = [None]
+    elif args.input.is_file():
+        matrix_paths = [args.input]
+    elif args.input.is_dir():
+        matrix_paths = sorted(args.input.glob("*.mtx"))
+        if not matrix_paths:
+            p.error(f"no .mtx files found in {args.input}")
+    else:
+        p.error(f"--input does not exist: {args.input}")
     payload = []
     for dtype_name in dtype_names:
-        try:
-            dtype_payload = run(Case(args.m, args.n, args.nnz, args.dense_cols, dtype_name), args.warmup, args.iters, device_id=args.device)
-        except (ImportError, RuntimeError) as exc:
-            dtype_payload = [{"dtype": dtype_name, "status": "blocked", "reason": str(exc)}]
-        payload.extend(dtype_payload)
-    if args.op is not None:
-        payload = [item for item in payload if item.get("op") == args.op] if isinstance(payload, list) else payload
+        for matrix_path in matrix_paths:
+            try:
+                dtype_payload = run(
+                    Case(args.m, args.n, args.nnz, args.dense_cols, dtype_name, matrix_path),
+                    args.warmup,
+                    args.iters,
+                    device_id=args.device,
+                    op=args.op,
+                )
+            except (ImportError, RuntimeError) as exc:
+                dtype_payload = [{"dtype": dtype_name, "matrix": str(matrix_path or "synthetic"),
+                                  "status": "blocked", "reason": str(exc)}]
+            payload.extend(dtype_payload)
     if args.csv_summary:
         rows = []
         for item in payload if isinstance(payload, list) else []:
@@ -279,6 +341,7 @@ def main():
             pt_ms = pt.get("mean_ms")
             rows.append({
                 "dtype": item.get("dtype", "float32"),
+                "matrix": item.get("matrix", ""),
                 "shape": item.get("op", args.op or "ascend"),
                 "triton_ms": "" if fs_ms is None else fs_ms,
                 "pytorch_ms": "" if pt_ms is None else pt_ms,
@@ -287,7 +350,11 @@ def main():
                 "status": item.get("status", ""),
             })
         with open(args.csv_summary, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["dtype", "shape", "triton_ms", "pytorch_ms", "speedup", "max_abs_err", "status"])
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["dtype", "matrix", "shape", "triton_ms", "pytorch_ms",
+                            "speedup", "max_abs_err", "status"],
+            )
             writer.writeheader()
             writer.writerows(rows)
     print(json.dumps(payload, indent=2))

@@ -21,6 +21,7 @@ from flagsparse import (
     prepare_spmm_csr_opt,
 )
 from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from tests.pytest.param_shapes import (
     MNK_SHAPES,
@@ -129,7 +130,15 @@ def test_spmm_csr_matches_torch(M, N, K, dtype):
     # Reference on CPU. This also subsumes the former MACA special case here: that
     # branch existed because the fp32 CSR reference ran on the card with int64
     # indices, which is exactly what no longer happens.
-    if dtype == torch.float32:
+    if common._use_scipy_accuracy_reference():
+        ref_dtype = _reference_dtype(dtype)
+        matrix = reference_utils.scipy_csr(
+            _plain_sparse_values(Asp), Asp.col_indices(), Asp.crow_indices(), (M, K), ref_dtype
+        )
+        ref = reference_utils.as_torch(
+            reference_utils.spmm(matrix, B, ref_dtype), ref_dtype, golden
+        ).to(dtype)
+    elif dtype == torch.float32:
         Asp64 = torch.sparse_csr_tensor(
             crow_indices=Asp.crow_indices(),
             col_indices=Asp.col_indices(),
@@ -163,7 +172,15 @@ def test_spmm_csr_op_matches_dense_reference(M, N, K, dtype, index_dtype, op):
     effective_cols = M if op in ("trans", "conj") else K
     B = _random_dense((effective_cols, N), dtype, golden)
     ref_dtype = _reference_dtype(dtype)
-    ref = (_apply_dense_op(dense, op).to(ref_dtype) @ B.to(ref_dtype)).to(dtype)
+    if common._use_scipy_accuracy_reference():
+        matrix = reference_utils.scipy_csr(
+            _plain_sparse_values(Asp), Asp.col_indices(), Asp.crow_indices(), (M, K), ref_dtype
+        )
+        ref = reference_utils.as_torch(
+            reference_utils.spmm(matrix, B, ref_dtype, op=op), ref_dtype, golden
+        ).to(dtype)
+    else:
+        ref = (_apply_dense_op(dense, op).to(ref_dtype) @ B.to(ref_dtype)).to(dtype)
     out = flagsparse_spmm_csr(data, indices, indptr, B.to(device), (M, K), op=op)
     rtol, atol = _tol(dtype)
     assert torch.allclose(out.to(ref.device), ref, rtol=rtol, atol=atol)
@@ -258,7 +275,15 @@ def test_spmm_csr_opt_matches_torch(M, N, K, dtype, index_dtype):
     golden = golden_device()
     Asp = _random_csr_mk(M, K, dtype, golden)
     B = torch.randn(K, N, dtype=dtype, device=golden)
-    if dtype == torch.float32:
+    if common._use_scipy_accuracy_reference():
+        ref_dtype = _reference_dtype(dtype)
+        matrix = reference_utils.scipy_csr(
+            _plain_sparse_values(Asp), Asp.col_indices(), Asp.crow_indices(), (M, K), ref_dtype
+        )
+        ref = reference_utils.as_torch(
+            reference_utils.spmm(matrix, B, ref_dtype), ref_dtype, golden
+        ).to(dtype)
+    elif dtype == torch.float32:
         Asp64 = torch.sparse_csr_tensor(
             crow_indices=Asp.crow_indices(),
             col_indices=Asp.col_indices(),

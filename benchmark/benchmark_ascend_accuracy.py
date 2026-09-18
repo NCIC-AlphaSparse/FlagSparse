@@ -9,7 +9,8 @@ def main():
     p.add_argument('--op', required=True)
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--output', required=True)
-    p.add_argument('--dtypes', default='float32,float64')
+    # f16 is a delivery dtype for gather/scatter; without it those variants read NF.
+    p.add_argument('--dtypes', default='float16,float32,float64')
     args = p.parse_args()
     payload = {}
     for dtype in (x.strip() for x in args.dtypes.split(',') if x.strip()):

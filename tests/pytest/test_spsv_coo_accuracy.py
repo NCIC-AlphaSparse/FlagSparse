@@ -26,6 +26,8 @@ from flagsparse import (
     flagsparse_spsv_solve_coo,
 )
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
+from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from tests.pytest.param_shapes import SPSV_N
 from tests.pytest.accuracy_utils import golden_device
@@ -50,6 +52,30 @@ pytestmark = [
 ]
 
 
+def _solve_triangular(A, B, *, upper, unitriangular=False):
+    """Use the CPU SciPy triangular oracle for XPU correctness checks."""
+    if common._use_scipy_accuracy_reference():
+        matrix = A.to_sparse_csr()
+        scipy_matrix = reference_utils.scipy_csr(
+            matrix.values(), matrix.col_indices(), matrix.crow_indices(), A.shape,
+            reference_utils.reference_dtype(A.dtype),
+        )
+        solved = reference_utils.triangular_solve(
+            scipy_matrix, B.squeeze(-1), reference_utils.reference_dtype(B.dtype),
+            lower=not upper, unit_diagonal=unitriangular,
+        )
+        # Back to the operand dtype: the oracle solves at the reference dtype,
+        # and allclose() refuses to compare float32 against float64.
+        return (
+            reference_utils.as_torch(
+                solved, reference_utils.reference_dtype(B.dtype), golden_device()
+            )
+            .to(B.dtype)
+            .unsqueeze(-1)
+        )
+    return torch.linalg.solve_triangular(A, B, upper=upper, unitriangular=unitriangular)
+
+
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("op_mode", TRANS_CONJ_MODES)
@@ -58,7 +84,7 @@ def test_spsv_coo_transpose_family_complex128_routes_through_csr(n, op_mode):
     dtype = torch.complex128
     A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), golden_device())
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A, op_mode),
         b.unsqueeze(-1),
         upper=_effective_upper(True, op_mode),
@@ -95,7 +121,7 @@ def test_spsv_coo_trans_supported_combos(n, dtype, index_dtype):
     b = _rand_like(dtype, (n,), golden_device())
     A_ref = A.to(dtype)
     b_ref = b.to(dtype)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A_ref, "TRANS"),
         b_ref.unsqueeze(-1),
         upper=_effective_upper(True, "TRANS"),
@@ -132,7 +158,7 @@ def test_spsv_coo_upper_trans_supported_combos(n, dtype, index_dtype):
     b = _rand_like(dtype, (n,), golden_device())
     A_ref = A.to(dtype)
     b_ref = b.to(dtype)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A_ref, "TRANS"),
         b_ref.unsqueeze(-1),
         upper=_effective_upper(False, "TRANS"),
@@ -169,7 +195,7 @@ def test_spsv_coo_conj_supported_combos(n, dtype, index_dtype):
     b = _rand_like(dtype, (n,), golden_device())
     A_ref = A.to(dtype)
     b_ref = b.to(dtype)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A_ref, "CONJ"),
         b_ref.unsqueeze(-1),
         upper=_effective_upper(True, "CONJ"),
@@ -206,7 +232,7 @@ def test_spsv_coo_upper_conj_supported_combos(n, dtype, index_dtype):
     b = _rand_like(dtype, (n,), golden_device())
     A_ref = A.to(dtype)
     b_ref = b.to(dtype)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A_ref, "CONJ"),
         b_ref.unsqueeze(-1),
         upper=_effective_upper(False, "CONJ"),
@@ -241,7 +267,7 @@ def test_spsv_coo_non_trans_supported_combos(n, dtype, index_dtype):
     device = accelerator_device()
     A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), golden_device())
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         A.to(dtype), b.to(dtype).unsqueeze(-1), upper=False
     ).squeeze(-1)
 
@@ -274,7 +300,7 @@ def test_spsv_coo_non_trans_upper_supported_combos(n, dtype, index_dtype):
     device = accelerator_device()
     A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), golden_device())
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         A.to(dtype), b.to(dtype).unsqueeze(-1), upper=True
     ).squeeze(-1)
 
@@ -305,7 +331,7 @@ def test_spsv_coo_non_trans_routes_through_csr(monkeypatch):
     n = SPSV_N[0]
     A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), golden_device())
-    x_ref = torch.linalg.solve_triangular(A, b.unsqueeze(-1), upper=False).squeeze(-1)
+    x_ref = _solve_triangular(A, b.unsqueeze(-1), upper=False).squeeze(-1)
 
     A_coo = A.to_sparse_coo().coalesce()
     row, col = A_coo.indices().to(device)

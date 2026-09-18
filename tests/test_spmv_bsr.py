@@ -25,6 +25,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -433,14 +435,14 @@ def _cuda_event_benchmark(op, warmup, iters):
     count = max(1, int(iters))
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(count):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / count
 
 
@@ -993,10 +995,10 @@ def _resolve_block_dims(block_dims, entries, shape):
 
 
 def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims
@@ -1048,10 +1050,10 @@ def run_synthetic(value_dtypes=None, index_dtypes=None, block_dims=None, ops=Non
 
 
 def run_csv(mtx_paths, csv_path, value_dtypes=None, index_dtypes=None, block_dims=None, ops=None, algs=None, warmup=WARMUP, iters=ITERS, timing=False, run_cusparse=True, fail_fast=False, resume=False):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims

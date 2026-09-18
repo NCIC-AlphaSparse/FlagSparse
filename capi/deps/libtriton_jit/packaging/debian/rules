@@ -1,0 +1,45 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Build parallelism: default to all cores, but allow the environment
+# to cap it (torch-heavy C++ at full parallelism OOMs constrained
+# runners — the build container passes parallel=4).
+DEB_BUILD_OPTIONS ?= parallel=$(shell nproc)
+export DEB_BUILD_OPTIONS
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	dh_auto_configure --buildsystem=cmake -- \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DFETCHCONTENT_FULLY_DISCONNECTED=OFF \
+		-DFETCHCONTENT_QUIET=OFF \
+		-DTRITON_JIT_USE_EXTERNAL_JSON=OFF \
+		-DTRITON_JIT_USE_EXTERNAL_FMTLIB=OFF \
+		-DTRITON_JIT_USE_EXTERNAL_PYBIND11=ON \
+		-DTRITON_JIT_BUILD_OPERATORS=OFF \
+		-DTRITON_JIT_INSTALL=ON
+
+override_dh_auto_build:
+	dh_auto_build --buildsystem=cmake
+
+override_dh_auto_install:
+	dh_auto_install --buildsystem=cmake
+	# Fix RPATH if needed
+	find debian/tmp/usr/lib -name "*.so*" -type f -exec patchelf --remove-rpath {} \; || true
+
+override_dh_auto_test:
+	# Skip tests during package build
+	@echo "Skipping tests"
+
+override_dh_shlibdeps:
+	# Ignore missing CUDA/vendor library dependencies
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info || true
+
+override_dh_dwz:
+	# Skip dwz optimization - it fails after patchelf modifications
+	@echo "Skipping dwz debug info optimization"

@@ -29,6 +29,8 @@ import os
 import time
 
 import torch
+
+from benchmark_utils import ACCEL, accelerator_device
 import sys
 from pathlib import Path
 
@@ -51,7 +53,7 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
     import math as _math
 
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = accelerator_device() if ACCEL.is_available() else torch.device("cpu")
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     mm_field = "real"
@@ -119,17 +121,17 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _cuda_event_benchmark(op, warmup, iters):
     out = None
     count = max(1, int(iters))
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         out = op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    e0 = ACCEL.Event(enable_timing=True)
+    e1 = ACCEL.Event(enable_timing=True)
     e0.record()
     for _ in range(count):
         out = op()
     e1.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, e0.elapsed_time(e1) / count
 
 
@@ -214,17 +216,17 @@ def _timed_pytorch(data, indices, indptr, x, shape, warmup, iters):
         ).coalesce()
         y = torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
         op = lambda: torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    e0 = ACCEL.Event(enable_timing=True)
+    e1 = ACCEL.Event(enable_timing=True)
     e0.record()
     for _ in range(iters):
         op()
     e1.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return y, e0.elapsed_time(e1) / iters
 
 
@@ -282,7 +284,7 @@ def _reference_tolerance(dtype):
 
 
 def run_one_mtx(path, dtype, index_dtype, warmup, iters, timing=False):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, shape = load_mtx_to_csr_torch(
         path, dtype=dtype, device=device
     )
@@ -575,7 +577,7 @@ def main():
         print("FLAGSPARSE SpMV Optimisation A/B Test - export CSV")
         print("=" * 80)
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv}"
+            f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}  |  CSV: {args.csv}"
         )
         dtype_map = {"float32": torch.float32, "float64": torch.float64}
         dtype_filter = None if args.dtype == "all" else dtype_map[args.dtype]
@@ -591,7 +593,7 @@ def main():
         print("=" * (210 if args.timing else 190))
         print(f"FLAGSPARSE SpMV Optimisation A/B Test")
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}"
+            f"GPU: {ACCEL.get_device_name(0)}  |  dtype: {dname}  |  Files: {len(paths)}"
         )
         print(
             "Base = prepared baseline kernel. "

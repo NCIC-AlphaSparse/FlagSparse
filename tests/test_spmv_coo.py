@@ -22,6 +22,9 @@ import os
 import time
 
 import torch
+
+from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
 import sys
 from pathlib import Path
 
@@ -219,6 +222,31 @@ def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
 
 
+def _scipy_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
+    """Same value as _pytorch_coo_reference, computed on CPU with SciPy."""
+    data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
+    ref_dtype = _reference_dtype(out_dtype)
+    matrix = reference_utils.scipy_coo(data, row, col, shape, ref_dtype)
+    product = reference_utils.spmv(matrix, x, ref_dtype)
+    y_ref = reference_utils.as_torch(product, ref_dtype, data.device)
+    return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
+
+
+def _correctness_reference(data, row, col, x, shape, out_dtype, op="non"):
+    """The value the kernel is compared against, per backend policy.
+
+    This is NOT the PyTorch baseline column: that one keeps calling
+    _pytorch_coo_reference directly, because it is the thing being measured
+    rather than the thing being trusted.
+    """
+    builder = (
+        _scipy_coo_reference
+        if fs_common._use_scipy_accuracy_reference()
+        else _pytorch_coo_reference
+    )
+    return builder(data, row, col, x, shape, out_dtype, op=op)
+
+
 def _dense_to_coo(A):
     rows, cols = A.nonzero(as_tuple=True)
     data = A[rows, cols]
@@ -264,14 +292,14 @@ def _cuda_event_benchmark(op, warmup, iters):
     count = max(1, int(iters))
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    e0 = ACCEL.Event(enable_timing=True)
+    e1 = ACCEL.Event(enable_timing=True)
     e0.record()
     for _ in range(count):
         out = op()
     e1.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, e0.elapsed_time(e1) / count
 
 
@@ -408,17 +436,17 @@ def _timed_flagsparse_coo_tocsr_runtime(
         assume_sorted=False,
     )
     y = spmv_op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         y = spmv_op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
+    ACCEL.synchronize()
+    e0 = ACCEL.Event(True)
+    e1 = ACCEL.Event(True)
     e0.record()
     for _ in range(iters):
         y = spmv_op()
     e1.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return y, e0.elapsed_time(e1) / iters
 
 
@@ -430,17 +458,17 @@ def _timed_flagsparse_coo_tocsr_prepared(
 ):
     spmv_op = lambda: fs.flagsparse_spmv_coo_tocsr(x=x, prepared=prepared)
     y = spmv_op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         y = spmv_op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
+    ACCEL.synchronize()
+    e0 = ACCEL.Event(True)
+    e1 = ACCEL.Event(True)
     e0.record()
     for _ in range(iters):
         y = spmv_op()
     e1.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return y, e0.elapsed_time(e1) / iters
 
 
@@ -452,16 +480,16 @@ def run_synthetic(
     iters=ITERS,
     timing=False,
 ):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available. Please run on a GPU-enabled system.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     print("=" * 172)
     print(
         "FLAGSPARSE SpMV COO BENCHMARK (synthetic dense -> COO). All backends stay COO."
     )
     print("=" * 172)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}")
     print(f"Warmup: {warmup} | Iters: {iters}")
     print()
 
@@ -560,7 +588,7 @@ def _run_one_coo_case(
     )
     y_base = base["out"]
     y_opt = opt["out"]
-    y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op=op)
+    y_ref = _correctness_reference(data, row, col, x, shape, dtype, op=op)
     err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
     err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
     err_pt = None
@@ -664,7 +692,7 @@ def _run_one_tocsr_case(
         warmup,
         iters,
     )
-    y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op="non")
+    y_ref = _correctness_reference(data, row, col, x, shape, dtype, op="non")
     err_runtime = _allclose_error_ratio(y_runtime, y_ref, atol, rtol)
     err_prepared = _allclose_error_ratio(y_prepared, y_ref, atol, rtol)
     pt_ms = _time_pytorch_coo(data, row, col, x, shape, "non", warmup, iters)
@@ -752,17 +780,17 @@ def _time_pytorch_coo(data, row, col, x, shape, op, warmup, iters):
             shape,
             op,
         )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         _ = spmv_op()
-    torch.cuda.synchronize()
-    e0 = torch.cuda.Event(True)
-    e1 = torch.cuda.Event(True)
+    ACCEL.synchronize()
+    e0 = ACCEL.Event(True)
+    e1 = ACCEL.Event(True)
     e0.record()
     for _ in range(iters):
         _ = spmv_op()
     e1.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return e0.elapsed_time(e1) / iters
 
 
@@ -929,10 +957,10 @@ def run_all_dtypes_coo_csv(
     timing=False,
     run_cusparse=True,
 ):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     rows_out = []
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
@@ -1052,10 +1080,10 @@ def run_all_dtypes_tocsr_csv(
     iters=ITERS,
     run_cusparse=True,
 ):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     rows_out = []
     value_dtypes = (
         (torch.float32, torch.float64) if value_dtypes is None else value_dtypes

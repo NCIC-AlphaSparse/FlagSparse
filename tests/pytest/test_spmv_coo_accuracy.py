@@ -22,6 +22,8 @@ from flagsparse import (
     prepare_spmv_coo_tocsr,
 )
 import flagsparse.sparse_operations.spmv_coo as spmv_coo_mod
+from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
@@ -145,7 +147,15 @@ def test_spmv_coo_matches_dense_reference(M, N, dtype, index_dtype, op):
     x_len = M if _op_transposes(op) else N
     x = _make_x(x_len, dtype, golden_device())
     ref_dtype = _reference_dtype(dtype)
-    ref = (_apply_dense_op(dense, op).to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
+    if common._use_scipy_accuracy_reference():
+        matrix = reference_utils.scipy_coo(
+            data, indices[0], indices[1], (M, N), ref_dtype
+        )
+        ref = reference_utils.as_torch(
+            reference_utils.spmv(matrix, x, ref_dtype, op=op), ref_dtype, golden_device()
+        ).to(dtype)
+    else:
+        ref = (_apply_dense_op(dense, op).to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
     out = flagsparse_spmv_coo(data, row, col, x.to(device), shape=(M, N), op=op)
     _assert_close(out, ref, dtype)
 

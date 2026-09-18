@@ -478,3 +478,53 @@ ops:
       - Utility
     stages:
       - beta: "1.0"
+
+# Delivery-report registrations. Python and C API summary writers both consume
+# this field. Add a record here before wiring a new reportable variant.
+#
+# The delivery list has 42 variants; 40 are registered here. The two missing are
+# sddmm_csr_c32_int_non_non_row / sddmm_csr_c64_int_non_non_row, which wait for a
+# complex SDDMM kernel -- register them once it lands. gather/scatter f16 ARE
+# delivery variants: 算子列表注册修改.xlsx omits them by mistake (confirmed
+# 2026-09-18), so do not treat them as extras. See capi/docs/README.md.
+delivery_variants:
+  - {id: gather_f16_int, operator: gather, format: sparse_vector, dtype: f16}
+  - {id: gather_f32_int, operator: gather, format: sparse_vector, dtype: f32}
+  - {id: gather_f64_int, operator: gather, format: sparse_vector, dtype: f64}
+  - {id: gather_c32_int, operator: gather, format: sparse_vector, dtype: c32}
+  - {id: gather_c64_int, operator: gather, format: sparse_vector, dtype: c64}
+  - {id: scatter_f16_int, operator: scatter, format: sparse_vector, dtype: f16}
+  - {id: scatter_f32_int, operator: scatter, format: sparse_vector, dtype: f32}
+  - {id: scatter_f64_int, operator: scatter, format: sparse_vector, dtype: f64}
+  - {id: scatter_c32_int, operator: scatter, format: sparse_vector, dtype: c32}
+  - {id: scatter_c64_int, operator: scatter, format: sparse_vector, dtype: c64}
+  - {id: spmv_csr_f32_int_non, operator: spmv_csr, format: csr, dtype: f32}
+  - {id: spmv_csr_f64_int_non, operator: spmv_csr, format: csr, dtype: f64}
+  - {id: spmv_csr_c32_int_non, operator: spmv_csr, format: csr, dtype: c32}
+  - {id: spmv_csr_c64_int_non, operator: spmv_csr, format: csr, dtype: c64}
+  - {id: spmv_coo_f32_int_non, operator: spmv_coo, format: coo, dtype: f32}
+  - {id: spmv_coo_f64_int_non, operator: spmv_coo, format: coo, dtype: f64}
+  - {id: spmv_coo_c32_int_non, operator: spmv_coo, format: coo, dtype: c32}
+  - {id: spmv_coo_c64_int_non, operator: spmv_coo, format: coo, dtype: c64}
+  - {id: spmm_csr_f32_int_non_non_row, operator: spmm_csr, format: csr, dtype: f32}
+  - {id: spmm_csr_f64_int_non_non_row, operator: spmm_csr, format: csr, dtype: f64}
+  - {id: spmm_csr_c32_int_non_non_row, operator: spmm_csr, format: csr, dtype: c32}
+  - {id: spmm_csr_c64_int_non_non_row, operator: spmm_csr, format: csr, dtype: c64}
+  - {id: spmm_coo_f32_int_non_non_row, operator: spmm_coo, format: coo, dtype: f32}
+  - {id: spmm_coo_f64_int_non_non_row, operator: spmm_coo, format: coo, dtype: f64}
+  - {id: spmm_coo_c32_int_non_non_row, operator: spmm_coo, format: coo, dtype: c32}
+  - {id: spmm_coo_c64_int_non_non_row, operator: spmm_coo, format: coo, dtype: c64}
+  - {id: spgemm_csr_f32_int_non_non, operator: spgemm_csr, format: csr, dtype: f32}
+  - {id: spgemm_csr_f64_int_non_non, operator: spgemm_csr, format: csr, dtype: f64}
+  - {id: sddmm_csr_f32_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f32}
+  - {id: sddmm_csr_f64_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f64}
+  - {id: spsv_csr_f32_int_non, operator: spsv_csr, format: csr, dtype: f32}
+  - {id: spsv_csr_f64_int_non, operator: spsv_csr, format: csr, dtype: f64}
+  - {id: spsv_csr_c32_int_non, operator: spsv_csr, format: csr, dtype: c32}
+  - {id: spsv_csr_c64_int_non, operator: spsv_csr, format: csr, dtype: c64}
+  - {id: spsv_coo_f32_int_non, operator: spsv_coo, format: coo, dtype: f32}
+  - {id: spsv_coo_f64_int_non, operator: spsv_coo, format: coo, dtype: f64}
+  - {id: spsv_coo_c32_int_non, operator: spsv_coo, format: coo, dtype: c32}
+  - {id: spsv_coo_c64_int_non, operator: spsv_coo, format: coo, dtype: c64}
+  - {id: spsm_csr_f32_int_non_non_row, operator: spsm_csr, format: csr, dtype: f32}
+  - {id: spsm_csr_f64_int_non_non_row, operator: spsm_csr, format: csr, dtype: f64}

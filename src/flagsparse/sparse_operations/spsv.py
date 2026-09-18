@@ -7212,6 +7212,64 @@ def flagsparse_spsv_analysis_coo(
     )
 
 
+def _spsv_ascend_row_sweep(
+    data,
+    indices32,
+    indptr64,
+    rhs,
+    n_rows,
+    *,
+    lower,
+    unit_diagonal,
+    out,
+    return_time,
+    target_dtype,
+):
+    """Torch-NPU SpSV fallback for CANN, which cannot lower the CW atomics."""
+    if return_time:
+        _ACCEL.synchronize()
+        t0 = time.perf_counter()
+
+    offsets = indptr64.to(torch.int64).tolist()
+    columns = indices32.to(torch.int64)
+    diag_eps = _spsv_diag_eps_for_dtype(data.dtype)
+    x = torch.empty_like(rhs)
+    order = range(n_rows) if lower else range(n_rows - 1, -1, -1)
+    for row in order:
+        begin, end = offsets[row], offsets[row + 1]
+        cols = columns[begin:end]
+        vals = data[begin:end]
+        off_diagonal = (cols < row) if lower else (cols > row)
+        value = rhs[row]
+        if bool(off_diagonal.any()):
+            value = value - torch.sum(vals[off_diagonal] * x[cols[off_diagonal]])
+        if unit_diagonal:
+            x[row] = value
+            continue
+        # Same conventions as the Triton kernels: a missing diagonal yields 0,
+        # and a near-zero one (below _spsv_diag_eps_for_dtype) divides by 1.
+        diagonal = (cols == row).nonzero(as_tuple=True)[0]
+        if diagonal.numel():
+            diag = vals[diagonal[0]]
+            if bool(torch.abs(diag) < diag_eps):
+                diag = torch.ones_like(diag)
+            x[row] = value / diag
+        else:
+            x[row] = torch.zeros_like(value)
+
+    if x.dtype != target_dtype:
+        x = x.to(target_dtype)
+    if out is not None:
+        if out.shape != x.shape or out.dtype != x.dtype:
+            raise ValueError("out shape/dtype must match result")
+        out.copy_(x)
+        x = out
+    if return_time:
+        _ACCEL.synchronize()
+        return x, (time.perf_counter() - t0) * 1000.0
+    return x
+
+
 def _execute_spsv_csr_plan(
     data,
     b,
@@ -7261,6 +7319,25 @@ def _execute_spsv_csr_plan(
     alpha_in = _coerce_spsv_alpha(alpha, compute_dtype, b.device)
     if not _spsv_alpha_is_identity(alpha):
         b_in = b_in * alpha_in
+    if _is_ascend_runtime():
+        if trans_mode != "N":
+            raise NotImplementedError(
+                "Ascend SpSV fallback currently supports non-transpose solves only"
+            )
+        return _spsv_ascend_row_sweep(
+            data_in,
+            kernel_indices32,
+            kernel_indptr64,
+            b_in,
+            n_rows,
+            lower=lower_eff,
+            unit_diagonal=unit_diagonal,
+            out=out,
+            return_time=return_time,
+            target_dtype=(
+                original_output_dtype if original_output_dtype is not None else data.dtype
+            ),
+        )
     solve_stream = _resolve_spsv_stream(handle, stream, b.device)
     block_nnz_use, max_segments_use = default_block_nnz, default_max_segments
     if solve_kind == "transpose_cw":

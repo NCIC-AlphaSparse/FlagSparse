@@ -1,0 +1,63 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Test parameter space (spec §6.6). ctest/ reads shapes from here so that
+# widening coverage does not mean editing C++.
+
+version: 1
+
+# Spec §6.3: strict first, then the relaxed retry of §6.3.1. A case that needs
+# the relaxed pass is reported PASS(relaxed) with its max_error_ratio, never
+# silently downgraded.
+tolerance:
+  strict:
+    float16:    {rtol: 1.0e-2,  atol: 1.0e-3}
+    bfloat16:   {rtol: 1.0e-2,  atol: 1.0e-3}
+    float32:    {rtol: 1.0e-5,  atol: 1.0e-6}
+    float64:    {rtol: 1.0e-12, atol: 1.0e-13}
+    complex64:  {rtol: 1.0e-5,  atol: 1.0e-6}
+    complex128: {rtol: 1.0e-12, atol: 1.0e-13}
+  relaxed:
+    float32:    {rtol: 1.0e-3,  atol: 1.0e-4}
+    complex64:  {rtol: 1.0e-3,  atol: 1.0e-4}
+    float64:    {rtol: 1.0e-10, atol: 1.0e-11}
+    complex128: {rtol: 1.0e-10, atol: 1.0e-11}
+  # Triangular solves and long reductions accumulate error row by row, so they
+  # get their own floor rather than being judged by the generic fp32 rule.
+  relaxed_long_reduction:
+    float32:    {rtol: 1.0e-2,  atol: 1.0e-4}
+
+benchmark:
+  warmup_iters: 10      # >= 10 (§6.4)
+  timed_iters: 100      # >= 100, median reported
+  statistic: median
+
+# §6.4 asks for small (<1K) / medium (1K~100K) / large (>100K) and a density
+# sweep over 0.01% / 0.1% / 1% / 10%.
+shapes:
+  small:  [{rows: 512,   cols: 512},   {rows: 64,    cols: 96}]
+  medium: [{rows: 8192,  cols: 8192},  {rows: 4096,  cols: 4096}]
+  large:  [{rows: 32768, cols: 32768}]
+densities: [0.0001, 0.001, 0.01, 0.1]
+
+dtypes:
+  default: [float32, float64]
+  complex: [complex64, complex128]
+index_types: [int32, int64]
+
+# Real matrices, when present. Downloaded separately; a missing file skips the
+# case rather than failing it, so a machine without the corpus still runs green.
+real_matrices:
+  source: SuiteSparse Matrix Collection
+  path_env: FLAGSPARSE_MTX_DIR
+  files: [net150.mtx, trdheim.mtx, wave.mtx]
+
+# Per-operator overrides. An operator absent here uses the defaults above.
+operators:
+  spmv:
+    ops: [non]
+    dtypes: [float32, float64]
+  spsv:
+    tolerance_profile: relaxed_long_reduction
+  sddmm:
+    tolerance_profile: relaxed_long_reduction

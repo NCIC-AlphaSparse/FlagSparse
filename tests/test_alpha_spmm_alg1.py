@@ -27,6 +27,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -180,17 +182,17 @@ def _error_profile(candidate, reference, dtype):
 
 def _benchmark(op, warmup, iters):
     out = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(max(1, int(iters))):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / max(1, int(iters))
 
 
@@ -803,7 +805,7 @@ def main():
     parser.add_argument("--require-tle-opt2", action="store_true")
     args = parser.parse_args()
 
-    device = torch.device("cuda")
+    device = accelerator_device()
     rows = []
     launch_rows = []
     if args.require_tle_opt and not fs.is_alpha_spmm_alg1_tle_opt_available():

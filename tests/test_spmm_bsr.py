@@ -26,6 +26,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -472,15 +474,15 @@ def _cuda_event_benchmark(op, warmup, iters):
     out = None
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
     start.record()
     for _ in range(count):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / count
 
 
@@ -858,7 +860,7 @@ def main():
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         raise RuntimeError("A CUDA/ROCm PyTorch device is required for native BSR SpMM benchmark")
     dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(args.index_dtypes, INDEX_DTYPE_MAP, "--index-dtypes")
@@ -891,7 +893,7 @@ def main():
             + (f" {'GPUProc':>9} {'Compute':>9}" if args.timing else "")
         )
         print("-" * 160)
-        device = torch.device("cuda")
+        device = accelerator_device()
         cases = []
         if args.synthetic:
             for M, K, dense_cols in TEST_SIZES:

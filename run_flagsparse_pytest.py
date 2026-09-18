@@ -45,6 +45,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.delivery_variants import load_delivery_variants
+
+# XPU compiler diagnostics can include an MLIR reproducer and exceed the
+# csv module's conservative 128 KiB default.  They are part of the execution
+# result, so retaining them must not turn a TRITON_COMPILE row into PASS.
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    csv.field_size_limit(2**31 - 1)
+
 try:
     import yaml
 except Exception:
@@ -81,6 +91,13 @@ STATUS_TO_FLAGGEMS = {
     "PASS": "Passed",
     "FAIL": "Failed",
     "SKIP": "Skipped",
+    # Capability-probe verdicts. A kernel the backend declined is a skip; one
+    # that would not compile is a failure -- neither may read as a pass.
+    "REJECTED": "Skipped",
+    "TRITON_COMPILE": "Failed",
+    "MISMATCH": "Failed",
+    "ERROR": "Error",
+    "MIXED": "Error",
     "TIMEOUT": "Timeout",
     "NO_TESTS": "NotFound",
     "CRASH": "Error",
@@ -91,6 +108,31 @@ STATUS_TO_FLAGGEMS = {
     "Timeout": "Timeout",
     "NotFound": "NotFound",
     "Error": "Error",
+    # Kernel ran and passed, but no vendor baseline exists for this dtype.
+    # Emitted by capi/tools/write_summary.py; kept here so the two tables match.
+    "NoBaseline": "NoBaseline",
+}
+# Benchmark arguments that narrow each delivery parent's default CSV sweep to
+# what the delivery variants actually name: int32 indices and the `non` op. The
+# default sweeps also cover int64 and trans/conj (spmm_csr: 720 rows, 120 of
+# them delivery), which on MetaX C550 ran past a 900 s --timeout. Injected only
+# under --delivery-only, BEFORE --benchmark-args/--op-benchmark-args, so an
+# explicit user flag still wins (argparse keeps the last value). Parents absent
+# here already sweep only delivery axes (sddmm_csr, spgemm_csr, spsm_csr).
+DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
+    "gather": (
+        "--index-dtypes",
+        "int32",
+        "--value-dtypes",
+        "float16,float32,float64,complex64,complex128",
+    ),
+    "scatter": ("--index-dtypes", "int32"),
+    "spmv_csr": ("--index-dtype", "int32", "--ops", "non"),
+    "spmv_coo": ("--index-dtypes", "int32", "--ops", "non"),
+    "spmm_csr": ("--index-dtypes", "int32", "--ops", "non"),
+    "spmm_coo": ("--index-dtypes", "int32"),
+    "spsv_csr": ("--index-dtypes", "int32", "--ops", "NON"),
+    "spsv_coo": ("--index-dtypes", "int32", "--ops", "NON"),
 }
 PYTEST_STATUS_TO_FLAGGEMS = {
     "PASSED": "Passed",
@@ -119,45 +161,77 @@ PERFORMANCE_METRIC_COLUMNS = {
     "max_abs_err",
     "max_rel_err",
 }
+# VENDOR FIRST, PyTorch as the fallback. The runner reports the first non-empty
+# match, so within every family the vendor pair is listed ahead of the PyTorch
+# pair: on CUDA and ROCm the number is FlagSparse against cuSPARSE / hipSPARSE,
+# and only an operator the vendor library does not implement falls through to
+# the PyTorch metric. A backend with no vendor column at all -- MACA, MUSA, XPU --
+# falls through for every operator, which is the same rule, not an exception.
+#
+# This ordering used to be the other way round for the `triton_*` family while a
+# comment further down claimed the vendor metric won; it did not, and every CUDA
+# speedup in the delivery report was against PyTorch.
+#
+# A speedup name can appear more than once with different column layouts --
+# spmm_coo reports triton_speedup_vs_pytorch over torch_ms/ms while spmm_csc uses
+# pytorch_ms/ms -- so each layout is listed and _performance_schema prefers the
+# entry whose measurement columns the row actually carries.
 PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("speedup", "latency_base", "latency"),
+    ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
+    ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
+    # spmm_coo carries BOTH triton_speedup_vs_pytorch (over torch_ms) and
+    # cusparse_vs_alg_speedup (over cusparse_ms). The vendor one has to be ahead
+    # of the PyTorch ones or that operator alone keeps reporting against torch
+    # while everything else reports against cuSPARSE -- vendor-first holding for
+    # ten operators and quietly not for the eleventh.
+    ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
+    ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
+    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "triton_ms"),
-    # spmm_coo and spmm_csc reuse the same speedup name with their own column layout:
-    # spmm_coo's baseline is torch_ms and its latency is "ms"; spmm_csc uses pytorch_ms
-    # with "ms".  Both are listed so a row resolves whichever pair it actually carries --
-    # pointing the name at only one pair makes the other operator's rows fail the
-    # completeness check and drop out of the aggregate entirely.
     ("triton_speedup_vs_pytorch", "pytorch_ms", "ms"),
     ("triton_speedup_vs_pytorch", "torch_ms", "ms"),
-    ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
-    # After vs_cusparse on purpose: the runner reports the first non-empty match, so on
-    # CUDA the vendor metric keeps winning (same measurement, historical label), while a
-    # backend with no vendor column falls through to the PyTorch API metric.
     ("triton_speedup_vs_pytorch_api", "pytorch_api_ms", "triton_ms"),
-    ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
-    ("csc_speedup_vs_pytorch", "pytorch_ms", "csc_ms"),
     ("csc_speedup_vs_cusparse", "cusparse_ms", "csc_ms"),
-    ("bsr_speedup_vs_pytorch", "pytorch_ms", "bsr_ms"),
+    ("csc_speedup_vs_pytorch", "pytorch_ms", "csc_ms"),
     ("bsr_speedup_vs_cusparse", "cusparse_ms", "bsr_ms"),
-    ("opt_speedup_vs_pytorch", "pytorch_ms", "opt_ms"),
+    ("bsr_speedup_vs_pytorch", "pytorch_ms", "bsr_ms"),
     ("opt_speedup_vs_cusparse", "cusparse_ms", "opt_ms"),
+    ("opt_speedup_vs_pytorch", "pytorch_ms", "opt_ms"),
     ("opt_vs_base", "base_ms", "opt_ms"),
     ("base_vs_alg2_speedup", "base_ms", "alg2_ms"),
     ("base_vs_alg1_speedup", "base_ms", "alg1_ms"),
     ("torch_vs_alg2_speedup", "torch_ms", "alg2_ms"),
     ("torch_vs_alg1_speedup", "torch_ms", "alg1_ms"),
-    ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
-    ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
-    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
-    ("pytorch_speedup_solve", "pytorch_ms", "solve_ms"),
-    ("cusparse_speedup_solve", "cusparse_ms", "solve_ms"),
-    ("pytorch_speedup_total", "pytorch_ms", "triton_total_ms"),
-    ("cusparse_speedup_total", "cusparse_ms", "triton_total_ms"),
     ("torch_vs_alg_speedup", "torch_ms", "ms"),
+    ("cusparse_speedup_solve", "cusparse_ms", "solve_ms"),
+    ("pytorch_speedup_solve", "pytorch_ms", "solve_ms"),
+    ("cusparse_speedup_total", "cusparse_ms", "triton_total_ms"),
+    ("pytorch_speedup_total", "pytorch_ms", "triton_total_ms"),
     ("scipy_vs_alg_speedup", "scipy_cpu_ms", "ms"),
     ("prepared_speedup_vs_pytorch", "pytorch_ms", "prepared_ms"),
-    ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
+    # SpSV and SpSM spell their columns in the vendor's own casing, and SpSV
+    # names the CuPy route explicitly. Column lookup is case-insensitive (see
+    # _row_value), so "cuSPARSE_ms" resolves against "cusparse_ms" here, but a
+    # DIFFERENT name still needs its own entry -- which is why the two below
+    # exist and why these operators used to report a speedup with both
+    # latencies reading 0.00 ms.
+    ("FlagSparse_vs_CuPy/cuSPARSE_speedup", "CuPy/cuSPARSE_ms", "flagsparse_ms"),
     ("FlagSparse_vs_cuSPARSE_speedup", "cusparse_ms", "flagsparse_ms"),
+    # SpSV names its columns after the ACTIVE vendor label, so DCU writes
+    # hipSPARSE_ms and FlagSparse_vs_hipSPARSE_all_speedup (the `_all` suffix is
+    # ROCm-only: that path reports bufferSize/analysis/solve separately). Without
+    # these two entries the DCU rows matched nothing and fell through to the
+    # PyTorch metric -- vendor-first would have held on CUDA and quietly not on DCU.
+    ("FlagSparse_vs_hipSPARSE_all_speedup", "hipsparse_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_hipSPARSE_speedup", "hipsparse_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_vendor_speedup", "cusparse_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_vendor_speedup", "hipsparse_ms", "flagsparse_ms"),
+    # Backends whose vendor is torch.sparse, or which have none, write a neutral
+    # `vendor_ms` rather than a column named after the PyTorch label or "N/A".
+    ("FlagSparse_vs_vendor_speedup", "vendor_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_PyTorch_all_speedup", "pytorch_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
 )
 
 
@@ -469,11 +543,27 @@ GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metax", "mthread
 # the capability probe, which reports PASS / REJECTED / TRITON_COMPILE per
 # operator -- on a platform where a kernel may not lower at all, that is the
 # measurement that matters, and it beats reporting nothing.
-PROBE_ONLY_BACKENDS: tuple[str, ...] = ("xpu", "gcu", "mlu")
+PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")
+
+# The XPU SDK has no cuSPARSE-shaped generic sparse API, so these five run
+# through benchmark_xpu.py instead of the probe.  The script compares each
+# FlagSparse result with an equivalent PyTorch-XPU expression and reports both
+# latencies and their ratio; it is not a vendor/XDNN sparse-library comparison.
+XPU_BASELINE_OPS: tuple[str, ...] = (
+    "gather",
+    "scatter",
+    "spmv_csr",
+    "spmm_csr",
+    "sddmm_csr",
+)
 
 
 ASCEND_BASELINE_OPS: tuple[str, ...] = (
-    "gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr",
+    "gather",
+    "scatter",
+    "spmv_csr",
+    "spmm_csr",
+    "sddmm_csr",
 )
 
 # The operators whose accuracy runs through benchmark_ascend_accuracy.py instead
@@ -484,12 +574,24 @@ ASCEND_BASELINE_OPS: tuple[str, ...] = (
 ASCEND_ACCURACY_OPS: frozenset[str] = frozenset(ASCEND_BASELINE_OPS)
 
 ASCEND_PROBE_OPS: tuple[str, ...] = (
-    "spmv_coo", "spmv_csc", "spmv_bsr", "spmv_coo_tocsr",
-    "spmm_coo", "spmm_csc", "spmm_bsr", "spmm_bell",
-    "spmm_csr_opt", "spmm_csr_opt_alg1", "spmm_csr_opt_alg2", "alpha_spmm_alg1",
+    "spmv_coo",
+    "spmv_csc",
+    "spmv_bsr",
+    "spmv_coo_tocsr",
+    "spmm_coo",
+    "spmm_csc",
+    "spmm_bsr",
+    "spmm_bell",
+    "spmm_csr_opt",
+    "spmm_csr_opt_alg1",
+    "spmm_csr_opt_alg2",
+    "alpha_spmm_alg1",
     "spgemm_csr",
-    "spsv_csr", "spsv_coo", "spsv_sell",
-    "spsm_csr", "spsm_coo",
+    "spsv_csr",
+    "spsv_coo",
+    "spsv_sell",
+    "spsm_csr",
+    "spsm_coo",
 )
 
 # Every operator, routed to the capability probe. Used by any backend that has
@@ -498,14 +600,40 @@ ASCEND_PROBE_OPS: tuple[str, ...] = (
 PROBE_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {}
 
 
+def _xpu_baseline_command(op: str) -> tuple[str, ...]:
+    """Measured baseline for the five operators PyTorch-XPU can express."""
+    return (
+        "benchmark/benchmark_xpu.py",
+        "--op",
+        op,
+        "--device",
+        "{device}",
+        # XPU baselines are isolated one matrix per subprocess by
+        # _run_bell_per_matrix(), so `{input}` is a file on this path.
+        "--matrix",
+        "{input}",
+        "--csv-summary",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    )
+
+
 def _probe_command(op: str) -> tuple[str, ...]:
     return (
         "benchmark/benchmark_ascend_probe.py",
-        "--op", "{op}",
-        "--device", "{device}",
-        "--csv-summary", "{csv}",
-        "--warmup", "{warmup}",
-        "--iters", "{iters}",
+        "--op",
+        "{op}",
+        "--device",
+        "{device}",
+        "--csv-summary",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
     )
 
 
@@ -513,23 +641,39 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
     **{
         op: (
             "benchmark/benchmark_ascend.py",
-            "--op", "{op}",
-            "--device", "{device}",
-            "--csv-summary", "{csv}",
-            "--dtypes", "float16,bfloat16,float32,float64",
-            "--warmup", "{warmup}",
-            "--iters", "{iters}",
+            "--op",
+            "{op}",
+            # The .mtx file or directory from --benchmark-input; without it the
+            # script silently measured its built-in synthetic case instead.
+            "--input",
+            "{input}",
+            "--device",
+            "{device}",
+            "--csv-summary",
+            "{csv}",
+            # bf16 is not a delivery dtype; measuring it only costs time.
+            "--dtypes",
+            "float16,float32,float64",
+            "--warmup",
+            "{warmup}",
+            "--iters",
+            "{iters}",
         )
         for op in ASCEND_BASELINE_OPS
     },
     **{
         op: (
             "benchmark/benchmark_ascend_probe.py",
-            "--op", "{op}",
-            "--device", "{device}",
-            "--csv-summary", "{csv}",
-            "--warmup", "{warmup}",
-            "--iters", "{iters}",
+            "--op",
+            "{op}",
+            "--device",
+            "{device}",
+            "--csv-summary",
+            "{csv}",
+            "--warmup",
+            "{warmup}",
+            "--iters",
+            "{iters}",
         )
         for op in ASCEND_PROBE_OPS
     },
@@ -762,10 +906,27 @@ def load_operator_catalog(path: Path) -> list[dict[str, object]]:
     if yaml is None:
         return _parse_operator_catalog_fallback(text)
     data = yaml.safe_load(text) or {}
-    ops = data.get("ops", [])
-    if not isinstance(ops, list):
-        raise ValueError(f"{path} must contain a top-level 'ops' list")
-    return [op for op in ops if isinstance(op, dict) and op.get("id")]
+    ops = data.get("ops")
+    if isinstance(ops, list):
+        return [op for op in ops if isinstance(op, dict) and op.get("id")]
+
+    # The C API owns the delivery manifest (capi/conf/operators.yaml). Its schema
+    # intentionally carries C-API details, but the runner needs only an id and
+    # the reporting scope.
+    wrapper_ops = data.get("operators", [])
+    if isinstance(wrapper_ops, list):
+        return [
+            {
+                "id": op["id"],
+                "labels": op.get("labels", []),
+                "reporting": op.get("reporting"),
+                "delivery_dtypes": op.get("delivery_dtypes"),
+                "dtypes": op.get("dtypes", []),
+            }
+            for op in wrapper_ops
+            if isinstance(op, dict) and op.get("id")
+        ]
+    raise ValueError(f"{path} must contain a top-level 'ops' or 'operators' list")
 
 
 def _parse_operator_catalog_fallback(text: str) -> list[dict[str, object]]:
@@ -781,6 +942,11 @@ def _parse_operator_catalog_fallback(text: str) -> list[dict[str, object]]:
             in_stages = False
             continue
         if current is None:
+            continue
+        reporting_match = re.match(r"^    reporting:\s*([A-Za-z0-9_-]+)\s*$", line)
+        if reporting_match:
+            current["reporting"] = reporting_match.group(1)
+            in_stages = False
             continue
         if re.match(r"^    stages:\s*$", line):
             in_stages = True
@@ -808,6 +974,20 @@ def _stage_name(op: dict[str, object]) -> str | None:
     return None
 
 
+def _delivery_parent_operators(yaml_path: Path) -> set[str] | None:
+    """Operators backing the delivery variants declared in `yaml_path`.
+
+    None when that manifest declares no variants, which is how the caller tells
+    the two manifest shapes apart rather than guessing from the file name.
+    """
+    try:
+        variants = load_delivery_variants(yaml_path)
+    except Exception:
+        return None
+    parents = {str(v["operator"]) for v in variants if v.get("operator")}
+    return parents or None
+
+
 def read_ops(
     *,
     project_root: Path,
@@ -816,6 +996,7 @@ def read_ops(
     ops_arg: str | None,
     stages_arg: str,
     start: str | None,
+    delivery_only: bool = False,
 ) -> list[str]:
     if ops_arg:
         return [op.strip().lstrip("_") for op in ops_arg.split(",") if op.strip()]
@@ -832,6 +1013,7 @@ def read_ops(
     if not yaml_path.is_absolute():
         yaml_path = project_root / yaml_path
     catalog = load_operator_catalog(yaml_path)
+    delivery_parents = _delivery_parent_operators(yaml_path) if delivery_only else None
 
     requested_stages = {
         item.strip() for item in stages_arg.split(",") if item.strip()
@@ -842,6 +1024,16 @@ def read_ops(
     result = []
     for op in catalog:
         op_id = str(op["id"]).strip()
+        if delivery_only:
+            # Two manifest shapes, one meaning: run exactly what the delivery
+            # report will have rows for. The repo manifest says so with
+            # `delivery_variants` (this operator backs one of them); the C API
+            # manifest says so per entry with `reporting: delivery`.
+            if delivery_parents is not None:
+                if op_id not in delivery_parents:
+                    continue
+            elif op.get("reporting") != "delivery":
+                continue
         if op_id in DEFAULT_EXCLUDED_OPS:
             continue
         if start and op_id < start:
@@ -1164,6 +1356,16 @@ def parse_accuracy_json(path: Path) -> dict[str, object]:
             "errors": 1,
         }
 
+    return summarize_accuracy_cases(raw_data)
+
+
+def summarize_accuracy_cases(raw_data: dict[str, object]) -> dict[str, object]:
+    """Classify recorded pytest cases into counts, a status and failure details.
+
+    The delivery projection feeds a dtype slice of the same artifact through
+    here, so an operator row and a variant row can never disagree about what
+    the same set of cases means.
+    """
     skipped: dict[str, list[str]] = {}
     failed: dict[str, list[str]] = {}
     passed = 0
@@ -1266,12 +1468,28 @@ def write_phase_result(
 def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
+        # torch_npu ignores CUDA_VISIBLE_DEVICES: without this every child landed
+        # on physical NPU 0 whatever --gpus said (measured on 910B, 2026-09-17).
+        env["ASCEND_RT_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
     pythonpath = [str(project_root / "src"), str(project_root)]
     if env.get("PYTHONPATH"):
         pythonpath.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     return env
+
+
+def _subprocess_device_id(gpu_id: int) -> int:
+    """The device ordinal to pass a child whose visible devices _base_env masked.
+
+    Backends whose runtime honours that mask renumber the one visible device to
+    0, so passing the physical id would point past it: Ascend reads
+    ASCEND_RT_VISIBLE_DEVICES, and XPU's torch_xmlir shim reads
+    CUDA_VISIBLE_DEVICES. Every other backend keeps the id it was given.
+    """
+    backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    return 0 if backend in ("ascend", "xpu") else gpu_id
 
 
 def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
@@ -1346,6 +1564,13 @@ def run_accuracy(
     if not marker:
         return _not_configured(op, "accuracy", "no pytest marker mapping")
 
+    accuracy_env = _base_env(project_root, gpu_id)
+    # XPU correctness is always evaluated against the CPU SciPy oracle.  This is
+    # deliberately independent of the GPU-side PyTorch expression timed by the
+    # performance phase.
+    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "xpu":
+        accuracy_env["FLAGSPARSE_ACCURACY_REFERENCE"] = "scipy"
+
     result_path = op_dir / "accuracy_result.json"
     if result_path.exists():
         result_path.unlink()
@@ -1370,14 +1595,14 @@ def run_accuracy(
             "--op",
             op,
             "--device",
-            str(gpu_id),
+            str(_subprocess_device_id(gpu_id)),
             "--output",
             str(result_path),
         ]
         returncode, stdout, stderr, duration, timed_out = run_subprocess(
             cmd,
             project_root=project_root,
-            env=_base_env(project_root, gpu_id),
+            env=accuracy_env,
             timeout=timeout,
         )
         stdout_path = op_dir / "accuracy_stdout.log"
@@ -1433,7 +1658,7 @@ def run_accuracy(
     returncode, stdout, stderr, duration, timed_out = run_subprocess(
         cmd,
         project_root=project_root,
-        env=_base_env(project_root, gpu_id),
+        env=accuracy_env,
         timeout=timeout,
     )
     output = stdout + ("\n" if stdout and stderr else "") + stderr
@@ -1504,6 +1729,9 @@ def _resolve_path(project_root: Path, value: str | None) -> Path | None:
 # Operators whose sweep is run one matrix per subprocess, so a single hung matrix is
 # skippable instead of killing the whole operator's results.
 PER_MATRIX_PERFORMANCE_OPS = frozenset({"spmm_bell"})
+# On Ascend these two also run one .mtx per subprocess: real matrices differ by
+# orders of magnitude, and one slow input must not erase the rows that finished.
+ASCEND_PER_MATRIX_PERFORMANCE_OPS = frozenset({"spmm_csr", "sddmm_csr"})
 
 
 def parse_op_benchmark_args(values: list[str]) -> dict[str, list[str]]:
@@ -1630,6 +1858,25 @@ def _detail_shape(row: dict[str, str], index: int, seen: set[str]) -> str:
     return fallback
 
 
+def _row_value(row: dict[str, str], key: str | None):
+    """Read a CSV column, tolerating the vendor's own casing.
+
+    SpSV and SpSM write `FlagSparse_ms`, `PyTorch_ms`, `cuSPARSE_ms`; the schema
+    table spells them lowercase. A case-sensitive `row.get()` missed every one of
+    them, so those ten delivery variants reported a speedup with both latencies
+    reading 0.00 ms -- a number that looks measured and is not.
+    """
+    if key is None:
+        return None
+    if key in row:
+        return row[key]
+    lowered = key.lower()
+    for name, value in row.items():
+        if name.lower() == lowered:
+            return value
+    return None
+
+
 def _is_metric_column(key: str) -> bool:
     lowered = key.lower()
     return (
@@ -1662,12 +1909,12 @@ def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | Non
     # columns the row actually carries.  Without this the first entry always wins and
     # the other operator's rows fail the completeness check and vanish from aggregates.
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
-        if not row.get(speedup_key):
+        if not _row_value(row, speedup_key):
             continue
-        if all(key is None or row.get(key) for key in (base_key, latency_key)):
+        if all(key is None or _row_value(row, key) for key in (base_key, latency_key)):
             return speedup_key, base_key, latency_key
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
-        if row.get(speedup_key):
+        if _row_value(row, speedup_key):
             return speedup_key, base_key, latency_key
     for key, value in row.items():
         if "speedup" in key.lower() and value:
@@ -1741,6 +1988,26 @@ def _performance_row_status_is_usable(row: dict[str, str]) -> bool:
     return not status or status.upper() in {"PASS", "PASSED", "OK", "SUCCESS"}
 
 
+def _capability_probe_status(rows: list[dict[str, str]]) -> str:
+    """Keep a probe's semantic status when its subprocess exits successfully.
+
+    The probe exits 0 whether the kernel ran, was declined or failed to compile
+    -- the verdict is in the rows. Taking the exit code would report every one
+    of them as a pass.
+    """
+
+    states = {
+        str(row.get("status") or "").strip().upper()
+        for row in rows
+        if str(row.get("status") or "").strip()
+    }
+    if not states:
+        return "NO_TESTS"
+    if len(states) == 1:
+        return states.pop()
+    return "MIXED"
+
+
 def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
     """Require a passing row and both measurements behind its speedup value.
 
@@ -1751,13 +2018,13 @@ def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
     if not _performance_row_status_is_usable(row):
         return False
     speedup_key, base_key, latency_key = _performance_schema(row)
-    speedup = _to_float(row.get(speedup_key))
+    speedup = _to_float(_row_value(row, speedup_key))
     if speedup is None or speedup <= 0:
         return False
     for key in (base_key, latency_key):
         if key is None:
             continue
-        measurement = _to_float(row.get(key))
+        measurement = _to_float(_row_value(row, key))
         if measurement is None or measurement <= 0:
             return False
     return True
@@ -1765,9 +2032,9 @@ def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
 
 def _benchmark_json_detail(row: dict[str, str], index: int) -> dict[str, object]:
     speedup_key, base_key, latency_key = _performance_schema(row)
-    base = _to_float(row.get(base_key)) if base_key else None
-    latency = _to_float(row.get(latency_key)) if latency_key else None
-    speedup = _to_float(row.get(speedup_key))
+    base = _to_float(_row_value(row, base_key))
+    latency = _to_float(_row_value(row, latency_key))
+    speedup = _to_float(_row_value(row, speedup_key))
     # ``None`` means "no measurement", which is not the same claim as a
     # measured 0.0: benchmarks whose CSV carries no speedup column (SpMV CSC,
     # SpMM CSC/BSR on DCU, where no vendor baseline runs) used to be reported
@@ -1817,11 +2084,17 @@ def write_benchmark_json_from_csv(
     csv_path: Path,
     json_path: Path,
     *,
+    status: str = "passed",
+    test_case: str = "csv",
     rows: list[dict[str, str]] | None = None,
 ) -> None:
     json_path.write_text(
         json.dumps(
-            benchmark_json_from_csv(op, csv_path, rows=rows), indent=2, sort_keys=True
+            benchmark_json_from_csv(
+                op, csv_path, status=status, test_case=test_case, rows=rows
+            ),
+            indent=2,
+            sort_keys=True,
         ),
         encoding="utf-8",
     )
@@ -1835,8 +2108,8 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         dtype = _row_dtype(row)
         shape = _detail_shape(row, index, seen_by_dtype.setdefault(dtype, set()))
         speedup_key, base_key, latency_key = _performance_schema(row)
-        speedup = _to_float(row.get(speedup_key))
-        base = _to_float(row.get(base_key)) if base_key else None
+        speedup = _to_float(_row_value(row, speedup_key))
+        base = _to_float(_row_value(row, base_key))
         latency = _to_float(row.get(latency_key)) if latency_key else None
 
         dtype_entry = grouped.setdefault(
@@ -2017,7 +2290,10 @@ def summarize_performance_csv(
         }
         summary["speedup_by_column"] = by_column
         if "speedup" not in summary:
-            preferred = [
+            # Vendor-first, same order as the per-row choice: this list used to
+            # put triton_speedup_vs_pytorch first, so the operator-level number
+            # was against PyTorch even where every row had a cuSPARSE baseline.
+            preferred = [key for key, _, _ in PERFORMANCE_SPEEDUP_SCHEMAS] + [
                 "speedup",
                 "triton_speedup_vs_pytorch",
                 "opt_speedup_vs_pytorch",
@@ -2056,9 +2332,14 @@ def run_performance(
         template = ASCEND_PERFORMANCE_COMMANDS.get(op)
         if template is None:
             return _not_configured(
-                op, "performance",
+                op,
+                "performance",
                 "no Ascend performance/probe command mapping for this operator",
             )
+    elif backend == "xpu":
+        template = (
+            _xpu_baseline_command(op) if op in XPU_BASELINE_OPS else _probe_command(op)
+        )
     elif backend in PROBE_ONLY_BACKENDS:
         # These platforms have no per-operator benchmark yet. Running the probe
         # reports which operators work and why the rest do not, which is a real
@@ -2067,7 +2348,8 @@ def run_performance(
         template = _probe_command(op)
     elif backend and backend not in GENERIC_BENCHMARK_BACKENDS:
         return _not_configured(
-            op, "performance",
+            op,
+            "performance",
             f"backend {backend!r} is in the registry but has no performance "
             "routing yet: add it to GENERIC_BENCHMARK_BACKENDS or "
             "PROBE_ONLY_BACKENDS",
@@ -2075,8 +2357,16 @@ def run_performance(
     if not template:
         return _not_configured(op, "performance", "no performance command mapping")
 
+    # _base_env exposes exactly one physical accelerator to each child, which
+    # XPU and Ascend then see as device 0 regardless of the id --gpus selected.
+    script_device = _subprocess_device_id(gpu_id)
+
     if (
-        op in PER_MATRIX_PERFORMANCE_OPS
+        (
+            op in PER_MATRIX_PERFORMANCE_OPS
+            or (backend == "xpu" and op in XPU_BASELINE_OPS)
+            or (backend == "ascend" and op in ASCEND_PER_MATRIX_PERFORMANCE_OPS)
+        )
         and benchmark_input is not None
         and benchmark_input.is_dir()
     ):
@@ -2084,6 +2374,7 @@ def run_performance(
             project_root=project_root,
             op=op,
             gpu_id=gpu_id,
+            script_device=script_device,
             template=template,
             op_dir=op_dir,
             benchmark_input=benchmark_input,
@@ -2104,7 +2395,7 @@ def run_performance(
         warmup=warmup,
         iters=iters,
         op=op,
-        device=gpu_id,
+        device=script_device,
         extra_args=extra_args,
     )
     returncode, stdout, stderr, duration, timed_out = run_subprocess(
@@ -2155,16 +2446,36 @@ def run_performance(
                 returncode=returncode,
                 timed_out=timed_out,
             )
-            write_benchmark_json_from_csv(op, csv_path, result_path, rows=rows)
+            # The probe and the XPU baseline exit 0 whether the kernel ran,
+            # was declined or failed to compile: their verdict lives in the CSV
+            # rows, so the exit code must not overwrite it with a pass.
+            status_from_csv = Path(template[0]).name in {
+                "benchmark_ascend_probe.py",
+                "benchmark_xpu.py",
+            }
+            if status_from_csv and status == "PASS":
+                status = _capability_probe_status(rows)
+            json_status = (
+                status.lower()
+                if status_from_csv and status not in {"PASS", "PASSED"}
+                else "passed"
+            )
+            write_benchmark_json_from_csv(
+                op, csv_path, result_path, rows=rows, status=json_status
+            )
             result.update(
                 summarize_performance_csv(csv_path, rows=rows, **filter_metadata)
             )
             parsed = parse_performance_json(op, result_path)
-            parsed["status"] = resolve_status_with_parsed(
-                status,
-                parsed.get("status"),
-                returncode=returncode,
-                timed_out=timed_out,
+            parsed["status"] = (
+                status
+                if status_from_csv
+                else resolve_status_with_parsed(
+                    status,
+                    parsed.get("status"),
+                    returncode=returncode,
+                    timed_out=timed_out,
+                )
             )
             result.update(parsed)
             result["data_file"] = str(result_path.relative_to(op_dir.parent))
@@ -2178,6 +2489,7 @@ def _run_bell_per_matrix(
     project_root: Path,
     op: str,
     gpu_id: int,
+    script_device: int,
     template: tuple[str, ...],
     op_dir: Path,
     benchmark_input: Path,
@@ -2215,7 +2527,7 @@ def _run_bell_per_matrix(
             warmup=warmup,
             iters=iters,
             op=op,
-            device=gpu_id,
+            device=script_device,
             extra_args=extra_args,
         )
         commands.append(cmd)
@@ -2248,7 +2560,9 @@ def _run_bell_per_matrix(
     csv_path = op_dir / "performance.csv"
     if fieldnames:
         with csv_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer = csv.DictWriter(
+                handle, fieldnames=fieldnames, extrasaction="ignore"
+            )
             writer.writeheader()
             writer.writerows(all_rows)
 
@@ -2272,8 +2586,12 @@ def _run_bell_per_matrix(
         "phase": "performance",
         "configured": True,
         "status": status,
-        "returncode": TIMEOUT_RETURN_CODE if timed_out_matrices else (1 if failed_matrices else 0),
-        "exit_code": TIMEOUT_RETURN_CODE if timed_out_matrices else (1 if failed_matrices else 0),
+        "returncode": TIMEOUT_RETURN_CODE
+        if timed_out_matrices
+        else (1 if failed_matrices else 0),
+        "exit_code": TIMEOUT_RETURN_CODE
+        if timed_out_matrices
+        else (1 if failed_matrices else 0),
         "duration_sec": total_duration,
         "duration": total_duration,
         "command": commands[0] if commands else [],
@@ -2285,7 +2603,9 @@ def _run_bell_per_matrix(
         "timed_out_matrices": timed_out_matrices,
         "failed_matrices": failed_matrices,
         "matrix_count": len(matrix_paths),
-        "completed_matrix_count": len(matrix_paths) - len(timed_out_matrices) - len(failed_matrices),
+        "completed_matrix_count": len(matrix_paths)
+        - len(timed_out_matrices)
+        - len(failed_matrices),
     }
     if csv_path.exists():
         # Each timed-out matrix ran in its own process, so rows from completed
@@ -2300,7 +2620,14 @@ def _run_bell_per_matrix(
         result.update(summarize_performance_csv(csv_path, rows=rows, **filter_metadata))
         parsed = parse_performance_json(op, result_path)
         result.update(parsed)
-        result["status"] = status
+        if (
+            status == "PASS"
+            and Path(template[0]).name
+            in {"benchmark_ascend_probe.py", "benchmark_xpu.py"}
+        ):
+            result["status"] = _capability_probe_status(rows)
+        else:
+            result["status"] = status
         result["data_file"] = str(result_path.relative_to(op_dir.parent))
     return result
 
@@ -2481,6 +2808,191 @@ def _operator_summary(result: dict[str, object]) -> dict[str, object]:
         [str(label) for label in labels] if isinstance(labels, list) else []
     )
     return entry
+
+
+_DELIVERY_DTYPE_TOKENS = {
+    "f16": ("torch.float16", "float16", "half", "fp16"),
+    "f32": ("torch.float32", "float32", "float", "fp32"),
+    "f64": ("torch.float64", "float64", "double", "fp64"),
+    "c32": ("torch.complex64", "complex64", "c32"),
+    "c64": ("torch.complex128", "complex128", "c64"),
+}
+_DELIVERY_PERF_DTYPES = {
+    "f16": ("fp16", "float16", "half"),
+    "f32": ("fp32", "float32", "float"),
+    "f64": ("fp64", "float64", "double"),
+    "c32": ("complex64", "c32"),
+    "c64": ("complex128", "c64"),
+}
+
+
+def _delivery_not_configured_phase(phase: str, reason: str) -> dict[str, object]:
+    return {
+        "operator": "",
+        "phase": phase,
+        "status": "NOT_CONFIGURED",
+        "reason": reason,
+        "duration": 0.0,
+        "exit_code": 0,
+        "data_file": "",
+    }
+
+
+def _delivery_accuracy_phase(
+    phase_result: dict[str, object], dtype: str
+) -> dict[str, object]:
+    """Restrict recorded pytest cases to one delivery dtype when available."""
+    path_value = phase_result.get("result_path")
+    if not path_value:
+        return _delivery_not_configured_phase("accuracy", "no accuracy artifact")
+    try:
+        raw = json.loads(Path(str(path_value)).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _delivery_not_configured_phase(
+            "accuracy", f"cannot read accuracy artifact: {exc}"
+        )
+
+    tokens = _DELIVERY_DTYPE_TOKENS[dtype]
+    selected: dict[str, object] = {}
+    for nodeid, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        values = [str(nodeid).lower()]
+        values.extend(
+            str(value).lower() for value in (item.get("params") or {}).values()
+        )
+        words = set(re.findall(r"[a-z0-9.]+", " ".join(values)))
+        if any(token in words for token in tokens):
+            selected[nodeid] = item
+    if not selected:
+        return _delivery_not_configured_phase(
+            "accuracy", f"the shared pytest suite recorded no {dtype} cases"
+        )
+
+    # Keep the parent's provenance -- the raw artifact and the two logs -- so a
+    # variant row in summary.csv and result.html still points at the pytest run
+    # it was sliced from. Only counts, status and details narrow to `dtype`.
+    projected = dict(phase_result)
+    for stale in ("errors", "xfailed", "xpassed", "failures", "tests"):
+        projected.pop(stale, None)
+    projected.update(summarize_accuracy_cases(selected))
+    projected["phase"] = "accuracy"
+    projected["duration"] = phase_result.get("duration", 0.0)
+    projected["exit_code"] = phase_result.get("exit_code", 0)
+    projected["data_file"] = phase_result.get("data_file", "")
+    return projected
+
+
+def _uses_generic_benchmark_script(op: str) -> bool:
+    """Whether run_performance will launch the op's own tests/test_*.py script.
+
+    DELIVERY_BENCHMARK_ARGS are flags of those scripts. XPU, the probe backends
+    and some Ascend entries run a different script that would reject them, so
+    the delivery narrowing must not reach those commands.
+    """
+    config = OP_TEST_CONFIGS.get(op)
+    if config is None or not config.performance_cmd:
+        return False
+    backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    if backend == "ascend":
+        template = ASCEND_PERFORMANCE_COMMANDS.get(op)
+        return bool(template) and template[0] == config.performance_cmd[0]
+    return not backend or backend in GENERIC_BENCHMARK_BACKENDS
+
+
+def _is_delivery_performance_row(row: dict[str, str]) -> bool:
+    """True for a CSV row on the delivery axes: int32 indices, `non` op.
+
+    Columns a benchmark does not write are not constraints. Without this filter
+    a variant named ..._int_non averaged its int64 and trans/conj rows in too.
+    """
+    index_dtype = str(_row_value(row, "index_dtype") or "").strip().lower()
+    if index_dtype and index_dtype.replace("torch.", "") != "int32":
+        return False
+    for key in ("op", "opA"):
+        op = str(_row_value(row, key) or "").strip().lower()
+        if op and op != "non":
+            return False
+    transpose = str(_row_value(row, "transpose") or "").strip().lower()
+    return transpose not in {"true", "1"}
+
+
+def _delivery_performance_phase(
+    phase_result: dict[str, object], dtype: str
+) -> dict[str, object]:
+    """Restrict CSV-derived performance data to one delivery variant."""
+    records = phase_result.get("records")
+    delivery_rows = None
+    if isinstance(records, list) and records:
+        delivery_rows = [
+            row
+            for row in records
+            if isinstance(row, dict) and _is_delivery_performance_row(row)
+        ]
+        data = _strict_flag_gems_perf_data(_flaggems_perf_data(delivery_rows))
+    else:
+        data = _strict_flag_gems_perf_data(phase_result.get("data"))
+    selected = {
+        key: value
+        for key, value in data.items()
+        if key.lower() in _DELIVERY_PERF_DTYPES[dtype]
+    }
+    if not selected:
+        # A process-level timeout has no dtype rows to project, but it did run:
+        # report Timeout rather than the NotFound an unconfigured variant gets.
+        if str(phase_result.get("status") or "").upper() == "TIMEOUT":
+            result = dict(phase_result)
+            result["data"] = {}
+            return result
+        return _delivery_not_configured_phase(
+            "performance", f"the benchmark recorded no {dtype} rows"
+        )
+    result = dict(phase_result)
+    result["data"] = selected
+    if delivery_rows is not None:
+        result["records"] = delivery_rows
+        result["delivery_row_count"] = len(delivery_rows)
+        result["non_delivery_row_count"] = len(records) - len(delivery_rows)
+    return result
+
+
+def _delivery_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Project group-level runner results onto the fixed delivery registry."""
+    by_operator = {str(result.get("operator")): result for result in results}
+    projected: list[dict[str, object]] = []
+    for variant in load_delivery_variants():
+        parent = by_operator.get(variant["operator"])
+        result: dict[str, object] = {
+            "operator": variant["id"],
+            "variant": variant,
+            "customized": True,
+            "labels": ["flagsparse", "delivery", variant["format"], variant["dtype"]],
+        }
+        if parent is None:
+            reason = f"delivery parent {variant['operator']!r} was not selected"
+            result["accuracy"] = _delivery_not_configured_phase("accuracy", reason)
+            result["performance"] = _delivery_not_configured_phase(
+                "performance", reason
+            )
+        else:
+            accuracy = parent.get("accuracy")
+            performance = parent.get("performance")
+            result["accuracy"] = (
+                _delivery_accuracy_phase(accuracy, variant["dtype"])
+                if isinstance(accuracy, dict)
+                else _delivery_not_configured_phase(
+                    "accuracy", "accuracy phase was not run"
+                )
+            )
+            result["performance"] = (
+                _delivery_performance_phase(performance, variant["dtype"])
+                if isinstance(performance, dict)
+                else _delivery_not_configured_phase(
+                    "performance", "performance phase was not run"
+                )
+            )
+        projected.append(result)
+    return projected
 
 
 def _flaggems_summary(
@@ -2760,10 +3272,15 @@ function sortTable(col, dir) {
 </script>"""
 
 
+# The short spellings (fp16/fp32/fp64/bf16) are what _flaggems_perf_data keys
+# `data` by, so without them a variant's own numbers matched no column and the
+# row fell back to operator-wide records -- f32 and f64 rows showed the same
+# mixed values, and there was no fp64 column at all for the f64 variants.
 HTML_SPEEDUP_DTYPES = (
-    ("fp16", ("float16", "torch.float16", "half")),
-    ("fp32", ("float32", "torch.float32", "float")),
-    ("bf16", ("bfloat16", "torch.bfloat16")),
+    ("fp16", ("float16", "torch.float16", "half", "fp16")),
+    ("fp32", ("float32", "torch.float32", "float", "fp32")),
+    ("fp64", ("float64", "torch.float64", "double", "fp64")),
+    ("bf16", ("bfloat16", "torch.bfloat16", "bf16")),
     ("int16", ("int16", "torch.int16")),
     ("int32", ("int32", "torch.int32")),
     ("int8", ("int8", "torch.int8")),
@@ -2910,6 +3427,15 @@ def _performance_speedups_for_html(
             number = _to_float(dtype_data.get("speedup"))
             if number is not None:
                 by_dtype.setdefault(bucket, []).append(number)
+
+    # A delivery-variant row carries its own `data`, but the phase-level
+    # "speedup" next to it is the whole operator's. Average what this row
+    # actually shows instead of printing the operator's number beside it.
+    if by_dtype:
+        values = [value for values in by_dtype.values() for value in values]
+        return statistics.mean(values), {
+            dtype: statistics.mean(vals) for dtype, vals in by_dtype.items()
+        }
 
     if not by_dtype:
         records = phase_result.get("records")
@@ -3089,6 +3615,9 @@ def _compat_summary(
     env_info: dict[str, object],
 ) -> dict[str, object]:
     generated_at = _dt.datetime.now().isoformat(timespec="seconds")
+    # `results` is already projected onto the delivery registry by the caller;
+    # projecting twice would look every variant up by its own id and report the
+    # whole registry as not configured.
     ordered = sorted(results, key=lambda item: str(item["operator"]))
     return {
         "generated_at": generated_at,
@@ -3107,7 +3636,7 @@ def write_summary(
     results_dir: Path,
     env_info: dict[str, object],
 ) -> None:
-    ordered = sorted(results, key=lambda item: str(item["operator"]))
+    ordered = _delivery_results(results)
     rows = _phase_rows(ordered)
     json_path = results_dir / "summary.json"
     json_path.write_text(
@@ -3205,6 +3734,27 @@ def _print_ops(ops: list[str], phase_arg: str = "both") -> None:
             print(f"{op}\taccuracy={accuracy}\tperformance={performance}")
 
 
+def warn_if_backend_fell_back() -> str | None:
+    """Say so, loudly, when the selected backend is not the one that will run.
+
+    Nothing in this pipeline checked this before. A box without the vendor plugin
+    answers FLAGSPARSE_BACKEND=<vendor> by running every kernel on torch.cuda,
+    and the whole suite then passes 40/40 with CUDA numbers under the vendor's
+    name -- a result that is worse than a failure, because it looks like one that
+    can be reported.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+        from flagsparse.sparse_operations._common import _accel_fallback_reason
+    except Exception:
+        return None
+    reason = _accel_fallback_reason()
+    if reason:
+        banner = "!" * 78
+        print(f"\n{banner}\nWARNING: {reason}\n{banner}\n", file=sys.stderr, flush=True)
+    return reason
+
+
 def main(
     default_phase: str = "both",
     expose_phase_arg: bool = True,
@@ -3226,6 +3776,19 @@ def main(
         "--stages",
         default="all",
         help="Comma-separated stages from operators.yaml, or all.",
+    )
+    parser.add_argument(
+        "--delivery-only",
+        action="store_true",
+        help=(
+            "Run exactly the operators the delivery report has rows for: the "
+            "parents of conf/operators.yaml's delivery_variants, or the "
+            "reporting: delivery entries of a C API manifest. Ignored by "
+            "--ops and --op-list. Also narrows each benchmark sweep to the "
+            "delivery axes (int32 indices, `non` op; see "
+            "DELIVERY_BENCHMARK_ARGS); explicit --benchmark-args / "
+            "--op-benchmark-args still override."
+        ),
     )
     parser.add_argument(
         "--start", default=None, help="Start from this operator id when reading YAML."
@@ -3289,6 +3852,7 @@ def main(
     phase_arg = args.phase if expose_phase_arg else default_phase
 
     project_root = Path(__file__).resolve().parent
+    warn_if_backend_fell_back()
     ops = read_ops(
         project_root=project_root,
         operators_yaml=args.operators_yaml,
@@ -3296,6 +3860,7 @@ def main(
         ops_arg=args.ops,
         stages_arg=args.stages,
         start=args.start,
+        delivery_only=args.delivery_only,
     )
     operator_metadata = read_operator_metadata(
         project_root=project_root, operators_yaml=args.operators_yaml
@@ -3346,6 +3911,26 @@ def main(
         if include_performance_args and args.benchmark_args
         else []
     )
+    if args.delivery_only and include_performance_args:
+        # Fold the global args into each op's list so the delivery defaults can
+        # sit in front of both: explicit --benchmark-args/--op-benchmark-args win.
+        for op in ops:
+            defaults = (
+                DELIVERY_BENCHMARK_ARGS.get(op, ())
+                if _uses_generic_benchmark_script(op)
+                else ()
+            )
+            op_benchmark_args[op] = [
+                *defaults,
+                *extra_benchmark_args,
+                *op_benchmark_args.get(op, []),
+            ]
+            if defaults:
+                print(
+                    f"delivery-only: {op} benchmark narrowed with {' '.join(defaults)}",
+                    flush=True,
+                )
+        extra_benchmark_args = []
     env_info = collect_env_info(project_root)
 
     tasks = {gpu: [] for gpu in gpus}
@@ -3369,7 +3954,7 @@ def main(
                 timeout=args.timeout,
                 extra_pytest_args=extra_pytest_args,
                 extra_benchmark_args=extra_benchmark_args,
-            op_benchmark_args=op_benchmark_args,
+                op_benchmark_args=op_benchmark_args,
                 env_info=env_info,
                 operator_metadata=operator_metadata,
                 results=results,

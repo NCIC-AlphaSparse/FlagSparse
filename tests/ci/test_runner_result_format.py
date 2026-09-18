@@ -17,13 +17,57 @@
 import csv
 import json
 import re
+from pathlib import Path
 
 import pytest
 
 import run_flagsparse_pytest as runner
+from tools.delivery_variants import load_delivery_variants
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _gather_accuracy_artifact(op_dir: Path) -> Path:
+    """A raw pytest artifact shaped like the real gather accuracy run.
+
+    Three dtypes are recorded and the two complex ones are absent, which is
+    what the kernel actually supports -- the delivery projection has to slice
+    this one file into five gather variants.
+    """
+    cases = {
+        "tests/pytest/test_gather.py::test_gather[int32-half-512-128]": {
+            "params": {"index_dtype": "torch.int32", "dtype": "torch.float16"},
+            "result": "passed",
+            "reason": None,
+        },
+        "tests/pytest/test_gather.py::test_gather[int32-float-512-128]": {
+            "params": {"index_dtype": "torch.int32", "dtype": "torch.float32"},
+            "result": "passed",
+            "reason": None,
+        },
+        "tests/pytest/test_gather.py::test_gather[int32-float-1024-256]": {
+            "params": {"index_dtype": "torch.int32", "dtype": "torch.float32"},
+            "result": "passed",
+            "reason": None,
+        },
+        "tests/pytest/test_gather.py::test_gather[int32-double-512-128]": {
+            "params": {"index_dtype": "torch.int32", "dtype": "torch.float64"},
+            "result": "skipped",
+            "reason": "fp64 is not available on this device",
+        },
+    }
+    path = op_dir / "accuracy_result.json"
+    path.write_text(json.dumps(cases), encoding="utf-8")
+    return path
 
 
 def test_runner_writes_flaggems_style_summary(tmp_path):
+    # The runner records one entry per OPERATOR and leaves the raw pytest
+    # artifact beside it; write_summary is what projects those onto the fixed
+    # delivery registry. So the fixture is operator-shaped, not variant-shaped.
+    op_dir = tmp_path / "gather"
+    op_dir.mkdir()
+    accuracy_artifact = _gather_accuracy_artifact(op_dir)
     results = [
         {
             "operator": "gather",
@@ -43,14 +87,15 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
                 "log_path": "gather/accuracy_stdout.log",
                 "stdout_log_path": "gather/accuracy_stdout.log",
                 "stderr_log_path": "gather/accuracy_stderr.log",
+                "result_path": str(accuracy_artifact),
                 "data_file": "gather/accuracy_result.json",
                 "passed": 3,
                 "failed": 0,
-                "skipped": 0,
+                "skipped": 1,
                 "errors": 0,
                 "xfailed": 0,
                 "xpassed": 0,
-                "total": 3,
+                "total": 4,
             },
             "performance": {
                 "operator": "gather",
@@ -69,6 +114,16 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
                 "data_file": "gather/performance_result.json",
                 "row_count": 0,
                 "test_case": "csv",
+                "data": {
+                    "float32": {
+                        "result": "Skipped",
+                        "speedup": 1.5,
+                        "details": {
+                            "512x128": {"base": 2.0, "gems": 1.0, "speedup": 2.0}
+                        },
+                    },
+                    "float16": {"result": "Skipped", "speedup": 1.0, "details": {}},
+                },
             },
         }
     ]
@@ -115,10 +170,19 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     }
     assert set(summary["env"]["triton"]) == {"version", "has_config"}
     assert set(summary["env"]["flag_gems"]) == {"version", "vendor", "device"}
-    gather = summary["result"]["gather"]
+    # `result` is keyed by DELIVERY VARIANT, not by operator: the names come from
+    # conf/operators.yaml's delivery_variants, which 算子列表注册修改.xlsx spells the
+    # same way (gather_f32_int, spmv_csr_f32_int_non, ...). The C API's
+    # capi/tools/write_summary.py keys its summary identically, from the same
+    # loader, so the two front ends produce comparable files.
+    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    assert set(summary["result"]) == {v["id"] for v in variants}
+
+    gather = summary["result"]["gather_f32_int"]
     assert list(gather) == ["customized", "accuracy", "performance", "labels"]
     assert gather["customized"] is True
-    assert gather["labels"] == ["flagsparse", "sparse"]
+    # Labels now carry the variant's own axes; "sparse" was the operator-level tag.
+    assert gather["labels"] == ["flagsparse", "delivery", "sparse_vector", "f32"]
 
     accuracy = gather["accuracy"]
     assert set(accuracy) == {
@@ -132,7 +196,12 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
         "exit_code",
         "data_file",
     }
+    # Counts are the f32 SLICE of the artifact (2 of its 4 cases), not the
+    # operator-level totals the runner recorded.
     assert accuracy["status"] == "Passed"
+    assert accuracy["total"] == 2
+    assert accuracy["passed"] == 2
+    assert accuracy["skipped"] == 0
     assert accuracy["duration"] == 1.25
     assert accuracy["exit_code"] == 0
     assert accuracy["data_file"] == "gather/accuracy_result.json"
@@ -149,21 +218,50 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     assert performance["status"] == "Skipped"
     assert performance["data_file"] == "gather/performance_result.json"
     assert performance["test_case"] == "csv"
+    # The benchmark's fp16 rows belong to a different variant.
+    assert set(performance["data"]) == {"fp32"}
+
+    # The same artifact read through a different dtype: f64 was skipped, and the
+    # two complex variants have no cases at all, so they report NotFound rather
+    # than inheriting gather's operator-level PASS.
+    assert summary["result"]["gather_f64_int"]["accuracy"]["status"] == "Skipped"
+    assert summary["result"]["gather_c32_int"]["accuracy"]["status"] == "NotFound"
+    assert summary["result"]["gather_c32_int"]["performance"]["status"] == "NotFound"
+    unselected = next(v for v in variants if v["operator"] != "gather")
+    assert summary["result"][unselected["id"]]["accuracy"]["status"] == "NotFound"
 
     compat_summary = json.loads(
         (tmp_path / "summary_flat.json").read_text(encoding="utf-8")
     )
     assert {"timestamp", "env", "result", "totals", "results"} <= set(compat_summary)
-    assert compat_summary["totals"]["by_phase"]["accuracy"]["PASS"] == 1
+    # summary_flat.json is fed the ALREADY projected results; if it projected a
+    # second time every variant would be looked up by its own id and the whole
+    # registry would come back not configured.
+    assert {str(item["operator"]) for item in compat_summary["results"]} == {
+        v["id"] for v in variants
+    }
+    accuracy_totals = compat_summary["totals"]["by_phase"]["accuracy"]
+    assert accuracy_totals["Passed"] == 2  # gather_f16_int, gather_f32_int
+    assert accuracy_totals["Skipped"] == 1  # gather_f64_int
+    assert accuracy_totals["NOT_CONFIGURED"] == len(variants) - 3
+    performance_totals = compat_summary["totals"]["by_phase"]["performance"]
+    assert performance_totals["SKIP"] == 2  # the fp16 and fp32 benchmark rows
+    assert performance_totals["NOT_CONFIGURED"] == len(variants) - 2
 
     with (tmp_path / "summary.csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert rows[0]["operator"] == "gather"
-    assert rows[0]["phase"] == "accuracy"
-    assert rows[0]["duration"] == "1.25"
-    assert rows[0]["exit_code"] == "0"
-    assert rows[0]["stdout_log_path"] == "gather/accuracy_stdout.log"
-    assert rows[0]["stderr_log_path"] == "gather/accuracy_stderr.log"
+    assert {row["operator"] for row in rows} == {v["id"] for v in variants}
+    row = next(
+        item
+        for item in rows
+        if item["operator"] == "gather_f32_int" and item["phase"] == "accuracy"
+    )
+    assert row["duration"] == "1.25"
+    assert row["exit_code"] == "0"
+    # A variant row keeps the parent's logs: they are how a reader gets from a
+    # delivery name back to the pytest run it was sliced from.
+    assert row["stdout_log_path"] == "gather/accuracy_stdout.log"
+    assert row["stderr_log_path"] == "gather/accuracy_stderr.log"
 
     html_report = (tmp_path / "result.html").read_text(encoding="utf-8")
     assert "FlagSparse Test Report" in html_report
@@ -175,7 +273,7 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     assert "OPAverageSpeedUp" in html_report
     assert "filterTable()" in html_report
     assert "sortTable(5, 'asc')" in html_report
-    assert "gather" in html_report
+    assert "gather_f32_int" in html_report
     assert "accuracy_result.json" in html_report
 
 
@@ -569,3 +667,105 @@ def test_parse_op_benchmark_args_keeps_arguments_scoped_to_each_operator():
 def test_parse_op_benchmark_args_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="op-benchmark-args"):
         runner.parse_op_benchmark_args([value])
+
+
+def test_html_speedups_use_the_variant_data_and_have_an_fp64_column():
+    # A delivery-variant row carries its own `data` next to the operator-wide
+    # `records`/`speedup`. The HTML used to miss the short dtype keys, fall back
+    # to the operator's records, and print the operator's speedup in the first
+    # column -- so f32 and f64 rows showed identical, mixed numbers.
+    assert "fp64" in [display for display, _ in runner.HTML_SPEEDUP_DTYPES]
+    performance = {
+        "speedup": 13.0,
+        "data": {"fp64": {"speedup": 2.0, "details": {}}},
+        "records": [
+            {"value_dtype": "float32", "triton_speedup_vs_pytorch": "9.0"},
+            {"value_dtype": "complex64", "triton_speedup_vs_pytorch": "7.0"},
+        ],
+    }
+    overall, by_dtype = runner._performance_speedups_for_html(performance)
+    assert by_dtype == {"fp64": 2.0}
+    assert overall == 2.0
+
+
+def test_operator_speedup_prefers_the_vendor_column(tmp_path):
+    csv_path = tmp_path / "performance.csv"
+    csv_path.write_text(
+        "matrix,value_dtype,triton_ms,cusparse_ms,pytorch_ms,"
+        "triton_speedup_vs_cusparse,triton_speedup_vs_pytorch,status\n"
+        "a.mtx,float32,1.0,2.0,9.0,2.0,9.0,PASS\n",
+        encoding="utf-8",
+    )
+    summary = runner.summarize_performance_csv(csv_path)
+    assert summary["speedup"] == 2.0
+
+
+def test_delivery_projection_keeps_only_int32_non_rows_with_a_speedup():
+    # A variant named ..._int_non used to average int64 and trans/conj rows in,
+    # and rows without a speedup counted as 0 (spsm f32 on CUDA: 8.9x read 3.8x).
+    header = "matrix,value_dtype,index_dtype,op,triton_ms,cusparse_ms,"
+    header += "triton_speedup_vs_cusparse,status"
+    lines = [
+        "a.mtx,float32,int32,non,1.0,2.0,2.0,PASS",
+        "b.mtx,float32,int32,non,1.0,4.0,4.0,PASS",
+        "c.mtx,float32,int32,non,1.0,,,PASS",
+        "a.mtx,float32,int64,non,1.0,50.0,50.0,PASS",
+        "a.mtx,float32,int32,trans,1.0,90.0,90.0,PASS",
+    ]
+    rows = list(csv.DictReader([header, *lines]))
+    phase = {"records": rows, "data": runner._flaggems_perf_data(rows)}
+    projected = runner._delivery_performance_phase(phase, "f32")
+    assert projected["delivery_row_count"] == 3
+    assert projected["non_delivery_row_count"] == 2
+    assert projected["data"]["fp32"]["speedup"] == 3.0
+
+
+def test_delivery_benchmark_args_name_flags_the_scripts_accept():
+    delivery_parents = {
+        variant["operator"]
+        for variant in load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    }
+    assert set(runner.DELIVERY_BENCHMARK_ARGS) <= delivery_parents
+    for op, args in runner.DELIVERY_BENCHMARK_ARGS.items():
+        script = ROOT / runner.OP_TEST_CONFIGS[op].performance_cmd[0]
+        source = script.read_text(encoding="utf-8")
+        for flag in (arg for arg in args if arg.startswith("--")):
+            assert f'"{flag}"' in source, f"{script.name} has no {flag}"
+
+
+@pytest.mark.parametrize(
+    ("backend", "ascend_mask", "child_device"),
+    [("ascend", "6", 0), ("xpu", None, 0), ("cuda", None, 6), ("", None, 6)],
+)
+def test_child_device_matches_the_visible_device_mask(
+    monkeypatch, backend, ascend_mask, child_device
+):
+    # torch_npu ignores CUDA_VISIBLE_DEVICES, so Ascend children landed on NPU 0
+    # whatever --gpus said; masked children then see their one card as device 0.
+    monkeypatch.setenv("FLAGSPARSE_BACKEND", backend)
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    env = runner._base_env(ROOT, 6)
+    assert env["CUDA_VISIBLE_DEVICES"] == "6"
+    assert env.get("ASCEND_RT_VISIBLE_DEVICES") == ascend_mask
+    assert runner._subprocess_device_id(6) == child_device
+
+
+def test_delivery_projection_keeps_a_timeout_distinct_from_not_run():
+    # Ascend, 2026-09-17: an operator killed by --timeout had no dtype rows, and
+    # every one of its variants then read NotFound -- the same as never running.
+    timed_out = runner._delivery_performance_phase({"status": "TIMEOUT"}, "f32")
+    assert timed_out["status"] == "TIMEOUT"
+    assert timed_out["data"] == {}
+    empty = runner._delivery_performance_phase({"status": "PASS"}, "f32")
+    assert empty["status"] == "NOT_CONFIGURED"
+
+
+def test_ascend_benchmark_commands_pass_the_matrix_input_the_script_accepts():
+    # The runner resolved --benchmark-input but never handed it to
+    # benchmark_ascend.py, so "30 real matrices" runs measured the synthetic case.
+    script = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(encoding="utf-8")
+    assert '"--input"' in script
+    for op in runner.ASCEND_BASELINE_OPS:
+        template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
+        assert template[template.index("--input") + 1] == "{input}"
+        assert "bfloat16" not in template[template.index("--dtypes") + 1]

@@ -1,0 +1,543 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# FlagSparse operator registry (spec §3.2).
+#
+# One entry per operator group of the alignment table in "FlagSparse 算子库开发规范"
+# §5.1 -- all 22 rows. `status` is the honest state of the C++ dispatch layer, NOT
+# of the Python package: every operator below already exists in Python/Triton, what
+# varies is whether it has been taken through the C API.
+#
+# TWO denominators, and they are not interchangeable:
+#   22  operator groups   -- the rows of the §5.1 alignment table, counted here
+#   115 operator variants -- §5.1's count after merging i32/i64 into `int`
+#
+# Coverage quoted as "n/22" is groups. The per-variant breakdown lives in
+# 算子对比结果_合并变体.csv, which is NOT in this repo; the `variants` field below is
+# therefore left unset rather than guessed, and 115 must not be re-derived from the
+# dtype/format lists here (they describe what the Python side supports, which is not
+# the same partition the CSV uses).
+#
+#   status: implemented  -- reachable through flagsparse.h, covered by ctest
+#           pending      -- entry point exists and returns NOT_SUPPORTED
+#
+# Index width is never part of a name: every operator accepts INDEX_32I and
+# INDEX_64I through the descriptor (§4.5.1), which is why variants say `int`.
+
+version: 1
+backend_default: cuda
+
+# Reference used by ctest/accuracy. The spec (§6.1) asks for cuSPARSE on NVIDIA
+# and a dense CPU fp64 reference elsewhere; the C++ tests use the host fp64
+# reference on every backend because it is the only one that stays correct when
+# the vendor's own sparse library is missing or broken -- which is exactly the
+# case on MUSA, where torch.sparse has no working matmul at all.
+accuracy_reference: host_fp64
+performance_baseline:
+  cuda: cusparse      # wired: ctest/baseline/cuda, verified against cuSPARSE 12.5
+  rocm: hipsparse     # wired: ctest/baseline/rocm, not yet compiled on a DCU box
+  mthreads: musparse  # MUSA 4.3.5 generic API, ctest/baseline/musa
+  default: none
+
+# REPORTING SCOPE. `reporting` says whether a variant belongs to the delivery
+# list (算子列表注册修改.xlsx, "新算子列表" column) or is merely retained.
+#
+#   delivery  in the delivery list; appears in the default report.
+#   retained  implemented and covered by ctest/accuracy, but NOT in the delivery
+#             list. Still built and still tested -- dropping it from the manifest
+#             would orphan tests that exist and pass. It is filtered out of the
+#             default report instead.
+#
+# `delivery_dtypes` narrows it when only some dtypes are in the list (spsm_csr
+# delivers f32/f64 while the kernel also does complex). Absent means "all of
+# `dtypes`".
+
+operators:
+  - id: gather
+    zhiyuan_name: Gather
+    cusparse_api: cusparseGather
+    c_api: [flagsparseGather]
+    python_impl: [flagsparse_gather]
+    formats: [sparse_vector]
+    # f16 is in the delivery list; bf16 is supported by the kernel but is not
+    # part of it, so it is left out here rather than measured and then filtered.
+    dtypes: [f16, f32, f64, c64, c128]
+    index_types: [int]
+    kernel_module: flagsparse_codegen/gather_scatter.py
+    kernel_name: [gather_real_kernel, gather_complex_kernel]
+    dispatch: src/ops/gather_scatter.cpp
+    tests: [ctest/accuracy/test_gather.cpp, ctest/benchmark/test_gather.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      Python side is complete. On MUSA the reference used by the Python test
+      (advanced indexing) has no complex kernel; the C++ test's host reference
+      does not hit that.
+
+  - id: scatter
+    zhiyuan_name: Scatter
+    cusparse_api: cusparseScatter
+    c_api: [flagsparseScatter]
+    python_impl: [flagsparse_scatter]
+    formats: [sparse_vector]
+    # f16 is in the delivery list; bf16 is supported by the kernel but is not
+    # part of it, so it is left out here rather than measured and then filtered.
+    dtypes: [f16, f32, f64, c64, c128]
+    index_types: [int]
+    kernel_module: flagsparse_codegen/gather_scatter.py
+    kernel_name: [scatter_real_kernel, scatter_complex_kernel]
+    dispatch: src/ops/gather_scatter.cpp
+    tests: [ctest/accuracy/test_scatter.cpp, ctest/benchmark/test_scatter.cpp]
+    status: implemented
+    reporting: delivery
+
+  - id: spmv_csr
+    zhiyuan_name: SpMV_CSR
+    cusparse_api: cusparseSpMV
+    c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
+    python_impl: [flagsparse_spmv_csr, prepare_spmv_csr]
+    formats: [csr]
+    dtypes: [f32, f64, c64, c128]   # complex wired 2026-09; measured accurate vs host fp64
+    index_types: [int]
+    ops: [non]                  # trans/conj pending
+    algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_CSR_ALG1, FLAGSPARSE_SPMV_CSR_ALG2]
+    kernel_module: flagsparse_codegen/spmv_csr.py
+    kernel_name: _spmv_csr_real_kernel
+    dispatch: src/ops/spmv.cpp
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
+    status: implemented
+    reporting: delivery
+
+  - id: spmv_coo
+    zhiyuan_name: SpMV_COO
+    cusparse_api: cusparseSpMV
+    c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
+    python_impl: [flagsparse_spmv_coo, prepare_spmv_coo]
+    formats: [coo]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non]                  # trans needs a column-offsets array; pending
+    algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_COO_ALG1,
+                 FLAGSPARSE_SPMV_COO_ALG2]
+    kernel_module: flagsparse_codegen/spmv_coo.py
+    kernel_name: [_spmv_coo_seg_f32, _spmv_coo_seg_f64, spmv_coo_seg_complex]
+    dispatch: src/ops/spmv.cpp
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      The deterministic segment route, run with SEG_IS_ROW=True so seg_starts is
+      a full row-offsets array and a row with no nonzeros still picks up beta*y.
+      bufferSize reports rows+1 int32 for that array; preprocess builds it and
+      rejects a COO that is not sorted by row. The atomic route is not wired up:
+      it needs the beta prologue and is non-deterministic by construction.
+
+  - id: spmv_csc
+    zhiyuan_name: SpMV_CSC
+    cusparse_api: cusparseSpMV
+    c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
+    python_impl: [flagsparse_spmv_csc, prepare_spmv_csc]
+    formats: [csc]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non, trans, conj_trans]
+    kernel_module: flagsparse_codegen/spmv_csc.py
+    kernel_name: [_spmv_csc_non_real_kernel, _spmv_csc_non_complex_kernel,
+                  _spmv_csc_trans_real_kernel, _spmv_csc_trans_complex_kernel]
+    dispatch: src/ops/spmv.cpp
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      The only format here with all three directions. trans/conj_trans are
+      deterministic (one program per column) and fold alpha and beta into the
+      store; conj costs nothing, the kernel carries a CONJ constexpr. non
+      scatters with atomics, so only alpha is in the kernel and beta comes from
+      the dense prologue -- that direction is not bit-reproducible in fp32.
+
+  - id: spmv_bsr
+    zhiyuan_name: SpMV_BSR
+    cusparse_api: cusparseSpMV
+    c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
+    python_impl: [flagsparse_spmv_bsr, prepare_spmv_bsr]
+    formats: [bsr]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non, trans, conj_trans]
+    orders: [row]               # blocks are read row-major; ORDER_COL is refused
+    kernel_module: flagsparse_codegen/spmv_bsr.py
+    kernel_name: [_spmv_bsr_non_real_kernel, _spmv_bsr_non_complex_kernel,
+                  _spmv_bsr_trans_real_kernel, _spmv_bsr_trans_complex_kernel]
+    dispatch: src/ops/spmv.cpp
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      Square blocks only: the kernel uses one BLOCK_DIM for both block extents,
+      so a non-square block or ORDER_COL is refused rather than mis-indexed.
+      Both directions are atomic, so beta comes from the dense prologue. Run
+      with SEG_FROM_GRID=True -- as a constexpr the segment index made the host
+      loop and compile one kernel per segment value.
+
+  - id: spmv_coo_tocsr
+    zhiyuan_name: SpMV_COO_toCSR
+    cusparse_api: cusparseSpMV
+    c_api: [flagsparseSpMV]
+    python_impl: [flagsparse_spmv_coo_tocsr, prepare_spmv_coo_tocsr]
+    formats: [coo]
+    dtypes: [f32, f64]          # the CSR row-parallel kernel has no complex variant
+    ops: [non]
+    algorithms: [FLAGSPARSE_SPMV_COO_ALG2]
+    kernel_module: flagsparse_codegen/spmv_csr.py
+    kernel_name: _spmv_csr_real_kernel
+    dispatch: src/ops/spmv.cpp
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      Selected by FLAGSPARSE_SPMV_COO_ALG2. Nothing is converted or copied: a
+      row-sorted COO's column indices and values already ARE the CSR arrays, and
+      the row-offsets array the COO path builds anyway is the missing indptr, so
+      this just launches the CSR kernel over it. Verified to agree with the
+      segment route to the same error ratio. Complex keeps the segment route.
+
+  - id: spmm_csr
+    zhiyuan_name: SpMM_CSR
+    cusparse_api: cusparseSpMM
+    c_api: [flagsparseSpMM, flagsparseSpMM_bufferSize, flagsparseSpMM_preprocess]
+    python_impl: [flagsparse_spmm_csr, flagsparse_spmm_csr_run, prepare_spmm_csr_route]
+    formats: [csr]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non]                  # opA trans/conj pending; opB non and trans both work
+    orders: [row, col]
+    algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT, FLAGSPARSE_SPMM_CSR_ALG1,
+                 FLAGSPARSE_SPMM_CSR_ALG2, FLAGSPARSE_SPMM_CSR_ALG3]
+    kernel_module: flagsparse_codegen/spmm_csr.py
+    kernel_name: [spmm_csr_real, spmm_csr_complex]
+    dispatch: src/ops/spmm.cpp
+    tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      Both dense operands carry explicit strides, so FLAGSPARSE_ORDER_COL and
+      op(B) = B^T are the same kernel with different strides -- the column-major
+      gap noted on the Python side does not exist through this API. The two
+      kernel_names are jit wrappers in the shim, not copies: the raw-args
+      signature parser cannot spell the tl.dtype accumulator constexpr, so they
+      take a bool and delegate to the operator package's own kernels. The four
+      algorithm ids all resolve to that one deterministic row-parallel route.
+
+  - id: spmm_coo
+    zhiyuan_name: SpMM_COO
+    cusparse_api: cusparseSpMM
+    c_api: [flagsparseSpMM, flagsparseSpMM_bufferSize, flagsparseSpMM_preprocess]
+    python_impl: [flagsparse_spmm_coo]
+    formats: [coo]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non]                  # opA trans/conj pending; opB non and trans both work
+    orders: [row, col]
+    algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT, FLAGSPARSE_SPMM_COO_ALG1,
+                 FLAGSPARSE_SPMM_COO_ALG2]
+    kernel_module: flagsparse_codegen/spmm_coo.py
+    kernel_name: [spmm_coo_real, spmm_coo_complex]
+    dispatch: src/ops/spmm.cpp
+    tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      The rowrun route only. Unlike CSR this one needs scratch:
+      flagsparseSpMM_bufferSize reports rows + 1 int32 for a row-offsets array,
+      built by _preprocess (or by the first solve) and rejected there if the COO
+      is not sorted by row, which cuSPARSE requires too. The kernel runs it with
+      SEG_IS_ROW=True so a row with no nonzeros still gets a program and picks up
+      beta * C; the Python path instead zeroes C and uses run-compressed segments.
+      The atomic and alg1-bucket routes are not wired up: the first needs C
+      pre-scaled by beta in a separate pass and is non-deterministic, the second
+      needs two prepare kernels.
+
+  - id: spmm_csr_opt
+    zhiyuan_name: SpMM_CSR_opt
+    cusparse_api: cusparseSpMM
+    c_api: [flagsparseSpMM]
+    python_impl: [flagsparse_spmm_csr_opt, prepare_spmm_csr_opt]
+    algorithms: [FLAGSPARSE_SPMM_CSR_ALG1]
+    status: pending
+
+  - id: spmm_csr_opt_alg1
+    zhiyuan_name: SpMM_CSR_opt_alg1
+    cusparse_api: cusparseSpMM
+    c_api: [flagsparseSpMM]
+    algorithms: [FLAGSPARSE_SPMM_CSR_ALG1]
+    status: pending
+
+  - id: spmm_csr_opt_alg2
+    zhiyuan_name: SpMM_CSR_opt_alg2
+    cusparse_api: cusparseSpMM
+    c_api: [flagsparseSpMM]
+    algorithms: [FLAGSPARSE_SPMM_CSR_ALG2]
+    status: pending
+
+  - id: alpha_spmm_alg1
+    zhiyuan_name: AlphaSparse SpMM
+    cusparse_api: null
+    c_api: [flagsparseSpMM]
+    algorithms: [FLAGSPARSE_SPMM_CSR_ALG3]
+    status: pending
+
+  - id: spgemm_csr
+    zhiyuan_name: SpGEMM
+    cusparse_api: cusparseSpGEMM_compute
+    c_api: [flagsparseSpGEMM_createDescr, flagsparseSpGEMM_workEstimation,
+            flagsparseSpGEMM_compute, flagsparseSpGEMM_copy, flagsparseSpGEMM_destroyDescr,
+            flagsparseCsrSetPointers]
+    python_impl: [flagsparse_spgemm_csr, prepare_spgemm_csr]
+    formats: [csr]
+    dtypes: [f32, f64]          # the hash kernels have no complex twin
+    index_types: [int]
+    ops: [non]
+    algorithms: [FLAGSPARSE_SPGEMM_DEFAULT]
+    kernel_module: flagsparse_codegen/spgemm_csr.py
+    kernel_name: [_spgemm_hash_count_kernel, _spgemm_hash_fill_kernel,
+                  _spgemm_hash_fill_kernel_f64]
+    dispatch: src/ops/spgemm.cpp
+    tests: [ctest/accuracy/test_spgemm.cpp, ctest/benchmark/test_spgemm.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      The only operator whose result SIZE is discovered rather than given, so it
+      follows cuSPARSE's five-call dance exactly. flagsparseCsrSetPointers had to
+      be added to the public header for it -- without it the caller cannot attach
+      C's arrays after the nnz is known. Shared-memory hash route only: a row too
+      wide for the largest table (6144 products) sets an overflow flag, and since
+      the package's expand-sort-compress fallback is pure torch with no kernel to
+      call, that returns NOT_SUPPORTED rather than a short row. alpha == 1 and
+      beta == 0 only, as in cuSPARSE. The fill kernel emits a row in hash-slot
+      order, so _copy sorts each row on the host to honour cuSPARSE's sorted-CSR
+      guarantee; a device-side segmented sort is the obvious later improvement.
+      Needs FlagTree TLE: the kernels live under `if _TLE_AVAILABLE` because the
+      scratchpad allocation is a TLE feature.
+
+  - id: sddmm_csr
+    zhiyuan_name: SDDMM
+    cusparse_api: cusparseSDDMM
+    c_api: [flagsparseSDDMM, flagsparseSDDMM_bufferSize, flagsparseSDDMM_preprocess]
+    python_impl: [flagsparse_sddmm_csr, prepare_sddmm_csr]
+    formats: [csr]
+    # c32/c64 are in the delivery list but not registered yet: the operator
+    # package has no complex SDDMM kernel. Add them here and to delivery_variants
+    # in conf/operators.yaml when it lands.
+    dtypes: [f32, f64]
+    index_types: [int]
+    ops: [non, trans]           # for BOTH dense operands; conj pending
+    orders: [row, col]
+    algorithms: [FLAGSPARSE_SDDMM_ALG_DEFAULT]
+    kernel_module: flagsparse_codegen/sddmm_csr.py
+    kernel_name: [sddmm_csr_real, _row_ids_kernel]
+    dispatch: src/ops/sddmm.cpp
+    # The delivery list asks for c32/c64 here too, but there is no complex SDDMM
+    # kernel: flagsparse_sddmm_csr rejects them with "x dtype must be
+    # torch.float32 or torch.float64" (measured 2026-09-15). Recording the gap
+    # instead of listing the dtypes keeps `dtypes` truthful about the kernel --
+    # listing them would generate variants that fail at runtime and read as a
+    # regression rather than as work not yet done.
+    delivery_gaps: [c64, c128]
+    tests: [ctest/accuracy/test_sddmm.cpp, ctest/benchmark/test_sddmm.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      The one operator whose kernel already spoke cuSPARSE -- alpha, beta and
+      HAS_IN were already there, so nothing had to be added to it. It needs one
+      row id per nonzero, which a CSR indptr does not store: bufferSize reports
+      nnz int32 and _preprocess fills it with a binary-search kernel. Both dense
+      operands are strided, so op(A)/op(B) and either order are stride choices.
+      fp32 with a long k can need the spec 6.3.1 relaxed retry; that is reduction
+      order, not a defect.
+
+  - id: spsv_csr
+    zhiyuan_name: SpSV_CSR
+    cusparse_api: cusparseSpSV_solve
+    c_api: [flagsparseSpSV_createDescr, flagsparseSpSV_bufferSize,
+            flagsparseSpSV_analysis, flagsparseSpSV_solve, flagsparseSpSV_destroyDescr]
+    python_impl: [flagsparse_spsv_solve_csr, flagsparse_spsv_analysis_csr]
+    formats: [csr]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non]                  # see spsv_transpose_gap in the notes below
+    fill_modes: [lower, upper]
+    diag_types: [unit, non_unit]
+    kernel_module: flagsparse_codegen/spsv.py
+    kernel_name: [_spsv_csr_cw_kernel, _spsv_csr_cw_kernel_complex]
+    dispatch: src/ops/spsv.cpp
+    tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      The chain-wave route: workers take rows from an atomic counter and spin on
+      a per-row ready flag, so one launch solves the system and no level table is
+      needed. Over-subscribing workers cannot deadlock -- a program only waits on
+      LOWER logical row indices, which can only be held by resident programs.
+      SCAN_BACKWARD was added for this API: the scan stops at the diagonal and so
+      needs it last, which with cuSPARSE's universal ascending column order means
+      scanning an upper row from its far end. Without it, upper + non-unit
+      silently skipped every off-diagonal term.
+
+      spsv_transpose_gap: opA=TRANSPOSE is refused for every format, and that is
+      an UNWIRED CAPABILITY rather than a missing one. The operator package has
+      _spsv_csr_transpose_cw_kernel(_complex), _spsv_csr_roc_kernel(_complex) and
+      the SELL trans queue kernels, all at module level and re-exportable; SELL
+      additionally does conjugate transpose. Solving L^T y = x over lower storage
+      is how an upper-triangular SYSTEM is expressed there, which is distinct from
+      a matrix STORED upper (FILL_MODE_UPPER), and that one is already wired for
+      CSR and COO.
+
+  - id: spsv_coo
+    zhiyuan_name: SpSV_COO
+    cusparse_api: cusparseSpSV_solve
+    c_api: [flagsparseSpSV_solve, flagsparseSpSV_bufferSize, flagsparseSpSV_analysis]
+    python_impl: [flagsparse_spsv_solve_coo, flagsparse_spsv_analysis_coo]
+    formats: [coo]
+    dtypes: [f32, f64, c64, c128]
+    ops: [non]
+    fill_modes: [lower, upper]
+    diag_types: [unit, non_unit]
+    kernel_module: flagsparse_codegen/spsv.py
+    kernel_name: [_spsv_csr_cw_kernel, _spsv_csr_cw_kernel_complex]
+    dispatch: src/ops/spsv.cpp
+    tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
+    status: implemented
+    reporting: delivery
+    notes: >
+      No second kernel and no converted copy: _analysis builds the row-offsets
+      array into the second half of the scratch, and a row-sorted COO plus that
+      array is a CSR matrix, so the CSR kernel runs over the view. bufferSize is
+      therefore twice the CSR figure.
+
+  - id: spsv_sell
+    zhiyuan_name: SpSV_SELL
+    cusparse_api: null          # sliced-ELL is a FlagSparse extension
+    c_api: [flagsparseCreateSlicedEll, flagsparseSpSV_bufferSize,
+            flagsparseSpSV_analysis, flagsparseSpSV_solve]
+    python_impl: [flagsparse_spsv_sell, flagsparse_spsv_analysis_sell]
+    formats: [sell]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int32]        # SELL column indices are i32; -1 marks padding
+    ops: [non]
+    fill_modes: [lower]         # the kernels have no fill-mode switch
+    diag_types: [unit, non_unit]
+    algorithms: [FLAGSPARSE_SPSV_ALG_DEFAULT, FLAGSPARSE_SPSV_SELL_ALG1,
+                 FLAGSPARSE_SPSV_SELL_ALG2]
+    kernel_module: flagsparse_codegen/spsv.py
+    kernel_name: [_spsv_sell_cw_kernel_alg1, _spsv_sell_cw_kernel_alg1_complex,
+                  _spsv_sell_slice_kernel_alg2, _spsv_sell_slice_kernel_alg2_complex]
+    dispatch: src/ops/spsv.cpp
+    tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      No cuSPARSE counterpart, so FLAGSPARSE_SPSV_SELL_ALG1/_ALG2 are FlagSparse's
+      own ids and had to be added to the public enum. ALG1 is one program per row
+      (the CSR chain-wave shape); ALG2 is one per slice with a lane per row, which
+      keeps column loads coalesced and lets an independent row continue instead of
+      waiting for the most serialised row in its slice. DEFAULT picks ALG1, and
+      that is measured, not assumed: on a uniform-row matrix ALG1 wins at every
+      slice size (0.089 vs 0.174 ms at slice 4, 8192 rows). ALG2's advantage
+      needs rows of very different lengths inside one slice, which that matrix
+      does not have -- so "ALG2 is slower" is not the conclusion to draw from it.
+      LOWER STORAGE ONLY, and the distinction matters: all four kernels test
+      dependencies with a bare col < row and carry no fill-mode constexpr, so a
+      matrix STORED upper is refused rather than solved as if its entries were
+      below the diagonal. The operator package has no fill mode for SELL either
+      -- flagsparse_spsv_sell takes no `lower` argument at all. An upper-triangular
+      SYSTEM is a different thing and IS reachable in the package, by solving
+      L^T y = x over lower storage (transpose=True, and "C" for conjugate); in
+      cuSPARSE terms that is FILL_MODE_LOWER with opA=TRANSPOSE, which this API
+      does not wire yet for any format. No DIAG_EPS either, unlike the CSR route
+      -- the format already requires exactly one diagonal per row.
+      Needs no scratch beyond the ready flags and the row counter: the slice
+      offsets already describe the structure, so there is nothing to build.
+
+  - id: spsv_descriptor_api
+    zhiyuan_name: SpSV descriptor lifecycle
+    cusparse_api: cusparseSpSV_* (全流程)
+    c_api: [flagsparseSpSV_createDescr, flagsparseSpSV_bufferSize,
+            flagsparseSpSV_analysis, flagsparseSpSV_solve, flagsparseSpSV_destroyDescr]
+    python_impl: [flagsparse_spsv_buffer_size, flagsparse_spsv_analysis_ex,
+                  flagsparse_spsv_solve_ex]
+    dispatch: src/ops/spsv.cpp
+    tests: [ctest/accuracy/test_spsv.cpp]
+    status: implemented
+    notes: >
+      The first operator with a descriptor lifecycle, and cuSPARSE's own shape is
+      the reason: flagsparseSpSV_solve takes no externalBuffer, so the scratch
+      given to _analysis has to be remembered somewhere. The descriptor also
+      records WHICH matrix it was analysed for and refuses a solve against a
+      different one, and a solve before any analysis returns INVALID_VALUE rather
+      than dereferencing null. FILL_MODE has no default: without the attribute,
+      which triangle to solve is a guess, so it is an error.
+
+  - id: spsm_csr
+    zhiyuan_name: SpSM_CSR
+    cusparse_api: cusparseSpSM_solve
+    c_api: [flagsparseSpSM_createDescr, flagsparseSpSM_bufferSize,
+            flagsparseSpSM_analysis, flagsparseSpSM_solve, flagsparseSpSM_destroyDescr]
+    python_impl: [flagsparse_spsm_csr, prepare_spsm_csr]
+    formats: [csr]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non]                  # opA trans pending; opB non and trans both work
+    orders: [row, col]
+    fill_modes: [lower, upper]
+    diag_types: [unit, non_unit]
+    kernel_module: flagsparse_codegen/spsm.py
+    kernel_name: [_spsm_csr_polling_kernel_real, _spsm_csr_polling_kernel_complex,
+                  _spsm_extract_diag_kernel_real, _spsm_extract_diag_kernel_complex]
+    dispatch: src/ops/spsm.cpp
+    tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
+    status: implemented
+    reporting: delivery
+    delivery_dtypes: [f32, f64]
+    notes: >
+      Polling route: one program per (row, RHS tile), spinning on a per-(tile,
+      row) done flag. Unlike SpSV it does not care about column order -- it
+      filters a row by col < row / col > row and scans all of it -- so ascending
+      CSR works for both fill modes with no backward-scan flag. The solver works
+      IN PLACE on a packed row-major work array, so the scratch holds that array
+      and the solve copies B in and C out through the strided dense copy; that is
+      what makes any order, leading dimension and op(B) work. The diagonal
+      depends only on the matrix and is extracted in _analysis.
+
+  - id: spsm_coo
+    zhiyuan_name: SpSM_COO
+    cusparse_api: cusparseSpSM_solve
+    c_api: [flagsparseSpSM_solve, flagsparseSpSM_bufferSize, flagsparseSpSM_analysis]
+    python_impl: [flagsparse_spsm_coo]
+    formats: [coo]
+    dtypes: [f32, f64, c64, c128]
+    ops: [non]
+    fill_modes: [lower, upper]
+    diag_types: [unit, non_unit]
+    kernel_module: flagsparse_codegen/spsm.py
+    kernel_name: [_spsm_csr_polling_kernel_real, _spsm_csr_polling_kernel_complex]
+    dispatch: src/ops/spsm.cpp
+    tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      Same treatment as SpSV COO: _analysis builds a row-offsets array after the
+      solver's own scratch, and the CSR kernel runs over that view. No second
+      kernel, no converted copy.
+
+  - id: sparse_format_constructors
+    zhiyuan_name: 稀疏格式构造
+    cusparse_api: null
+    c_api: [flagsparseCreateCsr, flagsparseCreateCsc, flagsparseCreateCoo,
+            flagsparseCreateBsr, flagsparseCreateBlockedEll, flagsparseCreateSlicedEll]
+    python_impl: [create_csr_matrix, coo_to_csr]
+    status: implemented
+    notes: >
+      Format construction and conversion. The descriptor constructors are done and
+      tested; the CONVERSIONS (coo_to_csr and friends) are not exposed yet -- cuSPARSE
+      puts those in its legacy API, which §4 does not cover, so they need an API
+      decision before an implementation.

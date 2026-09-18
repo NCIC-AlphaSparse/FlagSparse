@@ -1,0 +1,15 @@
+build/
+_deps/
+*.so
+*.so.*
+__pycache__/
+*.pyc
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+
+# Test artifacts. The sweep writes <op>_{accuracy,benchmark}.json here plus the
+# summary/report it derives from them -- measurements of one machine at one
+# moment, not source. CI collects the directory as an upload artifact instead.
+capi_results/
