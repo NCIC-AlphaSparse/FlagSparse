@@ -32,7 +32,7 @@ SCRIPTS = [
     "run_flagsparse_accuracy.py",
     "run_flagsparse_performance.py",
     "run_flagsparse_pytest.py",
-    "tests/test_spmv_csr.py",
+    "tests/test_spmv.py",
     "tests/test_spmv_coo.py",
     "tests/test_spmv_csc.py",
     "tests/test_spmv_bsr.py",

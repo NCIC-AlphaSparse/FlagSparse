@@ -54,10 +54,10 @@ def _parse_args() -> argparse.Namespace:
         help="Benchmark suite to execute.",
     )
     parser.add_argument(
-        "--warmup", type=int, default=10, help="Warmup iterations where supported."
+        "--warmup", type=int, default=5, help="Warmup iterations where supported."
     )
     parser.add_argument(
-        "--iters", type=int, default=50, help="Timed iterations where supported."
+        "--iters", type=int, default=20, help="Timed iterations where supported."
     )
     parser.add_argument(
         "--with-cusparse",
@@ -100,13 +100,8 @@ def _command_specs(
             str(results_dir / "scatter_samples.csv"),
         ],
         "spmv": [
-            "tests/test_spmv_csr.py",
+            "tests/test_spmv.py",
             "--synthetic",
-            "--alg",
-            "compare",
-            "--timing",
-            "--csv-csr",
-            str(results_dir / "spmv_csr.csv"),
             "--warmup",
             str(args.warmup),
             "--iters",

@@ -41,7 +41,6 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as ast
 import flagsparse.sparse_operations._common as fs_common
 import flagsparse.sparse_operations.spmm_csr as ast_ops
-from utils import cupy_event_benchmark_filtered
 
 VALUE_DTYPES = [
     torch.float16,
@@ -625,11 +624,18 @@ def run_one_mtx(
                 elif op == "conj":
                     A_eff = A_csr.transpose().conj().tocsr()
 
-                _, result["cusparse_ms"] = cupy_event_benchmark_filtered(
-                    lambda: A_eff @ B_cp,
-                    warmup,
-                    iters,
-                )
+                torch.cuda.synchronize()
+                for _ in range(warmup):
+                    _ = A_eff @ B_cp
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(iters):
+                    _ = A_eff @ B_cp
+                end.record()
+                torch.cuda.synchronize()
+                result["cusparse_ms"] = start.elapsed_time(end) / iters
 
                 cs_C = A_eff @ B_cp
                 cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())

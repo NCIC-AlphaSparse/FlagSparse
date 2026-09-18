@@ -108,9 +108,9 @@ SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64 = _spsv_env_flag(
 SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128 = _spsv_env_flag(
     "FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128", "0"
 )
-
-# DCU/ROCm tuning switches. The optimized NON path uses backend-scoped launch
-# choices, while TRANS/CONJ has its own fallback knobs below.
+# DCU/ROCm tuning switches.  The optimized NON path uses a bounded persistent
+# grid so dependency producers remain resident.  Both switches can be disabled
+# while bringing up a new ROCm stack to recover the conservative scalar path.
 SPSV_ROCM_ENABLE_ADVANCED_AUTO = _spsv_env_flag(
     "FLAGSPARSE_SPSV_ROCM_ENABLE_ADVANCED_AUTO", "1"
 )
@@ -134,74 +134,24 @@ if not 1 <= SPSV_ROCM_ALG3_WORKGROUPS_PER_CU <= 8:
 SPSV_ROCM_ALG4_WORKER_COUNT = _spsv_env_nonnegative_int(
     "FLAGSPARSE_SPSV_ROCM_ALG4_WORKER_COUNT", "0"
 )
-# The parallel ALG1 experiment remains available for tuning, but ROCm defaults
-# to the deterministic single-program path. A CU-capped grid alone cannot
-# guarantee that the program owning the first solvable row is resident, so the
-# ready/indegree loop can otherwise occupy every schedulable slot indefinitely.
-SPSV_ROCM_TRANS_CW_WORKGROUPS_PER_CU = _spsv_env_nonnegative_int(
-    "FLAGSPARSE_SPSV_ROCM_TRANS_CW_WORKGROUPS_PER_CU", "1"
-)
-if not 1 <= SPSV_ROCM_TRANS_CW_WORKGROUPS_PER_CU <= 2:
-    raise ValueError(
-        "FLAGSPARSE_SPSV_ROCM_TRANS_CW_WORKGROUPS_PER_CU must be 1 or 2"
-    )
-SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK = _spsv_env_flag(
-    "FLAGSPARSE_SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK", "1"
-)
-SPSV_CUDA_TRANS_ALG2_WORKGROUPS_PER_CU = _spsv_env_nonnegative_int(
-    "FLAGSPARSE_SPSV_CUDA_TRANS_ALG2_WORKGROUPS_PER_CU", "2"
-)
-if not 1 <= SPSV_CUDA_TRANS_ALG2_WORKGROUPS_PER_CU <= 8:
-    raise ValueError(
-        "FLAGSPARSE_SPSV_CUDA_TRANS_ALG2_WORKGROUPS_PER_CU must be between 1 and 8"
-    )
 _SPSV_CSR_PREPROCESS_CACHE = OrderedDict()
 _SPSV_CSR_PREPROCESS_CACHE_SIZE = 8
 _SPSV_SELL_TRANS_ANALYSIS_CACHE = OrderedDict()
 _SPSV_SELL_TRANS_ANALYSIS_CACHE_SIZE = 4
 
 
-def _spsv_cu_capped_worker_count(n_rows, device, is_rocm):
+def _spsv_alg4_worker_count(n_rows, device, is_rocm):
     n_rows = int(n_rows)
     if n_rows <= 0:
         return 0
     if not is_rocm:
         return n_rows
-
     cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
     if SPSV_ROCM_ALG4_WORKER_COUNT > 0:
         return min(n_rows, cu_count, SPSV_ROCM_ALG4_WORKER_COUNT)
     # One persistent program per CU keeps the complete worker grid resident on
     # gfx936 while exposing enough independent rows to hide ready-flag latency.
     return min(n_rows, max(1, cu_count))
-
-
-def _spsv_transpose_cw_worker_count(n_rows, device, matrix_stats=None):
-    """Choose a resident-friendly persistent grid for TRANS/CONJ CW."""
-
-    n_rows = int(n_rows)
-    if n_rows <= 0:
-        return 0
-    matrix_stats = matrix_stats or {}
-    cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
-    avg_nnz = float(matrix_stats.get("avg_nnz_per_row", 0.0))
-    if _is_rocm_runtime():
-        programs_per_cu = SPSV_ROCM_TRANS_CW_WORKGROUPS_PER_CU
-    elif avg_nnz <= 16.0:
-        programs_per_cu = 4
-    elif avg_nnz <= 64.0:
-        programs_per_cu = 2
-    else:
-        programs_per_cu = 1
-    return min(n_rows, max(1, cu_count * programs_per_cu))
-
-
-def _spsv_transpose_cw_num_warps(block_nnz):
-    """Match a Triton program to the native CUDA warp or AMD wavefront."""
-
-    block_nnz = int(block_nnz)
-    native_width = 64 if _is_rocm_runtime() else 32
-    return min(8, max(1, (block_nnz + native_width - 1) // native_width))
 
 
 def _try_set_hipsparse_current_stream(handle):
@@ -438,7 +388,6 @@ def _hipsparse_spsv_skip_reason(
 
 
 def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op="non"):
-
     """Select the same-format vendor SpSV baseline for the active backend."""
     indptr_dtype = index_dtype if indptr_dtype is None else indptr_dtype
     vendor = _vendor_sparse_library()
@@ -452,7 +401,6 @@ def _spsv_csr_sparse_ref_backend(value_dtype, index_dtype, indptr_dtype=None, op
         if reason is None:
             return "hipsparse", None
         return None, reason
-
     if vendor != "cupy_cusparse":
         if vendor is None:
             return None, f"no vendor sparse SpSV baseline is configured for {_backend_name()}"
@@ -1390,6 +1338,10 @@ def _validate_spsv_sell_structure(
             )
 
 
+def _spsv_diag_eps_for_dtype(value_dtype):
+    return 1e-12 if value_dtype in (torch.float64, torch.complex128) else 1e-6
+
+
 def _tensor_cache_token(tensor):
     try:
         storage_ptr = int(tensor.untyped_storage().data_ptr())
@@ -1517,11 +1469,6 @@ def _spsv_effective_compute_dtype(value_dtype, trans_mode, compute_dtype=None):
                 "compute_dtype must be one of: float32, float64, complex64, complex128"
             )
         return compute_dtype
-    # DCU CSR/COO must preserve the input precision: converting float32 or
-    # complex64 to their 64-bit counterparts costs an extra full matrix/vector
-    # copy and makes the comparison with native-precision hipSPARSE unfair.
-    if _is_rocm_runtime():
-        return value_dtype
     if (
         value_dtype == torch.complex64
         and trans_mode in ("T", "C")
@@ -1554,12 +1501,6 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
             _workspace_entry("indegree", n_rows, torch.int32),
             _workspace_entry("ready_queue", n_rows, torch.int32),
             _workspace_entry("queue_state", 2, torch.int32),
-
-        )
-    if solve_kind == "sell_trans_csc":
-        return (
-            _workspace_entry("ready", n_rows, torch.int32),
-            _workspace_entry("row_counter", 1, torch.int32),
         )
     if solve_kind == "sell_trans_csc":
         return (
@@ -1592,23 +1533,7 @@ def _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=None):
         return (
             _workspace_entry("residual", n_rows, value_dtype),
             _workspace_entry("indegree", n_rows, torch.int32),
-            _workspace_entry("diag_offsets", n_rows, torch.int64),
             _workspace_entry("row_counter", 1, torch.int32),
-        )
-    if solve_kind == "transpose_alg2":
-        if value_dtype is None:
-            raise ValueError("value_dtype is required for transpose_alg2 workspace sizing")
-        if not _is_rocm_runtime():
-            return (
-                _workspace_entry("residual", n_rows, value_dtype),
-                _workspace_entry("ready", n_rows, torch.int32),
-                _workspace_entry("indegree", n_rows, torch.int32),
-                _workspace_entry("work_counter", 1, torch.int32),
-            )
-        return (
-            _workspace_entry("tmp_sum", n_rows, value_dtype),
-            _workspace_entry("ready", n_rows, torch.int32),
-            _workspace_entry("indegree", n_rows, torch.int32),
         )
     raise ValueError(f"Unsupported SpSV solve kind for workspace sizing: {solve_kind}")
 
@@ -1709,7 +1634,7 @@ def flagsparse_spsv_buffer_size(
     )
     route = _normalize_requested_spsv_route(solve_kind, trans_mode)
     if route is None:
-        route = "transpose_alg2" if trans_mode in ("T", "C") else "csr_cw"
+        route = "transpose_cw" if trans_mode in ("T", "C") else "csr_cw"
     if trans_mode in ("T", "C") and storage_view != "csr_as_csc":
         raise ValueError("TRANS/CONJ SpSV only supports storage_view='csr_as_csc'")
     layout = _build_spsv_workspace_layout(n_rows, route, value_dtype=compute_dtype)
@@ -1770,8 +1695,7 @@ def _normalize_requested_spsv_route(solve_kind, trans_mode):
             f"{token!r} is a CUDA-only route"
         )
     aliases = {
-        "csr_cw": "csr_cw" if trans_mode == "N" else "transpose_cw",
-        "alg1": "csr_cw" if trans_mode == "N" else "transpose_cw",
+        "csr_cw": "csr_cw",
         "csr_roc": "csr_roc",
         "roc": "csr_roc",
         "alg3": "csr_nnz_balance" if is_rocm else "csr_roc",
@@ -1782,35 +1706,23 @@ def _normalize_requested_spsv_route(solve_kind, trans_mode):
         "csr_cw_levelschd": "csr_cw_levelschd",
         "levelschd": "csr_cw_levelschd",
         "level_sched": "csr_cw_levelschd",
-        "alg2": (
-            "csr_cw_levelschd" if trans_mode == "N" else "transpose_alg2"
-        ),
+        "alg2": "csr_cw_levelschd",
         "csr_nnz_balance": "csr_nnz_balance",
         "nnz_balance": "csr_nnz_balance",
         "alg8": "csr_nnz_balance",
         "cw": "csr_cw" if trans_mode == "N" else "transpose_cw",
         "transpose_cw": "transpose_cw",
         "csc_cw": "transpose_cw",
-        "transpose_alg2": "transpose_alg2",
-        "transpose_nnz_balance": "transpose_alg2",
     }
     route = aliases.get(token)
     if route is None:
         raise ValueError(
-            "solve_kind must be one of: alg1, csr_cw, csr_roc, csr_smblk, "
-            "csr_cw_levelschd, csr_nnz_balance, transpose_cw, "
-            "transpose_alg2"
+            "solve_kind must be one of: csr_cw, csr_roc, csr_smblk, csr_cw_levelschd, csr_nnz_balance, transpose_cw"
         )
-    if trans_mode in ("T", "C") and route not in {
-        "transpose_cw",
-        "transpose_alg2",
-    }:
-        raise ValueError(
-            "TRANS/CONJ SpSV only supports solve_kind='transpose_cw' or "
-            "'transpose_alg2'"
-        )
-    if trans_mode == "N" and route in {"transpose_cw", "transpose_alg2"}:
-        raise ValueError("NON_TRANS SpSV cannot use a transpose solve route")
+    if trans_mode in ("T", "C") and route != "transpose_cw":
+        raise ValueError("TRANS/CONJ SpSV only supports solve_kind='transpose_cw'")
+    if trans_mode == "N" and route == "transpose_cw":
+        raise ValueError("NON_TRANS SpSV cannot use solve_kind='transpose_cw'")
     return route
 
 
@@ -1819,9 +1731,9 @@ def _spsv_csc_preprocess_kernel(
     indices_ptr,
     indptr_ptr,
     indegree_ptr,
-    diag_offsets_ptr,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
     LOWER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
 ):
@@ -1830,240 +1742,16 @@ def _spsv_csc_preprocess_kernel(
         return
     start = tl.load(indptr_ptr + col)
     end = tl.load(indptr_ptr + col + 1)
-    diag_offset = tl.zeros((), dtype=tl.int64) - 1
-    row_segments = (end - start + BLOCK_NNZ - 1) // BLOCK_NNZ
-    for seg in tl.range(0, row_segments):
+    for seg in range(MAX_SEGMENTS):
         idx = start + seg * BLOCK_NNZ
         offsets = idx + tl.arange(0, BLOCK_NNZ)
         mask = offsets < end
         row = tl.load(indices_ptr + offsets, mask=mask, other=0)
-        segment_diag = tl.max(
-            tl.where(mask & (row == col), offsets, -1), axis=0
-        )
-        diag_offset = tl.maximum(diag_offset, segment_diag)
         if LOWER:
             dep_mask = mask & (row > col if UNIT_DIAG else row >= col)
         else:
             dep_mask = mask & (row < col if UNIT_DIAG else row <= col)
         tl.atomic_add(indegree_ptr + row, 1, mask=dep_mask)
-    tl.store(diag_offsets_ptr + col, diag_offset)
-
-
-def _build_spsv_transpose_alg2_gather_metadata(
-    data,
-    indices64,
-    indptr64,
-    n_rows,
-    *,
-    lower,
-    unit_diagonal,
-    conjugate,
-):
-    """Materialize op(A) as CSR and build the proven NON NNZ plan for ALG2."""
-
-    n_rows = int(n_rows)
-    device = indices64.device
-    nnz = int(indices64.numel())
-    rows64 = torch.repeat_interleave(
-        torch.arange(n_rows, dtype=torch.int64, device=device),
-        indptr64[1:] - indptr64[:-1],
-        output_size=nnz,
-    )
-    selected = indices64 <= rows64 if lower else indices64 >= rows64
-    diag = indices64 == rows64
-    if unit_diagonal:
-        # Materialize exactly one unit diagonal so the unchanged NON-ALG3
-        # diagonal lane also covers descriptors whose input omits the diagonal.
-        offdiag = selected & ~diag
-        trans_data = data[offdiag]
-        trans_rows64 = indices64[offdiag]
-        trans_cols64 = rows64[offdiag]
-        diagonal64 = torch.arange(n_rows, dtype=torch.int64, device=device)
-        trans_data = torch.cat(
-            (trans_data, torch.ones(n_rows, dtype=data.dtype, device=device))
-        )
-        trans_rows64 = torch.cat((trans_rows64, diagonal64))
-        trans_cols64 = torch.cat((trans_cols64, diagonal64))
-    else:
-        diag_counts32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
-        diag_counts32.scatter_add_(0, rows64, diag.to(torch.int32))
-        if bool(torch.any(diag_counts32 != 1).item()):
-            raise ValueError(
-                "NON_UNIT TRANS/CONJ SpSV requires exactly one diagonal entry per row"
-            )
-        trans_data = data[selected]
-        trans_rows64 = indices64[selected]
-        trans_cols64 = rows64[selected]
-
-    if conjugate and torch.is_complex(trans_data):
-        trans_data = trans_data.conj().resolve_conj()
-    trans_data, trans_indices64, trans_indptr64 = _coo2csr_for_spsv(
-        trans_data,
-        trans_rows64,
-        trans_cols64,
-        n_rows,
-        assume_ordered=False,
-    )
-    lower_eff = not lower
-    trans_data, trans_indices64, trans_indptr64 = _maybe_sort_csr_rows(
-        trans_data,
-        trans_indices64,
-        trans_indptr64,
-        n_rows,
-        n_rows,
-        lower=lower_eff,
-    )
-    if lower_eff:
-        nnz_meta = _build_spsv_nnz_balance_metadata(
-            trans_indices64,
-            trans_indptr64,
-            n_rows,
-            lower=True,
-            unit_diagonal=False,
-        )
-    else:
-        row_lengths64 = trans_indptr64[1:] - trans_indptr64[:-1]
-        row_idx32 = torch.repeat_interleave(
-            torch.arange(n_rows, dtype=torch.int32, device=device),
-            row_lengths64,
-            output_size=int(trans_indices64.numel()),
-        ).contiguous()
-        reverse_rows64 = torch.arange(
-            n_rows - 1, -1, -1, dtype=torch.int64, device=device
-        )
-        reverse_lengths64 = row_lengths64.index_select(0, reverse_rows64)
-        reverse_starts64 = torch.zeros(n_rows, dtype=torch.int64, device=device)
-        if n_rows > 1:
-            reverse_starts64[1:] = torch.cumsum(reverse_lengths64[:-1], dim=0)
-        launch_rows64 = torch.repeat_interleave(
-            reverse_rows64,
-            reverse_lengths64,
-            output_size=int(trans_indices64.numel()),
-        )
-        local_rank64 = torch.arange(
-            trans_indices64.numel(), dtype=torch.int64, device=device
-        ) - torch.repeat_interleave(
-            reverse_starts64,
-            reverse_lengths64,
-            output_size=int(trans_indices64.numel()),
-        )
-        launch_order32 = (
-            trans_indptr64.index_select(0, launch_rows64) + local_rank64
-        ).to(torch.int32)
-        nnz_meta = {
-            "launch_order32": launch_order32.contiguous(),
-            "csr_row_idx32": row_idx32,
-            "indegree_init32": row_lengths64.to(torch.int32).contiguous(),
-        }
-    return {
-        "data": trans_data,
-        "indices32": trans_indices64.to(torch.int32).contiguous(),
-        "launch_order32": nnz_meta["launch_order32"],
-        "row_idx32": nnz_meta["csr_row_idx32"],
-        "indegree_init32": nnz_meta["indegree_init32"],
-        "lower": lower_eff,
-    }
-
-
-def _build_spsv_transpose_alg2_metadata(
-    indices64,
-    indptr64,
-    n_rows,
-    *,
-    lower,
-    unit_diagonal,
-):
-    """Build CUDA's topologically ordered solve/propagation item stream."""
-
-    n_rows = int(n_rows)
-    device = indices64.device
-    nnz = int(indices64.numel())
-    rows64 = torch.repeat_interleave(
-        torch.arange(n_rows, dtype=torch.int64, device=device),
-        indptr64[1:] - indptr64[:-1],
-        output_size=nnz,
-    )
-    offsets64 = torch.arange(nnz, dtype=torch.int64, device=device)
-    diag_offsets64 = torch.full((n_rows,), -1, dtype=torch.int64, device=device)
-    if not unit_diagonal:
-        diag_mask = indices64 == rows64
-        diag_counts32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
-        diag_counts32.scatter_add_(0, rows64, diag_mask.to(torch.int32))
-        diag_offsets64.scatter_reduce_(
-            0,
-            rows64,
-            torch.where(diag_mask, offsets64, torch.full_like(offsets64, -1)),
-            reduce="amax",
-            include_self=True,
-        )
-        if bool(torch.any(diag_counts32 != 1).item()):
-            raise ValueError(
-                "NON_UNIT TRANS/CONJ SpSV requires exactly one diagonal entry per row"
-            )
-
-    propagation_mask = indices64 < rows64 if lower else indices64 > rows64
-    propagation_offsets64 = offsets64[propagation_mask]
-    propagation_sources64 = rows64[propagation_mask]
-    propagation_targets64 = indices64[propagation_mask]
-    indegree_init32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
-    propagation_count = int(propagation_targets64.numel())
-    if propagation_count > 0:
-        indegree_init32.scatter_add_(
-            0,
-            propagation_targets64,
-            torch.ones_like(propagation_targets64, dtype=torch.int32),
-        )
-
-    propagation_counts64 = torch.bincount(propagation_sources64, minlength=n_rows)
-    logical_sources64 = torch.arange(n_rows, dtype=torch.int64, device=device)
-    if lower:
-        logical_sources64 = torch.flip(logical_sources64, dims=(0,))
-    logical_group_sizes64 = propagation_counts64[logical_sources64] + 1
-    logical_group_starts64 = torch.zeros(n_rows, dtype=torch.int64, device=device)
-    if n_rows > 1:
-        logical_group_starts64[1:] = torch.cumsum(
-            logical_group_sizes64[:-1], dim=0
-        )
-    source_group_starts64 = torch.empty(n_rows, dtype=torch.int64, device=device)
-    source_group_starts64[logical_sources64] = logical_group_starts64
-
-    n_items = n_rows + propagation_count
-    item_sources32 = torch.empty(n_items, dtype=torch.int32, device=device)
-    item_targets32 = torch.full((n_items,), -1, dtype=torch.int32, device=device)
-    item_offsets64 = torch.empty(n_items, dtype=torch.int64, device=device)
-    solve_sources64 = torch.arange(n_rows, dtype=torch.int64, device=device)
-    solve_positions64 = source_group_starts64
-    item_sources32[solve_positions64] = solve_sources64.to(torch.int32)
-    item_offsets64[solve_positions64] = diag_offsets64
-
-    if propagation_count > 0:
-        propagation_starts64 = torch.zeros(n_rows, dtype=torch.int64, device=device)
-        if n_rows > 1:
-            propagation_starts64[1:] = torch.cumsum(
-                propagation_counts64[:-1], dim=0
-            )
-        local_propagation_rank64 = torch.arange(
-            propagation_count, dtype=torch.int64, device=device
-        ) - torch.repeat_interleave(propagation_starts64, propagation_counts64)
-        propagation_positions64 = (
-            source_group_starts64[propagation_sources64]
-            + 1
-            + local_propagation_rank64
-        )
-        item_sources32[propagation_positions64] = propagation_sources64.to(
-            torch.int32
-        )
-        item_targets32[propagation_positions64] = propagation_targets64.to(
-            torch.int32
-        )
-        item_offsets64[propagation_positions64] = propagation_offsets64
-
-    return {
-        "item_sources32": item_sources32,
-        "item_targets32": item_targets32,
-        "item_offsets64": item_offsets64,
-        "indegree_init32": indegree_init32,
-    }
 
 
 def _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
@@ -2082,7 +1770,7 @@ def _sort_csr_rows(data, indices64, indptr64, n_rows, n_cols, lower=True):
         order = torch.argsort(key, stable=True)
     except TypeError:
         order = torch.argsort(key)
-    return data[order], indices64[order], indptr64
+    return _gather_values(data, order), indices64[order], indptr64
 
 
 def _spsv_csr_row_length_summary(indptr64, n_rows):
@@ -2138,27 +1826,78 @@ def _cw_rhs_bucket(n_rhs):
     return 32
 
 
+_CW_MAX_WORKERS_CACHE = {}
+
+
+def _cw_device_max_workers(device=None, num_warps=4):
+    """Column-wave workers needed to fill the device once.
+
+    The single-RHS target was a hardcoded 32.  On a 170-SM card that runs the solve at
+    about 1% of the machine, and the column-wave kernel scales almost linearly with
+    workers because rows are handed out dynamically through ``row_counter``: a sweep at
+    fixed worker counts improved monotonically from 4 up to ~2048, where it saturates
+    (ecology1 59.2 -> 2.4 ms, roadNet-TX 81.5 -> 3.3 ms), with bit-identical results at
+    every setting.
+
+    Over-subscribing is safe: a program only ever waits on rows with a *lower* index, and
+    a lower index can only have been claimed by a program that already executed its
+    ``atomic_add`` -- i.e. one that is resident.  Non-resident programs start later and
+    find the counter exhausted.
+    """
+    key = (
+        None if device is None else (getattr(device, "type", None), getattr(device, "index", None)),
+        int(num_warps),
+    )
+    cached = _CW_MAX_WORKERS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if _backend_name() != "cuda":
+        # Measured and tuned on CUDA only.  ROCm/gfx936 in particular cannot rely on
+        # cross-program ready-flag polling making forward progress (the csr_cw path is
+        # already forced serial there), and MetaX/MUSA/Ascend have different warp sizes
+        # and occupancy limits, so they keep the original conservative target.
+        _CW_MAX_WORKERS_CACHE[key] = 32
+        return 32
+    try:
+        from ._common import _get_device_backend_info
+
+        info = _get_device_backend_info(device)
+        sm_count = int(info.get("multi_processor_count") or 0)
+        warp_size = int(info.get("device_warp_size") or 32)
+        max_threads_per_sm = int(info.get("max_threads_per_multi_processor") or 0)
+        block_threads = max(1, int(num_warps) * warp_size)
+        blocks_per_sm = max(1, max_threads_per_sm // block_threads) if max_threads_per_sm else 1
+        workers = sm_count * blocks_per_sm
+    except Exception:
+        workers = 0
+    if workers <= 0:
+        workers = 1024
+    _CW_MAX_WORKERS_CACHE[key] = workers
+    return workers
+
+
 def _snap_cw_worker_count(target, n_rows):
     if n_rows <= 0:
         return 1
     target = max(1, min(int(target), int(n_rows)))
     snapped = 1
     tier = 1
-    while tier < target and tier < 4096:
+    while tier < target and tier < 65536:
         tier *= 2
         if tier <= target:
             snapped = tier
     return int(max(1, min(snapped, int(n_rows))))
 
 
-def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
+def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs, device=None):
     if n_rows <= 0:
         return 1
     rhs_bucket = _cw_rhs_bucket(n_rhs)
+    device_max = _cw_device_max_workers(device)
     if rhs_bucket == 1:
-        target = min(n_rows, 32)
+        target = min(n_rows, device_max)
     else:
-        target = max(32, min(n_rows, 512))
+        target = max(32, min(n_rows, max(512, device_max)))
     if max_frontier > 0:
         target = min(target, max(4, min(n_rows, max_frontier * 2)))
     if avg_nnz_per_row > 8192:
@@ -2179,7 +1918,7 @@ def _cw_worker_count(n_rows, max_frontier, avg_nnz_per_row, n_rhs):
         target = max(4, (target * 3) // 4)
     return _snap_cw_worker_count(target, n_rows)
 
-def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None):
+def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=None, device=None):
     rhs_bucket = _cw_rhs_bucket(n_rhs)
     max_frontier = int(matrix_stats.get("max_frontier", n_rows))
     avg_frontier = float(matrix_stats.get("avg_frontier", float(max_frontier)))
@@ -2194,6 +1933,7 @@ def _resolve_cw_worker_count(n_rows, matrix_stats, n_rhs, cached_worker_count=No
             max_frontier,
             avg_nnz_per_row,
             rhs_bucket,
+            device=device,
         )
     if frontier_ratio < 0.01 or avg_frontier < 4.0:
         target = min(target, max(1, min(n_rows, 4)))
@@ -2366,7 +2106,37 @@ def _spsv_levelschd_analysis_kernel(
 
 
 @triton.jit
+def _spsv_levelschd_analysis_serial_kernel(
+    indices_ptr,
+    indptr_ptr,
+    levels_ptr,
+    indegree_ptr,
+    n_rows,
+    LOWER: tl.constexpr,
+    UNIT_DIAGONAL: tl.constexpr,
+):
+    """Build exact topological levels without cross-program synchronization."""
 
+    for logical_row in tl.range(0, n_rows):
+        row = tl.where(LOWER, logical_row, n_rows - 1 - logical_row)
+        ptr = tl.load(indptr_ptr + row)
+        end = tl.load(indptr_ptr + row + 1)
+        max_level = tl.zeros((), dtype=tl.int32)
+        degree = tl.zeros((), dtype=tl.int32)
+        while ptr < end:
+            col = tl.load(indices_ptr + ptr)
+            dependency = col < row if LOWER else col > row
+            if dependency:
+                max_level = tl.maximum(max_level, tl.load(levels_ptr + col))
+                degree += 1
+            elif (not UNIT_DIAGONAL) and (col == row):
+                degree += 1
+            ptr += 1
+        tl.store(levels_ptr + row, max_level + 1)
+        tl.store(indegree_ptr + row, degree)
+
+
+@triton.jit
 def _spsv_levelschd_analysis_persistent_kernel(
     indices_ptr,
     indptr_ptr,
@@ -2454,14 +2224,7 @@ def _spsv_levelschd_analysis_persistent_kernel(
 
 
 def _build_spsv_level_schedule_metadata_rocm_gpu(
-
-    indices64,
-    indptr64,
-    n_rows,
-    *,
-    lower,
-    unit_diagonal,
-    minimal=False,
+    indices64, indptr64, n_rows, *, lower, unit_diagonal, minimal=False
 ):
     """ROCm topology analysis kept on-device with a deadlock-free producer."""
 
@@ -2488,26 +2251,37 @@ def _build_spsv_level_schedule_metadata_rocm_gpu(
     indices32 = indices64.to(torch.int32).contiguous()
     levels32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
     indegree32 = torch.empty(n_rows, dtype=torch.int32, device=device)
-
-    block_rows = 32
-    n_blocks = triton.cdiv(n_rows, block_rows)
-    ready32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
-    block_counter32 = torch.zeros(1, dtype=torch.int32, device=device)
-    worker_count = _spsv_cu_capped_worker_count(n_blocks, device, True)
-    _spsv_levelschd_analysis_persistent_kernel[(worker_count,)](
-        indices32,
-        indptr64,
-        levels32,
-        ready32,
-        indegree32,
-        block_counter32,
-        n_rows,
-        n_blocks,
-        LOWER=bool(lower),
-        UNIT_DIAGONAL=bool(unit_diagonal),
-        BLOCK_ROWS=block_rows,
-        num_warps=1,
-    )
+    if SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL:
+        block_rows = 32
+        n_blocks = triton.cdiv(n_rows, block_rows)
+        ready32 = torch.zeros(n_rows, dtype=torch.int32, device=device)
+        block_counter32 = torch.zeros(1, dtype=torch.int32, device=device)
+        worker_count = _spsv_alg4_worker_count(n_blocks, device, True)
+        _spsv_levelschd_analysis_persistent_kernel[(worker_count,)](
+            indices32,
+            indptr64,
+            levels32,
+            ready32,
+            indegree32,
+            block_counter32,
+            n_rows,
+            n_blocks,
+            LOWER=bool(lower),
+            UNIT_DIAGONAL=bool(unit_diagonal),
+            BLOCK_ROWS=block_rows,
+            num_warps=1,
+        )
+    else:
+        _spsv_levelschd_analysis_serial_kernel[(1,)](
+            indices32,
+            indptr64,
+            levels32,
+            indegree32,
+            n_rows,
+            LOWER=bool(lower),
+            UNIT_DIAGONAL=bool(unit_diagonal),
+            num_warps=1,
+        )
 
     try:
         row_map64 = torch.argsort(levels32, stable=True)
@@ -2715,9 +2489,9 @@ def _build_spsv_nnz_balance_metadata(
     }
     if n_rows == 0:
         return empty_meta
-    # Lower uses the shared on-device preprocessing path. Upper retains the
-    # reverse-row launch order also consumed by DCU TRANS/CONJ ALG2 after op(A)
-    # has been materialized as CSR.
+    # SpSV input validation requires device tensors, so only the two device
+    # paths below are reachable. CUDA upper keeps its original reverse-row host
+    # metadata construction; DCU rejects upper ALG3 before entering here.
     if not lower:
         indices_cpu = indices64.to("cpu", non_blocking=False).tolist()
         indptr_cpu = indptr64.to("cpu", non_blocking=False).tolist()
@@ -2775,13 +2549,7 @@ def _build_spsv_nnz_balance_metadata(
 
 
 def _build_spsv_level_schedule_metadata(
-    indices64,
-    indptr64,
-    n_rows,
-    *,
-    lower,
-    unit_diagonal,
-    minimal=False,
+    indices64, indptr64, n_rows, *, lower, unit_diagonal, minimal=False
 ):
     n_rows = int(n_rows)
     device = indices64.device
@@ -2802,7 +2570,6 @@ def _build_spsv_level_schedule_metadata(
     }
     if n_rows == 0:
         return empty_meta
-
 
     if _is_accel_tensor(indices64):
         if _is_rocm_runtime():
@@ -2941,6 +2708,10 @@ def _prepare_spsv_csr_system(
             avg_nnz_per_row=avg_nnz_per_row,
             max_nnz_per_row=max_nnz_per_row,
         )
+        default_block_nnz, default_max_segments = _auto_spsv_launch_config(
+            indptr64,
+            max_nnz_per_row=max_nnz_per_row,
+        )
         if lower:
             nontrans_variant = "csr_u_lo_cw" if unit_diagonal else "csr_n_lo_cw"
         else:
@@ -3073,31 +2844,24 @@ def _prepare_spsv_csr_system(
             if nnz_meta is not None and "kernel_indices32" in nnz_meta
             else indices64.to(torch.int32)
         )
-
-        kernel_data = data
-        kernel_indptr64 = indptr64
         cw_plan = {
             "solve_kind": default_solve_kind,
             "default_solve_kind": default_solve_kind,
             "supported_solve_kinds": tuple(supported_solve_kinds),
             "nontrans_variant": nontrans_variant,
-
-            "kernel_data": kernel_data,
+            "kernel_data": data,
             "kernel_indices32": kernel_indices32,
-            "kernel_indptr64": kernel_indptr64,
+            "kernel_indptr64": indptr64,
             "lower_eff": lower,
+            "default_block_nnz": default_block_nnz,
+            "default_max_segments": default_max_segments,
             "storage_view": "csr",
+            "cw_worker_count": _cw_worker_count(
+                n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+            ),
             "matrix_stats": matrix_stats,
             "route_name": route_name,
         }
-
-        if default_solve_kind == "csr_cw":
-            cw_plan["cw_worker_count"] = _cw_worker_count(
-                n_rows,
-                matrix_stats["max_frontier"],
-                matrix_stats["avg_nnz_per_row"],
-                1,
-            )
         if level_meta is not None:
             cw_plan.update(
                 {
@@ -3125,79 +2889,25 @@ def _prepare_spsv_csr_system(
     default_block_nnz, default_max_segments = _choose_transpose_family_launch_config(
         indptr64
     )
-    requested_route = _normalize_requested_spsv_route(
-        requested_solve_kind, trans_mode
-    )
-    default_solve_kind = requested_route
-    if default_solve_kind is None:
-        default_solve_kind = "transpose_alg2"
-    alg2_meta = None
-    alg2_gather_meta = None
-    if default_solve_kind == "transpose_alg2":
-        if _is_rocm_runtime():
-            alg2_gather_meta = _build_spsv_transpose_alg2_gather_metadata(
-                data,
-                indices64,
-                indptr64,
-                n_rows,
-                lower=lower,
-                unit_diagonal=unit_diagonal,
-                conjugate=trans_mode == "C",
-            )
-        else:
-            alg2_meta = _build_spsv_transpose_alg2_metadata(
-                indices64,
-                indptr64,
-                n_rows,
-                lower=lower,
-                unit_diagonal=unit_diagonal,
-            )
-    transpose_plan = {
-        "solve_kind": default_solve_kind,
-        "default_solve_kind": default_solve_kind,
-        "supported_solve_kinds": (default_solve_kind,),
+    cw_plan = {
+        "solve_kind": "transpose_cw",
+        "default_solve_kind": "transpose_cw",
+        "supported_solve_kinds": ("transpose_cw",),
         "kernel_data": data,
         "kernel_indices32": indices64.to(torch.int32),
         "kernel_indptr64": indptr64,
         "lower_eff": lower_eff,
         "default_block_nnz": default_block_nnz,
         "default_max_segments": default_max_segments,
+        "cw_worker_count": _cw_worker_count(
+            n_rows, matrix_stats["max_frontier"], matrix_stats["avg_nnz_per_row"], 1
+        ),
         "matrix_stats": matrix_stats,
         "storage_view": storage_view,
-        "route_name": default_solve_kind,
+        "route_name": "transpose_cw",
     }
-    if alg2_meta is not None:
-        transpose_plan.update(
-            {
-                "transpose_alg2_item_sources32": alg2_meta["item_sources32"],
-                "transpose_alg2_item_targets32": alg2_meta["item_targets32"],
-                "transpose_alg2_item_offsets64": alg2_meta["item_offsets64"],
-                "transpose_alg2_indegree_init32": alg2_meta["indegree_init32"],
-                "transpose_alg2_mode": "scatter",
-            }
-        )
-    if alg2_gather_meta is not None:
-        transpose_plan.update(
-            {
-                "transpose_alg2_gather_data": alg2_gather_meta["data"],
-                "transpose_alg2_gather_indices32": alg2_gather_meta["indices32"],
-                "transpose_alg2_gather_launch_order32": alg2_gather_meta[
-                    "launch_order32"
-                ],
-                "transpose_alg2_gather_row_idx32": alg2_gather_meta["row_idx32"],
-                "transpose_alg2_gather_indegree_init32": alg2_gather_meta[
-                    "indegree_init32"
-                ],
-                "transpose_alg2_gather_lower": alg2_gather_meta["lower"],
-                "transpose_alg2_mode": "gather",
-            }
-        )
-        if torch.is_complex(alg2_gather_meta["data"]):
-            transpose_plan["transpose_alg2_gather_data_ri"] = _complex_interleaved_view(
-                alg2_gather_meta["data"]
-            )
-    _attach_spsv_complex_plan_views(transpose_plan)
-    return transpose_plan
+    _attach_spsv_complex_plan_views(cw_plan)
+    return cw_plan
 
 
 def _resolve_spsv_csr_runtime(
@@ -3337,47 +3047,23 @@ def _load_scalar_fp64(ptr, idx):
 def _complex_atomic_add_interleaved(ptr_ri, idx, delta_re, delta_im, mask):
     """Complex atomicAdd equivalent for interleaved real/imag buffers."""
 
-    tl.atomic_add(
-        ptr_ri + idx * 2,
-        delta_re,
-        mask=mask,
-        sem="relaxed",
-        scope="gpu",
-    )
-    tl.atomic_add(
-        ptr_ri + idx * 2 + 1,
-        delta_im,
-        mask=mask,
-        sem="relaxed",
-        scope="gpu",
-    )
+    tl.atomic_add(ptr_ri + idx * 2, delta_re, mask=mask)
+    tl.atomic_add(ptr_ri + idx * 2 + 1, delta_im, mask=mask)
 
 
 @triton.jit
 def _propagate_real(residual_ptr, idx, delta, mask):
     """Publish a real contribution into shared residual state."""
 
-    tl.atomic_add(
-        residual_ptr + idx,
-        delta,
-        mask=mask,
-        sem="relaxed",
-        scope="gpu",
-    )
+    tl.atomic_add(residual_ptr + idx, delta, mask=mask)
 
 
 @triton.jit
 def _propagate_then_release_real(residual_ptr, indegree_ptr, idx, delta, mask):
-    """Write a contribution, then publish dependency completion."""
+    """Approximate 'write contribution then decrement dependency count'."""
 
     _propagate_real(residual_ptr, idx, delta, mask)
-    tl.atomic_add(
-        indegree_ptr + idx,
-        -1,
-        mask=mask,
-        sem="release",
-        scope="gpu",
-    )
+    tl.atomic_add(indegree_ptr + idx, -1, mask=mask)
 
 
 @triton.jit
@@ -3392,13 +3078,7 @@ def _propagate_then_release_complex(residual_ri_ptr, indegree_ptr, idx, delta_re
     """Complex propagation + dependency release for transpose-style solve."""
 
     _propagate_complex(residual_ri_ptr, idx, delta_re, delta_im, mask)
-    tl.atomic_add(
-        indegree_ptr + idx,
-        -1,
-        mask=mask,
-        sem="release",
-        scope="gpu",
-    )
+    tl.atomic_add(indegree_ptr + idx, -1, mask=mask)
 
 
 @triton.jit
@@ -3410,30 +3090,60 @@ def _spsv_csr_cw_kernel(
     x_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha,
     n_rows,
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-
+    DIAG_EPS: tl.constexpr,
+    SERIAL_EXECUTION: tl.constexpr,
+    SCAN_BACKWARD: tl.constexpr,
 ):
-    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    """Solve op(A) y = alpha * x for a triangular A, chain-wave style.
+
+    ``alpha`` exists so the C API can express cuSPARSE's SpSV, whose right-hand
+    side is scaled; the solve is linear, so scaling the rhs at load is the whole
+    of it. This module's callers pass 1, for which the generated code is the
+    plain solve it has always been.
+
+    Over-subscribing workers is safe and cannot deadlock: a program only ever
+    waits on rows with a LOWER logical index, and a lower index can only have
+    been claimed by a program that already ran its ``atomic_add`` -- i.e. one
+    that is resident. Non-resident programs start later and find the counter
+    exhausted.
+
+    SCAN_BACKWARD says which end of a row the scan starts from, and it exists
+    because the two fill modes want opposite column orders. The scan walks a row
+    and stops at the diagonal, so it needs the diagonal LAST: ascending columns
+    give that for a lower triangle, descending for an upper one. This module
+    reorders rows per fill mode and keeps False. cuSPARSE callers cannot -- CSR
+    column indices are ascending by universal convention -- so the C API passes
+    True for an upper triangle and the scan runs from the far end instead, which
+    needs no reordered copy of the matrix.
+    """
+    logical_row = (
+        0
+        if SERIAL_EXECUTION
+        else tl.atomic_add(row_counter_ptr, 1)
+    )
     while logical_row < n_rows:
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
-        ptr = start
+        ptr = end - 1 if SCAN_BACKWARD else start
         if USE_FP64_ACC:
-            rhs = tl.load(b_ptr + row).to(tl.float64)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float64)
             tmp_sum = tl.zeros((), dtype=tl.float64)
         else:
-            rhs = tl.load(b_ptr + row).to(tl.float32)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float32)
             tmp_sum = tl.zeros((), dtype=tl.float32)
         row_done = 0
         while row_done == 0:
             if UNIT_DIAG:
-                if ptr >= end:
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
                     x_row = rhs - tmp_sum
+                    x_row = tl.where(x_row == x_row, x_row, 0.0)
                     tl.store(x_ptr + row, x_row)
                     row_done = 1
                 else:
@@ -3441,12 +3151,14 @@ def _spsv_csr_cw_kernel(
                     stop_at_diag = (col >= row) if LOWER else (col <= row)
                     if stop_at_diag:
                         x_row = rhs - tmp_sum
+                        x_row = tl.where(x_row == x_row, x_row, 0.0)
                         tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         if USE_FP64_ACC:
                             a = tl.load(data_ptr + ptr).to(tl.float64)
                             y_dep = tl.load(x_ptr + col).to(tl.float64)
@@ -3454,10 +3166,10 @@ def _spsv_csr_cw_kernel(
                             a = tl.load(data_ptr + ptr).to(tl.float32)
                             y_dep = tl.load(x_ptr + col).to(tl.float32)
                         tmp_sum += a * y_dep
-                        ptr += 1
+                        ptr += -1 if SCAN_BACKWARD else 1
             else:
-                if ptr >= end:
-                    x_row = rhs / (rhs * 0.0)
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
+                    x_row = rhs * 0
                     tl.store(x_ptr + row, x_row)
                     row_done = 1
                 else:
@@ -3467,13 +3179,16 @@ def _spsv_csr_cw_kernel(
                             diag = tl.load(data_ptr + ptr).to(tl.float64)
                         else:
                             diag = tl.load(data_ptr + ptr).to(tl.float32)
-                        x_row = (rhs - tmp_sum) / diag
+                        diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+                        x_row = (rhs - tmp_sum) / diag_safe
+                        x_row = tl.where(x_row == x_row, x_row, 0.0)
                         tl.store(x_ptr + row, x_row)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         if USE_FP64_ACC:
                             a = tl.load(data_ptr + ptr).to(tl.float64)
                             y_dep = tl.load(x_ptr + col).to(tl.float64)
@@ -3481,9 +3196,12 @@ def _spsv_csr_cw_kernel(
                             a = tl.load(data_ptr + ptr).to(tl.float32)
                             y_dep = tl.load(x_ptr + col).to(tl.float32)
                         tmp_sum += a * y_dep
-                        ptr += 1
-        _publish_ready_flag_i32(ready_ptr, row)
-        logical_row = tl.atomic_add(row_counter_ptr, 1)
+                        ptr += -1 if SCAN_BACKWARD else 1
+        if SERIAL_EXECUTION:
+            logical_row += 1
+        else:
+            _publish_ready_flag_i32(ready_ptr, row)
+            logical_row = tl.atomic_add(row_counter_ptr, 1)
 
 
 @triton.jit
@@ -3495,21 +3213,33 @@ def _spsv_csr_cw_kernel_complex(
     x_ri_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-
+    DIAG_EPS: tl.constexpr,
+    SERIAL_EXECUTION: tl.constexpr,
+    SCAN_BACKWARD: tl.constexpr,
 ):
-    logical_row = tl.atomic_add(row_counter_ptr, 1)
+    """Complex counterpart; see _spsv_csr_cw_kernel for alpha and for why
+    over-subscribing workers cannot deadlock."""
+    logical_row = (
+        0
+        if SERIAL_EXECUTION
+        else tl.atomic_add(row_counter_ptr, 1)
+    )
     lane2 = tl.arange(0, 2)
     while logical_row < n_rows:
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
-        rhs_re = tl.load(b_ri_ptr + row * 2)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        b_re = tl.load(b_ri_ptr + row * 2)
+        b_im = tl.load(b_ri_ptr + row * 2 + 1)
+        rhs_re = alpha_re * b_re - alpha_im * b_im
+        rhs_im = alpha_re * b_im + alpha_im * b_re
         if USE_FP64_ACC:
             rhs_re = rhs_re.to(tl.float64)
             rhs_im = rhs_im.to(tl.float64)
@@ -3520,13 +3250,15 @@ def _spsv_csr_cw_kernel_complex(
             rhs_im = rhs_im.to(tl.float32)
             tmp_re = tl.zeros((), dtype=tl.float32)
             tmp_im = tl.zeros((), dtype=tl.float32)
-        ptr = start
+        ptr = end - 1 if SCAN_BACKWARD else start
         row_done = 0
         while row_done == 0:
             if UNIT_DIAG:
-                if ptr >= end:
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
                     x_re_out = rhs_re - tmp_re
                     x_im_out = rhs_im - tmp_im
+                    x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+                    x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
                     out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
                     tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                     row_done = 1
@@ -3536,13 +3268,16 @@ def _spsv_csr_cw_kernel_complex(
                     if stop_at_diag:
                         x_re_out = rhs_re - tmp_re
                         x_im_out = rhs_im - tmp_im
+                        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+                        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
                         out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
                         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         x_re = tl.load(x_ri_ptr + col * 2)
                         x_im = tl.load(x_ri_ptr + col * 2 + 1)
                         a_re = tl.load(data_ri_ptr + ptr * 2)
@@ -3559,12 +3294,10 @@ def _spsv_csr_cw_kernel_complex(
                             a_im = a_im.to(tl.float32)
                         tmp_re += a_re * x_re - a_im * x_im
                         tmp_im += a_re * x_im + a_im * x_re
-                        ptr += 1
+                        ptr += -1 if SCAN_BACKWARD else 1
             else:
-                if ptr >= end:
-                    zero = rhs_re * 0.0 + rhs_im * 0.0
-                    missing_diag = (rhs_re + rhs_im) / zero
-                    out_vals = missing_diag + lane2 * 0.0
+                if (ptr < start) if SCAN_BACKWARD else (ptr >= end):
+                    out_vals = tl.where(lane2 == 0, rhs_re * 0, rhs_im * 0)
                     tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                     row_done = 1
                 else:
@@ -3581,15 +3314,19 @@ def _spsv_csr_cw_kernel_complex(
                         num_re = rhs_re - tmp_re
                         num_im = rhs_im - tmp_im
                         den = diag_re * diag_re + diag_im * diag_im
-                        x_re_out = (num_re * diag_re + num_im * diag_im) / den
-                        x_im_out = (num_im * diag_re - num_re * diag_im) / den
+                        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+                        x_re_out = (num_re * diag_re + num_im * diag_im) / den_safe
+                        x_im_out = (num_im * diag_re - num_re * diag_im) / den_safe
+                        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+                        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
                         out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
                         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
                         row_done = 1
                     else:
-                        dep_ready = tl.atomic_add(ready_ptr + col, 0)
-                        while dep_ready != 1:
+                        if not SERIAL_EXECUTION:
                             dep_ready = tl.atomic_add(ready_ptr + col, 0)
+                            while dep_ready != 1:
+                                dep_ready = tl.atomic_add(ready_ptr + col, 0)
                         x_re = tl.load(x_ri_ptr + col * 2)
                         x_im = tl.load(x_ri_ptr + col * 2 + 1)
                         a_re = tl.load(data_ri_ptr + ptr * 2)
@@ -3606,9 +3343,12 @@ def _spsv_csr_cw_kernel_complex(
                             a_im = a_im.to(tl.float32)
                         tmp_re += a_re * x_re - a_im * x_im
                         tmp_im += a_re * x_im + a_im * x_re
-                        ptr += 1
-        _publish_ready_flag_i32(ready_ptr, row)
-        logical_row = tl.atomic_add(row_counter_ptr, 1)
+                        ptr += -1 if SCAN_BACKWARD else 1
+        if SERIAL_EXECUTION:
+            logical_row += 1
+        else:
+            _publish_ready_flag_i32(ready_ptr, row)
+            logical_row = tl.atomic_add(row_counter_ptr, 1)
 
 
 @triton.jit
@@ -3727,12 +3467,10 @@ def _spsv_sell_trans_queue_kernel(
             row_in_slice = row - slice_id * SLICE_SIZE
             slice_start = tl.load(slice_offsets_ptr + slice_id)
             row_width = tl.load(row_widths_ptr + row)
-
-            rhs_atomic = tl.atomic_add(residual_ptr + row, 0.0)
             if USE_FP64_ACC:
-                rhs = rhs_atomic.to(tl.float64)
+                rhs = tl.load(residual_ptr + row).to(tl.float64)
             else:
-                rhs = rhs_atomic.to(tl.float32)
+                rhs = tl.load(residual_ptr + row).to(tl.float32)
             if UNIT_DIAG:
                 diag = rhs * 0.0 + 1.0
             else:
@@ -3820,9 +3558,8 @@ def _spsv_sell_trans_queue_complex_kernel(
             row_in_slice = row - slice_id * SLICE_SIZE
             slice_start = tl.load(slice_offsets_ptr + slice_id)
             row_width = tl.load(row_widths_ptr + row)
-
-            rhs_re = tl.atomic_add(residual_ri_ptr + row * 2, 0.0)
-            rhs_im = tl.atomic_add(residual_ri_ptr + row * 2 + 1, 0.0)
+            rhs_re = tl.load(residual_ri_ptr + row * 2)
+            rhs_im = tl.load(residual_ri_ptr + row * 2 + 1)
             if USE_FP64_ACC:
                 rhs_re = rhs_re.to(tl.float64)
                 rhs_im = rhs_im.to(tl.float64)
@@ -3919,12 +3656,23 @@ def _spsv_sell_cw_kernel_alg1(
     x_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha,
     n_rows,
     SLICE_SIZE: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
 ):
-    """ALG1: original persistent scalar-row dependency solver."""
+    """ALG1: original persistent scalar-row dependency solver.
+
+    ``alpha`` exists so the C API can express cuSPARSE's SpSV, whose right-hand
+    side is scaled; the solve is linear, so scaling the rhs at load is all of it.
+    This module's callers pass 1, for which the generated code is unchanged.
+
+    LOWER TRIANGLES ONLY: the dependency test is a bare ``col < row`` with no
+    fill-mode constexpr, so an upper triangle would be solved as if its stored
+    entries were below the diagonal. The C API refuses UPPER here rather than
+    returning that.
+    """
 
     logical_row = tl.atomic_add(row_counter_ptr, 1)
     while logical_row < n_rows:
@@ -3935,11 +3683,11 @@ def _spsv_sell_cw_kernel_alg1(
         slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
         width = (slice_end - slice_start) // SLICE_SIZE
         if USE_FP64_ACC:
-            rhs = tl.load(b_ptr + row).to(tl.float64)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float64)
             tmp_sum = tl.zeros((), dtype=tl.float64)
             diag = tl.zeros((), dtype=tl.float64)
         else:
-            rhs = tl.load(b_ptr + row).to(tl.float32)
+            rhs = (alpha * tl.load(b_ptr + row)).to(tl.float32)
             tmp_sum = tl.zeros((), dtype=tl.float32)
             diag = tl.zeros((), dtype=tl.float32)
         if UNIT_DIAG:
@@ -3985,6 +3733,8 @@ def _spsv_sell_cw_kernel_alg1_complex(
     x_ri_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     SLICE_SIZE: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
@@ -4000,8 +3750,10 @@ def _spsv_sell_cw_kernel_alg1_complex(
         slice_start = tl.load(slice_offsets_ptr + slice_id)
         slice_end = tl.load(slice_offsets_ptr + slice_id + 1)
         width = (slice_end - slice_start) // SLICE_SIZE
-        rhs_re = tl.load(b_ri_ptr + row * 2)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1)
+        b_re = tl.load(b_ri_ptr + row * 2)
+        b_im = tl.load(b_ri_ptr + row * 2 + 1)
+        rhs_re = alpha_re * b_re - alpha_im * b_im
+        rhs_im = alpha_re * b_im + alpha_im * b_re
         if USE_FP64_ACC:
             rhs_re = rhs_re.to(tl.float64)
             rhs_im = rhs_im.to(tl.float64)
@@ -4078,6 +3830,7 @@ def _spsv_sell_slice_kernel_alg2(
     x_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha,
     n_rows,
     n_slices,
     SLICE_SIZE: tl.constexpr,
@@ -4105,7 +3858,7 @@ def _spsv_sell_slice_kernel_alg2(
         width = (slice_end - slice_start) // SLICE_SIZE
         row = slice_id * SLICE_SIZE + lanes
         valid_row = (lanes < SLICE_SIZE) & (row < n_rows)
-        rhs = tl.load(b_ptr + row, mask=valid_row, other=0.0)
+        rhs = alpha * tl.load(b_ptr + row, mask=valid_row, other=0.0)
         if USE_FP64_ACC:
             rhs = rhs.to(tl.float64)
             tmp_sum = tl.zeros((BLOCK_ROWS,), dtype=tl.float64)
@@ -4205,6 +3958,8 @@ def _spsv_sell_slice_kernel_alg2_complex(
     x_ri_ptr,
     ready_ptr,
     row_counter_ptr,
+    alpha_re,
+    alpha_im,
     n_rows,
     n_slices,
     SLICE_SIZE: tl.constexpr,
@@ -4224,8 +3979,10 @@ def _spsv_sell_slice_kernel_alg2_complex(
         width = (slice_end - slice_start) // SLICE_SIZE
         row = slice_id * SLICE_SIZE + lanes
         valid_row = (lanes < SLICE_SIZE) & (row < n_rows)
-        rhs_re = tl.load(b_ri_ptr + row * 2, mask=valid_row, other=0.0)
-        rhs_im = tl.load(b_ri_ptr + row * 2 + 1, mask=valid_row, other=0.0)
+        b_re = tl.load(b_ri_ptr + row * 2, mask=valid_row, other=0.0)
+        b_im = tl.load(b_ri_ptr + row * 2 + 1, mask=valid_row, other=0.0)
+        rhs_re = alpha_re * b_re - alpha_im * b_im
+        rhs_im = alpha_re * b_im + alpha_im * b_re
         if USE_FP64_ACC:
             rhs_re = rhs_re.to(tl.float64)
             rhs_im = rhs_im.to(tl.float64)
@@ -4352,17 +4109,19 @@ def _spsv_csr_transpose_cw_kernel(
     indices_ptr,
     indptr_ptr,
     indegree_ptr,
-    diag_offsets_ptr,
     residual_ptr,
     x_ptr,
     row_counter_ptr,
+    diag_ptr,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
-
+    DIAG_EPS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
+    CUDA_TUNED: tl.constexpr,
 ):
     logical_row = (
         0
@@ -4373,44 +4132,70 @@ def _spsv_csr_transpose_cw_kernel(
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         if not SERIAL_EXECUTION:
             ready_value = 0 if UNIT_DIAG else 1
-            dep_ready = tl.atomic_add(
-                indegree_ptr + row, 0, sem="acquire", scope="gpu"
-            )
+            dep_ready = tl.atomic_add(indegree_ptr + row, 0)
             while dep_ready != ready_value:
-                dep_ready = tl.atomic_add(
-                    indegree_ptr + row, 0, sem="acquire", scope="gpu"
-                )
+                dep_ready = tl.atomic_add(indegree_ptr + row, 0)
 
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
         rhs = tl.load(residual_ptr + row)
         if UNIT_DIAG:
             diag = rhs * 0 + 1.0
+        elif CUDA_TUNED:
+            diag = tl.load(diag_ptr + row)
         else:
-            diag_offset = tl.load(diag_offsets_ptr + row)
-            diag = tl.load(
-                data_ptr + diag_offset, mask=diag_offset >= 0, other=0.0
-            )
-        x_row = rhs / diag
+            diag = rhs * 0
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+                dep_row = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                is_diag = dep_row == row
+                diag = diag + tl.sum(tl.where(mask & is_diag, a, 0.0), axis=0)
+        diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+        x_row = rhs / diag_safe
+        x_row = tl.where(x_row == x_row, x_row, 0.0)
         tl.store(x_ptr + row, x_row)
 
-        row_segments = (end - start + BLOCK_NNZ - 1) // BLOCK_NNZ
-        for seg in tl.range(0, row_segments):
-            idx = start + seg * BLOCK_NNZ
-            offsets = idx + tl.arange(0, BLOCK_NNZ)
-            mask = offsets < end
-            a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
-            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
-            if LOWER:
-                target_mask = mask & (col > row)
-            else:
-                target_mask = mask & (col < row)
-            if SERIAL_EXECUTION:
-                _propagate_real(residual_ptr, col, -a * x_row, target_mask)
-            else:
-                _propagate_then_release_real(
-                    residual_ptr, indegree_ptr, col, -a * x_row, target_mask
-                )
+        # Trip count from this row rather than MAX_SEGMENTS, which is
+        # ceil(max_row_nnz / BLOCK_NNZ) for the whole matrix and reaches 1207 on
+        # Stanford: every row used to run that many masked passes however short it is.
+        if CUDA_TUNED:
+            n_seg = tl.cdiv(end - start, BLOCK_NNZ)
+            for seg in tl.range(0, n_seg):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                if SERIAL_EXECUTION:
+                    _propagate_real(residual_ptr, col, -a * x_row, target_mask)
+                else:
+                    _propagate_then_release_real(
+                        residual_ptr, indegree_ptr, col, -a * x_row, target_mask
+                    )
+        else:
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                a = tl.load(data_ptr + offsets, mask=mask, other=0.0)
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                if SERIAL_EXECUTION:
+                    _propagate_real(residual_ptr, col, -a * x_row, target_mask)
+                else:
+                    _propagate_then_release_real(
+                        residual_ptr, indegree_ptr, col, -a * x_row, target_mask
+                    )
         if SERIAL_EXECUTION:
             logical_row += 1
         else:
@@ -4423,19 +4208,21 @@ def _spsv_csr_transpose_cw_kernel_complex(
     indices_ptr,
     indptr_ptr,
     indegree_ptr,
-    diag_offsets_ptr,
     residual_ri_ptr,
     x_ri_ptr,
     row_counter_ptr,
+    diag_ri_ptr,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     UNIT_DIAG: tl.constexpr,
     CONJ_TRANS: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-
+    DIAG_EPS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
+    CUDA_TUNED: tl.constexpr,
 ):
     logical_row = (
         0
@@ -4447,13 +4234,9 @@ def _spsv_csr_transpose_cw_kernel_complex(
         row = tl.where(REVERSE_ORDER, n_rows - 1 - logical_row, logical_row)
         if not SERIAL_EXECUTION:
             ready_value = 0 if UNIT_DIAG else 1
-            dep_ready = tl.atomic_add(
-                indegree_ptr + row, 0, sem="acquire", scope="gpu"
-            )
+            dep_ready = tl.atomic_add(indegree_ptr + row, 0)
             while dep_ready != ready_value:
-                dep_ready = tl.atomic_add(
-                    indegree_ptr + row, 0, sem="acquire", scope="gpu"
-                )
+                dep_ready = tl.atomic_add(indegree_ptr + row, 0)
         start = tl.load(indptr_ptr + row)
         end = tl.load(indptr_ptr + row + 1)
 
@@ -4469,15 +4252,11 @@ def _spsv_csr_transpose_cw_kernel_complex(
         if UNIT_DIAG:
             diag_re = rhs_re * 0 + 1.0
             diag_im = rhs_im * 0
-        else:
-            diag_offset = tl.load(diag_offsets_ptr + row)
-            has_diag = diag_offset >= 0
-            diag_re = tl.load(
-                data_ri_ptr + diag_offset * 2, mask=has_diag, other=0.0
-            )
-            diag_im = tl.load(
-                data_ri_ptr + diag_offset * 2 + 1, mask=has_diag, other=0.0
-            )
+        elif CUDA_TUNED:
+            # diag_ri_ptr holds the unconjugated diagonal, so one cached array serves
+            # both T and C; the conjugate is a single scalar negate here.
+            diag_re = tl.load(diag_ri_ptr + row * 2)
+            diag_im = tl.load(diag_ri_ptr + row * 2 + 1)
             if CONJ_TRANS:
                 diag_im = -diag_im
             if USE_FP64_ACC:
@@ -4486,329 +4265,126 @@ def _spsv_csr_transpose_cw_kernel_complex(
             else:
                 diag_re = diag_re.to(tl.float32)
                 diag_im = diag_im.to(tl.float32)
+        else:
+            if USE_FP64_ACC:
+                diag_re = tl.zeros((), dtype=tl.float64)
+                diag_im = tl.zeros((), dtype=tl.float64)
+            else:
+                diag_re = tl.zeros((), dtype=tl.float32)
+                diag_im = tl.zeros((), dtype=tl.float32)
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                dep_row = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+                a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+                if CONJ_TRANS:
+                    a_im = -a_im
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                is_diag = dep_row == row
+                diag_re = diag_re + tl.sum(tl.where(mask & is_diag, a_re, 0.0), axis=0)
+                diag_im = diag_im + tl.sum(tl.where(mask & is_diag, a_im, 0.0), axis=0)
 
         den = diag_re * diag_re + diag_im * diag_im
-        x_re_out = (rhs_re * diag_re + rhs_im * diag_im) / den
-        x_im_out = (rhs_im * diag_re - rhs_re * diag_im) / den
+        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+        x_re_out = (rhs_re * diag_re + rhs_im * diag_im) / den_safe
+        x_im_out = (rhs_im * diag_re - rhs_re * diag_im) / den_safe
+        x_re_out = tl.where(x_re_out == x_re_out, x_re_out, 0.0)
+        x_im_out = tl.where(x_im_out == x_im_out, x_im_out, 0.0)
 
         out_vals = tl.where(lane2 == 0, x_re_out, x_im_out)
         tl.store(x_ri_ptr + row * 2 + lane2, out_vals)
 
-        row_segments = (end - start + BLOCK_NNZ - 1) // BLOCK_NNZ
-        for seg in tl.range(0, row_segments):
-            idx = start + seg * BLOCK_NNZ
-            offsets = idx + tl.arange(0, BLOCK_NNZ)
-            mask = offsets < end
-            col = tl.load(indices_ptr + offsets, mask=mask, other=0)
-            a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
-            a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
-            if CONJ_TRANS:
-                a_im = -a_im
-            if USE_FP64_ACC:
-                a_re = a_re.to(tl.float64)
-                a_im = a_im.to(tl.float64)
-            else:
-                a_re = a_re.to(tl.float32)
-                a_im = a_im.to(tl.float32)
-            if LOWER:
-                target_mask = mask & (col > row)
-            else:
-                target_mask = mask & (col < row)
-            prod_re = a_re * x_re_out - a_im * x_im_out
-            prod_im = a_re * x_im_out + a_im * x_re_out
-            if SERIAL_EXECUTION:
-                _propagate_complex(
-                    residual_ri_ptr,
-                    col,
-                    -prod_re,
-                    -prod_im,
-                    target_mask,
-                )
-            else:
-                _propagate_then_release_complex(
-                    residual_ri_ptr,
-                    indegree_ptr,
-                    col,
-                    -prod_re,
-                    -prod_im,
-                    target_mask,
-                )
+        # Per-row trip count instead of the matrix-wide MAX_SEGMENTS bound.
+        if CUDA_TUNED:
+            n_seg = tl.cdiv(end - start, BLOCK_NNZ)
+            for seg in tl.range(0, n_seg):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+                a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+                if CONJ_TRANS:
+                    a_im = -a_im
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                prod_re = a_re * x_re_out - a_im * x_im_out
+                prod_im = a_re * x_im_out + a_im * x_re_out
+                if SERIAL_EXECUTION:
+                    _propagate_complex(
+                        residual_ri_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
+                else:
+                    _propagate_then_release_complex(
+                        residual_ri_ptr,
+                        indegree_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
+        else:
+            for seg in range(MAX_SEGMENTS):
+                idx = start + seg * BLOCK_NNZ
+                offsets = idx + tl.arange(0, BLOCK_NNZ)
+                mask = offsets < end
+                col = tl.load(indices_ptr + offsets, mask=mask, other=0)
+                a_re = tl.load(data_ri_ptr + offsets * 2, mask=mask, other=0.0)
+                a_im = tl.load(data_ri_ptr + offsets * 2 + 1, mask=mask, other=0.0)
+                if CONJ_TRANS:
+                    a_im = -a_im
+                if USE_FP64_ACC:
+                    a_re = a_re.to(tl.float64)
+                    a_im = a_im.to(tl.float64)
+                else:
+                    a_re = a_re.to(tl.float32)
+                    a_im = a_im.to(tl.float32)
+                if LOWER:
+                    target_mask = mask & (col > row)
+                else:
+                    target_mask = mask & (col < row)
+                prod_re = a_re * x_re_out - a_im * x_im_out
+                prod_im = a_re * x_im_out + a_im * x_re_out
+                if SERIAL_EXECUTION:
+                    _propagate_complex(
+                        residual_ri_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
+                else:
+                    _propagate_then_release_complex(
+                        residual_ri_ptr,
+                        indegree_ptr,
+                        col,
+                        -prod_re,
+                        -prod_im,
+                        target_mask,
+                    )
         if SERIAL_EXECUTION:
             logical_row += 1
         else:
             logical_row = tl.atomic_add(row_counter_ptr, 1)
-
-
-@triton.jit
-def _spsv_csr_transpose_alg2_kernel(
-    data_ptr,
-    item_sources_ptr,
-    item_targets_ptr,
-    item_offsets_ptr,
-    indegree_ptr,
-    residual_ptr,
-    ready_ptr,
-    x_ptr,
-    work_counter_ptr,
-    n_items,
-    UNIT_DIAG: tl.constexpr,
-    USE_FP64_ACC: tl.constexpr,
-    BLOCK_NNZ: tl.constexpr,
-):
-    lanes = tl.arange(0, BLOCK_NNZ)
-    item_base = tl.atomic_add(
-        work_counter_ptr, BLOCK_NNZ, sem="relaxed", scope="gpu"
-    )
-    item_id = item_base + lanes
-    active = item_id < n_items
-    while tl.sum(active.to(tl.int32), axis=0) > 0:
-        source = tl.load(item_sources_ptr + item_id, mask=active, other=0)
-        target = tl.load(item_targets_ptr + item_id, mask=active, other=-1)
-        value_offset = tl.load(item_offsets_ptr + item_id, mask=active, other=0)
-        solve_item = active & (target < 0)
-        propagation_item = active & (target >= 0)
-        done = ~active
-        while tl.sum((~done).to(tl.int32), axis=0) > 0:
-            pending_solve = (~done) & solve_item
-            degree = tl.atomic_add(
-                indegree_ptr + source,
-                0,
-                mask=pending_solve,
-                sem="acquire",
-                scope="gpu",
-            )
-            solve = pending_solve & (degree == 0)
-            rhs = tl.atomic_add(
-                residual_ptr + source,
-                0.0,
-                mask=solve,
-                sem="acquire",
-                scope="gpu",
-            )
-            if USE_FP64_ACC:
-                rhs = rhs.to(tl.float64)
-            else:
-                rhs = rhs.to(tl.float32)
-            if UNIT_DIAG:
-                diag = rhs * 0.0 + 1.0
-            else:
-                diag = tl.load(data_ptr + value_offset, mask=solve, other=1.0)
-                if USE_FP64_ACC:
-                    diag = diag.to(tl.float64)
-                else:
-                    diag = diag.to(tl.float32)
-            out = rhs / diag
-            tl.atomic_add(
-                x_ptr + source,
-                out,
-                mask=solve,
-                sem="release",
-                scope="gpu",
-            )
-            tl.atomic_add(
-                ready_ptr + source,
-                1,
-                mask=solve,
-                sem="release",
-                scope="gpu",
-            )
-
-            pending_prop = (~done) & propagation_item
-            source_ready = tl.atomic_add(
-                ready_ptr + source,
-                0,
-                mask=pending_prop,
-                sem="acquire",
-                scope="gpu",
-            )
-            propagate = pending_prop & (source_ready == 1)
-            source_x = tl.atomic_add(
-                x_ptr + source,
-                0.0,
-                mask=propagate,
-                sem="acquire",
-                scope="gpu",
-            )
-            value = tl.load(data_ptr + value_offset, mask=propagate, other=0.0)
-            if USE_FP64_ACC:
-                source_x = source_x.to(tl.float64)
-                value = value.to(tl.float64)
-            else:
-                source_x = source_x.to(tl.float32)
-                value = value.to(tl.float32)
-            _propagate_then_release_real(
-                residual_ptr,
-                indegree_ptr,
-                target,
-                -value * source_x,
-                propagate,
-            )
-            done = done | solve | propagate
-        item_base = tl.atomic_add(
-            work_counter_ptr, BLOCK_NNZ, sem="relaxed", scope="gpu"
-        )
-        item_id = item_base + lanes
-        active = item_id < n_items
-
-
-@triton.jit
-def _spsv_csr_transpose_alg2_kernel_complex(
-    data_ri_ptr,
-    item_sources_ptr,
-    item_targets_ptr,
-    item_offsets_ptr,
-    indegree_ptr,
-    residual_ri_ptr,
-    ready_ptr,
-    x_ri_ptr,
-    work_counter_ptr,
-    n_items,
-    UNIT_DIAG: tl.constexpr,
-    CONJ_TRANS: tl.constexpr,
-    USE_FP64_ACC: tl.constexpr,
-    BLOCK_NNZ: tl.constexpr,
-):
-    lanes = tl.arange(0, BLOCK_NNZ)
-    item_base = tl.atomic_add(
-        work_counter_ptr, BLOCK_NNZ, sem="relaxed", scope="gpu"
-    )
-    item_id = item_base + lanes
-    active = item_id < n_items
-    while tl.sum(active.to(tl.int32), axis=0) > 0:
-        source = tl.load(item_sources_ptr + item_id, mask=active, other=0)
-        target = tl.load(item_targets_ptr + item_id, mask=active, other=-1)
-        value_offset = tl.load(item_offsets_ptr + item_id, mask=active, other=0)
-        solve_item = active & (target < 0)
-        propagation_item = active & (target >= 0)
-        done = ~active
-        while tl.sum((~done).to(tl.int32), axis=0) > 0:
-            pending_solve = (~done) & solve_item
-            degree = tl.atomic_add(
-                indegree_ptr + source,
-                0,
-                mask=pending_solve,
-                sem="acquire",
-                scope="gpu",
-            )
-            solve = pending_solve & (degree == 0)
-            rhs_re = tl.atomic_add(
-                residual_ri_ptr + source * 2,
-                0.0,
-                mask=solve,
-                sem="acquire",
-                scope="gpu",
-            )
-            rhs_im = tl.atomic_add(
-                residual_ri_ptr + source * 2 + 1,
-                0.0,
-                mask=solve,
-                sem="acquire",
-                scope="gpu",
-            )
-            if UNIT_DIAG:
-                diag_re = rhs_re * 0.0 + 1.0
-                diag_im = rhs_im * 0.0
-            else:
-                diag_re = tl.load(
-                    data_ri_ptr + value_offset * 2, mask=solve, other=1.0
-                )
-                diag_im = tl.load(
-                    data_ri_ptr + value_offset * 2 + 1, mask=solve, other=0.0
-                )
-                if CONJ_TRANS:
-                    diag_im = -diag_im
-            if USE_FP64_ACC:
-                rhs_re = rhs_re.to(tl.float64)
-                rhs_im = rhs_im.to(tl.float64)
-                diag_re = diag_re.to(tl.float64)
-                diag_im = diag_im.to(tl.float64)
-            else:
-                rhs_re = rhs_re.to(tl.float32)
-                rhs_im = rhs_im.to(tl.float32)
-                diag_re = diag_re.to(tl.float32)
-                diag_im = diag_im.to(tl.float32)
-            den = diag_re * diag_re + diag_im * diag_im
-            out_re = (rhs_re * diag_re + rhs_im * diag_im) / den
-            out_im = (rhs_im * diag_re - rhs_re * diag_im) / den
-            tl.atomic_add(
-                x_ri_ptr + source * 2,
-                out_re,
-                mask=solve,
-                sem="release",
-                scope="gpu",
-            )
-            tl.atomic_add(
-                x_ri_ptr + source * 2 + 1,
-                out_im,
-                mask=solve,
-                sem="release",
-                scope="gpu",
-            )
-            tl.atomic_add(
-                ready_ptr + source,
-                1,
-                mask=solve,
-                sem="release",
-                scope="gpu",
-            )
-
-            pending_prop = (~done) & propagation_item
-            source_ready = tl.atomic_add(
-                ready_ptr + source,
-                0,
-                mask=pending_prop,
-                sem="acquire",
-                scope="gpu",
-            )
-            propagate = pending_prop & (source_ready == 1)
-            source_x_re = tl.atomic_add(
-                x_ri_ptr + source * 2,
-                0.0,
-                mask=propagate,
-                sem="acquire",
-                scope="gpu",
-            )
-            source_x_im = tl.atomic_add(
-                x_ri_ptr + source * 2 + 1,
-                0.0,
-                mask=propagate,
-                sem="acquire",
-                scope="gpu",
-            )
-            value_re = tl.load(
-                data_ri_ptr + value_offset * 2, mask=propagate, other=0.0
-            )
-            value_im = tl.load(
-                data_ri_ptr + value_offset * 2 + 1, mask=propagate, other=0.0
-            )
-            if CONJ_TRANS:
-                value_im = -value_im
-            if USE_FP64_ACC:
-                source_x_re = source_x_re.to(tl.float64)
-                source_x_im = source_x_im.to(tl.float64)
-                value_re = value_re.to(tl.float64)
-                value_im = value_im.to(tl.float64)
-            else:
-                source_x_re = source_x_re.to(tl.float32)
-                source_x_im = source_x_im.to(tl.float32)
-                value_re = value_re.to(tl.float32)
-                value_im = value_im.to(tl.float32)
-            product_re = value_re * source_x_re - value_im * source_x_im
-            product_im = value_re * source_x_im + value_im * source_x_re
-            _propagate_then_release_complex(
-                residual_ri_ptr,
-                indegree_ptr,
-                target,
-                -product_re,
-                -product_im,
-                propagate,
-            )
-            done = done | solve | propagate
-        item_base = tl.atomic_add(
-            work_counter_ptr, BLOCK_NNZ, sem="relaxed", scope="gpu"
-        )
-        item_id = item_base + lanes
-        active = item_id < n_items
 
 
 @triton.jit
@@ -4823,6 +4399,7 @@ def _spsv_csr_roc_kernel(
     n_rows,
     LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
     WARP_SIZE: tl.constexpr,
     LEVEL_SCHEDULED: tl.constexpr,
 ):
@@ -4893,8 +4470,9 @@ def _spsv_csr_roc_kernel(
     else:
         diag = diag.to(tl.float32)
     diag_val = tl.sum(diag, axis=0)
-
-    out = tl.sum(local_sum, axis=0) / diag_val
+    diag_safe = tl.where(tl.abs(diag_val) < DIAG_EPS, 1.0, diag_val)
+    out = tl.sum(local_sum, axis=0) / diag_safe
+    out = tl.where(out == out, out, 0.0)
     if LEVEL_SCHEDULED:
         tl.store(x_ptr + row, out)
     elif USE_FP64_ACC:
@@ -4917,6 +4495,7 @@ def _spsv_csr_roc_kernel_complex(
     n_rows,
     LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
     WARP_SIZE: tl.constexpr,
     LEVEL_SCHEDULED: tl.constexpr,
 ):
@@ -5007,9 +4586,11 @@ def _spsv_csr_roc_kernel_complex(
     sum_re = tl.sum(local_sum_re, axis=0)
     sum_im = tl.sum(local_sum_im, axis=0)
     den = diag_re * diag_re + diag_im * diag_im
-
-    out_re = (sum_re * diag_re + sum_im * diag_im) / den
-    out_im = (sum_im * diag_re - sum_re * diag_im) / den
+    den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+    out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+    out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
+    out_re = tl.where(out_re == out_re, out_re, 0.0)
+    out_im = tl.where(out_im == out_im, out_im, 0.0)
     if LEVEL_SCHEDULED:
         tl.store(x_ri_ptr + row * 2, out_re)
         tl.store(x_ri_ptr + row * 2 + 1, out_im)
@@ -5031,6 +4612,7 @@ def _spsv_csr_smblk_kernel(
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
     WARP_SIZE: tl.constexpr,
 ):
     logical_row = tl.program_id(0)
@@ -5087,7 +4669,9 @@ def _spsv_csr_smblk_kernel(
     else:
         diag = diag.to(tl.float32)
     diag_val = tl.sum(diag, axis=0)
-    out = tl.sum(local_sum, axis=0) / diag_val
+    diag_safe = tl.where(tl.abs(diag_val) < DIAG_EPS, 1.0, diag_val)
+    out = tl.sum(local_sum, axis=0) / diag_safe
+    out = tl.where(out == out, out, 0.0)
     tl.store(x_ptr + row, out)
     _publish_ready_flag_i32(ready_ptr, row)
 
@@ -5104,6 +4688,7 @@ def _spsv_csr_smblk_kernel_complex(
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
     WARP_SIZE: tl.constexpr,
 ):
     logical_row = tl.program_id(0)
@@ -5180,8 +4765,11 @@ def _spsv_csr_smblk_kernel_complex(
     sum_re = tl.sum(local_sum_re, axis=0)
     sum_im = tl.sum(local_sum_im, axis=0)
     den = diag_re * diag_re + diag_im * diag_im
-    out_re = (sum_re * diag_re + sum_im * diag_im) / den
-    out_im = (sum_im * diag_re - sum_re * diag_im) / den
+    den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+    out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+    out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
+    out_re = tl.where(out_re == out_re, out_re, 0.0)
+    out_im = tl.where(out_im == out_im, out_im, 0.0)
     tl.store(x_ri_ptr + row * 2, out_re)
     tl.store(x_ri_ptr + row * 2 + 1, out_im)
     _publish_ready_flag_i32(ready_ptr, row)
@@ -5199,6 +4787,7 @@ def _spsv_csr_cw_levelschd_kernel(
     n_rows,
     LEVEL_SCHEDULED: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
 ):
     logical_row = tl.program_id(0)
     if logical_row >= n_rows:
@@ -5231,8 +4820,9 @@ def _spsv_csr_cw_levelschd_kernel(
                     diag = tl.load(data_ptr + ptr).to(tl.float64)
                 else:
                     diag = tl.load(data_ptr + ptr).to(tl.float32)
-
-                x_row = (rhs - tmp_sum) / diag
+                diag_safe = tl.where(tl.abs(diag) < DIAG_EPS, 1.0, diag)
+                x_row = (rhs - tmp_sum) / diag_safe
+                x_row = tl.where(x_row == x_row, x_row, 0.0)
                 if LEVEL_SCHEDULED:
                     tl.store(x_ptr + row, x_row)
                 elif USE_FP64_ACC:
@@ -5275,6 +4865,7 @@ def _spsv_csr_cw_levelschd_kernel_complex(
     n_rows,
     LEVEL_SCHEDULED: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
 ):
     logical_row = tl.program_id(0)
     if logical_row >= n_rows:
@@ -5320,9 +4911,11 @@ def _spsv_csr_cw_levelschd_kernel_complex(
                 sum_re = rhs_re - tmp_sum_re
                 sum_im = rhs_im - tmp_sum_im
                 den = diag_re * diag_re + diag_im * diag_im
-
-                out_re = (sum_re * diag_re + sum_im * diag_im) / den
-                out_im = (sum_im * diag_re - sum_re * diag_im) / den
+                den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+                out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+                out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
+                out_re = tl.where(out_re == out_re, out_re, 0.0)
+                out_im = tl.where(out_im == out_im, out_im, 0.0)
                 if LEVEL_SCHEDULED:
                     tl.store(x_ri_ptr + row * 2, out_re)
                     tl.store(x_ri_ptr + row * 2 + 1, out_im)
@@ -5374,7 +4967,7 @@ def _spsv_csr_nnz_balance_kernel(
     nnz,
     LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-
+    DIAG_EPS: tl.constexpr,
     PERSISTENT: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
@@ -5409,10 +5002,8 @@ def _spsv_csr_nnz_balance_kernel(
                 scope="gpu",
             )
             contribute = offdiag & (dep_ready == 1)
-
-            # Keep the data read itself acquire-qualified.  On current DCU
-            # Triton lowering, relying only on the ready flag's acquire can
-            # expose stale x values under heavy cross-workgroup contention.
+            # Use the same device-scope publication chain on CUDA and ROCm.
+            # Consumers read x through an acquire atomic after observing ready.
             dep_x = tl.atomic_add(
                 x_ptr + col,
                 0.0,
@@ -5471,8 +5062,9 @@ def _spsv_csr_nnz_balance_kernel(
                     sem="acquire",
                     scope="gpu",
                 ).to(tl.float32)
-
-            out = (rhs - sum_val) / a
+            diag_safe = tl.where(tl.abs(a) < DIAG_EPS, 1.0, a)
+            out = (rhs - sum_val) / diag_safe
+            out = tl.where(out == out, out, 0.0)
             # x is zeroed before every solve and each row has one diagonal
             # producer, so atomic_add publishes the single-writer result.
             tl.atomic_add(
@@ -5511,7 +5103,7 @@ def _spsv_csr_nnz_balance_kernel_complex(
     nnz,
     LOWER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
-
+    DIAG_EPS: tl.constexpr,
     PERSISTENT: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
@@ -5632,9 +5224,11 @@ def _spsv_csr_nnz_balance_kernel_complex(
             num_re = rhs_re - sum_re
             num_im = rhs_im - sum_im
             den = val_re * val_re + val_im * val_im
-
-            out_re = (num_re * val_re + num_im * val_im) / den
-            out_im = (num_im * val_re - num_re * val_im) / den
+            den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+            out_re = (num_re * val_re + num_im * val_im) / den_safe
+            out_im = (num_im * val_re - num_re * val_im) / den_safe
+            out_re = tl.where(out_re == out_re, out_re, 0.0)
+            out_im = tl.where(out_im == out_im, out_im, 0.0)
             tl.atomic_add(
                 x_ri_ptr + row * 2,
                 out_re,
@@ -5722,6 +5316,7 @@ def _triton_spsv_csr_cw_vector(
     *,
     lower=True,
     unit_diagonal=False,
+    diag_eps=1e-12,
     worker_count=None,
     matrix_stats=None,
     ready_in=None,
@@ -5741,11 +5336,12 @@ def _triton_spsv_csr_cw_vector(
     if worker_count is None:
         matrix_stats = matrix_stats or {}
         worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
-    if _is_rocm_runtime():
-        # A Triton program is a schedulable workgroup, not one HIP thread.
-        # Multiple programs can therefore occupy every DCU slot while holding
-        # rows that wait on an earlier program. ALG1 is the compatibility CW
-        # route, so execute its dynamic row stream with one resident program.
+    is_rocm = _is_rocm_runtime()
+    persistent_parallel = is_rocm and SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL
+    serial_execution = is_rocm and not persistent_parallel
+    if persistent_parallel:
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, True)
+    elif serial_execution:
         worker_count = 1
     use_fp64_acc = data.dtype == torch.float64
     grid = (worker_count,)
@@ -5757,12 +5353,17 @@ def _triton_spsv_csr_cw_vector(
         x,
         ready,
         row_counter,
+        # y solves op(A) y = x here; alpha exists for the C API's
+        # cuSPARSE-compatible signature and folds away at 1.
+        1,
         n_rows,
         LOWER=lower,
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64_acc,
-
+        DIAG_EPS=diag_eps,
+        SERIAL_EXECUTION=serial_execution,
+        SCAN_BACKWARD=False,
     )
     return x
 
@@ -5776,6 +5377,7 @@ def _triton_spsv_csr_cw_vector_complex(
     *,
     lower=True,
     unit_diagonal=False,
+    diag_eps=1e-12,
     worker_count=None,
     matrix_stats=None,
     data_ri_in=None,
@@ -5803,7 +5405,12 @@ def _triton_spsv_csr_cw_vector_complex(
     if worker_count is None:
         matrix_stats = matrix_stats or {}
         worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
-    if _is_rocm_runtime():
+    is_rocm = _is_rocm_runtime()
+    persistent_parallel = is_rocm and SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL
+    serial_execution = is_rocm and not persistent_parallel
+    if persistent_parallel:
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, True)
+    elif serial_execution:
         worker_count = 1
     grid = (worker_count,)
     _spsv_csr_cw_kernel_complex[grid](
@@ -5814,12 +5421,18 @@ def _triton_spsv_csr_cw_vector_complex(
         x_ri,
         ready,
         row_counter,
+        # y solves op(A) y = x here; alpha exists for the C API's
+        # cuSPARSE-compatible signature and folds away at 1.
+        1,
+        0,
         n_rows,
         LOWER=lower,
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         USE_FP64_ACC=use_fp64,
-
+        DIAG_EPS=diag_eps,
+        SERIAL_EXECUTION=serial_execution,
+        SCAN_BACKWARD=False,
     )
     return x
 
@@ -5857,7 +5470,16 @@ def _launch_spsv_sell(
         )
         b_ri = torch.view_as_real(_as_strided_contiguous(b_vec)).reshape(-1)
         out_ri = torch.view_as_real(out).reshape(-1)
-    if alg_num == SPSV_SELL_ALG1:
+    # MUSA's persistent slice-cooperative ALG2 can lose forward progress while
+    # polling ready flags.  The same input succeeds through the scalar-row ALG1
+    # path, so keep the requested ALG2 descriptor/API but use the safe launch
+    # locally on MUSA.  CUDA and the other backends retain ALG2 unchanged.
+    effective_alg_num = (
+        SPSV_SELL_ALG1
+        if _is_mthreads_runtime() and alg_num == SPSV_SELL_ALG2
+        else alg_num
+    )
+    if effective_alg_num == SPSV_SELL_ALG1:
         worker_count = _snap_cw_worker_count(min(n_rows, 32), n_rows)
         if is_complex:
             _spsv_sell_cw_kernel_alg1_complex[(int(worker_count),)](
@@ -5868,6 +5490,10 @@ def _launch_spsv_sell(
                 out_ri,
                 ready,
                 row_counter,
+                # y solves op(A) y = x here; alpha exists for the C API's
+                # cuSPARSE-compatible signature and folds away at 1.
+                1,
+                0,
                 n_rows,
                 SLICE_SIZE=int(slice_size),
                 UNIT_DIAG=bool(unit_diagonal),
@@ -5882,6 +5508,9 @@ def _launch_spsv_sell(
                 out,
                 ready,
                 row_counter,
+                # y solves op(A) y = x here; alpha exists for the C API's
+                # cuSPARSE-compatible signature and folds away at 1.
+                1,
                 n_rows,
                 SLICE_SIZE=int(slice_size),
                 UNIT_DIAG=bool(unit_diagonal),
@@ -5906,6 +5535,10 @@ def _launch_spsv_sell(
             out_ri,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
+            0,
             n_rows,
             n_slices,
             SLICE_SIZE=int(slice_size),
@@ -5923,6 +5556,9 @@ def _launch_spsv_sell(
             out,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
             n_rows,
             n_slices,
             SLICE_SIZE=int(slice_size),
@@ -6018,27 +5654,24 @@ def _build_spsv_sell_trans_csc_metadata(
     )
     entry_offsets = torch.arange(n_entries, device=device, dtype=torch.int64)
     local_offsets = entry_offsets - slice_starts
-    source_rows = (
-        slice_ids * int(slice_size) + local_offsets.remainder(int(slice_size))
+    source_rows = slice_ids * int(slice_size) + local_offsets.remainder(
+        int(slice_size)
     )
     source_cols = col_indices.to(torch.int64)
     triangular = (
-        (source_rows < n_rows)
-        & (source_cols >= 0)
-        & (source_cols <= source_rows)
+        (source_rows < n_rows) & (source_cols >= 0) & (source_cols <= source_rows)
     )
     entry_offsets = entry_offsets[triangular]
     source_rows = source_rows[triangular]
     source_cols = source_cols[triangular]
 
-    # Row c of A^T/A^H contains entries (c, r) from A(r, c).  Descending r
-    # places upper-triangular dependencies before the diagonal, matching the
-    # existing CSR CW kernel's upper-row contract.
+    # Row c of A^T/A^H contains entries (c, r) from A(r, c). Descending r
+    # matches the existing CSR CW upper-row dependency order.
     key = source_cols * n_rows + (n_rows - 1 - source_rows)
     order = torch.argsort(key, stable=True)
     source_cols = source_cols[order]
     trans_indices = source_rows[order].to(index_dtype).contiguous()
-    trans_data = values.index_select(0, entry_offsets[order]).to(compute_dtype)
+    trans_data = _gather_values(values, entry_offsets[order]).to(compute_dtype)
     if conjugate and torch.is_complex(trans_data):
         trans_data = trans_data.conj().resolve_conj()
     trans_data = trans_data.contiguous()
@@ -6163,70 +5796,6 @@ def _launch_spsv_sell_trans_queue(
             BLOCK_SLOTS=int(block_slots),
             UNIT_DIAG=bool(unit_diagonal),
             USE_FP64_ACC=bool(use_fp64_acc),
-
-            num_warps=1,
-        )
-    return out
-
-
-def _launch_spsv_sell_trans_csc(
-    data,
-    indices,
-    indptr,
-    b_vec,
-    n_rows,
-    *,
-    worker_count,
-    out,
-    ready,
-    row_counter,
-    unit_diagonal=False,
-    data_ri_in=None,
-):
-    """Solve the analyzed upper CSC view with one gather owner per row."""
-
-    ready.zero_()
-    row_counter.zero_()
-    if int(n_rows) == 0:
-        return out
-    if _is_rocm_runtime():
-        worker_count = _spsv_cu_capped_worker_count(
-            n_rows, b_vec.device, True
-        )
-    if torch.is_complex(data):
-        if data_ri_in is None:
-            raise RuntimeError("SELL CSC analysis is missing interleaved values")
-        b_ri = torch.view_as_real(b_vec.contiguous()).reshape(-1).contiguous()
-        out_ri = torch.view_as_real(out.contiguous()).reshape(-1).contiguous()
-        _spsv_csr_cw_kernel_complex[(int(worker_count),)](
-            data_ri_in,
-            indices,
-            indptr,
-            b_ri,
-            out_ri,
-            ready,
-            row_counter,
-            int(n_rows),
-            LOWER=False,
-            REVERSE_ORDER=True,
-            UNIT_DIAG=bool(unit_diagonal),
-            USE_FP64_ACC=data.dtype == torch.complex128,
-            num_warps=1,
-        )
-    else:
-        _spsv_csr_cw_kernel[(int(worker_count),)](
-            data,
-            indices,
-            indptr,
-            b_vec,
-            out,
-            ready,
-            row_counter,
-            int(n_rows),
-            LOWER=False,
-            REVERSE_ORDER=True,
-            UNIT_DIAG=bool(unit_diagonal),
-            USE_FP64_ACC=data.dtype == torch.float64,
             num_warps=1,
         )
     return out
@@ -6254,6 +5823,10 @@ def _launch_spsv_sell_trans_csc(
         return out
     if _is_rocm_runtime():
         worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, True)
+    diag_eps = _spsv_diag_eps_for_dtype(data.dtype)
+    serial_execution = _is_rocm_runtime() and not SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL
+    if serial_execution:
+        worker_count = 1
     if torch.is_complex(data):
         if data_ri_in is None:
             raise RuntimeError("SELL CSC analysis is missing interleaved values")
@@ -6267,11 +5840,18 @@ def _launch_spsv_sell_trans_csc(
             out_ri,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
+            0,
             int(n_rows),
             LOWER=False,
             REVERSE_ORDER=True,
             UNIT_DIAG=bool(unit_diagonal),
             USE_FP64_ACC=data.dtype == torch.complex128,
+            DIAG_EPS=diag_eps,
+            SERIAL_EXECUTION=serial_execution,
+            SCAN_BACKWARD=False,
             num_warps=1,
         )
     else:
@@ -6283,11 +5863,17 @@ def _launch_spsv_sell_trans_csc(
             out,
             ready,
             row_counter,
+            # y solves op(A) y = x here; alpha exists for the C API's
+            # cuSPARSE-compatible signature and folds away at 1.
+            1,
             int(n_rows),
             LOWER=False,
             REVERSE_ORDER=True,
             UNIT_DIAG=bool(unit_diagonal),
             USE_FP64_ACC=data.dtype == torch.float64,
+            DIAG_EPS=diag_eps,
+            SERIAL_EXECUTION=serial_execution,
+            SCAN_BACKWARD=False,
             num_warps=1,
         )
     return out
@@ -6334,6 +5920,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
     n_rows,
     *,
     lower=True,
+    diag_eps=1e-12,
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
@@ -6355,7 +5942,7 @@ def _triton_spsv_csr_n_lo_roc_vector(
         n_rows,
         LOWER=lower,
         USE_FP64_ACC=use_fp64_acc,
-
+        DIAG_EPS=diag_eps,
         WARP_SIZE=_spsv_route_warp_size("alg3"),
         LEVEL_SCHEDULED=False,
         num_warps=1,
@@ -6372,6 +5959,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     n_rows,
     *,
     lower=True,
+    diag_eps=1e-12,
     data_ri_in=None,
     ready_in=None,
 ):
@@ -6398,7 +5986,7 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
         n_rows,
         LOWER=lower,
         USE_FP64_ACC=use_fp64,
-
+        DIAG_EPS=diag_eps,
         WARP_SIZE=_spsv_route_warp_size("alg3"),
         LEVEL_SCHEDULED=False,
         num_warps=1,
@@ -6406,10 +5994,6 @@ def _triton_spsv_csr_n_lo_roc_vector_complex(
     return x
 
 
-
-# Optional CUDA SMBLK (ALG4) persistent-worker variant used only for explicit
-# A/B testing through FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent.  DCU rejects
-# csr_smblk at route normalization and cannot reach this kernel.
 # MetaX/MACA tuning profiles. DCU/ROCm has explicit SPSV_ROCM_* knobs above;
 # other backends keep their own conservative launch choices.
 _MACA_SPSV_PROFILES = {
@@ -6455,6 +6039,7 @@ def _spsv_csr_smblk_persistent_kernel(
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
     WARP_SIZE: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
@@ -6519,7 +6104,9 @@ def _spsv_csr_smblk_persistent_kernel(
         else:
             diag = diag.to(tl.float32)
         diag_val = tl.sum(diag, axis=0)
-        out = tl.sum(local_sum, axis=0) / diag_val
+        diag_safe = tl.where(tl.abs(diag_val) < DIAG_EPS, 1.0, diag_val)
+        out = tl.sum(local_sum, axis=0) / diag_safe
+        out = tl.where(out == out, out, 0.0)
         tl.store(x_ptr + row, out)
         if not SERIAL_EXECUTION:
             tl.atomic_add(ready_ptr + row, 1, sem="release", scope="gpu")
@@ -6537,6 +6124,7 @@ def _spsv_csr_smblk_persistent_kernel_complex(
     LOWER: tl.constexpr,
     REVERSE_ORDER: tl.constexpr,
     USE_FP64_ACC: tl.constexpr,
+    DIAG_EPS: tl.constexpr,
     WARP_SIZE: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
     SERIAL_EXECUTION: tl.constexpr,
@@ -6617,8 +6205,11 @@ def _spsv_csr_smblk_persistent_kernel_complex(
         sum_re = tl.sum(local_sum_re, axis=0)
         sum_im = tl.sum(local_sum_im, axis=0)
         den = diag_re * diag_re + diag_im * diag_im
-        out_re = (sum_re * diag_re + sum_im * diag_im) / den
-        out_im = (sum_im * diag_re - sum_re * diag_im) / den
+        den_safe = tl.where(den < (DIAG_EPS * DIAG_EPS), 1.0, den)
+        out_re = (sum_re * diag_re + sum_im * diag_im) / den_safe
+        out_im = (sum_im * diag_re - sum_re * diag_im) / den_safe
+        out_re = tl.where(out_re == out_re, out_re, 0.0)
+        out_im = tl.where(out_im == out_im, out_im, 0.0)
         tl.store(x_ri_ptr + row * 2, out_re)
         tl.store(x_ri_ptr + row * 2 + 1, out_im)
         if not SERIAL_EXECUTION:
@@ -6626,7 +6217,6 @@ def _spsv_csr_smblk_persistent_kernel_complex(
 
 
 def _spsv_smblk_use_persistent():
-
     """Whether ALG4 uses its optional persistent-worker kernel.
 
     Override with FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog|persistent for A/B.
@@ -6639,7 +6229,6 @@ def _spsv_smblk_use_persistent():
             "FLAGSPARSE_SPSV_SMBLK_KERNEL must be 'rowprog' or 'persistent', "
             f"got {override!r}"
         )
-
     if _is_maca_runtime():
         return _maca_spsv_knob("smblk_persistent")
     return False
@@ -6653,6 +6242,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
     n_rows,
     *,
     lower=True,
+    diag_eps=1e-12,
     ready_in=None,
 ):
     x = torch.zeros_like(b_vec)
@@ -6664,8 +6254,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
         return x
     use_fp64_acc = data.dtype == torch.float64
     if _spsv_smblk_use_persistent():
-
-        worker_count = _spsv_cu_capped_worker_count(n_rows, b_vec.device, False)
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, False)
         _spsv_csr_smblk_persistent_kernel[(worker_count,)](
             data,
             indices,
@@ -6677,7 +6266,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
             LOWER=lower,
             REVERSE_ORDER=not lower,
             USE_FP64_ACC=use_fp64_acc,
-
+            DIAG_EPS=diag_eps,
             WARP_SIZE=_spsv_route_warp_size("alg4"),
             NUM_WORKERS=worker_count,
             SERIAL_EXECUTION=False,
@@ -6695,7 +6284,7 @@ def _triton_spsv_csr_n_lo_smblk_vector(
         LOWER=lower,
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64_acc,
-
+        DIAG_EPS=diag_eps,
         WARP_SIZE=_spsv_route_warp_size("alg4"),
         num_warps=1,
     )
@@ -6710,6 +6299,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     n_rows,
     *,
     lower=True,
+    diag_eps=1e-12,
     data_ri_in=None,
     ready_in=None,
 ):
@@ -6726,8 +6316,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
     if _spsv_smblk_use_persistent():
-
-        worker_count = _spsv_cu_capped_worker_count(n_rows, b_vec.device, False)
+        worker_count = _spsv_alg4_worker_count(n_rows, b_vec.device, False)
         _spsv_csr_smblk_persistent_kernel_complex[(worker_count,)](
             data_ri,
             indices,
@@ -6739,7 +6328,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
             LOWER=lower,
             REVERSE_ORDER=not lower,
             USE_FP64_ACC=use_fp64,
-
+            DIAG_EPS=diag_eps,
             WARP_SIZE=_spsv_route_warp_size("alg4"),
             NUM_WORKERS=worker_count,
             SERIAL_EXECUTION=False,
@@ -6757,7 +6346,7 @@ def _triton_spsv_csr_n_lo_smblk_vector_complex(
         LOWER=lower,
         REVERSE_ORDER=not lower,
         USE_FP64_ACC=use_fp64,
-
+        DIAG_EPS=diag_eps,
         WARP_SIZE=_spsv_route_warp_size("alg4"),
         num_warps=1,
     )
@@ -6772,16 +6361,14 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
     b_vec,
     n_rows,
     *,
-
+    diag_eps=1e-12,
     ready_in=None,
     level_ptr=None,
     level_ptr_host=None,
 ):
     is_rocm = _is_rocm_runtime()
     x = torch.zeros_like(b_vec)
-    ready = ready_in if ready_in is not None else torch.zeros(
-        n_rows, dtype=torch.int32, device=b_vec.device
-    )
+    ready = ready_in if ready_in is not None else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     ready.zero_()
     if n_rows == 0:
         return x
@@ -6809,7 +6396,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
                 count,
                 LEVEL_SCHEDULED=True,
                 USE_FP64_ACC=use_fp64_acc,
-
+                DIAG_EPS=diag_eps,
                 num_warps=1,
             )
     else:
@@ -6824,7 +6411,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector(
             n_rows,
             LEVEL_SCHEDULED=False,
             USE_FP64_ACC=use_fp64_acc,
-
+            DIAG_EPS=diag_eps,
             num_warps=1,
         )
     return x
@@ -6838,7 +6425,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
     b_vec,
     n_rows,
     *,
-
+    diag_eps=1e-12,
     data_ri_in=None,
     ready_in=None,
     level_ptr=None,
@@ -6882,7 +6469,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
                 count,
                 LEVEL_SCHEDULED=True,
                 USE_FP64_ACC=use_fp64,
-
+                DIAG_EPS=diag_eps,
                 num_warps=1,
             )
     else:
@@ -6897,7 +6484,7 @@ def _triton_spsv_csr_n_lo_cw_levelschd_vector_complex(
             n_rows,
             LEVEL_SCHEDULED=False,
             USE_FP64_ACC=use_fp64,
-
+            DIAG_EPS=diag_eps,
             num_warps=1,
         )
     return x
@@ -6931,10 +6518,7 @@ def _spsv_nnz_balance_launch_config(nnz, device):
 
     is_rocm = _is_rocm_runtime()
     if not is_rocm:
-        if _is_maca_runtime():
-            return False, 1, int(nnz), 1
-        # Match allinone CUDA: 256 threads per block, one NNZ per lane.
-        return False, 256, triton.cdiv(int(nnz), 256), 8
+        return False, 1, int(nnz), 1
 
     block_nnz = SPSV_ROCM_ALG3_BLOCK_NNZ
     cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
@@ -6954,7 +6538,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     n_rows,
     *,
     lower=True,
-
+    diag_eps=1e-12,
     tmp_sum_in,
     ready_in,
     indegree_in,
@@ -6971,8 +6555,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
     )
     use_fp64_acc = acc_dtype == torch.float64
     nnz = int(data.numel())
-
-    # CUDA assigns 256 NNZs to each 8-warp program. DCU uses a bounded
+    # CUDA keeps the original one-NNZ-per-program launch. DCU uses a bounded
     # persistent grid; the measured default uses four workgroups per CU, while the
     # environment-controlled multiplier enables occupancy experiments without
     # changing the kernel or the CUDA route.
@@ -6993,8 +6576,8 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector(
         nnz,
         LOWER=lower,
         USE_FP64_ACC=use_fp64_acc,
-
-        PERSISTENT=is_rocm and SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL,
+        DIAG_EPS=diag_eps,
+        PERSISTENT=is_rocm,
         NUM_WORKERS=worker_count,
         BLOCK_NNZ=block_nnz,
         num_warps=num_warps,
@@ -7012,7 +6595,7 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
     n_rows,
     *,
     lower=True,
-
+    diag_eps=1e-12,
     data_ri_in,
     tmp_sum_in,
     ready_in,
@@ -7052,8 +6635,8 @@ def _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
         nnz,
         LOWER=lower,
         USE_FP64_ACC=use_fp64,
-
-        PERSISTENT=is_rocm and SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL,
+        DIAG_EPS=diag_eps,
+        PERSISTENT=is_rocm,
         NUM_WORKERS=worker_count,
         BLOCK_NNZ=block_nnz,
         num_warps=num_warps,
@@ -7071,14 +6654,15 @@ def _triton_spsv_csr_transpose_cw_vector(
     unit_diagonal=False,
     block_nnz=None,
     max_segments=None,
+    diag_eps=1e-12,
     block_nnz_use=None,
     max_segments_use=None,
     worker_count=None,
     matrix_stats=None,
     residual_in=None,
     indegree_in=None,
-    diag_offsets_in=None,
     row_counter_in=None,
+    diag_in=None,
     preprocessed=False,
 ):
     x = torch.zeros_like(b_vec)
@@ -7089,11 +6673,6 @@ def _triton_spsv_csr_transpose_cw_vector(
         indegree_in
         if indegree_in is not None
         else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
-    )
-    diag_offsets = (
-        diag_offsets_in
-        if diag_offsets_in is not None
-        else torch.empty(n_rows, dtype=torch.int64, device=b_vec.device)
     )
     row_counter = (
         row_counter_in
@@ -7111,39 +6690,44 @@ def _triton_spsv_csr_transpose_cw_vector(
             indices,
             indptr,
             indegree,
-            diag_offsets,
             n_rows,
             lower=lower,
             unit_diagonal=unit_diagonal,
             block_nnz_use=block_nnz_use,
+            max_segments_use=max_segments_use,
         )
     if worker_count is None:
-        worker_count = _spsv_transpose_cw_worker_count(
-            n_rows, b_vec.device, matrix_stats
-        )
-    serial_execution = bool(
-        _is_rocm_runtime() and SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK
-    )
+        matrix_stats = matrix_stats or {}
+        worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
+    serial_execution = _is_rocm_runtime()
     if serial_execution:
         worker_count = 1
     grid = (worker_count,)
+    cuda_tuned = _backend_name() == "cuda"
+    if diag_in is not None:
+        diag = diag_in
+    elif unit_diagonal or not cuda_tuned:
+        diag = data
+    else:
+        diag = _compute_csr_diagonal(data, indices, indptr, n_rows)
     _spsv_csr_transpose_cw_kernel[grid](
         data,
         indices,
         indptr,
         indegree,
-        diag_offsets,
         residual,
         x,
         row_counter,
+        diag,
         n_rows,
         BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
-
+        DIAG_EPS=diag_eps,
         SERIAL_EXECUTION=serial_execution,
-        num_warps=_spsv_transpose_cw_num_warps(block_nnz_use),
+        CUDA_TUNED=cuda_tuned,
     )
     return x
 
@@ -7159,6 +6743,7 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
     conjugate=False,
     block_nnz=None,
     max_segments=None,
+    diag_eps=1e-12,
     block_nnz_use=None,
     max_segments_use=None,
     worker_count=None,
@@ -7166,8 +6751,8 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
     data_ri_in=None,
     residual_in=None,
     indegree_in=None,
-    diag_offsets_in=None,
     row_counter_in=None,
+    diag_in=None,
     preprocessed=False,
 ):
     x = torch.zeros_like(b_vec)
@@ -7186,11 +6771,6 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
         if indegree_in is not None
         else torch.zeros(n_rows, dtype=torch.int32, device=b_vec.device)
     )
-    diag_offsets = (
-        diag_offsets_in
-        if diag_offsets_in is not None
-        else torch.empty(n_rows, dtype=torch.int64, device=b_vec.device)
-    )
     row_counter = (
         row_counter_in
         if row_counter_in is not None
@@ -7203,171 +6783,61 @@ def _triton_spsv_csr_transpose_cw_vector_complex(
             indices,
             indptr,
             indegree,
-            diag_offsets,
             n_rows,
             lower=lower,
             unit_diagonal=unit_diagonal,
             block_nnz_use=block_nnz_use,
+            max_segments_use=max_segments_use,
         )
     data_ri = data_ri_in if data_ri_in is not None else _complex_interleaved_view(data)
     residual_ri = torch.view_as_real(residual_work).reshape(-1).contiguous()
     component_dtype = _component_dtype_for_complex(data.dtype)
     use_fp64 = component_dtype == torch.float64
     if component_dtype == torch.float16:
-        x_ri_work = torch.zeros(
-            (n_rows, 2), dtype=torch.float32, device=b_vec.device
-        )
+        x_ri_work = torch.zeros((n_rows, 2), dtype=torch.float32, device=b_vec.device)
         x_ri = x_ri_work.reshape(-1).contiguous()
     else:
         x_ri = torch.view_as_real(x.contiguous()).reshape(-1).contiguous()
 
     if worker_count is None:
-        worker_count = _spsv_transpose_cw_worker_count(
-            n_rows, b_vec.device, matrix_stats
-        )
-    serial_execution = bool(
-        _is_rocm_runtime() and SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK
-    )
+        matrix_stats = matrix_stats or {}
+        worker_count = _resolve_cw_worker_count(n_rows, matrix_stats, 1)
+    serial_execution = _is_rocm_runtime()
     if serial_execution:
         worker_count = 1
     grid = (worker_count,)
+    cuda_tuned = _backend_name() == "cuda"
+    if diag_in is not None:
+        diag_ri = diag_in
+    elif unit_diagonal or not cuda_tuned:
+        diag_ri = data_ri
+    else:
+        diag_ri = _complex_interleaved_view(
+            _compute_csr_diagonal(data, indices, indptr, n_rows)
+        )
     _spsv_csr_transpose_cw_kernel_complex[grid](
         data_ri,
         indices,
         indptr,
         indegree,
-        diag_offsets,
         residual_ri,
         x_ri,
         row_counter,
+        diag_ri,
         n_rows,
         BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
         REVERSE_ORDER=not lower,
         UNIT_DIAG=unit_diagonal,
         CONJ_TRANS=conjugate,
         USE_FP64_ACC=use_fp64,
-
+        DIAG_EPS=diag_eps,
         SERIAL_EXECUTION=serial_execution,
-        num_warps=_spsv_transpose_cw_num_warps(block_nnz_use),
+        CUDA_TUNED=cuda_tuned,
     )
     if component_dtype == torch.float16:
         return torch.view_as_complex(x_ri_work.contiguous())
-    return x
-
-
-def _spsv_transpose_alg2_launch_config(n_items, device):
-    """Choose CUDA's bounded persistent grid for the scatter ALG2 kernel."""
-
-    n_items = int(n_items)
-    block_nnz = 256
-    full_grid = triton.cdiv(n_items, block_nnz)
-    cu_count = int(_ACCEL.get_device_properties(device).multi_processor_count)
-    worker_cap = cu_count * SPSV_CUDA_TRANS_ALG2_WORKGROUPS_PER_CU
-    return block_nnz, min(full_grid, max(1, worker_cap)), 8
-
-
-def _triton_spsv_csr_transpose_alg2_vector(
-    data,
-    item_sources,
-    item_targets,
-    item_offsets,
-    indegree_init,
-    b_vec,
-    n_rows,
-    *,
-    unit_diagonal=False,
-    residual_in,
-    ready_in,
-    indegree_in,
-    work_counter_in,
-):
-    x = torch.zeros_like(b_vec)
-    if n_rows == 0:
-        return x
-    residual = residual_in
-    ready = ready_in
-    indegree = indegree_in
-    work_counter = work_counter_in
-    residual.copy_(b_vec)
-    ready.zero_()
-    indegree.copy_(indegree_init)
-    work_counter.zero_()
-    n_items = int(item_sources.numel())
-    block_nnz, worker_count, num_warps = (
-        _spsv_transpose_alg2_launch_config(n_items, b_vec.device)
-    )
-    _spsv_csr_transpose_alg2_kernel[(worker_count,)](
-        data,
-        item_sources,
-        item_targets,
-        item_offsets,
-        indegree,
-        residual,
-        ready,
-        x,
-        work_counter,
-        n_items,
-        UNIT_DIAG=bool(unit_diagonal),
-        USE_FP64_ACC=data.dtype == torch.float64,
-        BLOCK_NNZ=block_nnz,
-        num_warps=num_warps,
-    )
-    return x
-
-
-def _triton_spsv_csr_transpose_alg2_vector_complex(
-    data,
-    item_sources,
-    item_targets,
-    item_offsets,
-    indegree_init,
-    b_vec,
-    n_rows,
-    *,
-    unit_diagonal=False,
-    conjugate=False,
-    data_ri_in,
-    residual_in,
-    ready_in,
-    indegree_in,
-    work_counter_in,
-):
-    x = torch.zeros_like(b_vec)
-    if n_rows == 0:
-        return x
-    residual = residual_in
-    ready = ready_in
-    indegree = indegree_in
-    work_counter = work_counter_in
-    residual.copy_(b_vec.contiguous())
-    ready.zero_()
-    indegree.copy_(indegree_init)
-    work_counter.zero_()
-    data_ri = data_ri_in if data_ri_in is not None else _complex_interleaved_view(data)
-    residual_ri = _complex_interleaved_view(residual)
-    x_ri = _complex_interleaved_view(x)
-    n_items = int(item_sources.numel())
-    block_nnz, worker_count, num_warps = (
-        _spsv_transpose_alg2_launch_config(n_items, b_vec.device)
-    )
-    _spsv_csr_transpose_alg2_kernel_complex[(worker_count,)](
-        data_ri,
-        item_sources,
-        item_targets,
-        item_offsets,
-        indegree,
-        residual_ri,
-        ready,
-        x_ri,
-        work_counter,
-        n_items,
-        UNIT_DIAG=bool(unit_diagonal),
-        CONJ_TRANS=bool(conjugate),
-        USE_FP64_ACC=_component_dtype_for_complex(data.dtype) == torch.float64,
-        BLOCK_NNZ=block_nnz,
-        num_warps=num_warps,
-    )
     return x
 
 
@@ -7378,12 +6848,7 @@ def _choose_transpose_family_launch_config(indptr, block_nnz=None, max_segments=
     if indptr.numel() <= 1:
         return 32, 1
     max_nnz_per_row = int((indptr[1:] - indptr[:-1]).max().item())
-    candidates = (
-        (64, 128, 256, 512, 1024, 2048)
-        if _is_rocm_runtime()
-        else (32, 64, 128, 256, 512, 1024)
-    )
-    for cand in candidates:
+    for cand in (32, 64, 128, 256, 512, 1024):
         req = max((max_nnz_per_row + cand - 1) // cand, 1)
         if req <= 2048:
             return cand, req
@@ -7392,16 +6857,37 @@ def _choose_transpose_family_launch_config(indptr, block_nnz=None, max_segments=
     return cand, req
 
 
+def _compute_csr_diagonal(data, indices, indptr, n_rows):
+    """Per-row diagonal entries of a CSR matrix.
+
+    The transpose_cw kernels used to rediscover the diagonal with a full masked scan of
+    the row before every division.  That scan sits on the critical path of the column-wave
+    dependency chain, so hoisting it into the analysis phase pays for itself on any matrix
+    solved more than once.  Duplicate on-diagonal entries are summed, matching what the
+    in-kernel scan did.
+    """
+    diag = torch.zeros(n_rows, dtype=data.dtype, device=data.device)
+    if n_rows == 0 or indices.numel() == 0:
+        return diag
+    counts = (indptr[1:] - indptr[:-1]).to(torch.int64)
+    rows = torch.repeat_interleave(
+        torch.arange(n_rows, device=indptr.device, dtype=torch.int64), counts
+    )
+    on_diag = rows == indices.to(torch.int64)
+    diag.index_add_(0, rows[on_diag], data[on_diag])
+    return diag
+
+
 def _run_spsv_csc_preprocess(
     indices,
     indptr,
     indegree,
-    diag_offsets,
     n_rows,
     *,
     lower,
     unit_diagonal,
     block_nnz_use,
+    max_segments_use,
 ):
     indegree.zero_()
     if n_rows == 0:
@@ -7411,9 +6897,9 @@ def _run_spsv_csc_preprocess(
         indices,
         indptr,
         indegree,
-        diag_offsets,
         n_rows,
         BLOCK_NNZ=block_nnz_use,
+        MAX_SEGMENTS=max_segments_use,
         LOWER=lower,
         UNIT_DIAG=unit_diagonal,
     )
@@ -7501,7 +6987,7 @@ def _coo_order_for_spsv(data, row64, col64):
         order = torch.argsort(key, stable=True)
     except TypeError:
         order = torch.argsort(key)
-    return data[order], row64[order], col64[order]
+    return _gather_values(data, order), row64[order], col64[order]
 
 
 def _coo2csr_for_spsv(data, row64, col64, n_rows, assume_ordered=False):
@@ -7750,8 +7236,8 @@ def _execute_spsv_csr_plan(
     kernel_data = solve_plan["kernel_data"]
     kernel_indices32 = solve_plan["kernel_indices32"]
     kernel_indptr64 = solve_plan["kernel_indptr64"]
-    default_block_nnz = solve_plan.get("default_block_nnz")
-    default_max_segments = solve_plan.get("default_max_segments")
+    default_block_nnz = solve_plan["default_block_nnz"]
+    default_max_segments = solve_plan["default_max_segments"]
     cw_worker_count = solve_plan.get("cw_worker_count")
     nontrans_variant = solve_plan.get("nontrans_variant", "csr_n_lo_cw")
     lower_eff = solve_plan["lower_eff"]
@@ -7762,21 +7248,6 @@ def _execute_spsv_csr_plan(
     nnz_balance_row_idx32 = solve_plan.get("nnz_balance_row_idx32")
     nnz_balance_indegree32 = solve_plan.get("nnz_balance_indegree32")
     nnz_balance_launch_order32 = solve_plan.get("nnz_balance_launch_order32")
-    trans_alg2_sources32 = solve_plan.get("transpose_alg2_item_sources32")
-    trans_alg2_targets32 = solve_plan.get("transpose_alg2_item_targets32")
-    trans_alg2_offsets64 = solve_plan.get("transpose_alg2_item_offsets64")
-    trans_alg2_indegree32 = solve_plan.get("transpose_alg2_indegree_init32")
-    trans_alg2_mode = solve_plan.get("transpose_alg2_mode")
-    trans_alg2_gather_data = solve_plan.get("transpose_alg2_gather_data")
-    trans_alg2_gather_indices32 = solve_plan.get("transpose_alg2_gather_indices32")
-    trans_alg2_gather_launch_order32 = solve_plan.get(
-        "transpose_alg2_gather_launch_order32"
-    )
-    trans_alg2_gather_row_idx32 = solve_plan.get("transpose_alg2_gather_row_idx32")
-    trans_alg2_gather_indegree32 = solve_plan.get(
-        "transpose_alg2_gather_indegree_init32"
-    )
-    trans_alg2_gather_lower = solve_plan.get("transpose_alg2_gather_lower")
     kernel_indices = kernel_indices32
     kernel_indptr = kernel_indptr64
     compute_dtype = _spsv_effective_compute_dtype(
@@ -7787,13 +7258,6 @@ def _execute_spsv_csr_plan(
     if compute_dtype != data.dtype:
         data_in = kernel_data.to(compute_dtype)
         b_in = b.to(compute_dtype)
-    trans_alg2_gather_data_in = trans_alg2_gather_data
-    if (
-        trans_alg2_mode == "gather"
-        and trans_alg2_gather_data is not None
-        and trans_alg2_gather_data.dtype != compute_dtype
-    ):
-        trans_alg2_gather_data_in = trans_alg2_gather_data.to(compute_dtype)
     alpha_in = _coerce_spsv_alpha(alpha, compute_dtype, b.device)
     if not _spsv_alpha_is_identity(alpha):
         b_in = b_in * alpha_in
@@ -7806,9 +7270,6 @@ def _execute_spsv_csr_plan(
             )
         vec_real = _triton_spsv_csr_transpose_cw_vector
         vec_complex = _triton_spsv_csr_transpose_cw_vector_complex
-    elif solve_kind == "transpose_alg2":
-        vec_real = _triton_spsv_csr_transpose_alg2_vector
-        vec_complex = _triton_spsv_csr_transpose_alg2_vector_complex
     elif solve_kind == "csr_cw":
         nontrans_real_wrappers = {
             "csr_u_lo_cw": _triton_spsv_csr_u_lo_cw_vector,
@@ -7838,47 +7299,33 @@ def _execute_spsv_csr_plan(
         vec_complex = _triton_spsv_csr_n_lo_nnz_balance_vector_complex
     else:
         raise RuntimeError(f"unexpected SpSV solve kind: {solve_kind}")
+    diag_eps = _spsv_diag_eps_for_dtype(compute_dtype)
 
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
     worker_count_use = cw_worker_count
     matrix_stats_use = dict(matrix_stats)
-    if solve_kind == "transpose_cw":
-        worker_count_use = _spsv_transpose_cw_worker_count(
-            n_rows, b.device, matrix_stats_use
-        )
-        if _is_rocm_runtime() and SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK:
-            worker_count_use = 1
-    elif solve_kind == "csr_cw":
+    if solve_kind in ("csr_cw", "transpose_cw"):
         worker_count_use = _resolve_cw_worker_count(
             n_rows,
             matrix_stats_use,
             1,
             cached_worker_count=cw_worker_count,
         )
-        if _is_rocm_runtime():
-            worker_count_use = 1
+    # The shared CW kernel has a serial constexpr path which removes ready-flag
+    # polling entirely. Both NON and TRANS use it on ROCm; CUDA retains its
+    # existing multi-worker schedule.
+    if solve_kind in ("csr_cw", "transpose_cw") and _is_rocm_runtime():
+        worker_count_use = 1
     if solve_kind == "csr_cw" and _is_maca_runtime() and _maca_spsv_knob("cw_serial"):
         worker_count_use = 1
     complex_kernel_data_ri = None
-    if torch.is_complex(data_in) and not (
-        solve_kind == "transpose_alg2" and trans_alg2_mode == "gather"
-    ):
+    if torch.is_complex(data_in):
         if compute_dtype == solve_plan["kernel_data"].dtype:
             complex_kernel_data_ri = solve_plan.get("kernel_data_ri")
         if complex_kernel_data_ri is None:
             complex_kernel_data_ri = _complex_interleaved_view(data_in)
-    trans_alg2_gather_data_ri = None
-    if trans_alg2_mode == "gather" and torch.is_complex(trans_alg2_gather_data_in):
-        if trans_alg2_gather_data_in is trans_alg2_gather_data:
-            trans_alg2_gather_data_ri = solve_plan.get(
-                "transpose_alg2_gather_data_ri"
-            )
-        if trans_alg2_gather_data_ri is None:
-            trans_alg2_gather_data_ri = _complex_interleaved_view(
-                trans_alg2_gather_data_in
-            )
     workspace_buffers = _resolve_spsv_workspace(
         workspace,
         _build_spsv_workspace_layout(n_rows, solve_kind, value_dtype=compute_dtype),
@@ -7888,65 +7335,18 @@ def _execute_spsv_csr_plan(
     tmp_sum_buf = workspace_buffers.get("tmp_sum")
     residual_buf = workspace_buffers.get("residual")
     indegree_buf = workspace_buffers.get("indegree")
-    diag_offsets_buf = workspace_buffers.get("diag_offsets")
     row_counter_buf = workspace_buffers.get("row_counter")
-    work_counter_buf = workspace_buffers.get("work_counter")
-    # Runtime wrappers initialize the mutable solve state on every invocation.
-    transpose_preprocessed = False
+    transpose_preprocessed = bool(
+        solve_kind == "transpose_cw"
+        and _is_rocm_runtime()
+        and worker_count_use == 1
+    )
+    transpose_diag = None
     if solve_kind == "csr_nnz_balance":
         if tmp_sum_buf is None or ready_buf is None or indegree_buf is None:
             raise RuntimeError("csr_nnz_balance workspace is missing required buffers")
-    if solve_kind == "transpose_alg2":
-        if trans_alg2_mode == "gather":
-            if any(value is None for value in (tmp_sum_buf, ready_buf, indegree_buf)):
-                raise RuntimeError(
-                    "DCU transpose_alg2 workspace is missing required buffers"
-                )
-            if any(
-                value is None
-                for value in (
-                    trans_alg2_gather_data_in,
-                    trans_alg2_gather_indices32,
-                    trans_alg2_gather_launch_order32,
-                    trans_alg2_gather_row_idx32,
-                    trans_alg2_gather_indegree32,
-                    trans_alg2_gather_lower,
-                )
-            ):
-                raise RuntimeError(
-                    "DCU transpose_alg2 plan is missing gather analysis metadata"
-                )
-        elif trans_alg2_mode == "scatter":
-            if any(
-                value is None
-                for value in (residual_buf, ready_buf, indegree_buf, work_counter_buf)
-            ):
-                raise RuntimeError(
-                    "CUDA transpose_alg2 workspace is missing required buffers"
-                )
-            if any(
-                value is None
-                for value in (
-                    trans_alg2_sources32,
-                    trans_alg2_targets32,
-                    trans_alg2_offsets64,
-                    trans_alg2_indegree32,
-                )
-            ):
-                raise RuntimeError(
-                    "CUDA transpose_alg2 plan is missing scatter analysis metadata"
-                )
-        else:
-            raise RuntimeError(
-                f"unexpected transpose_alg2 execution mode: {trans_alg2_mode!r}"
-            )
     if solve_kind == "transpose_cw" and not transpose_preprocessed:
-        if (
-            residual_buf is None
-            or indegree_buf is None
-            or diag_offsets_buf is None
-            or row_counter_buf is None
-        ):
+        if residual_buf is None or indegree_buf is None or row_counter_buf is None:
             raise RuntimeError("transpose_cw workspace is missing required buffers")
         transpose_sig = _transpose_cw_preprocess_signature(
             solve_plan,
@@ -7965,13 +7365,27 @@ def _execute_spsv_csr_plan(
                 kernel_indices,
                 kernel_indptr,
                 indegree_buf,
-                diag_offsets_buf,
                 n_rows,
                 lower=lower_eff,
                 unit_diagonal=unit_diagonal,
                 block_nnz_use=block_nnz_use,
+                max_segments_use=max_segments_use,
             )
         transpose_preprocessed = True
+        if not unit_diagonal and _backend_name() == "cuda":
+            # Cached on the plan the way kernel_data_ri is, so a reused descriptor pays
+            # the O(nnz) gather once instead of once per solve.
+            diag_cacheable = compute_dtype == solve_plan["kernel_data"].dtype
+            if diag_cacheable:
+                transpose_diag = solve_plan.get("kernel_diag")
+            if transpose_diag is None:
+                transpose_diag = _compute_csr_diagonal(
+                    data_in, kernel_indices, kernel_indptr, n_rows
+                )
+                if torch.is_complex(data_in):
+                    transpose_diag = _complex_interleaved_view(transpose_diag)
+                if diag_cacheable:
+                    solve_plan["kernel_diag"] = transpose_diag
         if isinstance(workspace, FlagSparseSpSVWorkspace):
             workspace.prepared_solve_kind = "transpose_cw"
             workspace.prepared_signature = transpose_sig
@@ -7984,40 +7398,7 @@ def _execute_spsv_csr_plan(
         if torch.is_complex(data_in):
             if vec_complex is None:
                 raise ValueError(f"solve_kind={solve_kind!r} currently supports real dtypes only")
-            if solve_kind == "transpose_alg2":
-                if trans_alg2_mode == "gather":
-                    x = _triton_spsv_csr_n_lo_nnz_balance_vector_complex(
-                        trans_alg2_gather_data_in,
-                        trans_alg2_gather_indices32,
-                        trans_alg2_gather_launch_order32,
-                        trans_alg2_gather_row_idx32,
-                        trans_alg2_gather_indegree32,
-                        b_in,
-                        n_rows,
-                        lower=trans_alg2_gather_lower,
-                        data_ri_in=trans_alg2_gather_data_ri,
-                        tmp_sum_in=tmp_sum_buf,
-                        ready_in=ready_buf,
-                        indegree_in=indegree_buf,
-                    )
-                else:
-                    x = vec_complex(
-                        data_in,
-                        trans_alg2_sources32,
-                        trans_alg2_targets32,
-                        trans_alg2_offsets64,
-                        trans_alg2_indegree32,
-                        b_in,
-                        n_rows,
-                        unit_diagonal=unit_diagonal,
-                        conjugate=(trans_mode == "C"),
-                        data_ri_in=complex_kernel_data_ri,
-                        residual_in=residual_buf,
-                        ready_in=ready_buf,
-                        indegree_in=indegree_buf,
-                        work_counter_in=work_counter_buf,
-                    )
-            elif solve_kind == "transpose_cw":
+            if solve_kind == "transpose_cw":
                 x = vec_complex(
                 data_in,
                 kernel_indices,
@@ -8029,6 +7410,7 @@ def _execute_spsv_csr_plan(
                 conjugate=(trans_mode == "C"),
                 block_nnz=block_nnz,
                 max_segments=max_segments,
+                diag_eps=diag_eps,
                 block_nnz_use=block_nnz_use,
                 max_segments_use=max_segments_use,
                 worker_count=worker_count_use,
@@ -8036,8 +7418,8 @@ def _execute_spsv_csr_plan(
                 data_ri_in=complex_kernel_data_ri,
                 residual_in=residual_buf,
                 indegree_in=indegree_buf,
-                diag_offsets_in=diag_offsets_buf,
                 row_counter_in=row_counter_buf,
+                diag_in=transpose_diag,
                 preprocessed=transpose_preprocessed,
                 )
             else:
@@ -8050,6 +7432,7 @@ def _execute_spsv_csr_plan(
                     b_in,
                     n_rows,
                     lower=lower_eff,
+                    diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
                     )
@@ -8061,6 +7444,7 @@ def _execute_spsv_csr_plan(
                     b_in,
                     n_rows,
                     lower=lower_eff,
+                    diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
                     )
@@ -8072,7 +7456,7 @@ def _execute_spsv_csr_plan(
                     level_row_map32,
                     b_in,
                     n_rows,
-
+                    diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     ready_in=ready_buf,
                     level_ptr=level_ptr32,
@@ -8088,6 +7472,7 @@ def _execute_spsv_csr_plan(
                     b_in,
                     n_rows,
                     lower=lower_eff,
+                    diag_eps=diag_eps,
                     data_ri_in=complex_kernel_data_ri,
                     tmp_sum_in=tmp_sum_buf,
                     ready_in=ready_buf,
@@ -8100,6 +7485,7 @@ def _execute_spsv_csr_plan(
                     kernel_indptr,
                     b_in,
                     n_rows,
+                    diag_eps=diag_eps,
                     worker_count=worker_count_use,
                     matrix_stats=matrix_stats_use,
                     data_ri_in=complex_kernel_data_ri,
@@ -8107,37 +7493,7 @@ def _execute_spsv_csr_plan(
                     row_counter_in=row_counter_buf,
                     )
         else:
-            if solve_kind == "transpose_alg2":
-                if trans_alg2_mode == "gather":
-                    x = _triton_spsv_csr_n_lo_nnz_balance_vector(
-                        trans_alg2_gather_data_in,
-                        trans_alg2_gather_indices32,
-                        trans_alg2_gather_launch_order32,
-                        trans_alg2_gather_row_idx32,
-                        trans_alg2_gather_indegree32,
-                        b_in,
-                        n_rows,
-                        lower=trans_alg2_gather_lower,
-                        tmp_sum_in=tmp_sum_buf,
-                        ready_in=ready_buf,
-                        indegree_in=indegree_buf,
-                    )
-                else:
-                    x = vec_real(
-                        data_in,
-                        trans_alg2_sources32,
-                        trans_alg2_targets32,
-                        trans_alg2_offsets64,
-                        trans_alg2_indegree32,
-                        b_in,
-                        n_rows,
-                        unit_diagonal=unit_diagonal,
-                        residual_in=residual_buf,
-                        ready_in=ready_buf,
-                        indegree_in=indegree_buf,
-                        work_counter_in=work_counter_buf,
-                    )
-            elif solve_kind == "transpose_cw":
+            if solve_kind == "transpose_cw":
                 x = vec_real(
                 data_in,
                 kernel_indices,
@@ -8148,14 +7504,15 @@ def _execute_spsv_csr_plan(
                 unit_diagonal=unit_diagonal,
                 block_nnz=block_nnz,
                 max_segments=max_segments,
+                diag_eps=diag_eps,
                 block_nnz_use=block_nnz_use,
                 max_segments_use=max_segments_use,
                 worker_count=worker_count_use,
                 matrix_stats=matrix_stats_use,
                 residual_in=residual_buf,
                 indegree_in=indegree_buf,
-                diag_offsets_in=diag_offsets_buf,
                 row_counter_in=row_counter_buf,
+                diag_in=transpose_diag,
                 preprocessed=transpose_preprocessed,
                 )
             elif solve_kind == "csr_roc":
@@ -8167,6 +7524,7 @@ def _execute_spsv_csr_plan(
                 b_in,
                 n_rows,
                 lower=lower_eff,
+                diag_eps=diag_eps,
                 ready_in=ready_buf,
                 )
             elif solve_kind == "csr_smblk":
@@ -8177,6 +7535,7 @@ def _execute_spsv_csr_plan(
                 b_in,
                 n_rows,
                 lower=lower_eff,
+                diag_eps=diag_eps,
                 ready_in=ready_buf,
                 )
             elif solve_kind == "csr_cw_levelschd":
@@ -8187,7 +7546,7 @@ def _execute_spsv_csr_plan(
                 level_row_map32,
                 b_in,
                 n_rows,
-
+                diag_eps=diag_eps,
                 ready_in=ready_buf,
                 level_ptr=level_ptr32,
                 level_ptr_host=level_ptr_host,
@@ -8202,6 +7561,7 @@ def _execute_spsv_csr_plan(
                 b_in,
                 n_rows,
                 lower=lower_eff,
+                diag_eps=diag_eps,
                 tmp_sum_in=tmp_sum_buf,
                 ready_in=ready_buf,
                 indegree_in=indegree_buf,
@@ -8213,6 +7573,7 @@ def _execute_spsv_csr_plan(
                 kernel_indptr,
                 b_in,
                 n_rows,
+                diag_eps=diag_eps,
                 worker_count=worker_count_use,
                 matrix_stats=matrix_stats_use,
                 ready_in=ready_buf,
@@ -8330,7 +7691,6 @@ def _materialize_spsv_workspace_state(descr, workspace=None):
         "csr_smblk",
         "csr_cw_levelschd",
         "csr_nnz_balance",
-        "transpose_alg2",
     }:
         if isinstance(workspace, FlagSparseSpSVWorkspace):
             workspace.prepared_solve_kind = ""
@@ -8338,7 +7698,6 @@ def _materialize_spsv_workspace_state(descr, workspace=None):
     elif solve_kind == "transpose_cw":
         residual = buffers.get("residual")
         indegree = buffers.get("indegree")
-        diag_offsets = buffers.get("diag_offsets")
         row_counter = buffers.get("row_counter")
         block_nnz_use = int(descr.solve_plan["default_block_nnz"])
         max_segments_use = int(descr.solve_plan["default_max_segments"])
@@ -8351,16 +7710,16 @@ def _materialize_spsv_workspace_state(descr, workspace=None):
         )
         if residual is not None:
             residual.zero_()
-        if indegree is not None and diag_offsets is not None:
+        if indegree is not None:
             _run_spsv_csc_preprocess(
                 descr.solve_plan["kernel_indices32"],
                 descr.solve_plan["kernel_indptr64"],
                 indegree,
-                diag_offsets,
                 int(descr.shape[0]),
                 lower=bool(descr.solve_plan["lower_eff"]),
                 unit_diagonal=bool(descr.unit_diagonal),
                 block_nnz_use=block_nnz_use,
+                max_segments_use=max_segments_use,
             )
         if row_counter is not None:
             row_counter.zero_()
@@ -8376,9 +7735,7 @@ def _materialize_spsv_workspace_state(descr, workspace=None):
             device=descr.data.device,
             buffers=buffers,
             prepared_solve_kind=(
-                solve_kind
-                if solve_kind == "transpose_cw"
-                else ""
+                "transpose_cw" if solve_kind == "transpose_cw" else ""
             ),
             prepared_signature=preprocess_sig,
         )
@@ -8570,7 +7927,7 @@ def flagsparse_spsv_analysis_sell(
     When ``unit_diagonal`` is true, stored diagonal entries are ignored and
     missing diagonal entries are interpreted as one, matching SpSV descriptor
     semantics used by cuSPARSE.  ``transpose`` accepts the same N/T/C forms as
-    the CSR API; T solves A^T x=b and C solves A^H x=b.  For TRANS/CONJ,
+    the CSR API; T solves A^T x=b and C solves A^H x=b. For TRANS/CONJ,
     ALG1 keeps the direct SELL scatter queue and ALG2 builds a CSC gather view
     during analysis.
     """
@@ -8618,8 +7975,10 @@ def flagsparse_spsv_analysis_sell(
     else:
         _validate_spsv_trans_combo(values.dtype, cols.dtype, "SELL")
     compute_dtype = values.dtype
-    if trans_mode != "N":
-        compute_dtype = _spsv_effective_compute_dtype(values.dtype, trans_mode)
+    if trans_mode != "N" and values.dtype == torch.float32:
+        compute_dtype = torch.float64
+    elif trans_mode != "N" and values.dtype == torch.complex64:
+        compute_dtype = torch.complex128
     if trans_mode == "N":
         alg_num = (
             SPSV_SELL_ALG1
@@ -8830,7 +8189,6 @@ def flagsparse_spsv_solve_sell(
         unit_diagonal=bool(descr.unit_diagonal),
         values_ri_in=plan.get("kernel_data_ri"),
     )
-
 
 
 def flagsparse_spsv_sell(

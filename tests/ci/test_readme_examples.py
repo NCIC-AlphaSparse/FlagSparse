@@ -39,7 +39,7 @@ def test_readme_cpu_smoke_examples_are_present():
         accuracy_runner,
         performance_runner,
         both_phase_runner,
-        "python tests/test_spmv_csr.py <dir_or_file.mtx>",
+        "python tests/test_spmv.py <dir_or_file.mtx>",
         "python tests/test_spmm.py --synthetic",
         "python tests/test_spgemm.py <dir_or_file.mtx> --input-mode auto",
         "python tests/test_spsm.py --synthetic --n 512 --rhs 1024",

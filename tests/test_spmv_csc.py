@@ -31,7 +31,6 @@ if str(_SRC_ROOT) not in sys.path:
 
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as ast_ops
-from utils import cuda_event_benchmark_filtered, cupy_event_benchmark_filtered
 
 try:
     import cupy as cp
@@ -199,7 +198,19 @@ def _allclose_error_ratio(actual, expected, atol, rtol):
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    return cuda_event_benchmark_filtered(op, warmup, iters)
+    out = None
+    count = max(1, int(iters))
+    for _ in range(max(0, int(warmup))):
+        out = op()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(count):
+        out = op()
+    end.record()
+    torch.cuda.synchronize()
+    return out, start.elapsed_time(end) / count
 
 
 def _time_flagsparse_csc(
@@ -285,8 +296,18 @@ def _time_cusparse(data, indices, indptr, x, shape, op, warmup, iters):
     else:
         A_eff = A.conj().T
     fn = lambda: A_eff @ x_cp
-    _, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
-    return elapsed_ms
+    for _ in range(max(0, int(warmup))):
+        _ = fn()
+    cp.cuda.runtime.deviceSynchronize()
+    start = cp.cuda.Event()
+    end = cp.cuda.Event()
+    count = max(1, int(iters))
+    start.record()
+    for _ in range(count):
+        _ = fn()
+    end.record()
+    end.synchronize()
+    return cp.cuda.get_elapsed_time(start, end) / count
 
 
 def _fmt(v):
@@ -467,7 +488,7 @@ def run_synthetic(
     print("FLAGSPARSE SpMV CSC BENCHMARK (native CSC Triton)")
     print("=" * 140)
     print(
-        "Timing policy: csc_ms = process_cpu_ms + filtered csc_gpu_ms; CSC v1 has no process phase."
+        "Timing policy: csc_ms = process_cpu_ms + csc_gpu_ms; CSC v1 has no process phase."
     )
     for dtype in value_dtypes:
         for index_dtype in index_dtypes:

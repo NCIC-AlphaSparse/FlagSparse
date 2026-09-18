@@ -33,7 +33,6 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
-from utils import cuda_event_benchmark_filtered
 
 from flagsparse.sparse_operations.spmm_csr import (
     _normalize_spmm_base_device_props,
@@ -180,7 +179,19 @@ def _error_profile(candidate, reference, dtype):
 
 
 def _benchmark(op, warmup, iters):
-    return cuda_event_benchmark_filtered(op, warmup, iters)
+    out = op()
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        out = op()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(max(1, int(iters))):
+        out = op()
+    end.record()
+    torch.cuda.synchronize()
+    return out, start.elapsed_time(end) / max(1, int(iters))
 
 
 def _prepare_base_inputs(data, indices, indptr, B, shape):

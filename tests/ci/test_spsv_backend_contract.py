@@ -108,68 +108,28 @@ def test_spsv_rocm_alg_updates_are_present_but_backend_scoped():
     assert '"FLAGSPARSE_SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL", "1"' in SPSV_SOURCE
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_BLOCK_NNZ", "256"' in SPSV_SOURCE
     assert '"FLAGSPARSE_SPSV_ROCM_ALG3_WORKGROUPS_PER_CU", "4"' in SPSV_SOURCE
-    assert '"FLAGSPARSE_SPSV_ROCM_TRANS_CW_SERIAL_FALLBACK", "1"' in SPSV_SOURCE
-    assert '"FLAGSPARSE_SPSV_CUDA_TRANS_ALG2_WORKGROUPS_PER_CU", "2"' in SPSV_SOURCE
     assert "sell_trans_csc" in SPSV_SOURCE
     assert "_build_spsv_sell_trans_csc_metadata" in SPSV_SOURCE
     assert "_launch_spsv_sell_trans_csc" in SPSV_SOURCE
-    assert "_build_spsv_transpose_alg2_gather_metadata" in SPSV_SOURCE
-    assert "_build_spsv_transpose_alg2_metadata" in SPSV_SOURCE
-    assert "_triton_spsv_csr_transpose_alg2_vector" in SPSV_SOURCE
-    assert "_triton_spsv_csr_transpose_alg2_vector_complex" in SPSV_SOURCE
 
     normalize = _function_source(
         SPSV_TREE, SPSV_SOURCE, "_normalize_requested_spsv_route"
     )
     assert '"alg3": "csr_nnz_balance" if is_rocm else "csr_roc"' in normalize
     assert "CUDA-only route" in normalize
-    assert '"transpose_alg2": "transpose_alg2"' in normalize
-    assert '"transpose_nnz_balance": "transpose_alg2"' in normalize
 
     sell_analysis = _function_source(
         SPSV_TREE, SPSV_SOURCE, "flagsparse_spsv_analysis_sell"
     )
     assert "ALG1 keeps the direct SELL scatter queue" in sell_analysis
     assert "ALG2 builds a CSC gather view" in sell_analysis
-    assert "compute_dtype = _spsv_effective_compute_dtype(" in sell_analysis
+    assert "compute_dtype = torch.float64" in sell_analysis
+    assert "compute_dtype = torch.complex128" in sell_analysis
 
     launch = _function_source(SPSV_TREE, SPSV_SOURCE, "_spsv_nnz_balance_launch_config")
     assert "if not is_rocm:" in launch
     assert "SPSV_ROCM_ALG3_BLOCK_NNZ" in launch
     assert "_ACCEL.get_device_properties" in launch
-
-    nnz_balance = _function_source(
-        SPSV_TREE, SPSV_SOURCE, "_triton_spsv_csr_n_lo_nnz_balance_vector"
-    )
-    nnz_balance_complex = _function_source(
-        SPSV_TREE, SPSV_SOURCE, "_triton_spsv_csr_n_lo_nnz_balance_vector_complex"
-    )
-    for source in (nnz_balance, nnz_balance_complex):
-        assert "PERSISTENT=is_rocm and SPSV_ROCM_ENABLE_PERSISTENT_PARALLEL" in source
-
-    worker_count = _function_source(
-        SPSV_TREE, SPSV_SOURCE, "_spsv_cu_capped_worker_count"
-    )
-    assert "SPSV_ROCM_ALG4_WORKER_COUNT" in worker_count
-    assert "_ACCEL.get_device_properties" in worker_count
-
-    prepare = _function_source(SPSV_TREE, SPSV_SOURCE, "_prepare_spsv_csr_system")
-    assert 'default_solve_kind = "transpose_alg2"' in prepare
-    assert "_build_spsv_transpose_alg2_gather_metadata(" in prepare
-    assert "_build_spsv_transpose_alg2_metadata(" in prepare
-
-    executor = _function_source(SPSV_TREE, SPSV_SOURCE, "_execute_spsv_csr_plan")
-    assert 'elif solve_kind == "transpose_alg2":' in executor
-    assert 'trans_alg2_mode == "gather"' in executor
-    assert 'trans_alg2_mode == "scatter"' in executor
-
-    buffer_size = _function_source(
-        SPSV_TREE, SPSV_SOURCE, "flagsparse_spsv_buffer_size"
-    )
-    assert (
-        'route = "transpose_alg2" if trans_mode in ("T", "C") else "csr_cw"'
-        in buffer_size
-    )
 
 
 def test_spsv_preserves_update_non_rocm_profiles_and_public_sell_api():

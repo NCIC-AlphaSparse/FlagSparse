@@ -335,42 +335,6 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             ops=spmv_ops,
             notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent",
         ),
-        *(
-            ApiSpec(
-                "spmv",
-                "flagsparse_spmv_csr",
-                "spmv_csr",
-                "CSR",
-                algorithm,
-                value_const="SPMV_CSR_NEW_VALUE_DTYPES",
-                index_const="SUPPORTED_INDEX_DTYPES",
-                ops=("non",),
-                notes="CUDA/ROCm conservative profiles; FP64 compute; hardware validation pending",
-            )
-            for algorithm in modules["spmv_csr"].get("SPMV_CSR_NEW_ALGORITHMS")
-        ),
-        *(
-            ApiSpec(
-                "spmv",
-                "flagsparse_spmv_csr",
-                "spmv_csr",
-                "CSR",
-                algorithm,
-                values=(
-                    ("float32", "float64")
-                    if algorithm == "legacy_bucket_vector"
-                    else DEFAULT_VALUE_DTYPES
-                ),
-                indices=(
-                    ("int32",)
-                    if algorithm == "legacy_bucket_vector"
-                    else DEFAULT_INDEX_DTYPES
-                ),
-                ops=spmv_ops,
-                notes="named legacy route; original numerical policy retained",
-            )
-            for algorithm in ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
-        ),
         ApiSpec(
             "spmv",
             "flagsparse_spmv_coo",
@@ -593,12 +557,7 @@ def rows_for_spec(
 ) -> list[dict[str, str]]:
     module = modules.get(spec.module)
     notes = [spec.notes] if spec.notes else []
-    status = (
-        "UNVERIFIED"
-        if spec.route
-        in ("row_tile", "row_vector", "row_split_reduce", "row_adaptive_split")
-        else "SUPPORTED"
-    )
+    status = "SUPPORTED"
     if module is None:
         return [row(spec, NA, NA, NA, "PARTIAL")]
 

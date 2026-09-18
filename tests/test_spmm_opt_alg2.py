@@ -14,7 +14,7 @@
 
 """
 Protected CSR SpMM benchmark: base vs alg1 vs alg2 vs references.
-Alg1/Alg2 totals report filtered CPU-wall preprocessing plus filtered CUDA-event compute.
+Alg1/Alg2 totals report CPU-wall preprocessing plus CUDA-event compute time.
 
 Usage:
     python tests/test_spmm_opt_alg2.py --synthetic --dense-cols 32 --with-cusparse
@@ -27,6 +27,7 @@ import glob
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -39,7 +40,6 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 import flagsparse.sparse_operations.spmm_csr as spmm_csr_mod
 import flagsparse.sparse_operations.spmm_csr_opt_alg2 as spmm_alg2_mod
-from utils import cpu_wall_benchmark_filtered, cuda_event_benchmark_filtered
 
 from test_spmm_opt import _seeded_dense_matrix, load_mtx_to_csr_torch
 
@@ -167,22 +167,34 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
         prepared
     )
-    def preprocess_op():
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(count):
         runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
             prepared
         )
-        torch.cuda.synchronize()
-        return runtime_prepared
-
-    runtime_prepared, preprocess_ms = cpu_wall_benchmark_filtered(
-        preprocess_op, 0, count
-    )
+    torch.cuda.synchronize()
+    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
         out, _ = spmm_csr_mod._triton_spmm_csr_impl_opt_prepared(runtime_prepared, B)
         return out
 
-    measured_value, compute_ms = cuda_event_benchmark_filtered(op, warmup, count)
+    out = op()
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        _ = op()
+    torch.cuda.synchronize()
+
+    measured_value = out
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(count):
+        measured_value = op()
+    end.record()
+    torch.cuda.synchronize()
+    compute_ms = start.elapsed_time(end) / count
     return measured_value, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
 
@@ -194,18 +206,16 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
         prepared.data.dtype,
     )
     prepared.opt_buckets = opt_buckets
-    def preprocess_op():
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(count):
         opt_buckets = spmm_alg2_mod._build_spmm_opt_alg2_buckets_triton_symbolic(
             prepared.row_lengths,
             prepared.data.dtype,
         )
-        torch.cuda.synchronize()
-        return opt_buckets
-
-    opt_buckets, preprocess_ms = cpu_wall_benchmark_filtered(
-        preprocess_op, 0, count
-    )
     prepared.opt_buckets = opt_buckets
+    torch.cuda.synchronize()
+    preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
         out, meta = spmm_alg2_mod._triton_spmm_csr_impl_opt_alg2_prepared(
@@ -216,9 +226,23 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
         )
         return out, meta
 
+    first, meta = op()
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        _ = op()
+    torch.cuda.synchronize()
+
     measured_prepared = prepared
-    measured_pair, compute_ms = cuda_event_benchmark_filtered(op, warmup, count)
-    measured_value, measured_meta = measured_pair
+    measured_meta = meta
+    measured_value = first
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(count):
+        measured_value, measured_meta = op()
+    end.record()
+    torch.cuda.synchronize()
+    compute_ms = start.elapsed_time(end) / count
     return (
         measured_value,
         preprocess_ms + compute_ms,
@@ -276,7 +300,19 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
 
 
 def _benchmark(op, warmup, iters):
-    return cuda_event_benchmark_filtered(op, warmup, iters)
+    out = op()
+    torch.cuda.synchronize()
+    for _ in range(max(0, int(warmup))):
+        out = op()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(max(1, int(iters))):
+        out = op()
+    end.record()
+    torch.cuda.synchronize()
+    return out, start.elapsed_time(end) / max(1, int(iters))
 
 
 def _build_csr_from_row_lengths(
@@ -712,7 +748,7 @@ def main():
         f"{'Err(A1/T)':>10} {'Err(A1/CU)':>10} {'Err(A2/T)':>10} {'Err(A2/CU)':>10} {'Status':>6}"
     )
     print(
-        "A*Prep columns are filtered CPU wall time; A*Comp columns are filtered CUDA event compute time."
+        "A*Prep columns are CPU wall time; A*Comp columns are CUDA event compute time."
     )
     print("=" * 220)
 
