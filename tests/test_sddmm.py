@@ -35,6 +35,9 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -235,7 +238,17 @@ def _benchmark_reference_sddmm(
     ref_values, ref_ms = ast_ops._benchmark_cuda_op(
         timing_op, warmup=warmup, iters=iters
     )
-    if value_dtype == torch.float32:
+    if fs_common._use_scipy_accuracy_reference():
+        # Same formula as _sddmm_reference, evaluated off the accelerator: the
+        # sampled dot is where a half-working vendor dense library shows up as a
+        # "wrong" kernel.  Timing above is untouched.
+        ref_dtype = reference_utils.reference_dtype(value_dtype)
+        sampled = reference_utils.sddmm_csr_values(indices, indptr64, x, y, ref_dtype)
+        vals = reference_utils.as_torch(sampled, ref_dtype, x.device) * alpha
+        if data is not None:
+            vals = vals + beta * data.to(ref_dtype)
+        ref_values = vals.to(value_dtype)
+    elif value_dtype == torch.float32:
         x_ref = x.to(torch.float64)
         y_ref = y.to(torch.float64)
         data_ref = data.to(torch.float64) if data is not None else None
@@ -248,13 +261,13 @@ def _benchmark_reference_sddmm(
 def _benchmark_triton_sddmm(
     data, indices, indptr, shape, x, y, alpha, beta, warmup, iters, acc_mode
 ):
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t_prepare0 = time.perf_counter()
     prepared = ast.prepare_sddmm_csr(indices, indptr, shape, k_hint=int(x.shape[1]))
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
 
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t_first0 = time.perf_counter()
     if x.dtype == torch.float32 and acc_mode == "f64":
         _ = ast_ops._run_sddmm_prepared(
@@ -272,7 +285,7 @@ def _benchmark_triton_sddmm(
         _ = ast.flagsparse_sddmm_csr(
             data=data, x=x, y=y, alpha=alpha, beta=beta, prepared=prepared
         )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
 
     if x.dtype == torch.float32 and acc_mode == "f64":
@@ -347,7 +360,7 @@ def run_one_mtx(
     run_cusparse=True,
     acc_mode="f32",
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     _pattern_values, indices, indptr, shape = load_mtx_to_csr_torch(
         mtx_path, dtype=value_dtype, device=device
     )
@@ -785,10 +798,10 @@ def run_all_dtypes_export_csv(
 
 
 def run_api_validation_checks():
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("API checks skipped: CUDA is not available.")
         return 0
-    device = torch.device("cuda")
+    device = accelerator_device()
     indices = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
     indptr = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
     shape = (2, 2)
@@ -969,7 +982,7 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("CUDA is not available.")
         return
 
@@ -1000,7 +1013,7 @@ def main():
         print("FLAGSPARSE SDDMM - export to CSV")
         print("=" * 110)
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  dtypes: {','.join(_dtype_name(d) for d in value_dtypes)}  |  index_dtypes: {','.join(_dtype_name(d) for d in index_dtypes)}  |  acc_mode: {args.acc_mode}  |  K: {','.join(str(k) for k in k_dims)}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  CSV: {csv_path}"
+            f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}  |  dtypes: {','.join(_dtype_name(d) for d in value_dtypes)}  |  index_dtypes: {','.join(_dtype_name(d) for d in index_dtypes)}  |  acc_mode: {args.acc_mode}  |  K: {','.join(str(k) for k in k_dims)}  |  alpha: {args.alpha}  |  beta: {args.beta}  |  CSV: {csv_path}"
         )
         run_all_dtypes_export_csv(
             paths,
@@ -1020,7 +1033,7 @@ def main():
     print("=" * 150)
     print("FLAGSPARSE SDDMM - SuiteSparse .mtx batch (CSR pattern-guided)")
     print("=" * 150)
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtypes: {','.join(_dtype_name(d) for d in value_dtypes)}  index_dtypes: {','.join(_dtype_name(d) for d in index_dtypes)}  acc_mode: {args.acc_mode}  K: {','.join(str(k) for k in k_dims)}  alpha: {args.alpha}  beta: {args.beta}  warmup: {args.warmup}  iters: {args.iters}"
     )

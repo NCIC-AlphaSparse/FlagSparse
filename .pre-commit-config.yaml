@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Vendored third-party code is not ours to reformat. Without this, the
+# whitespace hooks rewrite 9 files under libtriton_jit on every run and
+# `pre-commit run --all-files` can never come back clean -- CI has not noticed
+# only because format-check runs first and was failing before it.
+exclude: '^capi/deps/'
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

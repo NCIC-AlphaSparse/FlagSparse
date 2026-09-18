@@ -1,0 +1,88 @@
+// Copyright 2026 FlagOS Contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#include "triton_jit/jit_utils.h"
+
+#include <dlfcn.h>  // dladdr
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace triton_jit {
+std::filesystem::path get_path_of_this_library() {
+  // This function gives the library path of this library as runtime, similar to the $ORIGIN
+  // that is used for run path (RPATH), but unfortunately, for custom dependencies (instead of linking)
+  // there is no build system generator to take care of this.
+  static const std::filesystem::path cached_path = []() {
+    Dl_info dl_info;
+    if (dladdr(reinterpret_cast<void*>(&get_path_of_this_library), &dl_info) && dl_info.dli_fname) {
+      return std::filesystem::canonical(dl_info.dli_fname);  // Ensure absolute, resolved path
+    } else {
+      throw std::runtime_error("cannot get the path of libjit_utils.so");
+    }
+  }();
+  return cached_path;
+}
+
+std::filesystem::path get_script_dir() {
+  const static std::filesystem::path script_dir = []() {
+    std::filesystem::path installed_script_dir =
+        get_path_of_this_library().parent_path().parent_path() / "share" / "triton_jit" / "scripts";
+
+    if (std::filesystem::exists(installed_script_dir)) {
+      return installed_script_dir;
+    } else {
+      std::filesystem::path source_script_dir =
+          std::filesystem::path(__FILE__).parent_path().parent_path() / "scripts";
+      return source_script_dir;
+    }
+  }();
+  return script_dir;
+}
+
+std::filesystem::path get_home_directory() {
+  const static std::filesystem::path home_dir = []() {
+#ifdef _WIN32
+    const char* home_dir_path = std::getenv("USERPROFILE");
+#else
+    const char* home_dir_path = std::getenv("HOME");
+#endif
+    return std::filesystem::path(home_dir_path);
+  }();
+  return home_dir;
+}
+
+#if !defined(BACKEND_NPU) && !defined(BACKEND_MUSA) && !defined(BACKEND_MACA) && !defined(BACKEND_MLU) && !defined(BACKEND_GCU) && !defined(BACKEND_HCU)
+void ensure_cuda_context() {
+  CUcontext pctx;
+  checkCudaErrors(cuCtxGetCurrent(&pctx));
+  if (!pctx) {
+    CUdevice device_index;
+    checkCudaErrors(cuDeviceGet(&device_index, /*ordinal*/ 0));
+    checkCudaErrors(cuDevicePrimaryCtxRetain(&pctx, device_index));
+    checkCudaErrors(cuCtxSetCurrent(pctx));
+  }
+}
+#endif
+}  // namespace triton_jit

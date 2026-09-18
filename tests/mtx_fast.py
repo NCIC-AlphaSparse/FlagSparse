@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+
+from benchmark_utils import ACCEL, accelerator_device
 from scipy.io import mmread
 
 
@@ -43,7 +45,7 @@ def _values_to_torch(data_np, dtype, device):
 def load_csr(file_path, dtype=torch.float32, device=None):
     """(data, indices, indptr, (n_rows, n_cols)) as torch tensors — CSR layout."""
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = accelerator_device() if ACCEL.is_available() else torch.device("cpu")
     csr = read_scipy_csr(file_path)
     data = _values_to_torch(csr.data, dtype, device)
     indices = torch.tensor(
@@ -58,7 +60,7 @@ def load_csr(file_path, dtype=torch.float32, device=None):
 def load_csc(file_path, dtype=torch.float32, device=None):
     """(data, indices(row), indptr(col), (n_rows, n_cols)) — CSC layout."""
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = accelerator_device() if ACCEL.is_available() else torch.device("cpu")
     csc = mmread(str(file_path)).tocsc()
     csc.sum_duplicates()
     csc.sort_indices()
@@ -75,7 +77,7 @@ def load_csc(file_path, dtype=torch.float32, device=None):
 def load_coo(file_path, dtype=torch.float32, device=None):
     """(data, rows, cols, (n_rows, n_cols)) — coalesced COO in row-major order."""
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = accelerator_device() if ACCEL.is_available() else torch.device("cpu")
     csr = read_scipy_csr(file_path)  # row-major, duplicates summed, cols sorted
     coo = csr.tocoo()
     data = _values_to_torch(coo.data, dtype, device)
@@ -113,7 +115,7 @@ def load_csr_spsv(file_path, dtype=torch.float32, device=None, lower=True):
     import scipy.sparse as sp
 
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = accelerator_device() if ACCEL.is_available() else torch.device("cpu")
     A = mmread(str(file_path)).tocsr()
     A.sum_duplicates()
     A.sort_indices()

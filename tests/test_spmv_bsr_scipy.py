@@ -25,6 +25,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -479,10 +481,10 @@ def run_synthetic(
     timing=False,
     run_cusparse=True,
 ):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("CUDA is not available.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims
@@ -549,10 +551,10 @@ def run_csv(
     run_cusparse=True,
     fail_fast=False,
 ):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("CUDA is not available.")
         return
-    device = torch.device("cuda")
+    device = accelerator_device()
     value_dtypes = VALUE_DTYPES if value_dtypes is None else value_dtypes
     index_dtypes = INDEX_DTYPES if index_dtypes is None else index_dtypes
     block_dims = list(DEFAULT_BLOCK_DIMS) if block_dims is None else block_dims

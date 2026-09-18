@@ -19,6 +19,8 @@ import os
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 import sys
 from pathlib import Path
 
@@ -35,7 +37,11 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float16,float32,float64"
+# complex64/complex128 are delivery variants (scatter_c32_int, scatter_c64_int):
+# leaving them out here passed accuracy 8/8 while the performance row came back
+# NOT_CONFIGURED with "the benchmark recorded no c32 rows" -- a coverage gap in
+# this list, not a kernel limit. The sibling gather script has carried them all along.
+DEFAULT_VALUE_DTYPES = "float16,float32,float64,complex64,complex128"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -208,7 +214,7 @@ def _print_row(row):
 
 
 def run_cli(args):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
         return
 
@@ -222,7 +228,7 @@ def run_cli(args):
     print("=" * 180)
     print("FLAGSPARSE SCATTER BENCHMARK/VALIDATION")
     print("=" * 180)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
         f"dtype_policy: {args.dtype_policy} | index_fallback_policy: {args.index_fallback_policy} | "
@@ -269,7 +275,7 @@ def run_cli(args):
                             failed_cases += 1
                         row = {
                             "case_id": case_id,
-                            "gpu": torch.cuda.get_device_name(0),
+                            "gpu": ACCEL.get_device_name(0),
                             "value_dtype_req": params.get("value_dtype"),
                             "value_dtype_compute": str(
                                 params.get("effective_value_dtype")
@@ -326,7 +332,7 @@ def run_cli(args):
                         failed_cases += 1
                         row = {
                             "case_id": case_id,
-                            "gpu": torch.cuda.get_device_name(0),
+                            "gpu": ACCEL.get_device_name(0),
                             "value_dtype_req": value_dtype,
                             "value_dtype_compute": "N/A",
                             "index_dtype": index_name,

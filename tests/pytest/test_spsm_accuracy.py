@@ -16,6 +16,8 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spsm_coo, flagsparse_spsm_csr
+from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
@@ -53,6 +55,25 @@ def _tol(dtype):
     return close_tolerances(dtype)
 
 
+def _reference(A, B, *, lower, unit_diagonal):
+    if common._use_scipy_accuracy_reference():
+        matrix = A.to_sparse_csr()
+        scipy_matrix = reference_utils.scipy_csr(
+            matrix.values(), matrix.col_indices(), matrix.crow_indices(), A.shape,
+            reference_utils.reference_dtype(A.dtype),
+        )
+        solved = reference_utils.triangular_solve(
+            scipy_matrix, B, reference_utils.reference_dtype(B.dtype),
+            lower=lower, unit_diagonal=unit_diagonal,
+        )
+        return reference_utils.as_torch(
+            solved, reference_utils.reference_dtype(B.dtype), golden_device()
+        ).to(B.dtype)
+    return torch.linalg.solve_triangular(
+        A, B, upper=not lower, unitriangular=unit_diagonal
+    )
+
+
 @pytest.mark.spsm
 @pytest.mark.spsm_csr
 @pytest.mark.parametrize("n, n_rhs", SPSM_N_RHS)
@@ -65,12 +86,7 @@ def test_spsm_csr_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
     device = accelerator_device()
     A = _build_triangular_dense(n, dtype, golden_device(), lower, unit_diagonal)
     B = torch.randn(n, n_rhs, dtype=dtype, device=golden_device())
-    ref = torch.linalg.solve_triangular(
-        A,
-        B,
-        upper=not lower,
-        unitriangular=unit_diagonal,
-    )
+    ref = _reference(A, B, lower=lower, unit_diagonal=unit_diagonal)
     Acsr = A.to_sparse_csr()
     out = flagsparse_spsm_csr(
         Acsr.values().to(device),
@@ -97,12 +113,7 @@ def test_spsm_coo_matches_dense(n, n_rhs, dtype, lower, unit_diagonal):
     device = accelerator_device()
     A = _build_triangular_dense(n, dtype, golden_device(), lower, unit_diagonal)
     B = torch.randn(n, n_rhs, dtype=dtype, device=golden_device())
-    ref = torch.linalg.solve_triangular(
-        A,
-        B,
-        upper=not lower,
-        unitriangular=unit_diagonal,
-    )
+    ref = _reference(A, B, lower=lower, unit_diagonal=unit_diagonal)
     Acoo = A.to_sparse_coo().coalesce()
     indices = Acoo.indices()
     out = flagsparse_spsm_coo(

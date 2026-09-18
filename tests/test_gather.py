@@ -26,6 +26,8 @@ if SRC_ROOT.is_dir():
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -166,7 +168,7 @@ def _collect_samples(case_id, expected, flagsparse_out, limit):
 
 
 def _check_dtype_supported(value_dtype_req):
-    if value_dtype_req in ("bfloat16",) and not torch.cuda.is_bf16_supported():
+    if value_dtype_req in ("bfloat16",) and not ACCEL.is_bf16_supported():
         raise RuntimeError("bfloat16 not supported on this GPU")
 
 
@@ -215,7 +217,7 @@ def _print_row(row):
 
 
 def run_cli(args):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("CUDA is not available. Please run on a GPU-enabled system.")
         return
 
@@ -228,7 +230,7 @@ def run_cli(args):
     print("FLAGSPARSE GATHER BENCHMARK/VALIDATION")
     print("=" * 180)
     print(f"FlagSparse source: {Path(ast.__file__).resolve()}")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}")
     print(
         f"Warmup: {args.warmup} | Iterations: {args.iters} | "
         f"Kernel graph batch: {KERNEL_GRAPH_BATCH} | "
@@ -287,7 +289,7 @@ def run_cli(args):
                         failed_cases += 1
                     row = {
                         "case_id": case_id,
-                        "gpu": torch.cuda.get_device_name(0),
+                        "gpu": ACCEL.get_device_name(0),
                         "value_dtype_req": value_dtype,
                         "value_dtype_compute": str(params.get("value_dtype")).replace(
                             "torch.", ""
@@ -339,7 +341,7 @@ def run_cli(args):
                     print(f"\nERROR [{case_id}]: {error_text}")
                     row = {
                         "case_id": case_id,
-                        "gpu": torch.cuda.get_device_name(0),
+                        "gpu": ACCEL.get_device_name(0),
                         "value_dtype_req": value_dtype,
                         "value_dtype_compute": "N/A",
                         "index_dtype": index_name,

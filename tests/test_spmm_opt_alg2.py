@@ -32,6 +32,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -167,13 +169,13 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
     runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
         prepared
     )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t0 = time.perf_counter()
     for _ in range(count):
         runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
             prepared
         )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
@@ -181,19 +183,19 @@ def _timed_spmm_opt(data, indices, indptr, B, shape, warmup, iters):
         return out
 
     out = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(max(0, int(warmup))):
         _ = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
 
     measured_value = out
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(count):
         measured_value = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     compute_ms = start.elapsed_time(end) / count
     return measured_value, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
@@ -206,7 +208,7 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
         prepared.data.dtype,
     )
     prepared.opt_buckets = opt_buckets
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t0 = time.perf_counter()
     for _ in range(count):
         opt_buckets = spmm_alg2_mod._build_spmm_opt_alg2_buckets_triton_symbolic(
@@ -214,7 +216,7 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
             prepared.data.dtype,
         )
     prepared.opt_buckets = opt_buckets
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
@@ -227,21 +229,21 @@ def _timed_spmm_opt_alg2(data, indices, indptr, B, shape, warmup, iters):
         return out, meta
 
     first, meta = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(max(0, int(warmup))):
         _ = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
 
     measured_prepared = prepared
     measured_meta = meta
     measured_value = first
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(count):
         measured_value, measured_meta = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     compute_ms = start.elapsed_time(end) / count
     return (
         measured_value,
@@ -301,17 +303,17 @@ def _timed_sparse_backend(data, indices, indptr, B, shape, warmup, iters, enable
 
 def _benchmark(op, warmup, iters):
     out = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(max(1, int(iters))):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / max(1, int(iters))
 
 
@@ -628,7 +630,7 @@ def print_row(row):
 def run_batch(
     paths, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     results = []
     for path in paths:
         try:
@@ -662,7 +664,7 @@ def run_batch(
 def run_synthetic(
     case_names, dtype, index_dtype, dense_cols, warmup, iters, seed, with_cusparse
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     results = []
     for case_name in case_names:
         data, indices, indptr, shape = build_synthetic_case(
@@ -737,7 +739,7 @@ def main():
     print("=" * 220)
     print("FLAGSPARSE SpMM Alg1 / Alg2 Protected Benchmark")
     print(
-        f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  dense_cols: {args.dense_cols}  "
+        f"GPU: {ACCEL.get_device_name(0)}  |  dtype: {args.dtype}  |  dense_cols: {args.dense_cols}  "
         f"|  with_cusparse: {args.with_cusparse}"
     )
     print(

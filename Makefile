@@ -50,10 +50,10 @@ compile:
 	$(PYTHON) -m compileall src tests tools
 
 format-check:
-	ruff format --check tests/ci tools/ci
+	ruff format --check tests/ci tools/ci tools/run_backend_tests.py capi/tools
 
 lint:
-	ruff check tests/ci tools/ci
+	ruff check tests/ci tools/ci tools/run_backend_tests.py capi/tools
 
 lint-src:
 	ruff check src --select E9,F63,F7,F82

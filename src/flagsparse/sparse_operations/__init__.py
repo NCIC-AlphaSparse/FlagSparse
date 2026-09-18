@@ -14,6 +14,20 @@
 
 """FlagSparse sparse operations (gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, SpSM)."""
 
+# Per-backend overrides, BEFORE any operator is imported below.
+#
+# Normally a no-op: backends/<name>/ is empty and every import below resolves to
+# the shared implementation in this package. When a backend does ship an override
+# for one operator, this registers it under the shared module's name so the
+# imports below -- and every later caller -- pick it up. See _dispatch.py.
+#
+# Order matters and is enforced: install_overrides() raises if an operator module
+# was already imported, because replacing it then would leave two live copies.
+from ._dispatch import install_overrides as _install_overrides
+
+_install_overrides()
+del _install_overrides
+
 from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
 from .alpha_spmm_alg1 import (
     PreparedAlphaSpmmAlg1,

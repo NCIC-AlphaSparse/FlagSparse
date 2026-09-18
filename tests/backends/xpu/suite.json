@@ -1,0 +1,8 @@
+{
+  "backend": "xpu",
+  "selector": "xpu",
+  "capi_backend": "XPU",
+  "capi_buildable": false,
+  "pytest_paths": ["tests/pytest"],
+  "benchmark_runner": "run_flagsparse_pytest.py"
+}

@@ -31,6 +31,9 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -119,10 +122,10 @@ def _is_resource_error(message):
 
 def _cleanup_reference_pools():
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        if hasattr(torch.cuda, "ipc_collect"):
-            torch.cuda.ipc_collect()
+    if ACCEL.is_available():
+        ACCEL.empty_cache()
+        if hasattr(ACCEL, "ipc_collect"):
+            ACCEL.ipc_collect()
     if ast_ops.cp is not None:
         try:
             ast_ops.cp.get_default_memory_pool().free_all_blocks()
@@ -403,6 +406,38 @@ def _build_spgemm_rhs(a_data, a_indices, a_indptr, a_shape, mode):
     # CSR^T may materialize as CSC; convert through COO so downstream always receives CSR.
     b_t = a_t.transpose(0, 1).to_sparse_coo().coalesce()
     return ast_ops._torch_sparse_to_csr(b_t)
+
+
+def _build_scipy_spgemm_reference(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+):
+    """C = A @ B on CPU with SciPy, in the same (data, indices, indptr, shape) form.
+
+    Index widths follow _torch_sparse_to_csr -- int32 columns, int64 row pointers
+    -- so the comparison downstream comes out of the same shape of object no
+    matter which reference produced it.
+    """
+    ref_dtype = reference_utils.reference_dtype(a_data.dtype)
+    a_csr = reference_utils.scipy_csr(a_data, a_indices, a_indptr, a_shape, ref_dtype)
+    b_csr = reference_utils.scipy_csr(b_data, b_indices, b_indptr, b_shape, ref_dtype)
+    product = reference_utils.spgemm(a_csr, b_csr)
+    product.sort_indices()
+    device = a_data.device
+    data = reference_utils.as_torch(product.data, ref_dtype, device).to(a_data.dtype)
+    indices = torch.as_tensor(
+        product.indices, dtype=torch.int32, device=device
+    ).contiguous()
+    indptr = torch.as_tensor(
+        product.indptr, dtype=torch.int64, device=device
+    ).contiguous()
+    return data, indices, indptr, (int(a_shape[0]), int(b_shape[1]))
 
 
 def _build_torch_spgemm_reference(
@@ -1056,7 +1091,7 @@ def _benchmark_flagsparse_spgemm(
     mtx_path,
 ):
     _log_stage(mtx_path, "prepare", start_time)
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t_prepare0 = time.perf_counter()
     prepared = ast.prepare_spgemm_csr(
         a_data,
@@ -1068,16 +1103,16 @@ def _benchmark_flagsparse_spgemm(
         b_indptr,
         b_shape,
     )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0
 
     _log_stage(mtx_path, "first-call", start_time)
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t_first0 = time.perf_counter()
     first_result, first_meta = ast.flagsparse_spgemm_csr(
         prepared=prepared, return_meta=True
     )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     first_call_ms = (time.perf_counter() - t_first0) * 1000.0
     first_meta = dict(first_meta)
     first_meta["prepare_ms"] = prepare_ms
@@ -1138,7 +1173,7 @@ def run_one_mtx(
     compare_device=DEFAULT_COMPARE_DEVICE,
 ):
     case_start = time.perf_counter()
-    device = torch.device("cuda")
+    device = accelerator_device()
 
     _log_stage(mtx_path, "load", case_start)
     a_data, a_indices, a_indptr, a_shape = load_mtx_to_csr_torch(
@@ -1262,6 +1297,19 @@ def run_one_mtx(
         pt_ref_result = pt_ref.get("result")
         result["pytorch_format"] = pt_ref.get("format")
         result["pytorch_ms"] = pt_ref.get("ms")
+        if ast_common._use_scipy_accuracy_reference():
+            # Correctness moves to SciPy on CPU; pytorch_ms just above stays the
+            # measured PyTorch baseline, so the column keeps meaning what it did.
+            pt_ref_result = _build_scipy_spgemm_reference(
+                a_data,
+                a_indices,
+                a_indptr,
+                a_shape,
+                b_data,
+                b_indices,
+                b_indptr,
+                b_shape,
+            )
     else:
         result["pytorch_reason"] = pt_ref.get("reason")
         result["ref_fail_stage"] = pt_ref.get("fail_stage")
@@ -1551,7 +1599,7 @@ def run_mtx_batch(
                 "compare_device": compare_device,
             }
             try:
-                torch.cuda.empty_cache()
+                ACCEL.empty_cache()
             except Exception:
                 pass
         results.append(entry)
@@ -1903,10 +1951,10 @@ def run_all_dtypes_export_csv(
 
 
 def run_api_validation_checks():
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("API checks skipped: CUDA is not available.")
         return 0
-    device = torch.device("cuda")
+    device = accelerator_device()
     a_data = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=device)
     a_indices = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
     a_indptr = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
@@ -2076,7 +2124,7 @@ def _convert_result_for_compare(csr_tuple, compare_device, device=None):
 
 
 def _run_reference_worker(args):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         payload = {
             "success": False,
             "reason": "CUDA is not available in worker",
@@ -2087,7 +2135,7 @@ def _run_reference_worker(args):
         return 1
 
     value_dtype = torch.float32 if args.dtype == "float32" else torch.float64
-    device = torch.device("cuda")
+    device = accelerator_device()
     a_data, a_indices, a_indptr, a_shape = load_mtx_to_csr_torch(
         args._worker_mtx, dtype=value_dtype, device=device
     )
@@ -2257,7 +2305,7 @@ def main():
             raise SystemExit("worker mode requires --_worker-mtx and --_worker-output")
         raise SystemExit(_run_reference_worker(args))
 
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("CUDA is not available.")
         return
 
@@ -2290,7 +2338,7 @@ def main():
         print("FLAGSPARSE SpGEMM - f32/f64 with int32, export to CSV")
         print("=" * 120)
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  "
+            f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}  |  "
             f"input_mode: {args.input_mode}  |  adaptive_loops: {args.adaptive_loops}  |  "
             f"ref_blocked_retry: {args.ref_blocked_retry}  |  ref_isolated_retry: {args.ref_isolated_retry}  |  "
             f"ref_block_rows: {args.ref_block_rows}  |  compare_device: {args.compare_device}  |  CSV: {csv_path}"
@@ -2316,7 +2364,7 @@ def main():
     print("=" * 160)
     print("FLAGSPARSE SpGEMM - SuiteSparse .mtx batch (CSR)")
     print("=" * 160)
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  warmup: {args.warmup}  "
         f"iters: {args.iters}  adaptive_loops: {args.adaptive_loops}  input_mode: {args.input_mode}  "

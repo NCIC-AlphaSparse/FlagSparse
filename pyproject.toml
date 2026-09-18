@@ -22,6 +22,9 @@ version = "1.0.0"
 description = "FlagSparse - GPU sparse operations package"
 readme = "README.md"
 requires-python = ">=3.10"
+# Empty on purpose: torch and triton come from the vendor's own build on every
+# non-NVIDIA box (torch_musa, torch_npu, the MACA and Kunlunxin wheels), so
+# declaring them here would make pip pull the generic CUDA torch over the top.
 dependencies = []
 authors = [{ name = "Your Name", email = "your.email@example.com" }]
 license = { file = "LICENSE" }
@@ -33,6 +36,15 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12"
 ]
+
+# What the benchmarks and accuracy suites need, which the package itself does
+# not: src/flagsparse imports no scipy, but tests/mtx_fast.py reads every .mtx
+# through it and the SciPy correctness references (every backend except CUDA and
+# ROCm) compute through it. The floor is not cosmetic -- before 1.14,
+# spsolve_triangular was a pure-Python loop: minutes to hours on a 130k-row
+# matrix where 1.15 takes well under a second, which reads as a --timeout.
+[project.optional-dependencies]
+test = ["scipy>=1.14", "pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/yourusername/flagsparse"

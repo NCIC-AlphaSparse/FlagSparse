@@ -34,6 +34,7 @@ import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 import flagsparse.sparse_operations.spsv as fs_spsv_impl
 from mtx_fast import NonSquareMatrixError
+import reference_utils
 
 try:
     import cupy as cp
@@ -202,6 +203,21 @@ def _safe_ratio(other_ms, base_ms):
 
 
 def _vendor_backend_name():
+    """The token this script builds its vendor column names from.
+
+    NOT the display label. The label is fine to print and wrong to build column
+    names with: on Ascend and XPU the vendor sparse library IS torch.sparse, so
+    the label is "PyTorch" and `f"{name}_ms"` produced a second "PyTorch_ms" --
+    one dict key written twice, the vendor timing and the PyTorch timing
+    overwriting each other. On MUSA, GCU and MLU there is no vendor at all and
+    the label is "N/A", which produced columns literally named "N/A_ms".
+
+    CUDA and DCU keep their real names (CuPy/cuSPARSE, hipSPARSE) so their CSVs
+    are unchanged.
+    """
+    backend = fs_common._expected_vendor_sparse_backend()
+    if backend is None or backend == "torch":
+        return "vendor"
     return fs_common._expected_vendor_sparse_label()
 
 
@@ -422,7 +438,51 @@ def _build_csr_tensor_for_op(data, indices, indptr, shape, op_mode, *, lower):
     )
 
 
+def _scipy_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    """Triangular solve on CPU with SciPy, over the SAME effective operand.
+
+    `_effective_csr_for_op` has already applied the triangle and the transpose,
+    so the operand goes through as-is and only the triangle flag follows op_mode
+    -- the same `lower_eff` the CuPy reference computes. Flipping twice would
+    silently solve the other system and look like a wrong kernel.
+    """
+    data_eff, indices_eff, indptr_eff = _effective_csr_for_op(
+        data, indices, indptr, shape, lower=lower, op_mode=op_mode
+    )
+    lower_eff = lower if op_mode == "NON" else not lower
+    ref_dtype = reference_utils.reference_dtype(b.dtype)
+    matrix = reference_utils.scipy_csr(
+        data_eff, indices_eff, indptr_eff, shape, ref_dtype
+    )
+    solved = reference_utils.triangular_solve(
+        matrix, b, ref_dtype, lower=lower_eff, unit_diagonal=False
+    )
+    return reference_utils.as_torch(solved, ref_dtype, b.device).to(b.dtype)
+
+
 def _benchmark_pytorch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
+    """(reference, pytorch_ms, backend, reason), reference per backend policy.
+
+    On non-CUDA/ROCm the value comes from SciPy while the timing keeps coming
+    from torch.sparse.spsolve. Where that solve is simply unavailable -- as it is
+    on several of these stacks -- this is the difference between having a
+    correctness check and having none.
+    """
+    x_ref, ms, pt_backend, reason = _benchmark_torch_reference(
+        data, indices, indptr, shape, b, lower=lower, op_mode=op_mode
+    )
+    if not fs_common._use_scipy_accuracy_reference():
+        return x_ref, ms, pt_backend, reason
+    try:
+        scipy_ref = _scipy_reference(
+            data, indices, indptr, shape, b, lower=lower, op_mode=op_mode
+        )
+    except Exception as exc:
+        return x_ref, ms, pt_backend, f"SciPy reference unavailable ({exc})"
+    return scipy_ref, ms, pt_backend, reason
+
+
+def _benchmark_torch_reference(data, indices, indptr, shape, b, *, lower, op_mode):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
         if sparse_spsolve is None:

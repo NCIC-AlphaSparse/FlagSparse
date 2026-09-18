@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmv_csr
+from flagsparse.sparse_operations import _common as common
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
     accelerator_available,
@@ -25,6 +26,7 @@ from tests.pytest.accuracy_utils import (
     close_tolerances,
     golden_device,
 )
+from tests import reference_utils
 from tests.pytest.param_shapes import SPMV_MN_SHAPES
 
 spmv_mod = importlib.import_module("flagsparse.sparse_operations.spmv_csr")
@@ -154,8 +156,14 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
     x_len = M if transpose else N
     x = _make_x(x_len, dtype, golden_device())
     ref_dtype = _reference_dtype(dtype)
-    ref_mat = _apply_dense_op(dense, op)
-    ref = (ref_mat.to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
+    if common._use_scipy_accuracy_reference():
+        matrix = reference_utils.scipy_csr(data, indices, indptr, (M, N), ref_dtype)
+        ref = reference_utils.as_torch(
+            reference_utils.spmv(matrix, x, ref_dtype, op=op), ref_dtype, golden_device()
+        ).to(dtype)
+    else:
+        ref_mat = _apply_dense_op(dense, op)
+        ref = (ref_mat.to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
     out = flagsparse_spmv_csr(
         data,
         indices,

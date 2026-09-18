@@ -31,6 +31,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -59,17 +61,17 @@ def load_mtx_to_csr_torch(file_path, dtype=torch.float32, device=None):
 def _timed_spmm_base(data, indices, indptr, B, shape, warmup, iters):
     op = lambda: fs.flagsparse_spmm_csr(data, indices, indptr, B, shape)
     out = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / iters
 
 
@@ -79,13 +81,13 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
     runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
         prepared
     )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     t0 = time.perf_counter()
     for _ in range(count):
         runtime_prepared = spmm_csr_mod._build_spmm_csr_opt_runtime_symbolic_triton(
             prepared
         )
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     preprocess_ms = (time.perf_counter() - t0) * 1000.0 / count
 
     def op():
@@ -93,17 +95,17 @@ def _timed_spmm_alg1_impl(data, indices, indptr, B, shape, warmup, iters):
         return out
 
     out = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(count):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     compute_ms = start.elapsed_time(end) / count
     return out, preprocess_ms + compute_ms, preprocess_ms, compute_ms
 
@@ -140,17 +142,17 @@ def _timed_pytorch(data, indices, indptr, B, shape, warmup, iters):
         ).coalesce()
     op = lambda: torch.sparse.mm(sparse, B)
     out = op()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     for _ in range(warmup):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / iters
 
 
@@ -223,13 +225,13 @@ def _seeded_dense_matrix(shape, dtype, device, seed):
     if seed is None:
         return torch.randn(shape, dtype=dtype, device=device)
     torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
+    if ACCEL.is_available():
+        ACCEL.manual_seed_all(int(seed))
     return torch.randn(shape, dtype=dtype, device=device)
 
 
 def run_one_mtx(path, dtype, index_dtype, dense_cols, warmup, iters, seed=None):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, shape = load_mtx_to_csr_torch(
         path, dtype=dtype, device=device
     )
@@ -486,7 +488,7 @@ def main():
     print("=" * 182)
     print("FLAGSPARSE SpMM Alg1 Test")
     print(
-        f"GPU: {torch.cuda.get_device_name(0)}  |  dtype: {args.dtype}  |  Dense cols: {args.dense_cols}  |  Files: {len(paths)}"
+        f"GPU: {ACCEL.get_device_name(0)}  |  dtype: {args.dtype}  |  Dense cols: {args.dense_cols}  |  Files: {len(paths)}"
     )
     if args.seed is not None:
         print(f"Seed: {args.seed}")

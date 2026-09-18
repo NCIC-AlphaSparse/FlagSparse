@@ -32,6 +32,9 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -544,6 +547,43 @@ def _prepare_canonical_case(data, row, col, shape, B, op="non", layout="row"):
 def _build_pytorch_reference(
     data, row, col, shape, B, prepared=None, op="non", layout="row"
 ):
+    """(reference, timing closure, format, reason), reference per backend policy.
+
+    The canonical arrays already have `op` and the layout folded in, so the SciPy
+    reference is a plain A @ B over them -- no second chance to get the operand
+    form wrong. The timing closure is untouched: the PyTorch baseline column
+    still measures torch.sparse on the accelerator.
+    """
+    prepared = (
+        _prepare_canonical_case(data, row, col, shape, B, op=op, layout=layout)
+        if prepared is None
+        else prepared
+    )
+    expected, pytorch_op, fmt, reason = _build_torch_reference_and_timing(
+        data, row, col, shape, B, prepared=prepared, op=op, layout=layout
+    )
+    if not fs_common._use_scipy_accuracy_reference():
+        return expected, pytorch_op, fmt, reason
+
+    out_dtype = prepared["output_dtype"]
+    ref_dtype = reference_utils.reference_dtype(out_dtype)
+    matrix = reference_utils.scipy_coo(
+        prepared["canonical_data"],
+        prepared["canonical_row"],
+        prepared["canonical_col"],
+        (prepared["n_rows"], prepared["n_cols"]),
+        ref_dtype,
+    )
+    product = reference_utils.spmm(matrix, prepared["canonical_B"], ref_dtype)
+    scipy_ref = reference_utils.as_torch(
+        product, ref_dtype, prepared["canonical_B"].device
+    )
+    return scipy_ref.to(out_dtype), pytorch_op, fmt, reason
+
+
+def _build_torch_reference_and_timing(
+    data, row, col, shape, B, prepared=None, op="non", layout="row"
+):
     prepared = (
         _prepare_canonical_case(data, row, col, shape, B, op=op, layout=layout)
         if prepared is None
@@ -565,15 +605,15 @@ def _cuda_event_benchmark(op, warmup, iters):
     out = None
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     count = max(1, int(iters))
     start.record()
     for _ in range(count):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / count
 
 
@@ -790,7 +830,7 @@ def run_one_alg_case(
                 flush=True,
             )
 
-    device = torch.device("cuda")
+    device = accelerator_device()
     stage_t0 = _start("load mtx")
     data, row, col, shape = load_mtx_to_coo_torch(path, dtype=dtype, device=device)
     row = row.to(index_dtype)
@@ -1103,10 +1143,10 @@ def _benchmark_spmm_coo_route_policy(
             plan = _spmm_coo_rowrun_process(base)
             return _spmm_coo_rowrun_compute(base, plan)
 
-        torch.cuda.synchronize()
+        ACCEL.synchronize()
         t0 = time.perf_counter()
         _ = full_op()
-        torch.cuda.synchronize()
+        ACCEL.synchronize()
         first_call_ms = (time.perf_counter() - t0) * 1000.0
         values, gpu_ms = _cuda_event_benchmark(full_op, warmup, iters)
         process_gpu_ms = None
@@ -1125,10 +1165,10 @@ def _benchmark_spmm_coo_route_policy(
         def full_op():
             return _spmm_coo_atomic_compute(base)
 
-        torch.cuda.synchronize()
+        ACCEL.synchronize()
         t0 = time.perf_counter()
         _ = full_op()
-        torch.cuda.synchronize()
+        ACCEL.synchronize()
         first_call_ms = (time.perf_counter() - t0) * 1000.0
         values, gpu_ms = _cuda_event_benchmark(full_op, warmup, iters)
         process_gpu_ms = 0.0 if timing else None
@@ -1361,7 +1401,7 @@ def run_one_mtx(
     selected_route = _selected_route(route)
     op_name = ast_ops._spmm_coo_op_to_name(op)
     layout = _normalize_layout_name(layout)
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, row, col, shape = load_mtx_to_coo_torch(
         mtx_path, dtype=value_dtype, device=device
     )
@@ -1568,17 +1608,17 @@ def run_one_mtx(
                 A_coo.sum_duplicates()
 
                 def _run_cusparse_timing(rhs):
-                    torch.cuda.synchronize()
+                    ACCEL.synchronize()
                     for _ in range(warmup):
                         _ = cupyx.cusparse.spmm(A_coo, rhs)
-                    torch.cuda.synchronize()
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
+                    ACCEL.synchronize()
+                    start = ACCEL.Event(enable_timing=True)
+                    end = ACCEL.Event(enable_timing=True)
                     start.record()
                     for _ in range(iters):
                         _ = cupyx.cusparse.spmm(A_coo, rhs)
                     end.record()
-                    torch.cuda.synchronize()
+                    ACCEL.synchronize()
                     return start.elapsed_time(end) / iters
 
                 try:
@@ -1789,7 +1829,7 @@ def _benchmark_spmm_coo_synthetic_policy(
     dense_layout="row",
     timing=False,
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     route = _selected_route(route)
     layout = _normalize_layout_name(dense_layout)
     op_name = ast_ops._spmm_coo_op_to_name(op)
@@ -2333,11 +2373,11 @@ def run_all_dtypes_export_csv(
 
 
 def run_api_validation_checks():
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("API checks skipped: a CUDA/ROCm PyTorch device is not available.")
         return 0
 
-    device = torch.device("cuda")
+    device = accelerator_device()
     data = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=device)
     row = torch.tensor([0, 0, 1], dtype=torch.int32, device=device)
     col = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
@@ -2619,7 +2659,7 @@ def run_api_validation_checks():
 
 
 def run_coo_tile_branch_coverage(warmup=WARMUP, iters=ITERS, run_cusparse=True):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print(
             "COO branch coverage skipped: a CUDA/ROCm PyTorch device is not available."
         )
@@ -2720,7 +2760,7 @@ def run_comprehensive_synthetic(
     layout_names=None,
     timing=False,
 ):
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
 
@@ -2735,7 +2775,7 @@ def run_comprehensive_synthetic(
     print("FLAGSPARSE SpMM BENCHMARK (synthetic COO @ dense)")
     print("=" * 150)
     print(
-        f"GPU: {torch.cuda.get_device_name(0)}  |  Warmup: {warmup}  Iters: {iters}  "
+        f"GPU: {ACCEL.get_device_name(0)}  |  Warmup: {warmup}  Iters: {iters}  "
         f"BLOCK_N: {_fmt_launch_value(block_n)}  BLOCK_NNZ: {_fmt_launch_value(block_nnz)}  Route: {route}  Ops: {','.join(op_names)}  Layouts: {','.join(layout_names)}"
     )
     print(
@@ -3022,7 +3062,7 @@ def main():
     )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
 
@@ -3100,7 +3140,7 @@ def main():
         except ValueError as exc:
             parser.error(str(exc))
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  Alg: {args.alg or args.route}  |  CSV: {csv_path}"
+            f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}  |  DenseN: {args.dense_cols}  |  Alg: {args.alg or args.route}  |  CSV: {csv_path}"
         )
         print(
             f"dtypes: {args.dtypes}  |  index_dtypes: {args.index_dtypes}  |  ops: {args.op}  |  layouts: {args.layout}"
@@ -3141,7 +3181,7 @@ def main():
     ):
         print(line)
     vendor_short = fs_common._expected_vendor_sparse_short()
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  Files: {len(paths)}")
+    print(f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}")
     print(
         f"dtype: {args.dtype}  index_dtype: {args.index_dtype}  dense_cols: {args.dense_cols}  "
         f"op: {args.op}  layout: {args.layout}  warmup: {args.warmup}  iters: {args.iters}  block_n: {_fmt_launch_value(args.block_n)}  "

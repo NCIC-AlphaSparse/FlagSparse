@@ -16,6 +16,8 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmm_coo
+from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
@@ -93,6 +95,16 @@ def _reference(Asp, B, op):
     raise ValueError(op)
 
 
+def _scipy_reference(Asp, B, op, dtype):
+    indices = Asp.indices()
+    matrix = reference_utils.scipy_coo(
+        Asp.values(), indices[0], indices[1], tuple(Asp.shape), dtype
+    )
+    return reference_utils.as_torch(
+        reference_utils.spmm(matrix, B, dtype, op=op), dtype, golden_device()
+    )
+
+
 @pytest.mark.spmm_coo
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
 @pytest.mark.parametrize(
@@ -115,7 +127,11 @@ def test_spmm_coo_matches_dense_reference(M, N, K, dtype_name, dtype, index_dtyp
     b_rows = M if op in ("trans", "conj") else K
     B = _random_dense((b_rows, N), dtype, golden)
     ref_dtype = _reference_dtype(dtype)
-    ref = _reference(Asp.to(ref_dtype), B.to(ref_dtype), op).to(dtype)
+    ref = (
+        _scipy_reference(Asp, B, op, ref_dtype)
+        if common._use_scipy_accuracy_reference()
+        else _reference(Asp.to(ref_dtype), B.to(ref_dtype), op)
+    ).to(dtype)
     out = flagsparse_spmm_coo(
         data.to(device),
         row.to(device),

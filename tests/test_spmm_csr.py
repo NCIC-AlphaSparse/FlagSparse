@@ -28,6 +28,8 @@ from pathlib import Path
 
 import torch
 
+from benchmark_utils import ACCEL, accelerator_device
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -342,14 +344,14 @@ def _cuda_event_benchmark(op, warmup, iters):
     out = None
     for _ in range(max(0, int(warmup))):
         out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ACCEL.synchronize()
+    start = ACCEL.Event(enable_timing=True)
+    end = ACCEL.Event(enable_timing=True)
     start.record()
     for _ in range(max(1, int(iters))):
         out = op()
     end.record()
-    torch.cuda.synchronize()
+    ACCEL.synchronize()
     return out, start.elapsed_time(end) / max(1, int(iters))
 
 
@@ -549,7 +551,7 @@ def run_one_case(
     diagnose,
     exclude_tle=False,
 ):
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, shape = load_mtx_to_csr_torch(
         path, dtype=dtype, device=device
     )
@@ -784,7 +786,7 @@ def main():
     )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
+    if not ACCEL.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
         return
     paths = _resolve_input_paths(args.input)
