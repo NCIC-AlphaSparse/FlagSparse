@@ -14,6 +14,7 @@
 
 """Native COO SpMM kernels, route helpers, and internal benchmark entry points."""
 
+import os
 import ctypes
 from dataclasses import dataclass
 
@@ -165,7 +166,7 @@ def _sort_coo_lex_inplace(data, row, col, n_cols):
     key = row64 * max(1, int(n_cols)) + col64
     order = torch.argsort(key)
     return (
-        data[order].contiguous(),
+        _gather_values(data, order).contiguous(),
         row64[order].contiguous(),
         col64[order].contiguous(),
     )
@@ -794,6 +795,8 @@ def _spmm_coo_rowrun_real_kernel(
     b_ptr,
     c_ptr,
     seg_starts_ptr,
+    alpha,
+    beta,
     n_segs,
     n_dense_cols,
     stride_bk,
@@ -803,7 +806,25 @@ def _spmm_coo_rowrun_real_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """C[row] = alpha * sum(A[row] * B) + beta * C[row], one program per segment.
+
+    ``alpha``/``beta``/``HAS_BETA`` exist so the C API can express cuSPARSE's
+    SpMM in one launch; this module's own callers pass 1 and 0, for which the
+    generated code is what it always was.
+
+    ``SEG_IS_ROW`` says what a segment IS.  False (this module's callers) means
+    the run-compressed form: ``seg_starts`` holds one entry per RUN of equal row
+    ids, so the row is read from the COO itself and rows with no nonzeros get no
+    program at all -- fine when C was zeroed first, which is what the Python path
+    does.  True means ``seg_starts`` is a full row-offsets array of length
+    n_rows + 1, so segment index IS the row id and an empty row still runs, which
+    is what makes ``beta * C`` reach every row without a second pass.  Reading
+    the row from the COO would be wrong there: an empty row has start == end and
+    would pick up the NEXT row's id.
+    """
     seg = tl.program_id(0)
     pid_n = tl.program_id(1)
     if seg >= n_segs:
@@ -814,7 +835,10 @@ def _spmm_coo_rowrun_real_kernel(
     start = tl.load(seg_starts_ptr + seg)
     end = tl.load(seg_starts_ptr + seg + 1)
     row_nnz = end - start
-    row_id = tl.load(row_ptr + start)
+    if SEG_IS_ROW:
+        row_id = seg
+    else:
+        row_id = tl.load(row_ptr + start)
     acc = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
 
     for chunk_start in tl.range(0, row_nnz, BLOCK_NNZ):
@@ -830,7 +854,11 @@ def _spmm_coo_rowrun_real_kernel(
             )
             acc = acc + a_val.to(ACC_DTYPE) * b_vals.to(ACC_DTYPE)
 
-    tl.store(c_ptr + row_id * stride_cm + offs_n * stride_cn, acc, mask=mask_n)
+    c_ptrs = c_ptr + row_id * stride_cm + offs_n * stride_cn
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(c_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+    tl.store(c_ptrs, out, mask=mask_n)
 
 
 @triton.jit
@@ -841,6 +869,10 @@ def _spmm_coo_rowrun_complex_kernel(
     b_ri_ptr,
     c_ri_ptr,
     seg_starts_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_segs,
     n_dense_cols,
     stride_bk,
@@ -852,7 +884,10 @@ def _spmm_coo_rowrun_complex_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_NNZ: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """Complex counterpart; see the real kernel for SEG_IS_ROW and HAS_BETA."""
     seg = tl.program_id(0)
     pid_n = tl.program_id(1)
     if seg >= n_segs:
@@ -863,7 +898,10 @@ def _spmm_coo_rowrun_complex_kernel(
     start = tl.load(seg_starts_ptr + seg)
     end = tl.load(seg_starts_ptr + seg + 1)
     row_nnz = end - start
-    row_id = tl.load(row_ptr + start)
+    if SEG_IS_ROW:
+        row_id = seg
+    else:
+        row_id = tl.load(row_ptr + start)
     acc_re = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
     acc_im = tl.zeros([BLOCK_N], dtype=ACC_DTYPE)
 
@@ -895,12 +933,17 @@ def _spmm_coo_rowrun_complex_kernel(
                 + a_im.to(ACC_DTYPE) * b_re.to(ACC_DTYPE)
             )
 
-    tl.store(c_ri_ptr + row_id * stride_cm + offs_n * stride_cn, acc_re, mask=mask_n)
-    tl.store(
-        c_ri_ptr + row_id * stride_cm + offs_n * stride_cn + stride_cr,
-        acc_im,
-        mask=mask_n,
-    )
+    c_re_ptrs = c_ri_ptr + row_id * stride_cm + offs_n * stride_cn
+    c_im_ptrs = c_re_ptrs + stride_cr
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(c_re_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+        prev_im = tl.load(c_im_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(c_re_ptrs, out_re, mask=mask_n)
+    tl.store(c_im_ptrs, out_im, mask=mask_n)
 
 
 @triton.jit
@@ -1298,6 +1341,12 @@ def _triton_spmm_coo_rowrun_impl(
             B,
             C_compute,
             seg_starts,
+            # This operator computes C = A @ B into a zeroed C; alpha/beta exist
+            # for the C API's cuSPARSE-compatible signature, and SEG_IS_ROW=False
+            # keeps the run-compressed seg_starts this path builds. Both constexprs
+            # fold away, so the generated kernel is unchanged.
+            1,
+            0,
             n_segs,
             n_dense_cols,
             B.stride(0),
@@ -1307,6 +1356,8 @@ def _triton_spmm_coo_rowrun_impl(
             BLOCK_N=block_n,
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
+            SEG_IS_ROW=False,
+            HAS_BETA=False,
             num_warps=num_warps,
         )
         if dtype != output_dtype:
@@ -1346,6 +1397,11 @@ def _triton_spmm_coo_rowrun_impl(
         B_ri,
         C_ri,
         seg_starts,
+        # See the real kernel above: identity alpha/beta, run-compressed segments.
+        1,
+        0,
+        0,
+        0,
         n_segs,
         n_dense_cols,
         B_ri.stride(0),
@@ -1357,6 +1413,8 @@ def _triton_spmm_coo_rowrun_impl(
         BLOCK_N=block_n,
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
+        SEG_IS_ROW=False,
+        HAS_BETA=False,
         num_warps=num_warps,
     )
     if dtype != output_dtype:
@@ -1505,6 +1563,70 @@ def _normalize_spmm_coo_route(route):
     return route
 
 
+# ---------------------------------------------------------------------------
+# Ascend dispatch.
+#
+# Both COO routes allocate scratchpad inside the kernel -- the rowrun one unrolls
+# tl.static_range(0, BLOCK_NNZ) over a shared tile, the atomic one accumulates
+# through shared memory -- and CANN's Triton backend fails to compile that shape.
+# On Ascend the product is built with torch ops instead.
+#
+# Unlike the triangular solves this has no dependency chain, so the fallback is
+# ONE scatter-add rather than a loop: every nonzero contributes independently.
+# That makes it a reasonable path rather than merely a correct one.
+#
+# SPMM_COO_ASCEND_DISPATCH is the routing table, and
+# FLAGSPARSE_SPMM_COO_ASCEND_DISPATCH forces it on any backend, which is how the
+# fallback is tested where no NPU is attached -- the body is pure torch.
+# ---------------------------------------------------------------------------
+
+
+def _spmm_coo_ascend_scatter(
+    data, row, col, B, n_rows, n_dense_cols, *, output_dtype=None, out=None,
+    dense_layout="row"
+):
+    """C = A @ B for a COO A, as a single index_add over the nonzeros."""
+    dense_layout = _normalize_dense_layout(dense_layout)
+    dtype = data.dtype if output_dtype is None else output_dtype
+    if n_rows == 0 or n_dense_cols == 0 or data.numel() == 0:
+        C = _zeros_dense_layout((n_rows, n_dense_cols), dtype, data.device, dense_layout)
+        if out is not None:
+            out.zero_()
+            return out
+        return C
+
+    rows64 = row.to(torch.int64)
+    cols64 = col.to(torch.int64)
+    # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]].
+    contrib = data.unsqueeze(1) * B[cols64]
+    acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
+    acc.index_add_(0, rows64, contrib)
+    acc = acc.to(dtype)
+
+    if out is not None:
+        out.copy_(acc)
+        return out
+    if dense_layout == "col":
+        C = _empty_dense_layout((n_rows, n_dense_cols), dtype, data.device, dense_layout)
+        C.copy_(acc)
+        return C
+    return acc
+
+
+SPMM_COO_ASCEND_DISPATCH: dict[str, object] = {
+    "spmm_coo": _spmm_coo_ascend_scatter,
+}
+
+
+def _use_spmm_coo_ascend_dispatch():
+    forced = os.environ.get("FLAGSPARSE_SPMM_COO_ASCEND_DISPATCH", "").strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    if forced in ("0", "false", "no", "off"):
+        return False
+    return _is_ascend_runtime()
+
+
 def _triton_spmm_coo_impl(
     data,
     row,
@@ -1522,6 +1644,20 @@ def _triton_spmm_coo_impl(
     route = _normalize_spmm_coo_route(route)
     dense_layout = _normalize_dense_layout(dense_layout)
     resolved_output_dtype = output_dtype if output_dtype is not None else data.dtype
+    if _use_spmm_coo_ascend_dispatch():
+        # Both routes fail to compile on CANN; the scatter gives the same result
+        # for either, so the requested route is a hint rather than a promise here.
+        return SPMM_COO_ASCEND_DISPATCH["spmm_coo"](
+            data,
+            row,
+            col,
+            B,
+            n_rows,
+            n_dense_cols,
+            output_dtype=resolved_output_dtype,
+            out=out,
+            dense_layout=dense_layout,
+        )
     if route == "rowrun":
         return _triton_spmm_coo_rowrun_impl(
             data,

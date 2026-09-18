@@ -222,7 +222,19 @@ def _time_flagsparse_csc(
 
 
 def _time_pytorch(data, indices, indptr, x, shape, op, warmup, iters):
-    A = _csc_to_torch_coo(data, indices, indptr, shape)
+    if ast_ops._is_maca_runtime():
+        # MACA has a native sparse CSC path, so the baseline does not need the
+        # COO round-trip the other backends take.
+        A = torch.sparse_csc_tensor(
+            indptr,
+            indices,
+            data,
+            size=shape,
+            device=data.device,
+            dtype=data.dtype,
+        )
+    else:
+        A = _csc_to_torch_coo(data, indices, indptr, shape)
     if op == "non":
         fn = lambda: torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
     elif op == "trans":
@@ -364,6 +376,7 @@ def _run_one_case(
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": None,
         "pytorch_ms": None,
+        "csc_speedup_vs_pytorch": None,
         "cusparse_ms": None,
         "err": None,
         "status": "ERROR",
@@ -406,6 +419,9 @@ def _run_one_case(
     base_row.update(
         {
             "pytorch_ms": pt_ms,
+            "csc_speedup_vs_pytorch": (
+                pt_ms / csc["ms"] if pt_ms is not None and csc["ms"] > 0 else None
+            ),
             "cusparse_ms": cu_ms,
             "err": err,
             "status": _status(ok),
@@ -553,6 +569,7 @@ def run_csv(
                             "process_gpu_ms": None,
                             "compute_ms": None,
                             "pytorch_ms": None,
+                            "csc_speedup_vs_pytorch": None,
                             "cusparse_ms": None,
                             "err": None,
                             "status": "ERROR",
@@ -578,6 +595,7 @@ def run_csv(
         "process_gpu_ms",
         "compute_ms",
         "pytorch_ms",
+        "csc_speedup_vs_pytorch",
         "cusparse_ms",
         "err",
         "status",

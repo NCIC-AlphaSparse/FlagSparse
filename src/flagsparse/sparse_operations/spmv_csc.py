@@ -19,6 +19,10 @@ from ._common import *
 import triton
 import triton.language as tl
 
+# Resolved once at import: the runtime cannot change under a live process, and
+# prepare_spmv_csc sits on the per-call path.
+_SPMV_CSC_CUDA = _backend_name() == "cuda"
+
 SUPPORTED_SPMV_CSC_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -92,6 +96,7 @@ class PreparedCscSpmv:
         "col_lengths",
         "max_col_nnz",
         "col_ids",
+        "csr_delegate",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -116,6 +121,7 @@ class PreparedCscSpmv:
         op=None,
         transpose=False,
         col_ids=None,
+        csr_delegate=None,
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
@@ -135,6 +141,7 @@ class PreparedCscSpmv:
             col_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
         self.col_lengths = col_lengths
         self.col_ids = col_ids
+        self.csr_delegate = csr_delegate
         self.max_col_nnz = int(max_col_nnz)
         self.op = _normalize_spmv_csc_op(op, transpose=transpose)
         self.transpose = _spmv_csc_op_transposes(self.op)
@@ -157,9 +164,17 @@ def _spmv_csc_non_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
 ):
+    """y += alpha * A @ x, accumulated with atomics.
+
+    Only alpha lives here: this route scatters into y, so ``beta * y`` cannot be
+    folded into the store and the C API applies it with a separate prologue
+    (``_dense_scale_kernel``) before launching. This module's callers pass
+    alpha = 1 into a zeroed y, which is the code this kernel always generated.
+    """
     col = tl.program_id(0)
     seg = tl.program_id(1)
     if col >= n_cols:
@@ -171,7 +186,7 @@ def _spmv_csc_non_real_kernel(
     rows = tl.load(indices_ptr + offs, mask=mask, other=0)
     vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
     x_val = tl.load(x_ptr + col)
-    tl.atomic_add(y_ptr + rows, vals * x_val, mask=mask, sem="relaxed")
+    tl.atomic_add(y_ptr + rows, alpha * vals * x_val, mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -181,9 +196,12 @@ def _spmv_csc_non_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
 ):
+    """Complex counterpart; see _spmv_csc_non_real_kernel for why beta is absent."""
     col = tl.program_id(0)
     seg = tl.program_id(1)
     if col >= n_cols:
@@ -199,8 +217,10 @@ def _spmv_csc_non_complex_kernel(
     x_im = tl.load(x_ri_ptr + col * 2 + 1)
     prod_re = a_re * x_re - a_im * x_im
     prod_im = a_re * x_im + a_im * x_re
-    tl.atomic_add(y_ri_ptr + rows * 2, prod_re, mask=mask, sem="relaxed")
-    tl.atomic_add(y_ri_ptr + rows * 2 + 1, prod_im, mask=mask, sem="relaxed")
+    out_re = alpha_re * prod_re - alpha_im * prod_im
+    out_im = alpha_re * prod_im + alpha_im * prod_re
+    tl.atomic_add(y_ri_ptr + rows * 2, out_re, mask=mask, sem="relaxed")
+    tl.atomic_add(y_ri_ptr + rows * 2 + 1, out_im, mask=mask, sem="relaxed")
 
 
 @triton.jit
@@ -210,10 +230,19 @@ def _spmv_csc_trans_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
+    beta,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y = alpha * op(A) * x + beta * y, one program per column.
+
+    Unlike the op="non" route this one is deterministic and writes every column
+    exactly once, so both scalars fold into the store; no prologue is needed and
+    an empty column still gets beta * y. This module's callers pass 1 and 0.
+    """
     col = tl.program_id(0)
     if col >= n_cols:
         return
@@ -237,7 +266,10 @@ def _spmv_csc_trans_real_kernel(
         vals = tl.load(data_ptr + offs, mask=mask, other=0.0)
         x_vals = tl.load(x_ptr + rows, mask=mask, other=0.0)
         acc = acc + tl.sum(tl.where(mask, vals * x_vals, 0.0))
-    tl.store(y_ptr + col, acc)
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(y_ptr + col)
+    tl.store(y_ptr + col, out)
 
 
 @triton.jit
@@ -247,11 +279,17 @@ def _spmv_csc_trans_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_cols,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     CONJ: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """Complex counterpart; see _spmv_csc_trans_real_kernel."""
     col = tl.program_id(0)
     if col >= n_cols:
         return
@@ -277,8 +315,15 @@ def _spmv_csc_trans_complex_kernel(
         prod_im = a_re * x_im + a_im * x_re
         acc_re = acc_re + tl.sum(tl.where(mask, prod_re, 0.0))
         acc_im = acc_im + tl.sum(tl.where(mask, prod_im, 0.0))
-    tl.store(y_ri_ptr + col * 2, acc_re)
-    tl.store(y_ri_ptr + col * 2 + 1, acc_im)
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(y_ri_ptr + col * 2)
+        prev_im = tl.load(y_ri_ptr + col * 2 + 1)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(y_ri_ptr + col * 2, out_re)
+    tl.store(y_ri_ptr + col * 2 + 1, out_im)
 
 
 def _prepare_spmv_csc_matrix(data, indices, indptr, shape):
@@ -383,6 +428,43 @@ def prepare_spmv_csc(
             col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
         except Exception:
             col_ids = None
+    # op="trans"/"conj": CSC(A) and CSR(A.T) are the same three arrays, so the
+    # transposed product is a plain CSR SpMV -- and spmv_csr has the tuned CSR-Vector
+    # bucket machinery this module never grew.  The bespoke CSC trans kernel runs one
+    # program per column with a serial segment loop, which on a mean-8-nnz matrix is
+    # mostly masked-off loads; delegating measured 4.39x geomean over 240 cases
+    # (fp64 5.73x, complex128 8.22x) with 16 mild regressions, worst 0.75x.
+    # prepare_spmv_csr already uses this same transpose-in-prepare technique for its own
+    # trans/conj, so the timing convention matches the cuSPARSE baseline, which
+    # materialises A.conj().T once outside the timed window.
+    # CUDA only: this swaps which kernel actually runs, and the CSR-Vector bucket tiers
+    # it lands on were tuned per backend separately.  Elsewhere the original CSC
+    # transpose kernel is kept.
+    csr_delegate = None
+    if (
+        _SPMV_CSC_CUDA
+        and _spmv_csc_op_transposes(op_code)
+        and int(data.numel()) > 0
+    ):
+        try:
+            from .spmv_csr import prepare_spmv_csr
+
+            delegate_values = data
+            if op_code == SPMV_CSC_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+                delegate_values = data.conj()
+                if hasattr(delegate_values, "resolve_conj"):
+                    delegate_values = delegate_values.resolve_conj()
+                delegate_values = delegate_values.contiguous()
+            csr_delegate = prepare_spmv_csr(
+                delegate_values,
+                indices,
+                indptr,
+                (n_cols, n_rows),
+                op="non",
+                index_fallback_policy=index_fallback_policy,
+            )
+        except Exception:
+            csr_delegate = None
     return PreparedCscSpmv(
         data=data,
         kernel_indices=indices,
@@ -395,6 +477,7 @@ def prepare_spmv_csc(
         max_col_nnz=max_col_nnz,
         col_lengths=col_lengths,
         col_ids=col_ids,
+        csr_delegate=csr_delegate,
         op=op_code,
         index_fallback_policy=index_fallback_policy,
         launch_backend=launch_backend,
@@ -488,6 +571,16 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if trans and prepared.nnz != 0:
+        csr_delegate = getattr(prepared, "csr_delegate", None)
+        if csr_delegate is not None:
+            from .spmv_csr import flagsparse_spmv_csr
+
+            # Let spmv_csr allocate: it fills the whole vector, so zeroing first is a
+            # wasted memset -- that alone moved the operator 0.765 -> 0.940.
+            # use_opt=False deliberately: the bucketed path measured 0.39x on fp32,
+            # while the default matches the oracle over both (4.39x vs 4.41x).
+            return flagsparse_spmv_csr(prepared=csr_delegate, x=x, use_opt=False)
     y = torch.zeros(out_len, dtype=dtype, device=prepared.data.device)
     if prepared.nnz == 0:
         return y
@@ -533,6 +626,10 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
                 prepared.kernel_indptr,
                 x_ri,
                 y_ri,
+            # y = op(A) @ x here; alpha/beta exist for the C API's
+            # cuSPARSE-compatible signature and fold away at 1 / 0.
+                1,
+                0,
                 prepared.n_cols,
                 BLOCK_NNZ=prepared.block_nnz,
             )
@@ -544,6 +641,7 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
             prepared.kernel_indptr,
             x,
             y,
+            1,                       # alpha; beta is a prologue on this route
             prepared.n_cols,
             BLOCK_NNZ=prepared.block_nnz,
         )
@@ -559,10 +657,15 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
             prepared.kernel_indptr,
             x_ri,
             y_ri,
+            1,
+            0,
+            0,
+            0,
             prepared.n_cols,
             BLOCK_NNZ=prepared.block_nnz,
             MAX_SEGMENTS=prepared.max_segments,
             CONJ=(op_code == SPMV_CSC_OP_CONJ_TRANS),
+            HAS_BETA=False,
         )
         y.copy_(torch.view_as_complex(y_ri.reshape(out_len, 2)))
         return y
@@ -572,9 +675,12 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
         prepared.kernel_indptr,
         x,
         y,
+        1,
+        0,
         prepared.n_cols,
         BLOCK_NNZ=prepared.block_nnz,
         MAX_SEGMENTS=prepared.max_segments,
+        HAS_BETA=False,
     )
     return y
 

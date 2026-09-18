@@ -494,6 +494,7 @@ def _run_one_coo_case(
     warmup,
     iters,
     timing=False,
+    run_cusparse=True,
 ):
     row = row.to(index_dtype).contiguous()
     col = col.to(index_dtype).contiguous()
@@ -534,8 +535,12 @@ def _run_one_coo_case(
     cu_ms = None
     triton_ok_cu = False
     # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
-    sparse_ref = fs_common._benchmark_spmv_coo_sparse_ref(
+    sparse_ref = (
+        fs_common._benchmark_spmv_coo_sparse_ref(
         data, row, col, x, shape, warmup=warmup, iters=iters, op=op
+    )
+        if run_cusparse
+        else {"backend": None}
     )
     if sparse_ref["backend"] is not None:
         try:
@@ -601,6 +606,7 @@ def _run_one_tocsr_case(
     matrix_name,
     warmup,
     iters,
+    run_cusparse=True,
 ):
     row = row.to(index_dtype).contiguous()
     col = col.to(index_dtype).contiguous()
@@ -629,8 +635,12 @@ def _run_one_tocsr_case(
     cu_ms = None
     err_cu = None
     triton_ok_cu = False
-    sparse_ref = fs_common._benchmark_spmv_coo_sparse_ref(
+    sparse_ref = (
+        fs_common._benchmark_spmv_coo_sparse_ref(
         data, row, col, x, shape, warmup=warmup, iters=iters, op="non"
+    )
+        if run_cusparse
+        else {"backend": None}
     )
     if sparse_ref["backend"] is not None:
         try:
@@ -871,6 +881,7 @@ def run_all_dtypes_coo_csv(
     warmup=WARMUP,
     iters=ITERS,
     timing=False,
+    run_cusparse=True,
 ):
     if not torch.cuda.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
@@ -925,6 +936,7 @@ def run_all_dtypes_coo_csv(
                             warmup=warmup,
                             iters=iters,
                             timing=timing,
+                            run_cusparse=run_cusparse,
                         )
                         rows_out.append(result)
                         _print_coo_result(result, timing=timing)
@@ -992,6 +1004,7 @@ def run_all_dtypes_tocsr_csv(
     index_dtypes=None,
     warmup=WARMUP,
     iters=ITERS,
+    run_cusparse=True,
 ):
     if not torch.cuda.is_available():
         print("A CUDA/ROCm PyTorch device is not available.")
@@ -1036,6 +1049,7 @@ def run_all_dtypes_tocsr_csv(
                         matrix_name=os.path.basename(path),
                         warmup=warmup,
                         iters=iters,
+                        run_cusparse=run_cusparse,
                     )
                     rows_out.append(result)
                     _print_tocsr_result(result)
@@ -1124,6 +1138,11 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument(
+        "--no-cusparse",
+        action="store_true",
+        help="Disable the optional vendor sparse baseline.",
+    )
+    parser.add_argument(
         "--timing",
         action="store_true",
         help="Show/export native COO timing breakdown columns",
@@ -1167,6 +1186,7 @@ def main():
             ops=ops,
             warmup=args.warmup,
             iters=args.iters,
+            run_cusparse=not args.no_cusparse,
             timing=args.timing,
         )
         return

@@ -332,8 +332,8 @@ def _prepare_spmm_bell_matrix(data, indices, shape, block_dim=None):
         raise ValueError("BELL data must have shape (mb, ell_width_blocks, block_dim, block_dim)")
     if indices.dim() != 2:
         raise ValueError("BELL indices must have shape (mb, ell_width_blocks)")
-    if data.device.type != "cuda" or indices.device.type != "cuda":
-        raise ValueError("BELL SpMM inputs must be CUDA tensors")
+    if not _is_accel_tensor(data) or not _is_accel_tensor(indices):
+        raise ValueError("BELL SpMM inputs must be accelerator tensors")
     if data.device != indices.device:
         raise ValueError("BELL data and indices must be on the same device")
     if data.dtype not in SUPPORTED_SPMM_BELL_VALUE_DTYPES:
@@ -509,14 +509,14 @@ def _run_spmm_bell_base_route(prepared, B, *, timing=False, diagnostics=False):
     compute_ms = None
     launch = _resolve_spmm_bell_launch(prepared, int(B.shape[1]))
     if timing:
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        _ACCEL.synchronize()
+        start = _ACCEL.Event(enable_timing=True)
+        end = _ACCEL.Event(enable_timing=True)
         start.record()
     C = _triton_spmm_bell_base_kernel(prepared, B)
     if timing:
         end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         compute_ms = start.elapsed_time(end)
     process_cpu_ms = 0.0
     meta = {
@@ -1052,13 +1052,13 @@ def flagsparse_spmm_bell_run(
     B = _validate_spmm_bell_B(B, prepared)
     collect_timing = bool(return_time or return_meta)
     if collect_timing:
-        event_start = torch.cuda.Event(enable_timing=True)
-        event_end = torch.cuda.Event(enable_timing=True)
+        event_start = _ACCEL.Event(enable_timing=True)
+        event_end = _ACCEL.Event(enable_timing=True)
         event_start.record()
     C, route_meta = algorithm.run(prepared, B, timing=timing)
     if collect_timing:
         event_end.record()
-        torch.cuda.synchronize()
+        _ACCEL.synchronize()
         gpu_ms = event_start.elapsed_time(event_end)
     else:
         gpu_ms = None

@@ -27,6 +27,15 @@ def dtype_name(dtype):
     return str(dtype).removeprefix("torch.")
 
 
+def set_known_backends(backends):
+    """Synchronize legacy-route backend names with the shared runtime registry."""
+    global BACKENDS
+    normalized = tuple(dict.fromkeys(str(name) for name in backends if name))
+    if not normalized:
+        raise ValueError("CSR SpMV backend registry must not be empty")
+    BACKENDS = normalized
+
+
 def normalize_alg(alg):
     name = "auto" if alg is None else str(alg).strip().lower()
     if name == "base":

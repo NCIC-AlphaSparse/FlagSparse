@@ -22,7 +22,10 @@ import triton.language as tl
 from copy import copy, deepcopy
 from contextlib import nullcontext
 from dataclasses import asdict
+from . import _common as _common_mod
 from . import _spmv_csr_config as _csr_config
+
+_csr_config.set_known_backends(spec.name for spec in _common_mod.backend_specs())
 
 SPMV_CSR_NEW_ALGORITHMS = (
     "row_tile",
@@ -42,6 +45,19 @@ SUPPORTED_SPMV_VALUE_DTYPES = (
     torch.complex64,
     torch.complex128,
 )
+_ASCEND_ROW_IDS_CACHE = {}
+
+
+def _ascend_csr_row_ids(indptr, n_rows):
+    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
+    cached = _ASCEND_ROW_IDS_CACHE.get(key)
+    if cached is None:
+        cached = torch.repeat_interleave(
+            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
+            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
+        )
+        _ASCEND_ROW_IDS_CACHE[key] = cached
+    return cached
 
 SPMV_OP_NON = 0
 SPMV_OP_TRANS = 1
@@ -315,10 +331,24 @@ def _spmv_csr_real_kernel(
     indptr_ptr,
     x_ptr,
     y_ptr,
+    alpha,
+    beta,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y = alpha * A @ x + beta * y.
+
+    ``alpha``/``beta`` exist so the C API can express cuSPARSE's SpMV in one
+    launch; this module's own callers pass 1 and 0, for which the generated code
+    is the plain ``y = A @ x`` it has always been.  Keeping them here rather than
+    in a second copy of the kernel is deliberate -- the C++ dispatch layer
+    re-exports THIS function, so there is exactly one kernel to tune or fix.
+
+    ``HAS_BETA`` is constexpr because cuSPARSE defines beta == 0 as "ignore y":
+    reading an uninitialised output would turn into NaN through 0 * NaN.
+    """
     row = tl.program_id(0)
     if row >= n_rows:
         return
@@ -334,7 +364,10 @@ def _spmv_csr_real_kernel(
         x_vals = tl.load(x_ptr + col, mask=mask, other=0.0)
         part = tl.where(mask, a * x_vals, 0.0)
         acc = acc + tl.sum(part)
-    tl.store(y_ptr + row, acc)
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(y_ptr + row)
+    tl.store(y_ptr + row, out)
 
 
 @triton.jit
@@ -344,10 +377,25 @@ def _spmv_csr_complex_kernel(
     indptr_ptr,
     x_ri_ptr,
     y_ri_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_rows,
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y = alpha * A @ x + beta * y, with complex alpha/beta.
+
+    Complex counterpart of _spmv_csr_real_kernel and added for the same reason:
+    the C API expresses cuSPARSE's SpMV in one launch. This module's callers pass
+    alpha = 1 + 0j and beta = 0, which folds back to the plain product.
+
+    Triton has no complex type, so the scalars arrive split into real and
+    imaginary components of the interleaved buffers' element dtype -- the same
+    representation the operands themselves use.
+    """
     row = tl.program_id(0)
     if row >= n_rows:
         return
@@ -368,8 +416,15 @@ def _spmv_csr_complex_kernel(
         prod_im = tl.where(mask, a_re * x_im + a_im * x_re, 0.0)
         acc_re = acc_re + tl.sum(prod_re)
         acc_im = acc_im + tl.sum(prod_im)
-    tl.store(y_ri_ptr + row * 2, acc_re)
-    tl.store(y_ri_ptr + row * 2 + 1, acc_im)
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(y_ri_ptr + row * 2)
+        prev_im = tl.load(y_ri_ptr + row * 2 + 1)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(y_ri_ptr + row * 2, out_re)
+    tl.store(y_ri_ptr + row * 2 + 1, out_im)
 
 
 # ── Optimised SpMV (CSR-Vector, perf-oriented, no CuPy) ─────────────
@@ -775,7 +830,7 @@ def _transpose_csr_for_spmv(data, indices, indptr, shape):
         order = torch.argsort(col_ids)
     sorted_cols = col_ids[order]
     sorted_rows = row_ids[order]
-    transposed_data = data[order].contiguous()
+    transposed_data = _gather_values(data, order).contiguous()
 
     nnz_per_transposed_row = torch.bincount(sorted_cols, minlength=n_cols)
     transposed_indptr64 = torch.zeros(n_cols + 1, dtype=torch.int64, device=device)
@@ -1032,9 +1087,15 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
             prepared.kernel_indptr,
             x_in,
             y_out,
+            # This operator computes y = A @ x; alpha/beta exist for the C API's
+            # cuSPARSE-compatible signature. HAS_BETA=False makes the beta term
+            # vanish at compile time, so the generated kernel is unchanged.
+            1,
+            0,
             n_rows=prepared.n_rows,
             BLOCK_NNZ=prepared.block_nnz,
             MAX_SEGMENTS=prepared.max_segments,
+            HAS_BETA=False,
         )
         return y
     data_ri = torch.view_as_real(data_in).reshape(-1)
@@ -1046,9 +1107,16 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
         prepared.kernel_indptr,
         x_ri,
         y_ri,
+        # y = A @ x here; alpha/beta exist for the C API's
+        # cuSPARSE-compatible signature and fold away at 1 + 0j / 0.
+        1,
+        0,
+        0,
+        0,
         n_rows=prepared.n_rows,
         BLOCK_NNZ=prepared.block_nnz,
         MAX_SEGMENTS=prepared.max_segments,
+        HAS_BETA=False,
     )
     return y
 
@@ -1534,6 +1602,46 @@ def flagsparse_spmv_csr(
         and bool(transpose) != _spmv_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
+
+    # Ascend 910B Triton currently fails lowering the segmented-scan kernel.
+    # Use an equivalent torch_npu index_add implementation only for Ascend;
+    # CUDA/ROCm/MetaX/MUSA retain the existing Triton path below.
+    if _is_ascend_runtime():
+        if prepared is not None:
+            raise NotImplementedError("Ascend fallback does not accept prepared SpMV metadata")
+        if any(arg is None for arg in (data, indices, indptr, shape, x)):
+            raise ValueError("data, indices, indptr, x, and shape are required")
+        if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
+            raise ValueError("data, indices, indptr, and x must be 1D tensors")
+        n_rows, n_cols = int(shape[0]), int(shape[1])
+        if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+            raise ValueError("invalid CSR dimensions")
+        if x.numel() != (n_rows if _spmv_op_transposes(op_code) else n_cols):
+            raise ValueError("x shape does not match CSR operation")
+        row_ids = _ascend_csr_row_ids(indptr, n_rows)
+        cols = indices.to(torch.int64)
+        timed = bool(return_time or return_meta)
+        if timed:
+            _ACCEL.synchronize()
+        t0 = time.perf_counter()
+        if _spmv_op_transposes(op_code):
+            y = torch.zeros((n_cols,), device=data.device, dtype=data.dtype)
+            y.index_add_(0, cols, data * x[row_ids])
+        else:
+            y = torch.zeros((n_rows,), device=data.device, dtype=data.dtype)
+            y.index_add_(0, row_ids, data * x[cols])
+        if out is not None:
+            out.copy_(y)
+            y = out
+        if timed:
+            _ACCEL.synchronize()
+            elapsed = (time.perf_counter() - t0) * 1000.0
+        else:
+            elapsed = None
+        if return_meta:
+            meta = {"symbolic_ms": 0.0 if timed else None, "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return (y, elapsed) if return_time else y
     if prepared is None:
         if any(value is None for value in (data, indices, indptr, shape)):
             raise ValueError(
@@ -1605,7 +1713,7 @@ def coo_to_csr_for_spmv(data, row, col, shape, assume_sorted=False):
         order = torch.argsort(key)
         row_s = row64[order]
         col_s = col64[order]
-        data_s = data[order].to(data.dtype)
+        data_s = _gather_values(data, order).to(data.dtype)
 
     indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=data.device)
     nnz = data_s.numel()

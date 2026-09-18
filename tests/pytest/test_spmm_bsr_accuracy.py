@@ -18,11 +18,17 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmm_bsr, prepare_spmm_bsr_route
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 
 
 spmm_bsr_mod = importlib.import_module("flagsparse.sparse_operations.spmm_bsr")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 BSR_MNK_SHAPES = ((7, 5, 4), (16, 32, 8), (64, 96, 16))
 
@@ -100,17 +106,23 @@ def _dense_to_bsr(dense, index_dtype, block_dim):
 
 
 def _random_bsr_mk(M, K, dtype, index_dtype, block_dim, device):
+    """BSR arrays on ``device``, dense oracle copy on CPU.
+
+    Built on the golden device: ``torch.where`` has no muDNN kernel for
+    float64/complex on Moore Threads.  See ``golden_device()``.
+    """
+    golden = golden_device()
     p = min(0.25, max(0.06, 32.0 / max(M * K, 1)))
-    mask = torch.rand(M, K, device=device) < p
+    mask = torch.rand(M, K, device=golden) < p
     if int(mask.sum().item()) == 0:
         mask[0, 0] = True
     dense = torch.where(
         mask,
-        _random_values((M, K), dtype, device),
-        torch.zeros((), dtype=dtype, device=device),
+        _random_values((M, K), dtype, golden),
+        torch.zeros((), dtype=dtype, device=golden),
     )
     data, indices, indptr = _dense_to_bsr(dense, index_dtype, block_dim)
-    return data, indices, indptr, dense
+    return data.to(device), indices.to(device), indptr.to(device), dense
 
 
 def _padded_rows(M, block_dim):
@@ -157,8 +169,12 @@ def _dense_reference(dense, B, dtype, op):
 def _assert_close(actual, expected, dtype):
     rtol, atol = close_tolerances(dtype)
     ref_dtype = _reference_dtype(dtype)
+    golden = golden_device()
     assert torch.allclose(
-        actual.to(ref_dtype), expected.to(ref_dtype), rtol=rtol, atol=atol
+        actual.to(device=golden, dtype=ref_dtype),
+        expected.to(device=golden, dtype=ref_dtype),
+        rtol=rtol,
+        atol=atol,
     )
 
 
@@ -172,17 +188,17 @@ def _assert_close(actual, expected, dtype):
 @pytest.mark.parametrize("op", ["non", "trans", "conj"], ids=["non", "trans", "conj"])
 def test_spmm_bsr_matches_dense_reference(M, K, N, name, dtype, index_dtype, block_dim, op):
     del name
-    device = torch.device("cuda")
+    device = accelerator_device()
     data, indices, indptr, dense = _random_bsr_mk(
         M, K, dtype, index_dtype, block_dim, device
     )
-    B = _random_values((_logical_b_rows(M, K, op), N), dtype, device)
+    B = _random_values((_logical_b_rows(M, K, op), N), dtype, golden_device())
     ref = _dense_reference(dense, B, dtype, op)
     out = flagsparse_spmm_bsr(
         data,
         indices,
         indptr,
-        B,
+        B.to(device),
         shape=(M, K),
         block_dim=block_dim,
         op=op,
@@ -194,7 +210,7 @@ def test_spmm_bsr_matches_dense_reference(M, K, N, name, dtype, index_dtype, blo
 
 @pytest.mark.spmm_bsr
 def test_spmm_bsr_prepared_path_and_meta():
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 7, 5, 4
     dtype = torch.complex64
     block_dim = 4
@@ -203,11 +219,11 @@ def test_spmm_bsr_prepared_path_and_meta():
     )
     op = "conj"
     prepared = prepare_spmm_bsr_route(data, indices, indptr, (M, K), block_dim=block_dim, op=op)
-    B = _random_values((M, N), dtype, device)
+    B = _random_values((M, N), dtype, golden_device())
     ref = _dense_reference(dense, B, dtype, op)
     out, meta = spmm_bsr_mod.flagsparse_spmm_bsr_run(
         prepared,
-        B,
+        B.to(device),
         op=op,
         return_meta=True,
         timing=True,
@@ -226,7 +242,7 @@ def test_spmm_bsr_prepared_path_and_meta():
 @pytest.mark.spmm_bsr
 @pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
 def test_spmm_bsr_accepts_padded_B(op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 7, 5, 4
     block_dim = 4
     dtype = torch.float32
@@ -234,10 +250,15 @@ def test_spmm_bsr_accepts_padded_B(op):
         M, K, dtype, torch.int32, block_dim, device
     )
     logical_b_rows = _logical_b_rows(M, K, op)
-    B = torch.zeros((_padded_b_rows(M, K, block_dim, op), N), dtype=dtype, device=device)
-    B[:logical_b_rows, :] = _random_values((logical_b_rows, N), dtype, device)
-    ref = _dense_reference(dense, B[:logical_b_rows, :], dtype, op)
-    out = flagsparse_spmm_bsr(data, indices, indptr, B, shape=(M, K), block_dim=block_dim, op=op)
+    B_logical = _random_values((logical_b_rows, N), dtype, golden_device())
+    ref = _dense_reference(dense, B_logical, dtype, op)
+    B = torch.zeros(
+        (_padded_b_rows(M, K, block_dim, op), N), dtype=dtype, device=device
+    )
+    B[:logical_b_rows, :] = B_logical.to(device)
+    out = flagsparse_spmm_bsr(
+        data, indices, indptr, B, shape=(M, K), block_dim=block_dim, op=op
+    )
     assert out.shape == (_padded_out_rows(M, K, block_dim, op), N)
     _assert_close(out[: _logical_out_rows(M, K, op), :], ref, dtype)
 
@@ -245,13 +266,15 @@ def test_spmm_bsr_accepts_padded_B(op):
 @pytest.mark.spmm_bsr
 @pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
 def test_spmm_bsr_B_length_mismatch_rejected(op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 8, 12, 4
     data, indices, indptr, _dense = _random_bsr_mk(
         M, K, torch.float32, torch.int32, 2, device
     )
     good_rows = _logical_b_rows(M, K, op)
-    B = torch.randn((good_rows - 1, N), dtype=torch.float32, device=device)
+    B = torch.randn(
+        (good_rows - 1, N), dtype=torch.float32, device=golden_device()
+    ).to(device)
     with pytest.raises(ValueError, match="B.shape\\[0\\] must be"):
         flagsparse_spmm_bsr(data, indices, indptr, B, shape=(8, 12), block_dim=2, op=op)
 
@@ -259,15 +282,16 @@ def test_spmm_bsr_B_length_mismatch_rejected(op):
 @pytest.mark.spmm_bsr
 @pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
 def test_spmm_bsr_int64_auto_fallback_to_int32(monkeypatch, op):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 7, 5, 4
     dtype = torch.float32
     block_dim = 2
     data, indices, indptr, dense = _random_bsr_mk(
         M, K, dtype, torch.int64, block_dim, device
     )
-    B = _random_values((_logical_b_rows(M, K, op), N), dtype, device)
+    B = _random_values((_logical_b_rows(M, K, op), N), dtype, golden_device())
     ref = _dense_reference(dense, B, dtype, op)
+    B = B.to(device)
     state = {"forced_once": False}
     original = spmm_bsr_mod._triton_spmm_bsr_base_kernel
 

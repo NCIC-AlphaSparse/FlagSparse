@@ -209,15 +209,33 @@ def _spmv_coo_seg_f32(
     x_ptr,
     y_ptr,
     seg_starts_ptr,
+    alpha,
+    beta,
     n_segs,
     BLOCK_INNER: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y[row] = alpha * sum(A[row] * x) + beta * y[row].
+
+    alpha/beta/HAS_BETA exist so the C API can express cuSPARSE's SpMV in one
+    launch; this module's callers pass 1 and 0 and the generated code is
+    unchanged. SEG_IS_ROW says what a segment IS: False (this module) means one
+    entry per RUN of equal row ids, so a row with no nonzeros gets no program at
+    all -- fine when y was zeroed first. True means seg_starts is a full
+    row-offsets array and the segment index IS the row id, which is what lets
+    beta * y reach an empty row. Reading the row from the COO would be wrong
+    there: an empty row has start == end and would pick up the NEXT row's id.
+    """
     seg = tl.program_id(0)
     if seg >= n_segs:
         return
     start = tl.load(seg_starts_ptr + seg)
     end = tl.load(seg_starts_ptr + seg + 1)
-    row_id = tl.load(row_ptr + start)
+    if SEG_IS_ROW:
+        row_id = seg
+    else:
+        row_id = tl.load(row_ptr + start)
     acc = tl.zeros((), dtype=tl.float32)
     pos = start
     while pos < end:
@@ -228,7 +246,10 @@ def _spmv_coo_seg_f32(
         xv = tl.load(x_ptr + c, mask=m, other=0.0)
         acc += tl.sum(tl.where(m, v * xv, 0.0))
         pos += BLOCK_INNER
-    tl.store(y_ptr + row_id, acc)
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(y_ptr + row_id)
+    tl.store(y_ptr + row_id, out)
 
 
 @triton.jit
@@ -239,15 +260,33 @@ def _spmv_coo_seg_f64(
     x_ptr,
     y_ptr,
     seg_starts_ptr,
+    alpha,
+    beta,
     n_segs,
     BLOCK_INNER: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """y[row] = alpha * sum(A[row] * x) + beta * y[row].
+
+    alpha/beta/HAS_BETA exist so the C API can express cuSPARSE's SpMV in one
+    launch; this module's callers pass 1 and 0 and the generated code is
+    unchanged. SEG_IS_ROW says what a segment IS: False (this module) means one
+    entry per RUN of equal row ids, so a row with no nonzeros gets no program at
+    all -- fine when y was zeroed first. True means seg_starts is a full
+    row-offsets array and the segment index IS the row id, which is what lets
+    beta * y reach an empty row. Reading the row from the COO would be wrong
+    there: an empty row has start == end and would pick up the NEXT row's id.
+    """
     seg = tl.program_id(0)
     if seg >= n_segs:
         return
     start = tl.load(seg_starts_ptr + seg)
     end = tl.load(seg_starts_ptr + seg + 1)
-    row_id = tl.load(row_ptr + start)
+    if SEG_IS_ROW:
+        row_id = seg
+    else:
+        row_id = tl.load(row_ptr + start)
     acc = tl.zeros((), dtype=tl.float64)
     pos = start
     while pos < end:
@@ -258,7 +297,10 @@ def _spmv_coo_seg_f64(
         xv = tl.load(x_ptr + c, mask=m, other=0.0)
         acc += tl.sum(tl.where(m, v * xv, 0.0))
         pos += BLOCK_INNER
-    tl.store(y_ptr + row_id, acc)
+    out = alpha * acc
+    if HAS_BETA:
+        out = out + beta * tl.load(y_ptr + row_id)
+    tl.store(y_ptr + row_id, out)
 
 
 @triton.jit
@@ -269,16 +311,26 @@ def _spmv_coo_seg_complex(
     x_ri_ptr,
     y_ri_ptr,
     seg_starts_ptr,
+    alpha_re,
+    alpha_im,
+    beta_re,
+    beta_im,
     n_segs,
     BLOCK_INNER: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
+    """Complex counterpart; see _spmv_coo_seg_f32 for SEG_IS_ROW and HAS_BETA."""
     seg = tl.program_id(0)
     if seg >= n_segs:
         return
     start = tl.load(seg_starts_ptr + seg)
     end = tl.load(seg_starts_ptr + seg + 1)
-    row_id = tl.load(row_ptr + start)
+    if SEG_IS_ROW:
+        row_id = seg
+    else:
+        row_id = tl.load(row_ptr + start)
     acc_re = tl.zeros((), dtype=ACC_DTYPE)
     acc_im = tl.zeros((), dtype=ACC_DTYPE)
     pos = start
@@ -295,8 +347,15 @@ def _spmv_coo_seg_complex(
         acc_re += tl.sum(prod_re)
         acc_im += tl.sum(prod_im)
         pos += BLOCK_INNER
-    tl.store(y_ri_ptr + row_id * 2, acc_re)
-    tl.store(y_ri_ptr + row_id * 2 + 1, acc_im)
+    out_re = alpha_re * acc_re - alpha_im * acc_im
+    out_im = alpha_re * acc_im + alpha_im * acc_re
+    if HAS_BETA:
+        prev_re = tl.load(y_ri_ptr + row_id * 2)
+        prev_im = tl.load(y_ri_ptr + row_id * 2 + 1)
+        out_re = out_re + beta_re * prev_re - beta_im * prev_im
+        out_im = out_im + beta_re * prev_im + beta_im * prev_re
+    tl.store(y_ri_ptr + row_id * 2, out_re)
+    tl.store(y_ri_ptr + row_id * 2 + 1, out_im)
 
 
 @triton.jit
@@ -380,7 +439,7 @@ def _sort_coo_lex_inplace(data, row, col, n_cols):
     key = row64 * max(1, int(n_cols)) + col64
     order = torch.argsort(key)
     return (
-        data[order].contiguous(),
+        _gather_values(data, order).contiguous(),
         row[order].to(index_dtype).contiguous(),
         col[order].to(index_dtype).contiguous(),
     )
@@ -607,9 +666,18 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
                 x_ri,
                 y_ri,
                 prepared.seg_starts,
+                # y = A @ x here; alpha/beta exist for the C API's
+                # cuSPARSE-compatible signature and SEG_IS_ROW=False keeps the
+                # run-compressed seg_starts this path builds. All three fold away.
+                1,
+                0,
+                0,
+                0,
                 prepared.n_segs,
                 BLOCK_INNER=block_inner,
                 ACC_DTYPE=acc_dtype,
+                SEG_IS_ROW=False,
+                HAS_BETA=False,
                 num_warps=1,
             )
         else:
@@ -637,8 +705,14 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
             x,
             y,
             prepared.seg_starts,
+            # See the complex branch above: identity alpha/beta, run-compressed
+            # segments, both constexprs fold away.
+            1,
+            0,
             prepared.n_segs,
             BLOCK_INNER=block_inner,
+            SEG_IS_ROW=False,
+            HAS_BETA=False,
             num_warps=1,
         )
         return y

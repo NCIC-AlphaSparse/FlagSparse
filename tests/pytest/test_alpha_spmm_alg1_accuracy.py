@@ -25,12 +25,23 @@ from flagsparse import (
     prepare_alpha_spmm_alg1_tle_opt,
     prepare_alpha_spmm_alg1_tle_opt2,
 )
-from tests.pytest.accuracy_utils import close_tolerances
+from tests.pytest.accuracy_utils import (
+    ACCELERATOR_REQUIRED,
+    accelerator_available,
+    accelerator_device,
+    close_tolerances,
+    golden_device,
+)
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(not accelerator_available(), reason=ACCELERATOR_REQUIRED)
 
 
 def _random_csr_mk(M, K, dtype, device):
+    """Random sparse CSR matrix on ``device``.
+
+    Tests pass ``golden_device()``: ``_reference`` uses ``torch.sparse.mm``, which
+    has no working implementation on MUSA.  See ``accuracy_utils.golden_device()``.
+    """
     denom = max(M * K, 1)
     p = min(0.25, max(0.06, 32.0 / denom))
     mask = torch.rand(M, K, device=device) < p
@@ -66,16 +77,21 @@ def _reference(Asp, B, dtype):
     "dtype", [torch.float32, torch.float64], ids=["float32", "float64"]
 )
 def test_alpha_spmm_alg1_tle_opt_matches_torch(dtype):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 96, 80, 48
-    Asp = _random_csr_mk(M, K, dtype, device)
-    B = torch.randn(K, N, dtype=dtype, device=device)
+    golden = golden_device()
+    Asp = _random_csr_mk(M, K, dtype, golden)
+    B = torch.randn(K, N, dtype=dtype, device=golden)
     out = flagsparse_alpha_spmm_alg1_tle_opt(
-        Asp.values(), Asp.col_indices(), Asp.crow_indices(), B, (M, K)
+        Asp.values().to(device),
+        Asp.col_indices().to(device),
+        Asp.crow_indices().to(device),
+        B.to(device),
+        (M, K),
     )
     ref = _reference(Asp, B, dtype)
     atol, rtol = _tol(dtype)
-    assert torch.allclose(out, ref, atol=atol, rtol=rtol)
+    assert torch.allclose(out.to(ref.device), ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.alpha_spmm_alg1
@@ -86,16 +102,21 @@ def test_alpha_spmm_alg1_tle_opt_matches_torch(dtype):
     "dtype", [torch.float32, torch.float64], ids=["float32", "float64"]
 )
 def test_alpha_spmm_alg1_tle_opt2_matches_torch(dtype):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 96, 80, 48
-    Asp = _random_csr_mk(M, K, dtype, device)
-    B = torch.randn(K, N, dtype=dtype, device=device)
+    golden = golden_device()
+    Asp = _random_csr_mk(M, K, dtype, golden)
+    B = torch.randn(K, N, dtype=dtype, device=golden)
     out = flagsparse_alpha_spmm_alg1_tle_opt2(
-        Asp.values(), Asp.col_indices(), Asp.crow_indices(), B, (M, K)
+        Asp.values().to(device),
+        Asp.col_indices().to(device),
+        Asp.crow_indices().to(device),
+        B.to(device),
+        (M, K),
     )
     ref = _reference(Asp, B, dtype)
     atol, rtol = _tol(dtype)
-    assert torch.allclose(out, ref, atol=atol, rtol=rtol)
+    assert torch.allclose(out.to(ref.device), ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.alpha_spmm_alg1
@@ -106,7 +127,7 @@ def test_alpha_spmm_alg1_tle_opt2_matches_torch(dtype):
     "dtype", [torch.float32, torch.float64], ids=["float32", "float64"]
 )
 def test_alpha_spmm_alg1_tle_opt_prepare_and_meta_match_raw(dtype):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 72, 64, 33
     Asp = _random_csr_mk(M, K, dtype, device)
     B = torch.randn(K, N, dtype=dtype, device=device)
@@ -130,7 +151,7 @@ def test_alpha_spmm_alg1_tle_opt_prepare_and_meta_match_raw(dtype):
     "dtype", [torch.float32, torch.float64], ids=["float32", "float64"]
 )
 def test_alpha_spmm_alg1_tle_opt2_prepare_and_meta_match_raw(dtype):
-    device = torch.device("cuda")
+    device = accelerator_device()
     M, K, N = 72, 64, 33
     Asp = _random_csr_mk(M, K, dtype, device)
     B = torch.randn(K, N, dtype=dtype, device=device)
@@ -175,7 +196,7 @@ def test_alpha_spmm_alg1_tle_opt_launch_heuristics_match_alphasparse(
         and is_alpha_spmm_alg1_tle_opt2_available()
     ):
         pytest.skip("TLEOpt runtime unavailable")
-    device = torch.device("cuda")
+    device = accelerator_device()
     dtype = torch.float32
     M, K = 40, 48
     Asp = _random_csr_mk(M, K, dtype, device)
@@ -214,7 +235,7 @@ def test_alpha_spmm_alg1_tle_opt_family_handles_empty_rows_and_tail_columns(dtyp
         and is_alpha_spmm_alg1_tle_opt2_available()
     ):
         pytest.skip("TLEOpt runtime unavailable")
-    device = torch.device("cuda")
+    device = accelerator_device()
     n_rows, n_cols, dense_cols = 5, 9, 17
     data = torch.tensor([1.5, -2.0, 3.0, 4.0], dtype=dtype, device=device)
     indices = torch.tensor([0, 4, 2, 8], dtype=torch.int32, device=device)

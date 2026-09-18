@@ -62,6 +62,7 @@ from .spgemm_csr import (
     prepare_spgemm_csr,
 )
 from .spmm_coo import (
+    SPMM_COO_ASCEND_DISPATCH,
     PreparedCooSpmmRoute,
     SPMM_COO_ALGORITHMS,
     SpmmCooAlgorithm,
@@ -147,7 +148,12 @@ from .spmv_csr import (
     prepare_spmv_coo_tocsr,
     prepare_spmv_csr,
 )
-from .spsm import benchmark_spsm_case, flagsparse_spsm_coo, flagsparse_spsm_csr
+from .spsm import (
+    SPSM_ASCEND_DISPATCH,
+    benchmark_spsm_case,
+    flagsparse_spsm_coo,
+    flagsparse_spsm_csr,
+)
 from .spsv import (
     FlagSparseDnVecDescr,
     FlagSparseSpMatDescr,
@@ -227,6 +233,7 @@ __all__ = [
     "benchmark_spmm_opt_case",
     "benchmark_spmm_opt_alg2_case",
     "benchmark_spmv_case",
+    "SPSM_ASCEND_DISPATCH",
     "benchmark_spsm_case",
     "comprehensive_gather_test",
     "comprehensive_scatter_test",
@@ -246,6 +253,7 @@ __all__ = [
     "flagsparse_alpha_spmm_alg1_tle_opt2",
     "flagsparse_sddmm_csr",
     "flagsparse_spgemm_csr",
+    "SPMM_COO_ASCEND_DISPATCH",
     "flagsparse_spmm_coo",
     "flagsparse_spmm_bsr",
     "flagsparse_spmm_bsr_run",

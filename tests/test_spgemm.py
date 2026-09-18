@@ -41,6 +41,7 @@ if str(_TESTS_DIR) not in sys.path:
 
 import flagsparse as ast
 import flagsparse.sparse_operations.spgemm_csr as ast_ops
+import flagsparse.sparse_operations._common as ast_common
 from test_spmm import load_mtx_to_csr_torch
 
 VALUE_DTYPES = [torch.float32, torch.float64]
@@ -699,6 +700,150 @@ def _run_reference_worker_subprocess(
     }
 
 
+def _matrix_failure_entry(mtx_path, value_dtype, input_mode, reason):
+    shape = (0, 0)
+    nnz = None
+    resolved_mode = input_mode
+    try:
+        _, indices, _, shape = load_mtx_to_csr_torch(
+            mtx_path, dtype=value_dtype, device="cpu"
+        )
+        shape = (int(shape[0]), int(shape[1]))
+        nnz = int(indices.numel())
+        resolved_mode = _resolve_input_mode(input_mode, shape)
+    except Exception:
+        pass
+    b_shape = shape if resolved_mode != "A_AT" else (shape[1], shape[0])
+    return {
+        "path": mtx_path,
+        "shape": shape,
+        "shape_a": shape,
+        "shape_b": b_shape,
+        "nnz": nnz,
+        "nnz_a": nnz,
+        "nnz_b": nnz,
+        "nnz_c": None,
+        "value_dtype": str(value_dtype),
+        "index_dtype": str(torch.int32),
+        "input_mode": resolved_mode,
+        "status": "ERROR",
+        "error": str(reason),
+        "compare_status": "MATRIX_WORKER_FAILED",
+    }
+
+def _run_matrix_worker(args):
+    value_dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    index_dtype = torch.int32
+    try:
+        entry = run_one_mtx(
+            args._worker_mtx,
+            value_dtype=value_dtype,
+            index_dtype=index_dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+            run_cusparse=not args.no_cusparse,
+            input_mode=args.input_mode,
+            adaptive_loops=args.adaptive_loops,
+            target_window_seconds=args.target_window_seconds,
+            ref_blocked_retry=args.ref_blocked_retry,
+            ref_block_rows=_parse_ref_block_rows(args.ref_block_rows),
+            ref_isolated_retry=args.ref_isolated_retry,
+            ref_cleanup=args.ref_cleanup,
+            compare_device=args.compare_device,
+            isolate_matrices=ast_common._is_maca_runtime(),
+        )
+        torch.save({"success": True, "entry": entry}, args._worker_output)
+        return 0
+    except BaseException as exc:  # noqa: BLE001
+        torch.save(
+            {
+                "success": False,
+                "reason": f"{type(exc).__name__}: {str(exc)[:500]}",
+            },
+            args._worker_output,
+        )
+        return 1
+
+def _run_matrix_worker_subprocess(
+    mtx_path,
+    value_dtype,
+    index_dtype,
+    warmup,
+    iters,
+    run_cusparse,
+    input_mode,
+    adaptive_loops,
+    target_window_seconds,
+    ref_blocked_retry,
+    ref_block_rows,
+    ref_isolated_retry,
+    ref_cleanup,
+    compare_device,
+):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
+    tmp_path = tmp.name
+    tmp.close()
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--_matrix-worker",
+        "--_worker-mtx",
+        str(mtx_path),
+        "--_worker-output",
+        tmp_path,
+        "--dtype",
+        _dtype_name(value_dtype),
+        "--index-dtype",
+        _dtype_name(index_dtype),
+        "--warmup",
+        str(int(warmup)),
+        "--iters",
+        str(int(iters)),
+        "--input-mode",
+        str(input_mode).lower(),
+        "--compare-device",
+        str(compare_device),
+        "--ref-block-rows",
+        str(int(ref_block_rows)),
+    ]
+    if not run_cusparse:
+        cmd.append("--no-cusparse")
+    if adaptive_loops:
+        cmd.extend(["--adaptive-loops", "--target-window-seconds", str(target_window_seconds)])
+    if not ref_blocked_retry:
+        cmd.append("--no-ref-blocked-retry")
+    if not ref_isolated_retry:
+        cmd.append("--no-ref-isolated-retry")
+    if not ref_cleanup:
+        cmd.append("--no-ref-cleanup")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    payload = None
+    try:
+        if os.path.exists(tmp_path):
+            payload = torch.load(tmp_path, map_location="cpu")
+    except Exception as exc:
+        payload = {"success": False, "reason": f"failed to load matrix worker result: {exc}"}
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    if isinstance(payload, dict) and payload.get("success") and isinstance(payload.get("entry"), dict):
+        return payload["entry"]
+    reason = ""
+    if isinstance(payload, dict):
+        reason = str(payload.get("reason") or "")
+    if not reason:
+        reason = (proc.stderr or proc.stdout or "").strip()
+    if not reason:
+        reason = f"matrix worker exited with code {proc.returncode}"
+    if proc.returncode < 0:
+        reason = f"matrix worker terminated by signal {-proc.returncode}: {reason}"
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    return _matrix_failure_entry(mtx_path, value_dtype, input_mode, reason)
+
+
 def _run_reference_with_retries(
     backend,
     a_data,
@@ -1334,6 +1479,7 @@ def run_mtx_batch(
     ref_isolated_retry=True,
     ref_cleanup=True,
     compare_device=DEFAULT_COMPARE_DEVICE,
+    isolate_matrices=False,
     on_result=None,
     on_entry=None,
 ):
@@ -1342,22 +1488,42 @@ def run_mtx_batch(
     for idx, path in enumerate(mtx_paths, start=1):
         print(f"[SpGEMM] ({idx}/{total}) {path}", flush=True)
         try:
-            entry = run_one_mtx(
-                path,
-                value_dtype=value_dtype,
-                index_dtype=index_dtype,
-                warmup=warmup,
-                iters=iters,
-                run_cusparse=run_cusparse,
-                input_mode=input_mode,
-                adaptive_loops=adaptive_loops,
-                target_window_seconds=target_window_seconds,
-                ref_blocked_retry=ref_blocked_retry,
-                ref_block_rows=ref_block_rows,
-                ref_isolated_retry=ref_isolated_retry,
-                ref_cleanup=ref_cleanup,
-                compare_device=compare_device,
-            )
+            if isolate_matrices:
+                # MACA leaks/crashes across matrices in SpGEMM, so each one runs in its
+                # own subprocess there; every other backend stays in-process.
+                entry = _run_matrix_worker_subprocess(
+                    path,
+                    value_dtype=value_dtype,
+                    index_dtype=index_dtype,
+                    warmup=warmup,
+                    iters=iters,
+                    run_cusparse=run_cusparse,
+                    input_mode=input_mode,
+                    adaptive_loops=adaptive_loops,
+                    target_window_seconds=target_window_seconds,
+                    ref_blocked_retry=ref_blocked_retry,
+                    ref_block_rows=ref_block_rows,
+                    ref_isolated_retry=ref_isolated_retry,
+                    ref_cleanup=ref_cleanup,
+                    compare_device=compare_device,
+                )
+            else:
+                entry = run_one_mtx(
+                    path,
+                    value_dtype=value_dtype,
+                    index_dtype=index_dtype,
+                    warmup=warmup,
+                    iters=iters,
+                    run_cusparse=run_cusparse,
+                    input_mode=input_mode,
+                    adaptive_loops=adaptive_loops,
+                    target_window_seconds=target_window_seconds,
+                    ref_blocked_retry=ref_blocked_retry,
+                    ref_block_rows=ref_block_rows,
+                    ref_isolated_retry=ref_isolated_retry,
+                    ref_cleanup=ref_cleanup,
+                    compare_device=compare_device,
+                )
         except BaseException as exc:  # noqa: BLE001
             # One matrix must not sink the whole sweep: an OOM (often in the
             # reference worker, whose result then fails to load) used to abort
@@ -1670,6 +1836,7 @@ def run_all_dtypes_export_csv(
     ref_isolated_retry=True,
     ref_cleanup=True,
     compare_device=DEFAULT_COMPARE_DEVICE,
+    isolate_matrices=False,
 ):
     csv_path = _normalize_csv_path(csv_path)
     written = 0
@@ -1725,6 +1892,7 @@ def run_all_dtypes_export_csv(
                     ref_isolated_retry=ref_isolated_retry,
                     ref_cleanup=ref_cleanup,
                     compare_device=compare_device,
+                    isolate_matrices=isolate_matrices,
                     on_result=_print_spgemm_mtx_row,
                     on_entry=_emit,
 
@@ -2141,6 +2309,7 @@ def main():
             ref_isolated_retry=args.ref_isolated_retry,
             ref_cleanup=args.ref_cleanup,
             compare_device=args.compare_device,
+            isolate_matrices=ast_common._is_maca_runtime(),
         )
         return
 

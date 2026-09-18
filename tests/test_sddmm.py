@@ -220,19 +220,28 @@ def _benchmark_reference_sddmm(
     data, indices, indptr, x, y, alpha, beta, value_dtype, warmup, iters
 ):
     indptr64 = indptr.to(torch.int64)
+    # The two roles of this reference are deliberately split by dtype.
+    #
+    # Timing runs at the operator's own dtype, so ``pytorch_ms`` is a like-for-like
+    # baseline (this is the only usable one on MACA, whose torch.sparse.sampled_addmm
+    # returns wrong sampled-dot values).
+    #
+    # Correctness for fp32 is still checked against an fp64 evaluation: an oracle at the
+    # same precision as the thing under test cannot separate a real accumulation bug from
+    # rounding both sides share.  That evaluation runs once, outside the timed window.
+    timing_op = lambda: ast_ops._sddmm_reference(
+        indices, indptr64, x, y, data, alpha, beta
+    )
+    ref_values, ref_ms = ast_ops._benchmark_cuda_op(
+        timing_op, warmup=warmup, iters=iters
+    )
     if value_dtype == torch.float32:
         x_ref = x.to(torch.float64)
         y_ref = y.to(torch.float64)
         data_ref = data.to(torch.float64) if data is not None else None
-
-        op = lambda: ast_ops._sddmm_reference(
+        ref_values = ast_ops._sddmm_reference(
             indices, indptr64, x_ref, y_ref, data_ref, alpha, beta
         ).to(torch.float32)
-    else:
-        op = lambda: ast_ops._sddmm_reference(
-            indices, indptr64, x, y, data, alpha, beta
-        )
-    ref_values, ref_ms = ast_ops._benchmark_cuda_op(op, warmup=warmup, iters=iters)
     return ref_values, ref_ms
 
 
@@ -362,6 +371,15 @@ def run_one_mtx(
         "triton_first_call_ms": None,
         "prepare_ms": None,
         "pytorch_ms": None,
+        # pytorch_api_ms is a *separate* column from pytorch_ms on purpose:
+        # pytorch_ms is the accuracy reference (it materialises nnz x K temporaries and
+        # is not a performance baseline), while pytorch_api_ms times the real
+        # torch.sparse.sampled_addmm API.  Folding them into one column would change
+        # both the historical CSV meaning and the test semantics.
+        "pytorch_api_ms": None,
+        "pytorch_api_status": "REF_UNAVAILABLE",
+        "pytorch_api_reason": None,
+        "err_pytorch_api": None,
         "cusparse_ms": None,
         "err_pt": None,
         "err_cu": None,
@@ -455,6 +473,10 @@ def run_one_mtx(
                     iters=iters,
                 )
                 result["cusparse_ms"] = cusparse_ms
+                # Same call, honest second label: sampled_addmm dispatches to cuSPARSE
+                # here, but to the platform sparse implementation on MACA.
+                result["pytorch_api_ms"] = cusparse_ms
+                result["pytorch_api_status"] = "PASS"
             else:
                 cu_vals = None
                 result["cu_status"] = "PERF_UNAVAILABLE"
@@ -473,6 +495,9 @@ def run_one_mtx(
                     triton_values, cu_vals, atol, rtol
                 )
                 result["cu_status"] = "PASS" if result["triton_ok_cu"] else "FAIL"
+                if result["pytorch_api_ms"] is not None:
+                    result["err_pytorch_api"] = result["err_cu"]
+                    result["pytorch_api_status"] = result["cu_status"]
             else:
                 result["cu_status"] = "PERF_ONLY"
         except Exception as exc:
@@ -480,9 +505,42 @@ def run_one_mtx(
                 "PERF_RESOURCE" if _is_resource_error(exc) else "PERF_UNAVAILABLE"
             )
             result["cu_reason"] = str(exc)
+            result["pytorch_api_status"] = result["cu_status"]
+            result["pytorch_api_reason"] = str(exc)
     else:
         result["cu_status"] = "PERF_ONLY"
         result["cu_reason"] = "vendor sparse baseline is disabled by CLI"
+        if fs_common._is_maca_runtime():
+            try:
+                api_vals, pytorch_api_ms = _benchmark_cusparse_sddmm(
+                    indices=indices,
+                    indptr=indptr,
+                    shape=shape,
+                    x=x,
+                    y=y,
+                    data_in=data_in,
+                    alpha=alpha,
+                    beta=beta,
+                    warmup=warmup,
+                    iters=iters,
+                )
+                result["pytorch_api_ms"] = pytorch_api_ms
+                result["pytorch_api_status"] = "PASS"
+                if triton_values is not None and api_vals is not None:
+                    atol, rtol = _resolve_tolerance(value_dtype, acc_mode)
+                    result["err_pytorch_api"] = _scaled_allclose_error(
+                        triton_values, api_vals, atol, rtol
+                    )
+                    result["pytorch_api_status"] = (
+                        "PASS"
+                        if bool(torch.allclose(triton_values, api_vals, atol=atol, rtol=rtol))
+                        else "FAIL"
+                    )
+            except Exception as exc:
+                result["pytorch_api_status"] = (
+                    "PERF_RESOURCE" if _is_resource_error(exc) else "PERF_UNAVAILABLE"
+                )
+                result["pytorch_api_reason"] = str(exc)
 
     result["cusparse_reason"] = result["cu_reason"]
     result["status"] = "PASS" if result["triton_ok_pt"] else "FAIL"
@@ -625,6 +683,7 @@ def run_all_dtypes_export_csv(
                     n_rows, n_cols = entry["shape"]
                     cusparse_ms = entry.get("cusparse_ms")
                     pytorch_ms = entry.get("pytorch_ms")
+                    pytorch_api_ms = entry.get("pytorch_api_ms")
                     triton_ms = entry.get("triton_ms")
                     rows.append(
                         {
@@ -637,6 +696,23 @@ def run_all_dtypes_export_csv(
                             "triton_ms": triton_ms,
                             "cusparse_ms": cusparse_ms,
                             "pytorch_ms": pytorch_ms,
+                            "pytorch_api_ms": pytorch_api_ms,
+                            "pytorch_api_status": entry.get("pytorch_api_status"),
+                            "pytorch_api_reason": entry.get("pytorch_api_reason"),
+                            "err_pytorch_api": entry.get("err_pytorch_api"),
+                            "triton_speedup_vs_pytorch_api": _speedup_ratio(
+                                pytorch_api_ms, triton_ms
+                            ),
+                            # Only meaningful where pytorch_ms is a dtype-matched
+                            # baseline rather than an fp64 oracle.  Left empty elsewhere
+                            # so the runner -- which reports the first non-empty schema
+                            # match, and puts vs_pytorch before vs_cusparse -- keeps
+                            # reporting the vendor metric on CUDA/ROCm.
+                            "triton_speedup_vs_pytorch": (
+                                _speedup_ratio(pytorch_ms, triton_ms)
+                                if fs_common._is_maca_runtime()
+                                else None
+                            ),
                             # Scenario B is the single performance metric. There is
                             # deliberately no speedup-vs-pytorch column: the PyTorch
                             # path is a correctness reference that materialises
@@ -673,6 +749,12 @@ def run_all_dtypes_export_csv(
         "n_cols",
         "nnz",
         "triton_ms",
+        "pytorch_api_ms",
+        "triton_speedup_vs_pytorch_api",
+        "triton_speedup_vs_pytorch",
+        "pytorch_api_status",
+        "pytorch_api_reason",
+        "err_pytorch_api",
         "cusparse_ms",
         "pytorch_ms",
         "triton_speedup_vs_cusparse",

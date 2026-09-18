@@ -18,6 +18,8 @@ import csv
 import json
 import re
 
+import pytest
+
 import run_flagsparse_pytest as runner
 
 
@@ -489,3 +491,81 @@ def test_missing_measurements_are_null_not_zero(tmp_path):
     assert entry["speedup"] is None
     # the raw column is still carried through, so nothing is lost
     assert entry["ms"] == 1.5
+
+
+def test_runner_excludes_interrupted_matrix_and_invalid_speedups(tmp_path):
+    csv_path = tmp_path / "performance.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "matrix",
+                "dtype",
+                "triton_ms",
+                "pytorch_ms",
+                "triton_speedup_vs_pytorch",
+                "status",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "matrix": "complete.mtx",
+                "dtype": "float32",
+                "triton_ms": "1.0",
+                "pytorch_ms": "2.0",
+                "triton_speedup_vs_pytorch": "2.0",
+                "status": "PASS",
+            }
+        )
+        writer.writerow(
+            {
+                "matrix": "interrupted.mtx",
+                "dtype": "float32",
+                "triton_ms": "1.0",
+                "pytorch_ms": "4.0",
+                "triton_speedup_vs_pytorch": "4.0",
+                "status": "PASS",
+            }
+        )
+        writer.writerow(
+            {
+                "matrix": "failed.mtx",
+                "dtype": "float32",
+                "triton_ms": "1.0",
+                "pytorch_ms": "8.0",
+                "triton_speedup_vs_pytorch": "8.0",
+                "status": "FAIL",
+            }
+        )
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    filtered, metadata = runner.filter_interrupted_performance_rows(
+        rows,
+        output="RUNNING: interrupted.mtx | dtype=float32",
+        returncode=-15,
+        timed_out=False,
+    )
+    summary = runner.summarize_performance_csv(csv_path, rows=filtered, **metadata)
+
+    assert summary["raw_row_count"] == 3
+    assert summary["row_count"] == 2
+    assert summary["excluded_row_count"] == 1
+    assert summary["excluded_matrix_keys"] == ["interrupted.mtx"]
+    assert summary["speedup_row_count"] == 1
+    assert summary["speedup"] == 2.0
+
+
+def test_parse_op_benchmark_args_keeps_arguments_scoped_to_each_operator():
+    parsed = runner.parse_op_benchmark_args(
+        ["spmv_bsr=--resume", "spmv_bsr=--dtypes float64,complex64"]
+    )
+
+    assert parsed == {"spmv_bsr": ["--resume", "--dtypes", "float64,complex64"]}
+
+
+@pytest.mark.parametrize("value", ["spmv_bsr", "=--resume", "spmv_bsr="])
+def test_parse_op_benchmark_args_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="op-benchmark-args"):
+        runner.parse_op_benchmark_args([value])
