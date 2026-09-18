@@ -222,6 +222,7 @@ def runtime_namespace():
         "_spmv_op_transposes": lambda op: op in (1, 2),
         "_spmv_csr_default_backend": lambda: "rowpar",
         "_spmv_uses_int64_indices": lambda p: True,
+        "_is_ascend_runtime": lambda: False,
     }
     exec(
         compile(
