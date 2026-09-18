@@ -337,8 +337,10 @@ CUDA/MACA 路径继续使用原来的总耗时字段，避免 ROCm 分阶段口�
 SELL SpSV 的 TRANS/CONJ 路径现在允许显式选择 `--alg_num 1|2`：
 
 - `ALG1`：`sell_trans_queue`，沿用原始 SELL scatter queue；
-- `ALG2`：`sell_trans_csc`，analysis 阶段构造 CSC gather 视图，`float32/complex64`
-  会分别提升到 `float64/complex128` 做 transpose-family solve。
+- `ALG2`：`sell_trans_csc`，analysis 阶段构造 CSC gather 视图；
+- transpose-family 的计算精度由 `FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64`
+  和 `FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128` 控制，默认保持输入
+  dtype。
 
 ---
 

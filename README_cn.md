@@ -314,8 +314,9 @@ python tests/test_spgemm.py <目录/> --csv results.csv    # 可选：--dtype fl
 分析加求解，静态 descriptor 与 SELL 转换不计时。直接
 `flagsparse_spsv_sell` API 默认使用 ALG1；使用 `--alg_num 2` 或显式
 `flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` 生命周期可启用
-slice-cooperative ALG2 路径。TRANS/CONJ 使用专用反向依赖 kernel，且不接受
-`--alg_num` 或 `--alg2-workers`。
+slice-cooperative ALG2 路径。TRANS/CONJ 可显式选择 `--alg_num 1|2`：
+ALG1 为 `sell_trans_queue`，ALG2 为 `sell_trans_csc`，会在 analysis 阶段构造
+CSC gather 视图；TRANS/CONJ 不接受 `--alg2-workers`。
 
 ```bash
 python tests/test_spsv.py --synthetic

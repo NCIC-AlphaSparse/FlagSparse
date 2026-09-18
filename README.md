@@ -358,7 +358,9 @@ and SELL conversion are outside the timed interval. The direct
 `flagsparse_spsv_sell` API defaults to ALG1; use `--alg_num 2` or the explicit
 `flagsparse_spsv_analysis_sell` + `flagsparse_spsv_solve_sell` lifecycle for
 the slice-cooperative ALG2 path. TRANS/CONJ use a dedicated reverse-dependency
-kernel and do not accept `--alg_num` or `--alg2-workers`.
+family: `--alg_num 1` selects `sell_trans_queue`, while `--alg_num 2` selects
+`sell_trans_csc` and builds a CSC gather view during analysis. TRANS/CONJ do not
+accept `--alg2-workers`.
 
 ```bash
 python tests/test_spsv.py --synthetic
