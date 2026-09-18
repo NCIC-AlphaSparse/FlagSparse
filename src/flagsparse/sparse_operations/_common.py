@@ -3177,6 +3177,27 @@ def _prepare_scatter_inputs(
     return sparse_values, indices, kernel_indices, dense_size
 
 
+def _filtered_avg_ms(times):
+    if not times:
+        return None
+    values = [float(t) for t in times]
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2 == 0:
+        median = (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    else:
+        median = ordered[n // 2]
+    if median == 0.0:
+        kept = [t for t in ordered if t == 0.0]
+    else:
+        lo = median * 0.9
+        hi = median * 1.1
+        kept = [t for t in ordered if lo <= t <= hi]
+    return sum(kept) / len(kept) if kept else median
+
+
 def _benchmark_cuda_op(op, warmup, iters):
     warmup = max(0, int(warmup))
     iters = max(1, int(iters))
@@ -3188,14 +3209,15 @@ def _benchmark_cuda_op(op, warmup, iters):
     _ACCEL.synchronize()
     if cp is not None:
         cp.cuda.runtime.deviceSynchronize()
-    start_time = time.perf_counter()
+    samples_ms = []
     for _ in range(iters):
+        start_time = time.perf_counter()
         output = op()
-    _ACCEL.synchronize()
-    if cp is not None:
-        cp.cuda.runtime.deviceSynchronize()
-    elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
-    return output, elapsed_ms
+        _ACCEL.synchronize()
+        if cp is not None:
+            cp.cuda.runtime.deviceSynchronize()
+        samples_ms.append((time.perf_counter() - start_time) * 1000.0)
+    return output, _filtered_avg_ms(samples_ms)
 
 
 def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
@@ -3212,26 +3234,34 @@ def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
 
         if _is_rocm_runtime() and _hip_runtime_event_available():
             _ACCEL.synchronize()
-            start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
-            stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
-            _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
+            samples_ms = []
             for _ in range(iters):
+                start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+                stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+                _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
                 output = run_fn(state)
-            _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
-            _hip_check_result(
-                hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
-            )
-            return output, _hip_event_elapsed_ms(start_ev, stop_ev) / iters
+                _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
+                _hip_check_result(
+                    hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
+                )
+                samples_ms.append(_hip_event_elapsed_ms(start_ev, stop_ev))
+                _destroy_hip_event(stop_ev)
+                _destroy_hip_event(start_ev)
+                start_ev = None
+                stop_ev = None
+            return output, _filtered_avg_ms(samples_ms)
 
         _ACCEL.synchronize()
-        start_ev_torch = _ACCEL.Event(enable_timing=True)
-        end_ev_torch = _ACCEL.Event(enable_timing=True)
-        start_ev_torch.record()
+        samples_ms = []
         for _ in range(iters):
+            start_ev_torch = _ACCEL.Event(enable_timing=True)
+            end_ev_torch = _ACCEL.Event(enable_timing=True)
+            start_ev_torch.record()
             output = run_fn(state)
-        end_ev_torch.record()
-        _ACCEL.synchronize()
-        return output, start_ev_torch.elapsed_time(end_ev_torch) / iters
+            end_ev_torch.record()
+            _ACCEL.synchronize()
+            samples_ms.append(start_ev_torch.elapsed_time(end_ev_torch))
+        return output, _filtered_avg_ms(samples_ms)
     finally:
         _destroy_hip_event(stop_ev)
         _destroy_hip_event(start_ev)
@@ -3259,14 +3289,20 @@ def _benchmark_prepared_hip_event_op(
             output = run_fn(state)
 
         _ACCEL.synchronize()
-        start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
-        stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
-        _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
+        samples_ms = []
         for _ in range(iters):
+            start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+            stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
             output = run_fn(state)
-        _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
-        _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
-        return output, _hip_event_elapsed_ms(start_evt, stop_evt) / iters
+            _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
+            _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
+            samples_ms.append(_hip_event_elapsed_ms(start_evt, stop_evt))
+            _destroy_hip_event(stop_evt)
+            _destroy_hip_event(start_evt)
+            start_evt = None
+            stop_evt = None
+        return output, _filtered_avg_ms(samples_ms)
     finally:
         _destroy_hip_event(stop_evt)
         _destroy_hip_event(start_evt)

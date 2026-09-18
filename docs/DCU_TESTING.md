@@ -213,8 +213,8 @@ segbin 未在 DCU 上调过参（`BLOCK` 固定 256），rowpar 未在 CUDA 上�
 建议在 DCU 上两个都跑一遍再定：
 
 ```bash
-FLAGSPARSE_SPMV_CSR_KERNEL=rowpar python tests/test_spmv.py <dir/> --csv-csr rowpar.csv
-FLAGSPARSE_SPMV_CSR_KERNEL=segbin python tests/test_spmv.py <dir/> --csv-csr segbin.csv
+FLAGSPARSE_SPMV_CSR_KERNEL=rowpar python tests/test_spmv_csr.py <dir/> --csv-csr rowpar.csv
+FLAGSPARSE_SPMV_CSR_KERNEL=segbin python tests/test_spmv_csr.py <dir/> --csv-csr segbin.csv
 ```
 
 `use_opt=True` 的 bucket 路径另有一套设备属性调优（`_spmv_opt_bucket_configs` /
@@ -337,8 +337,10 @@ CUDA/MACA 路径继续使用原来的总耗时字段，避免 ROCm 分阶段口�
 SELL SpSV 的 TRANS/CONJ 路径现在允许显式选择 `--alg_num 1|2`：
 
 - `ALG1`：`sell_trans_queue`，沿用原始 SELL scatter queue；
-- `ALG2`：`sell_trans_csc`，analysis 阶段构造 CSC gather 视图，`float32/complex64`
-  会分别提升到 `float64/complex128` 做 transpose-family solve。
+- `ALG2`：`sell_trans_csc`，analysis 阶段构造 CSC gather 视图；
+- transpose-family 的计算精度由 `FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_FP32_TO_FP64`
+  和 `FLAGSPARSE_SPSV_PROMOTE_TRANSPOSE_COMPLEX64_TO_COMPLEX128` 控制，默认保持输入
+  dtype。
 
 ---
 
@@ -374,8 +376,8 @@ python -m pytest tests/ci -q     # 期望 39 passed / 3 skipped
 export PYTHONPATH=$PWD/src
 M=tests/data/trdheim.mtx
 
-python tests/test_spmv.py      $M --warmup 2 --iters 5
-python tests/test_spmv_opt.py  $M --warmup 2 --iters 5
+python tests/test_spmv_csr.py      $M --warmup 2 --iters 5
+python tests/test_spmv_csr.py --alg compare --timing  $M --warmup 2 --iters 5
 python tests/test_spmm.py      $M --warmup 2 --iters 5
 python tests/test_spmm_opt.py  $M --warmup 2 --iters 5
 python tests/test_spgemm.py    $M --warmup 2 --iters 5
@@ -396,7 +398,7 @@ python tests/test_scatter.py  --value-dtypes float32 --warmup 3 --iters 10
 `test_scatter`、`test_spmm_coo`）可以用该参数先把基线关掉，单独确认 Triton 内核本身没问题：
 
 ```bash
-python tests/test_spmv.py $M --no-cusparse --warmup 2 --iters 5
+python tests/test_spmv_csr.py $M --no-cusparse --warmup 2 --iters 5
 ```
 
 ---

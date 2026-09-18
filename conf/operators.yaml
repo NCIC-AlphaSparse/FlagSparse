@@ -48,6 +48,9 @@ ops:
       Computes sparse matrix-vector multiplication for a CSR matrix.
     for:
       - flagsparse_spmv_csr
+      - flagsparse_spmv_csr_run
+      - list_spmv_csr_algorithms
+      - get_spmv_csr_algorithm_spec
       - prepare_spmv_csr
     labels:
       - flagsparse

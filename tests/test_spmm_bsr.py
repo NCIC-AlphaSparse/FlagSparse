@@ -20,7 +20,6 @@ import glob
 import math
 import os
 import sys
-import time
 import warnings
 from pathlib import Path
 
@@ -34,6 +33,11 @@ if str(_SRC_ROOT) not in sys.path:
 import flagsparse as fs
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_bsr as bsr_ops
+from utils import (
+    cpu_wall_benchmark_filtered,
+    cuda_event_benchmark_filtered,
+    cupy_event_benchmark_filtered,
+)
 
 try:
     import cupy as cp
@@ -469,19 +473,7 @@ def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, block_dim,
 
 
 def _cuda_event_benchmark(op, warmup, iters):
-    out = None
-    for _ in range(max(0, int(warmup))):
-        out = op()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out = op()
-    end.record()
-    torch.cuda.synchronize()
-    return out, start.elapsed_time(end) / count
+    return cuda_event_benchmark_filtered(op, warmup, iters)
 
 
 def _pad_dense_for_bsr_run(B, padded_rows):
@@ -619,19 +611,9 @@ def _time_cusparse_bsr(data, indices, indptr, B, shape, block_dim, op, warmup, i
         fn = lambda: A.conj().T @ B_cp
     else:
         raise ValueError(f"unsupported op: {op}")
-    for _ in range(max(0, int(warmup))):
-        _ = fn()
-    cp.cuda.runtime.deviceSynchronize()
-    start = cp.cuda.Event()
-    end = cp.cuda.Event()
-    count = max(1, int(iters))
-    start.record()
-    for _ in range(count):
-        out_cp = fn()
-    end.record()
-    end.synchronize()
+    out_cp, elapsed_ms = cupy_event_benchmark_filtered(fn, warmup, iters)
     out = torch.utils.dlpack.from_dlpack(out_cp.toDlpack())
-    return cp.cuda.get_elapsed_time(start, end) / count, None, out
+    return elapsed_ms, None, out
 
 
 def _time_scipy_bsr_cpu(data, indices, indptr, B, shape, block_dim, op, warmup, iters):
@@ -652,14 +634,7 @@ def _time_scipy_bsr_cpu(data, indices, indptr, B, shape, block_dim, op, warmup, 
         fn = lambda: A.conj().T @ B_np
     else:
         raise ValueError(f"unsupported op: {op}")
-    out_np = None
-    for _ in range(max(0, int(warmup))):
-        out_np = fn()
-    count = max(1, int(iters))
-    start = time.perf_counter()
-    for _ in range(count):
-        out_np = fn()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0 / count
+    out_np, elapsed_ms = cpu_wall_benchmark_filtered(fn, warmup, iters)
     out = torch.as_tensor(out_np, dtype=data.dtype, device=data.device)
     return elapsed_ms, None, out
 
