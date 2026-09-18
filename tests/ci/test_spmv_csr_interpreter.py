@@ -24,9 +24,8 @@ SOURCE = Path(__file__).resolve().parents[2] / "src/flagsparse/sparse_operations
 
 
 def close_tolerances(dtype):
-    from tests.pytest.accuracy_utils import close_tolerances as _close_tolerances
-
-    return _close_tolerances(dtype)
+    module = importlib.import_module("tests.pytest.accuracy_utils")
+    return module.close_tolerances(dtype)
 
 
 def load_module(name, filename):
