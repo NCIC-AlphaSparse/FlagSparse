@@ -190,7 +190,8 @@ DCU 基准线：排除 851 个 SpSV/SpSM 用例后 `984 passed / 1 failed`，约
 **3. 策略/契约类测试** —— 不需要 GPU，秒级：
 
 ```bash
-python -m pytest tests/ci -q     # 期望 39 passed / 3 skipped
+python -m pytest tests/ci -q     # 判据：0 failed（通过数随新增测试增长，
+                                 # 2026-09-19 为 102 passed / 3 skipped）
 ```
 
 **4. 逐算子基准：**

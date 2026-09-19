@@ -186,7 +186,8 @@ baseline for the full suite: `1613 passed / 3 failed`.
 **3. Policy/contract tests** — no GPU needed, runs in seconds:
 
 ```bash
-python -m pytest tests/ci -q     # expect 39 passed / 3 skipped
+python -m pytest tests/ci -q     # criterion: 0 failed (the pass count grows as
+                                 # tests are added: 102 passed / 3 skipped on 2026-09-19)
 ```
 
 **4. Per-operator benchmarks:**
