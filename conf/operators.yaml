@@ -46,8 +46,14 @@ ops:
   - id: spmv_csr
     description: |
       Computes sparse matrix-vector multiplication for a CSR matrix.
+      Seven explicit algorithms support six value dtypes and non/trans/conj.
+      Transpose CSR construction is performed and timed in every run.
+      New dtype/op combinations require hardware validation.
     for:
       - flagsparse_spmv_csr
+      - flagsparse_spmv_csr_run
+      - list_spmv_csr_algorithms
+      - get_spmv_csr_algorithm_spec
       - prepare_spmv_csr
     labels:
       - flagsparse

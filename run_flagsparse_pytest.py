@@ -178,6 +178,7 @@ PERFORMANCE_METRIC_COLUMNS = {
 # entry whose measurement columns the row actually carries.
 PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("speedup", "latency_base", "latency"),
+    ("speedup_vs_vendor", "vendor_ms", "ms"),
     ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
     ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
     # spmm_coo carries BOTH triton_speedup_vs_pytorch (over torch_ms) and
@@ -261,10 +262,12 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{iters}",
     ),
     "spmv_csr": (
-        "tests/test_spmv.py",
+        "tests/test_spmv_csr.py",
         "{input}",
         "--csv-csr",
         "{csv}",
+        "--alg",
+        "compare",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -1818,17 +1821,24 @@ def _row_dtype(row: dict[str, str]) -> str:
 
 
 def _row_shape(row: dict[str, str], index: int) -> str:
+    base = None
     for key in ("shape", "matrix", "name", "case", "m,n,k", "M,N,K"):
         value = row.get(key)
         if value:
-            return str(value)
+            base = str(value)
+            break
     dims = [row.get(key) for key in ("M", "N", "K") if row.get(key)]
-    if dims:
-        return "x".join(str(item) for item in dims)
+    if base is None and dims:
+        base = "x".join(str(item) for item in dims)
     dims = [row.get(key) for key in ("rows", "cols", "nnz") if row.get(key)]
-    if dims:
-        return "x".join(str(item) for item in dims)
-    return f"row_{index}"
+    if base is None and dims:
+        base = "x".join(str(item) for item in dims)
+    if base is None:
+        base = f"row_{index}"
+    algorithm = row.get("alg_resolved") or row.get("algorithm") or row.get("alg")
+    if algorithm:
+        return f"{base}|alg={algorithm}"
+    return base
 
 
 def _detail_shape(row: dict[str, str], index: int, seen: set[str]) -> str:
