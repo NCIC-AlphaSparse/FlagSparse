@@ -463,6 +463,48 @@ def test_runner_normalizes_performance_csv_rows(tmp_path):
     )
 
 
+def test_spgemm_performance_isolates_dtype_crashes(tmp_path, monkeypatch):
+    """A float32 rocSPARSE abort must not prevent the float64 sweep."""
+
+    def fake_run_subprocess(cmd, **_kwargs):
+        csv_path = Path(cmd[cmd.index("--csv") + 1])
+        dtype = cmd[cmd.index("--dtypes") + 1]
+        csv_path.write_text(
+            "matrix,value_dtype,triton_ms,cusparse_ms,pytorch_ms,"
+            "triton_speedup_vs_cusparse,status\n"
+            f"sample.mtx,{dtype},1.0,2.0,3.0,2.0,PASS\n",
+            encoding="utf-8",
+        )
+        return (-6 if dtype == "float32" else 0), "", "", 0.1, False
+
+    monkeypatch.setattr(runner, "run_subprocess", fake_run_subprocess)
+    result = runner._run_spgemm_split_dtypes(
+        project_root=ROOT,
+        op="spgemm_csr",
+        gpu_id=0,
+        script_device=0,
+        template=("tests/test_spgemm.py", "--csv", "{csv}"),
+        op_dir=tmp_path,
+        benchmark_input=None,
+        warmup=1,
+        iters=1,
+        extra_args=[],
+        timeout=10,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failed_dtypes"] == ["float32"]
+    assert len(result["commands"]) == 2
+    assert [cmd[cmd.index("--dtypes") + 1] for cmd in result["commands"]] == [
+        "float32",
+        "float64",
+    ]
+    with (tmp_path / "performance.csv").open(encoding="utf-8", newline="") as handle:
+        # A crashed child may lose its in-flight final row, but the independent
+        # float64 child must still contribute a reportable measurement.
+        assert {row["value_dtype"] for row in csv.DictReader(handle)} == {"float64"}
+
+
 def test_runner_parses_flaggems_accuracy_json(tmp_path):
     result_path = tmp_path / "accuracy_result.json"
     result_path.write_text(
