@@ -1885,8 +1885,10 @@ def run_all_dtypes_export_csv(
     ref_cleanup=True,
     compare_device=DEFAULT_COMPARE_DEVICE,
     isolate_matrices=False,
+    value_dtypes=None,
 ):
     csv_path = _normalize_csv_path(csv_path)
+    value_dtypes = CSV_VALUE_DTYPES if value_dtypes is None else value_dtypes
     written = 0
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
@@ -1894,7 +1896,7 @@ def run_all_dtypes_export_csv(
         )
         writer.writeheader()
         handle.flush()
-        for value_dtype in CSV_VALUE_DTYPES:
+        for value_dtype in value_dtypes:
             for index_dtype in CSV_INDEX_DTYPES:
                 print("=" * 180)
                 _print_spgemm_mtx_header(value_dtype, index_dtype)
@@ -2250,6 +2252,11 @@ def main():
     )
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument(
+        "--dtypes",
+        default="float32,float64",
+        help="Comma-separated dtype grid for --csv: float32,float64",
+    )
+    parser.add_argument(
         "--run-api-checks",
         action="store_true",
         help="run API validation checks before matrix benchmark (disabled by default)",
@@ -2334,8 +2341,20 @@ def main():
             print("No .mtx files found. Specify files or a directory.")
             return
         csv_path = _normalize_csv_path(args.csv)
+        dtype_map = {"float32": torch.float32, "float64": torch.float64}
+        dtype_names = [name.strip().lower() for name in args.dtypes.split(",") if name.strip()]
+        unknown_dtypes = [name for name in dtype_names if name not in dtype_map]
+        if unknown_dtypes or not dtype_names:
+            raise SystemExit(
+                "--dtypes must contain one or both of: float32,float64"
+            )
+        selected_dtypes = [dtype_map[name] for name in dtype_names]
         print("=" * 120)
-        print("FLAGSPARSE SpGEMM - f32/f64 with int32, export to CSV")
+        print(
+            "FLAGSPARSE SpGEMM - "
+            + "/".join(dtype_names)
+            + " with int32, export to CSV"
+        )
         print("=" * 120)
         print(
             f"GPU: {ACCEL.get_device_name(0)}  |  Files: {len(paths)}  |  "
@@ -2358,6 +2377,7 @@ def main():
             ref_cleanup=args.ref_cleanup,
             compare_device=args.compare_device,
             isolate_matrices=ast_common._is_maca_runtime(),
+            value_dtypes=selected_dtypes,
         )
         return
 

@@ -1766,8 +1766,9 @@ def render_performance_command(
     op: str,
     device: int,
     extra_args: list[str],
+    csv_path: Path | None = None,
 ) -> tuple[list[str], Path]:
-    csv_path = op_dir / "performance.csv"
+    csv_path = csv_path or op_dir / "performance.csv"
     rendered = [sys.executable]
     for token in template:
         if token == "{input}":
@@ -1788,6 +1789,173 @@ def render_performance_command(
     if not Path(rendered[1]).is_absolute():
         rendered[1] = str(project_root / rendered[1])
     return rendered, csv_path
+
+
+def _merge_csv_rows(paths: list[Path], destination: Path) -> list[dict[str, str]]:
+    """Merge same-schema benchmark CSVs, retaining every column seen."""
+    fieldnames: list[str] = []
+    rows: list[dict[str, str]] = []
+    for path in paths:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames:
+                for field in reader.fieldnames:
+                    if field not in fieldnames:
+                        fieldnames.append(field)
+            rows.extend(reader)
+    if fieldnames:
+        with destination.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    return rows
+
+
+def _run_spgemm_split_dtypes(
+    *,
+    project_root: Path,
+    op: str,
+    gpu_id: int,
+    script_device: int,
+    template: tuple[str, ...],
+    op_dir: Path,
+    benchmark_input: Path | None,
+    warmup: int,
+    iters: int,
+    extra_args: list[str],
+    timeout: int,
+) -> dict[str, object]:
+    """Isolate SpGEMM f32/f64 so a vendor-library abort cannot erase fp64."""
+    result_path = op_dir / "performance_result.json"
+    if result_path.exists():
+        result_path.unlink()
+
+    commands: list[list[str]] = []
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    csv_paths: list[Path] = []
+    rows: list[dict[str, str]] = []
+    raw_row_count = 0
+    excluded_matrix_keys: list[str] = []
+    returncodes: list[int] = []
+    timed_out_dtypes: list[str] = []
+    failed_dtypes: list[str] = []
+    total_duration = 0.0
+
+    for dtype in ("float32", "float64"):
+        csv_path = op_dir / f"performance_{dtype}.csv"
+        cmd, csv_path = render_performance_command(
+            template,
+            project_root=project_root,
+            op_dir=op_dir,
+            benchmark_input=benchmark_input,
+            warmup=warmup,
+            iters=iters,
+            op=op,
+            device=script_device,
+            extra_args=[*extra_args, "--dtypes", dtype],
+            csv_path=csv_path,
+        )
+        commands.append(cmd)
+        returncode, stdout, stderr, duration, timed_out = run_subprocess(
+            cmd,
+            project_root=project_root,
+            env=_base_env(project_root, gpu_id),
+            timeout=timeout,
+        )
+        total_duration += duration
+        returncodes.append(returncode)
+        stdout_parts.append(f"===== {dtype} =====\n{stdout}")
+        stderr_parts.append(f"===== {dtype} =====\n{stderr}")
+        if timed_out:
+            timed_out_dtypes.append(dtype)
+        elif returncode != 0:
+            failed_dtypes.append(dtype)
+        if not csv_path.exists():
+            continue
+
+        csv_paths.append(csv_path)
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            dtype_rows = list(csv.DictReader(handle))
+        raw_row_count += len(dtype_rows)
+        filtered_rows, metadata = filter_interrupted_performance_rows(
+            dtype_rows,
+            output=stdout + ("\n" if stdout and stderr else "") + stderr,
+            returncode=returncode,
+            timed_out=timed_out,
+        )
+        rows.extend(filtered_rows)
+        excluded_matrix_keys.extend(metadata["excluded_matrix_keys"])
+
+    csv_path = op_dir / "performance.csv"
+    if csv_paths:
+        _merge_csv_rows(csv_paths, csv_path)
+        # The merged CSV must match the filtered records used for reporting.
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            fieldnames = list(csv.DictReader(handle).fieldnames or [])
+        if fieldnames:
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=fieldnames, extrasaction="ignore"
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+    stdout_path = op_dir / "performance_stdout.log"
+    stderr_path = op_dir / "performance_stderr.log"
+    stdout_path.write_text("\n".join(stdout_parts), encoding="utf-8")
+    stderr_path.write_text("\n".join(stderr_parts), encoding="utf-8")
+    if timed_out_dtypes:
+        status = "TIMEOUT"
+    elif failed_dtypes:
+        status = "FAIL"
+    elif not csv_path.exists():
+        status = "NO_TESTS"
+    else:
+        status = "PASS"
+    result: dict[str, object] = {
+        "operator": op,
+        "phase": "performance",
+        "configured": True,
+        "status": status,
+        "returncode": TIMEOUT_RETURN_CODE if timed_out_dtypes else next(
+            (code for code in returncodes if code != 0), 0
+        ),
+        "exit_code": TIMEOUT_RETURN_CODE if timed_out_dtypes else next(
+            (code for code in returncodes if code != 0), 0
+        ),
+        "duration_sec": total_duration,
+        "duration": total_duration,
+        "command": commands[0] if commands else [],
+        "commands": commands,
+        "stdout_log_path": str(stdout_path),
+        "stderr_log_path": str(stderr_path),
+        "log_path": str(stdout_path),
+        "data_path": str(csv_path) if csv_path.exists() else None,
+        "timed_out_dtypes": timed_out_dtypes,
+        "failed_dtypes": failed_dtypes,
+    }
+    if csv_path.exists():
+        write_benchmark_json_from_csv(op, csv_path, result_path, rows=rows)
+        result.update(
+            summarize_performance_csv(
+                csv_path,
+                rows=rows,
+                raw_row_count=raw_row_count,
+                excluded_row_count=raw_row_count - len(rows),
+                excluded_matrix_keys=excluded_matrix_keys,
+            )
+        )
+        parsed = parse_performance_json(op, result_path)
+        parsed["status"] = resolve_status_with_parsed(
+            status,
+            parsed.get("status"),
+            returncode=int(result["returncode"]),
+            timed_out=bool(timed_out_dtypes),
+        )
+        result.update(parsed)
+        result["data_file"] = str(result_path.relative_to(op_dir.parent))
+    return result
 
 
 def _to_float(value: object) -> float | None:
@@ -2381,6 +2549,23 @@ def run_performance(
         and benchmark_input.is_dir()
     ):
         return _run_bell_per_matrix(
+            project_root=project_root,
+            op=op,
+            gpu_id=gpu_id,
+            script_device=script_device,
+            template=template,
+            op_dir=op_dir,
+            benchmark_input=benchmark_input,
+            warmup=warmup,
+            iters=iters,
+            extra_args=extra_args,
+            timeout=timeout,
+        )
+
+    # `not backend` covers an unexported FLAGSPARSE_BACKEND, which is how a CUDA
+    # box usually runs -- it takes the generic per-operator script too.
+    if op == "spgemm_csr" and (not backend or backend in GENERIC_BENCHMARK_BACKENDS):
+        return _run_spgemm_split_dtypes(
             project_root=project_root,
             op=op,
             gpu_id=gpu_id,
