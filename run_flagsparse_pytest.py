@@ -261,10 +261,12 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{iters}",
     ),
     "spmv_csr": (
-        "tests/test_spmv.py",
+        "tests/test_spmv_csr.py",
         "{input}",
         "--csv-csr",
         "{csv}",
+        "--alg",
+        "compare",
         "--warmup",
         "{warmup}",
         "--iters",
