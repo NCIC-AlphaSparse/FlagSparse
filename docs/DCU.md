@@ -418,7 +418,8 @@ CUDA 基准线：`1613 passed / 3 failed`。
 
 ```bash
 # 策略/契约类测试（不需要 GPU，秒级）
-python -m pytest tests/ci -q     # 期望 39 passed / 3 skipped
+python -m pytest tests/ci -q     # 判据：0 failed（通过数随新增测试增长，
+                                 # 2026-09-19 为 102 passed / 3 skipped）
 ```
 
 ---

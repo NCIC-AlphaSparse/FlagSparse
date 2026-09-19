@@ -31,6 +31,13 @@ print(C._backend_name(), C._accel_device_type(), C._accel_fallback_reason())"
 # 期望：<BACKEND> <设备类型> None
 ```
 
+**昆仑芯是例外，别照上面那行判**：FlagTree 的 `torch_xmlir` 是 CUDA-shim 构建，它把
+`torch.cuda` 调用路由到昆仑芯，所以正确输出是 **`xpu cuda None`** —— `accel device type`
+就是 `cuda`，这不是回退（`torch.xpu` 在那个构建里是上游 PyTorch 的不支持 stub，
+`torch.xpu.is_available()` 为 `False` 属正常）。判据看 `fallback reason` 是不是 `None`，
+外加 `FLAGTREE_BACKEND=xpu`、`TRITON_BACKEND=xpu` 是否已导出，展开见 `docs/XPU.md` 第 1 节。
+反过来说：如果 backend 自己打出 `cuda`（而不是 `xpu`），那才是真的没选中后端。
+
 `fallback reason` 不是 `None`，说明厂商的 torch 插件没装好，**整轮会静默地跑在 CUDA 语义下**，
 跑出来的不是你这台机器的数。摩尔线程和昇腾尤其要注意：它们是独立设备类型（`musa` / `npu`），
 `torch.cuda.*` 和 `Tensor.is_cuda` 在那里不适用。
@@ -203,8 +210,12 @@ if _is_<backend>_runtime():      # 来自 _common.py，已在 __all__ 里
 ## 6. 验收
 
 ```bash
-python3 -m pytest tests/ci -q        # 当前基线：87 passed / 3 skipped
+python3 -m pytest tests/ci -q        # 判据：0 failed
 ```
+
+**别把通过数当固定基线**：`tests/ci` 一直在加新用例，这个数只会长（2026-09-19 是
+102 passed / 3 skipped，此前文档里写过 39、80、87）。所以开工前先在**你的基线提交**上跑一次
+记下数字，改完再跑一次和它比；判据是 **0 failed**，以及通过数只增不减。
 
 `tests/ci` 不需要 GPU，是策略/契约测试。**任何后端改动都不应该让它变红**；变红就说明
 改到了共享契约，那要么是 bug，要么需要一次有意的评审。
