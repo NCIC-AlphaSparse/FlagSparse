@@ -335,6 +335,38 @@ def registry(modules: dict[str, SourceModule]) -> tuple[ApiSpec, ...]:
             ops=spmv_ops,
             notes="op supports non/trans/conj; conj on real dtypes is transpose-equivalent",
         ),
+        *(
+            ApiSpec(
+                "spmv",
+                "flagsparse_spmv_csr",
+                "spmv_csr",
+                "CSR",
+                algorithm,
+                value_const="SPMV_CSR_NEW_VALUE_DTYPES",
+                index_const="SUPPORTED_INDEX_DTYPES",
+                ops=spmv_ops,
+                notes="CUDA/ROCm; input-dependent accumulation; per-run CSR transpose; hardware validation pending",
+            )
+            for algorithm in modules["spmv_csr"].get("SPMV_CSR_NEW_ALGORITHMS")
+        ),
+        *(
+            ApiSpec(
+                "spmv",
+                "flagsparse_spmv_csr",
+                "spmv_csr",
+                "CSR",
+                algorithm,
+                values=DEFAULT_VALUE_DTYPES,
+                index_const="SUPPORTED_INDEX_DTYPES",
+                ops=spmv_ops,
+                notes="legacy CSR route preserved for all registered backends",
+            )
+            for algorithm in (
+                modules["spmv_csr"].get("SPMV_CSR_SUPPORTED_ALGORITHMS")
+                or ("legacy_rowpar", "legacy_segbin", "legacy_bucket_vector")
+            )
+            if str(algorithm).startswith("legacy_")
+        ),
         ApiSpec(
             "spmv",
             "flagsparse_spmv_coo",
@@ -578,6 +610,13 @@ def rows_for_spec(
     if spec.api not in module.functions and spec.api not in public_apis:
         status = "PARTIAL"
         notes.append(f"api {spec.api} not found in source exports/functions")
+    if (
+        spec.module == "spmv_csr"
+        and spec.route in (module.get("SPMV_CSR_NEW_ALGORITHMS") or ())
+        and status == "SUPPORTED"
+    ):
+        status = "UNVERIFIED"
+        notes.append("new CSR SpMV route requires backend-specific hardware validation")
 
     ops = spec.ops
     if ops is None:
