@@ -55,13 +55,14 @@ python3 -c "from flagsparse.sparse_operations import _common as c; print(c._back
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' \
   --results-dir pytest_results_metax_delivery \
   > pytest_results_metax_delivery.log 2>&1 < /dev/null &
 ```
 
-- `--no-cusparse`：C550 上没有可用的厂商稀疏库，SDDMM 的 `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），
-  性能 baseline 只能是 PyTorch；
+- `--op-benchmark-args='sddmm_csr=--no-cusparse'`：C550 上没有可用的厂商稀疏库，且 SDDMM 的
+  `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
+  `--benchmark-args` 会广播给所有性能脚本；SpSV 不接受 `--no-cusparse`，不能在这里使用全局参数；
 - `--timeout 4500`：`--delivery-only` 已把 spmv/spmm/spsv 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
   不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
@@ -458,7 +459,7 @@ runner 的精度阶段是**一个算子起一个 pytest 进程**（`-m <算子�
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
   --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spmv_bsr=--resume' \
   --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
 ```
 
@@ -472,7 +473,8 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gp
 
 `--benchmark-args` 是传给所有性能脚本的字符串，runner 通过 `shlex.split()` 展开。只由
 单个性能脚本支持的参数使用可重复的 `--op-benchmark-args=算子名=参数`；参数部分含空格时
-才需要整体引用。上面的全量命令只向 BSR 传入 `--resume`。`spmv_bsr` 若被 7200 秒超时中断，
+才需要整体引用。上面的全量命令只向 SDDMM 传入 `--no-cusparse`，并向 BSR 传入 `--resume`。
+`spmv_bsr` 若被 7200 秒超时中断，
 可复用同一结果目录续跑：
 
 ```bash
@@ -498,7 +500,7 @@ sampled-dot 输出不正确，不能作为 SDDMM 的精度参考或性能 baseli
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --gpus 0 \
   --ops sddmm_csr --benchmark-input /root/gcx/matrix \
-  --benchmark-warmup 5 --benchmark-iters 20 --benchmark-args=--no-cusparse \
+  --benchmark-warmup 5 --benchmark-iters 20 --op-benchmark-args='sddmm_csr=--no-cusparse' \
   --timeout 7200 --results-dir pytest_results_metax_sddmm_csr_pytorch_full_w5_i20
 ```
 
@@ -531,9 +533,8 @@ setsid env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR
   --phase performance --mode normal --delivery-only --gpus 0 --timeout 1200 \
   --ops spmm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse \
   --op-benchmark-args='spmm_csr=--dtypes float32,float64,complex64,complex128 --index-dtypes int32 --ops non' \
-  --op-benchmark-args='sddmm_csr=--dtype float32,float64 --index-dtype int32 --k 64' \
+  --op-benchmark-args='sddmm_csr=--no-cusparse --dtype float32,float64 --index-dtype int32 --k 64' \
   --results-dir pytest_results_metax_delivery_perf_remaining_w5_i20 \
   > pytest_results_metax_delivery_perf_remaining_w5_i20/runner.log 2>&1 < /dev/null &
 ```

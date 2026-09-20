@@ -52,7 +52,7 @@ python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 40-row 
 |---|---|---|---|---|---|
 | CUDA | -- (`pip install cupy-cuda12x`) | -- | cuSPARSE (CuPy) | cuSPARSE + torch | this section |
 | DCU / ROCm | `pip install hip-python` | SpSV/SpSM may deadlock (read as `Timeout`) | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) §0.5 |
-| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--benchmark-args=--no-cusparse`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
+| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--op-benchmark-args='sddmm_csr=--no-cusparse'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
 | Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
 | Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; others probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (5 ops; others probe only) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
@@ -228,7 +228,7 @@ because a single matrix can take much longer than the rest of the sweep put toge
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
   --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_csc,spgemm_csr,sddmm_csr \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse --op-benchmark-args=spmv_bsr=--resume \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spmv_bsr=--resume' \
   --timeout 7200 --results-dir pytest_results_metax_runner_both_w5_i20
 ```
 
@@ -269,7 +269,7 @@ A dedicated full C550 SDDMM run is:
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --gpus 0 \
   --ops sddmm_csr --benchmark-input /root/gcx/matrix \
-  --benchmark-warmup 5 --benchmark-iters 20 --benchmark-args=--no-cusparse \
+  --benchmark-warmup 5 --benchmark-iters 20 --op-benchmark-args='sddmm_csr=--no-cusparse' \
   --timeout 7200 --results-dir pytest_results_metax_sddmm_csr_pytorch_full_w5_i20
 ```
 
