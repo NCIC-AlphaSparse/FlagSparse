@@ -83,10 +83,13 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 所有加速比的分母都是 PyTorch，不能和
 CUDA/MUSA 对厂商库的数放在一起比。
 
-本 checkout 的 runner 在 pytest collection 时会读取缺失的
-`tests/data/spmv_csr_regressions.json`。只跑 `spsm_csr` 时，将
-`--pytest-args='--ignore=tests/pytest/test_spmv_csr_accuracy.py'` 传给 runner，避免无关的
-SpMV fixture 阻止 SpSM 用例开始执行。SMBLK 的实现、精度覆盖、性能运行状态和完整后台命令记录在
+runner 的精度阶段总是先收集整个 `tests/pytest`，而 `test_spmv_csr_accuracy.py` 在**导入时**就读
+`tests/data/spmv_csr_regressions.json`。这个文件曾在 09-18 被一次 revert 删掉，测试却留了下来，
+于是任何算子的精度阶段都会在 collection 报 `FileNotFoundError`，表现为 `exit_code=2`、`total=0`
+（不是精度失败，用例根本没开始跑）。**该文件现已恢复**，拉到最新即可，不需要再传 `--ignore`。
+如果你的 checkout 里还缺它，先 `ls tests/data/spmv_csr_regressions.json`；确认缺失又暂时拉不到时，
+可临时给 runner 加 `--pytest-args='--ignore=tests/pytest/test_spmv_csr_accuracy.py'`。
+SMBLK 的实现、精度覆盖、性能运行状态和完整后台命令记录在
 [modified/MACA.md](../modified/MACA.md)。
 
 跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：

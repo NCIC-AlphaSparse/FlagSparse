@@ -211,11 +211,11 @@ def test_spmv_csr_int64_auto_fallback_to_int32(monkeypatch):
     state = {"forced_once": False}
     original = spmv_mod._triton_spmv_csr_impl_prepared
 
-    def fail_int64_once(prepared, x_in):
+    def fail_int64_once(prepared, x_in, out=None):
         if prepared.kernel_indices.dtype == torch.int64 and not state["forced_once"]:
             state["forced_once"] = True
             raise RuntimeError("unsupported int64 kernel indices")
-        return original(prepared, x_in)
+        return original(prepared, x_in, out=out)
 
     monkeypatch.setattr(spmv_mod, "_triton_spmv_csr_impl_prepared", fail_int64_once)
     out = flagsparse_spmv_csr(
@@ -241,10 +241,10 @@ def test_spmv_csr_int64_strict_no_fallback(monkeypatch):
     )
     x = torch.randn(9, dtype=torch.float32, device=device)
 
-    def fail_int64(prepared, x_in):
+    def fail_int64(prepared, x_in, out=None):
         if prepared.kernel_indices.dtype == torch.int64:
             raise RuntimeError("unsupported int64 kernel indices")
-        return spmv_mod._triton_spmv_csr_impl_prepared(prepared, x_in)
+        return spmv_mod._triton_spmv_csr_impl_prepared(prepared, x_in, out=out)
 
     monkeypatch.setattr(spmv_mod, "_triton_spmv_csr_impl_prepared", fail_int64)
     with pytest.raises(RuntimeError, match="unsupported int64 kernel indices"):

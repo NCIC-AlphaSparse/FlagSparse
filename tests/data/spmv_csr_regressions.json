@@ -1,0 +1,16 @@
+{
+  "source": "dcu_spmv_opt_all.csv (user supplied 9.02data results)",
+  "matrices": [
+    "2cubes_sphere.mtx", "ASIC_680ks.mtx", "CurlCurl_1.mtx", "GL7d14.mtx", "H2O.mtx",
+    "NACA0015.mtx", "Stanford.mtx", "TF19.mtx", "TSOPF_FS_b300_c1.mtx", "amazon0601.mtx",
+    "auto.mtx", "c8_mat11.mtx", "cage12.mtx", "cfd2.mtx", "ecology1.mtx", "engine.mtx",
+    "filter3D.mtx", "mac_econ_fwd500.mtx", "mip1.mtx", "msc10848.mtx", "neos3.mtx",
+    "net150.mtx", "pkustk13.mtx", "roadNet-TX.mtx", "smt.mtx", "trdheim.mtx",
+    "water_tank.mtx", "wave.mtx", "wheel_601.mtx", "wiki-Talk.mtx"
+  ],
+  "previous_fp32_failures": [
+    "2cubes_sphere.mtx", "CurlCurl_1.mtx", "c8_mat11.mtx", "engine.mtx", "smt.mtx", "water_tank.mtx"
+  ],
+  "short_row_focus": ["roadNet-TX.mtx", "ecology1.mtx", "NACA0015.mtx"],
+  "long_tail_focus": ["wiki-Talk.mtx", "Stanford.mtx", "mip1.mtx"]
+}
