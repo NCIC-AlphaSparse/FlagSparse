@@ -63,6 +63,12 @@ python -m pytest tests/pytest/test_spmv_csr_accuracy.py -m spmv_csr
 FLAGSPARSE_SPMV_CSR_MTX_DIR=../matrix python -m pytest tests/pytest/test_spmv_csr_accuracy.py -k external_matrix_regressions
 ```
 
+Row-level results are recorded in the `status` column of the CSV, and the script
+prints a one-line count of FAIL rows at the end. Like the other benchmark scripts it
+exits 0 whether or not rows FAIL, because the runner treats a non-zero exit as a failed
+phase and every delivery row of the operator inherits that. `--fail-fast` is the
+explicit way to stop, and exit non-zero, at the first failing row.
+
 `compare` selects seven algorithms with int32 columns and six with int64 columns
 on a capable CUDA/ROCm device, for each requested dtype/op. It reports exclusions;
 prepare still checks actual device capability. `auto` continues to select the old
