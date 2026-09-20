@@ -78,9 +78,16 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 
 精度不走 torch.sparse 是有实测原因的：MACA 的 fp32 CSR 路径会返回非有限值，拿它当参考会把好内核报成错的。
 
-**预期会看到的非 Passed**：`spsv_*` / `spsm_csr` 在走到 `csr_cw`（ALG1，unit 对角）时可能非法访存或挂死，
-记为 `Error` / `Timeout`（第 5 节）；**不要**用 CPU 求解顶替。所有加速比的分母都是 PyTorch，不能和
+**预期会看到的非 Passed**：`spsv_*` 在走到 `csr_cw`（ALG1，unit 对角）时可能非法访存或挂死，
+记为 `Error` / `Timeout`（第 5 节）；`spsm_csr` 已改走 MetaX 的 SMBLK 路径。**不要**用 CPU 求解顶替。
+所有加速比的分母都是 PyTorch，不能和
 CUDA/MUSA 对厂商库的数放在一起比。
+
+本 checkout 的 runner 在 pytest collection 时会读取缺失的
+`tests/data/spmv_csr_regressions.json`。只跑 `spsm_csr` 时，将
+`--pytest-args='--ignore=tests/pytest/test_spmv_csr_accuracy.py'` 传给 runner，避免无关的
+SpMV fixture 阻止 SpSM 用例开始执行。SMBLK 的实现、精度覆盖、性能运行状态和完整后台命令记录在
+[modified/MACA.md](../modified/MACA.md)。
 
 跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
@@ -302,13 +309,14 @@ python -m pytest tests/ci -q --deselect tests/ci/test_installed_wheel.py
 | marker | 状态 |
 | --- | --- |
 | `spsv_csr` | ❌ **崩溃/挂死**，见第 5 节 |
-| `spsm_csr` `spsv_coo` `spsv_sell` `spsm_coo` | ⏸ 未验证，很可能撞上同一问题 |
+| `spsm_csr` | ✅ MetaX SMBLK 路径已验证；详细实现和实测记录见 [modified/MACA.md](../modified/MACA.md) |
+| `spsv_coo` `spsv_sell` `spsm_coo` | ⏸ 未验证，三角求解仍须防挂死 |
 | `alpha_spmm_alg1` | ❌ 缺 TLE。沐曦的 triton 没有 `triton.experimental.tle`，而 FlagOS 的 flagtree（带 TLE）要 GLIBC 2.38，本机是 2.31。只影响这一个算子 |
 | `spmm_csr_opt` `opt_alg1` `opt_alg2` | ⏸ 未验证，风险低，可以跑 |
 | `spmm_bell` | ⏸ 当前 checkout 里没有用例 |
 
-**跑三角类算子必须套 `timeout -s KILL`** —— 内核挂死时 Ctrl-C 送不进去（进程卡在驱动
-调用里），代价是整个容器要重开。
+**跑尚未验证的三角类算子必须套 `timeout -s KILL`** —— 内核挂死时 Ctrl-C 送不进去（进程卡在驱动
+调用里），代价是整个容器要重开。`spsm_csr` 的新路径也建议在批量首跑时保留超时保护。
 
 ```bash
 timeout -s KILL 900 python -m pytest tests/pytest -q -m "spsm_csr"
@@ -604,7 +612,7 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=persistent python tests/test_spsv.py --synthetic
 | 基线列全是 `N/A` | CuPy 是否可用（2.4）；再看 `reason` 字段 |
 | `memory size or pointer value too large to fit in 32 bit` | 私有内存超 4 KB/线程，见第 6 节；调小 BLOCK_NNZ |
 | `memory violation(0x4) ... offset is negative` | 非法访存。加 `CUDA_LAUNCH_BLOCKING=1` 重跑才能定位到真正的内核 |
-| **SpSV / SpSM 挂住不动、Ctrl-C 无效** | 内核死锁（第 5 节），只能等 `timeout -s KILL` 或重开容器。先试 `FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog`。**跑三角类算子永远套 timeout** |
+| **SpSV 或未验证的 SpSM 路径挂住不动、Ctrl-C 无效** | 内核死锁（第 5 节），只能等 `timeout -s KILL` 或重开容器。SpSV 可先试 `FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog`；批量三角测试保留 timeout。 |
 | `libmcruntime.so` / `libnuma.so.1` 找不到 | 环境变量丢了（换容器会丢），重跑第 1 节；`ldd .../torch/lib/*.so \| grep "not found"` 一次列全 |
 | SpMV/SpSV 性能明显偏低 | profile 是 CUDA 平移值，尤其确认 `warp_size`（第 8 节） |
 | 单次失败、重跑就好 | 本机偶发失败率不低，已观察到多次。**重要结论都要多跑几轮**，单次结果不算数 |
