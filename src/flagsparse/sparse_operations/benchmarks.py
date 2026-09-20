@@ -105,7 +105,7 @@ def benchmark_gather_case(
     run_cusparse=True,
 ):
     """Benchmark gather device time with CUDA Graph replay and CUDA events."""
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     dense_vector = _build_random_dense(dense_size, value_dtype, device)
     indices = _build_indices(nnz, dense_size, index_dtype, device, unique=False)
 
@@ -267,7 +267,7 @@ def benchmark_scatter_case(
     index_fallback_policy="auto",
 ):
     """Benchmark Triton scatter vs PyTorch index_copy vs cuSPARSE-backed COO SpMV."""
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     (
         requested_value_dtype,
         requested_effective_dtype,
@@ -521,7 +521,7 @@ def benchmark_spmv_case(
     index_fallback_policy="auto",
 ):
     """Benchmark Triton CSR SpMV vs cuSPARSE (CuPy CSR @ x)."""
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )

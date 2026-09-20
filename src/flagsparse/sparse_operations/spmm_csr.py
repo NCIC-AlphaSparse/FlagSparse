@@ -5420,7 +5420,7 @@ def benchmark_spmm_opt_case(
     """Benchmark SpMM base vs opt against the same high-precision PyTorch reference."""
     if value_dtype not in (torch.float32, torch.float64):
         raise TypeError("benchmark_spmm_opt_case only supports float32 and float64")
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )
@@ -5547,7 +5547,7 @@ def benchmark_spmm_case(
     """Benchmark Triton CSR SpMM vs PyTorch sparse.mm and CuPy/cuSPARSE CSR @ dense."""
     op_code = _normalize_spmm_op(op)
     op_name = _spmm_op_to_name(op_code)
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )

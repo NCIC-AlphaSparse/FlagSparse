@@ -2101,7 +2101,7 @@ def benchmark_spgemm_case(
     """Benchmark CSR SpGEMM and compare with torch/cuSPARSE baselines."""
     if value_dtype not in SUPPORTED_SPGEMM_VALUE_DTYPES:
         raise TypeError("value_dtype must be torch.float32 or torch.float64")
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     a_data, a_indices, a_indptr = _build_random_csr(
         n_rows, n_inner, nnz_a, value_dtype, torch.int32, device
     )

@@ -236,19 +236,21 @@ def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
     timing closure and its format stay exactly as the PyTorch path built them, so
     the baseline column measures the same thing everywhere.
     """
-    ref, timing_op, fmt = _build_torch_reference_and_timing(
+    if fs_common._use_scipy_accuracy_reference():
+        # Do not construct a MUSA torch.sparse tensor just to discard it: sparse
+        # matmul is not registered on that backend.  The CPU SciPy result is the
+        # complete oracle and the performance baseline is intentionally absent.
+        ref_dtype = reference_utils.reference_dtype(data.dtype)
+        matrix = reference_utils.scipy_csr(data, indices, indptr, shape, ref_dtype)
+        product = reference_utils.spmm(
+            matrix, B, ref_dtype, op=ast_ops._spmm_op_to_name(op)
+        )
+        scipy_ref = reference_utils.as_torch(product, ref_dtype, B.device)
+        return scipy_ref.to(data.dtype), None, "SciPy"
+
+    return _build_torch_reference_and_timing(
         data, indices, indptr, shape, B, op=op
     )
-    if not fs_common._use_scipy_accuracy_reference():
-        return ref, timing_op, fmt
-
-    ref_dtype = reference_utils.reference_dtype(data.dtype)
-    matrix = reference_utils.scipy_csr(data, indices, indptr, shape, ref_dtype)
-    product = reference_utils.spmm(
-        matrix, B, ref_dtype, op=ast_ops._spmm_op_to_name(op)
-    )
-    scipy_ref = reference_utils.as_torch(product, ref_dtype, B.device)
-    return scipy_ref.to(data.dtype), timing_op, fmt
 
 
 def _build_torch_reference_and_timing(data, indices, indptr, shape, B, op="non"):
@@ -571,14 +573,19 @@ def run_one_mtx(
     else:
         result["triton_ok_pt"] = False
 
-    try:
-        _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(
-            pytorch_op,
-            warmup=warmup,
-            iters=iters,
-        )
-    except Exception as exc:
-        result["pytorch_reason"] = str(exc)
+    if fs_common._use_scipy_accuracy_reference():
+        # MUSA torch.sparse.mm is not registered.  The SciPy result above is
+        # the correctness oracle; there is deliberately no PyTorch baseline.
+        result["pytorch_reason"] = "torch.sparse baseline unavailable on MUSA"
+    else:
+        try:
+            _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(
+                pytorch_op,
+                warmup=warmup,
+                iters=iters,
+            )
+        except Exception as exc:
+            result["pytorch_reason"] = str(exc)
 
     _cupy_supported_dtypes = (
         torch.float32,

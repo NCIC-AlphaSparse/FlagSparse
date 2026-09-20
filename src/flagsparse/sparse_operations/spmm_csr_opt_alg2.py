@@ -1268,7 +1268,7 @@ def benchmark_spmm_opt_alg2_case(
             "benchmark_spmm_opt_alg2_case only supports float32 and float64"
         )
 
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )

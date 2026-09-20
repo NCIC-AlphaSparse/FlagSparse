@@ -475,16 +475,21 @@ def run_one_mtx(
                 value_dtype,
                 op=op,
             )
-        pytorch_ms = _time_pytorch_spmv(
-            data,
-            indices,
-            indptr,
-            x,
-            shape,
-            warmup,
-            iters,
-            op=op,
-        )
+        if not use_scipy_ref:
+            pytorch_ms = _time_pytorch_spmv(
+                data,
+                indices,
+                indptr,
+                x,
+                shape,
+                warmup,
+                iters,
+                op=op,
+            )
+        else:
+            # MUSA has no torch.sparse SpMV implementation.  SciPy is the
+            # correctness oracle, not a device performance baseline.
+            pytorch_ms = None
         if y_size:
             pt_error_reason = _non_finite_error_reason(
                 triton_y, pt_ref_y, reference_name

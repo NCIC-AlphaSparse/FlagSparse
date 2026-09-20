@@ -23,11 +23,9 @@
 //
 // `compute` IS TIMED, NOT `copy`. Both sides.
 //
-// copy sorts each row of C on the HOST (src/ops/spgemm.cpp:519 -- the kernel emits
-// hash-slot order and cuSPARSE guarantees sorted CSR), which is a one-time cost
-// per result for a real caller but was being paid on every iteration of a timing
-// loop: 1311 ms against cuSPARSE's 0.33 ms on H2O, three orders of magnitude that
-// say more about the benchmark than about the algorithm.
+// On MUSA the current Triton fill artifact has an ABI/codegen defect, so copy
+// materializes the validated CSR result on the host. That setup is intentionally
+// outside the timing loop; compute remains the C API device phase being measured.
 //
 // So the timed region is the iterative numeric phase, `compute`, on both sides.
 // The setup (workEstimation, the sizing compute, the allocation, one copy) runs
@@ -159,13 +157,20 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                                          FLAGSPARSE_SPGEMM_DEFAULT, descr, &b2, nullptr);
             }
             DeviceBuffer s2(b2 ? b2 : 1);
+            bool host_fallback = false;
             if (st == FLAGSPARSE_STATUS_SUCCESS) {
                 st = flagsparseSpGEMM_compute(handle.h, NT, NT, sc.alpha(dt), matA, matB,
                                               sc.beta(dt), matC, dt,
                                               FLAGSPARSE_SPGEMM_DEFAULT, descr, &b2,
                                               s2.get());
+                const char* note = nullptr;
+                flagsparseGetLastErrorString(handle.h, &note);
+                host_fallback = note && std::string(note).rfind(
+                    "SpGEMM host_fallback:", 0) == 0;
             }
             if (st != FLAGSPARSE_STATUS_SUCCESS) {
+                const char* why = nullptr;
+                flagsparseGetLastErrorString(handle.h, &why);
                 teardown();
                 // The hash-table overflow path lands here. It is a capability
                 // limit of the C wrapper (the Python side falls back to a chunked
@@ -174,7 +179,8 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                 g_report.skip(std::move(row),
                               st == FLAGSPARSE_STATUS_NOT_SUPPORTED ? "not_supported"
                                                                     : "failed",
-                              "SpGEMM compute declined this matrix");
+                              std::string("SpGEMM compute declined this matrix") +
+                                  (why && *why ? std::string(": ") + why : ""));
                 continue;
             }
 
@@ -191,6 +197,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
             }
             flagsparseCsrSetPointers(matC, c_ptr.get(), c_ind.get(), c_val.get());
             row.num("c_nnz", static_cast<double>(cnnz));
+            row.tag("execution", host_fallback ? "host_fallback" : "device_hash");
 
             baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
                                    A.rows, A.cols, A.nnz, dt};
@@ -211,11 +218,14 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                                       sc.beta(dt), matC, dt,
                                       FLAGSPARSE_SPGEMM_DEFAULT, descr);
             if (cp != FLAGSPARSE_STATUS_SUCCESS) {
+                const char* why = nullptr;
+                flagsparseGetLastErrorString(handle.h, &why);
                 teardown();
-                g_report.skip(std::move(row), "failed", "SpGEMM_copy failed");
+                g_report.skip(std::move(row), "failed",
+                              std::string("SpGEMM_copy failed") +
+                                  (why && *why ? std::string(": ") + why : ""));
                 continue;
             }
-
             g_report.measure_vs_baseline(
                 std::move(row),
                 [&]() {
@@ -246,8 +256,9 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                 },
                 [&](baseline::Timing* t) {
                     const baseline::Status s = baseline::spgemm_csr(
-                        bA, sc.alpha(dt), sc.beta(dt), BenchReport::kWarmup,
-                        BenchReport::kIters, t, &vendor_c);
+                        bA, sc.alpha(dt), sc.beta(dt),
+                        host_fallback ? 0 : BenchReport::kWarmup,
+                        host_fallback ? 1 : BenchReport::kIters, t, &vendor_c);
                     // The oracle reads the vendor's C from here on. Its nnz is
                     // its own: two implementations of A*A agree mathematically,
                     // but one may keep explicit zeros the other drops, and

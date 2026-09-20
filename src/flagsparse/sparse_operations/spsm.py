@@ -1905,7 +1905,7 @@ def benchmark_spsm_case(
     iters=50,
 ):
     """Pure FlagSparse SpSM benchmark entry for one configuration."""
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, indices, indptr = _build_random_csr(
         n_rows, n_rows, nnz, value_dtype, index_dtype, device
     )

@@ -699,20 +699,26 @@ def _compile_a_kernel(
                 if isinstance(capability, tuple):
                     capability = capability[0] * 10 + capability[1]
 
-                # Use official compilation function (same as Triton MUSA backend)
-                asm_str, mubin_tmp_path = mtgpu.translate_llvmir_to_mubin(
-                    llir_content, opt_option, capability, 0
-                )
-
-                # Copy mubin to cache directory
                 mubin_path = Path(cache_dir) / f"{kernel_name}.mubin"
-                shutil.copy2(mubin_tmp_path, mubin_path)
-
-                # Optionally save ASM for debugging
-                if os.environ.get("MUSA_ASM_ENABLE_DUMP", "0") == "1":
-                    asm_path = Path(cache_dir) / f"{kernel_name}.asm"
-                    with open(asm_path, "w") as f:
-                        f.write(asm_str)
+                # Triton 3.6's MUSA backend emits this artifact during
+                # triton.compile; older builds required the extension API.
+                translate = getattr(mtgpu, "translate_llvmir_to_mubin", None)
+                if mubin_path.exists():
+                    pass
+                elif translate is not None:
+                    asm_str, mubin_tmp_path = translate(
+                        llir_content, opt_option, capability, 0
+                    )
+                    shutil.copy2(mubin_tmp_path, mubin_path)
+                    if os.environ.get("MUSA_ASM_ENABLE_DUMP", "0") == "1":
+                        asm_path = Path(cache_dir) / f"{kernel_name}.asm"
+                        with open(asm_path, "w") as f:
+                            f.write(asm_str)
+                else:
+                    raise RuntimeError(
+                        "Triton did not emit a MUSA .mubin and this extension "
+                        "does not provide translate_llvmir_to_mubin"
+                    )
 
             except Exception as e:
                 import sys

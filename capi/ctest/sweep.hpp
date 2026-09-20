@@ -320,11 +320,14 @@ inline const FormatCase* csr_and_coo(std::size_t* n) {
 // namespace fstest -- it declares fstest::registry itself, and including it in
 // here would nest that into fstest::fstest::registry.
 // Entries belonging to one benchmark binary.
-inline std::vector<const registry::Variant*> variants_of(const char* family) {
+inline std::vector<const registry::Variant*> variants_of(
+    const char* family, const char* reporting = nullptr) {
     std::vector<const registry::Variant*> out;
     for (int i = 0; i < registry::kVariantCount; ++i) {
-        if (std::string(registry::kVariants[i].family) == family) {
-            out.push_back(&registry::kVariants[i]);
+        const auto& variant = registry::kVariants[i];
+        if (std::string(variant.family) == family &&
+            (reporting == nullptr || std::string(variant.reporting) == reporting)) {
+            out.push_back(&variant);
         }
     }
     return out;

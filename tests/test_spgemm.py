@@ -1266,41 +1266,12 @@ def run_one_mtx(
     ref_warmup = max(0, int(ref_warmup))
     ref_iters = max(1, int(ref_iters))
 
-    pt_ref = _run_reference_with_retries(
-        backend="torch",
-        a_data=a_data,
-        a_indices=a_indices,
-        a_indptr=a_indptr,
-        a_shape=a_shape,
-        b_data=b_data,
-        b_indices=b_indices,
-        b_indptr=b_indptr,
-        b_shape=b_shape,
-        warmup=ref_warmup,
-        iters=ref_iters,
-        blocked_retry=ref_blocked_retry,
-        block_rows=ref_block_rows,
-        isolated_retry=ref_isolated_retry,
-        ref_cleanup=ref_cleanup,
-        mtx_path=mtx_path,
-        value_dtype=value_dtype,
-        input_mode=input_mode,
-        result_device=compare_device,
-    )
-    result["pt_exec_mode"] = pt_ref.get("exec_mode")
-    result["attempted_modes_pt"] = pt_ref.get("attempted_modes")
-    result["pt_retry_count"] = int(pt_ref.get("retry_count", 0))
-    if pt_ref.get("peak_block_rows") is not None:
-        result["ref_peak_block_rows"] = int(pt_ref["peak_block_rows"])
-    if pt_ref.get("success"):
-        pt_ref_success = True
-        pt_ref_result = pt_ref.get("result")
-        result["pytorch_format"] = pt_ref.get("format")
-        result["pytorch_ms"] = pt_ref.get("ms")
-        if ast_common._use_scipy_accuracy_reference():
-            # Correctness moves to SciPy on CPU; pytorch_ms just above stays the
-            # measured PyTorch baseline, so the column keeps meaning what it did.
-            pt_ref_result = _build_scipy_spgemm_reference(
+    if ast_common._use_scipy_accuracy_reference():
+        # MUSA has no torch.sparse.mm implementation.  Build the CPU oracle
+        # directly and do not launch the failing torch reference worker.
+        pt_ref = {
+            "success": True,
+            "result": _build_scipy_spgemm_reference(
                 a_data,
                 a_indices,
                 a_indptr,
@@ -1309,23 +1280,17 @@ def run_one_mtx(
                 b_indices,
                 b_indptr,
                 b_shape,
-            )
+            ),
+            "format": "SciPy",
+            "ms": None,
+            "exec_mode": "scipy_cpu",
+            "attempted_modes": "scipy_cpu",
+            "retry_count": 0,
+            "peak_block_rows": None,
+        }
     else:
-        result["pytorch_reason"] = pt_ref.get("reason")
-        result["ref_fail_stage"] = pt_ref.get("fail_stage")
-        result["error"] = _append_error(
-            result["error"], f"pt_ref: {pt_ref.get('reason')}"
-        )
-    if ref_cleanup:
-        _cleanup_reference_pools()
-
-    if run_cusparse:
-        # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
-        vendor_backend, _vendor_reason = ast_ops._spgemm_csr_sparse_ref_backend(
-            value_dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
-        )
-        cu_ref = _run_reference_with_retries(
-            backend="hipsparse" if vendor_backend == "hipsparse" else "cupy",
+        pt_ref = _run_reference_with_retries(
+            backend="torch",
             a_data=a_data,
             a_indices=a_indices,
             a_indptr=a_indptr,
@@ -1345,6 +1310,65 @@ def run_one_mtx(
             input_mode=input_mode,
             result_device=compare_device,
         )
+    result["pt_exec_mode"] = pt_ref.get("exec_mode")
+    result["attempted_modes_pt"] = pt_ref.get("attempted_modes")
+    result["pt_retry_count"] = int(pt_ref.get("retry_count", 0))
+    if pt_ref.get("peak_block_rows") is not None:
+        result["ref_peak_block_rows"] = int(pt_ref["peak_block_rows"])
+    if pt_ref.get("success"):
+        pt_ref_success = True
+        pt_ref_result = pt_ref.get("result")
+        if ast_common._use_scipy_accuracy_reference():
+            pt_ref_result = _convert_result_for_compare(
+                pt_ref_result, compare_device, device=device
+            )
+        result["pytorch_format"] = pt_ref.get("format")
+        result["pytorch_ms"] = pt_ref.get("ms")
+    else:
+        result["pytorch_reason"] = pt_ref.get("reason")
+        result["ref_fail_stage"] = pt_ref.get("fail_stage")
+        result["error"] = _append_error(
+            result["error"], f"pt_ref: {pt_ref.get('reason')}"
+        )
+    if ref_cleanup:
+        _cleanup_reference_pools()
+
+    if run_cusparse:
+        # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
+        vendor_backend, _vendor_reason = ast_ops._spgemm_csr_sparse_ref_backend(
+            value_dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
+        )
+        if vendor_backend is None:
+            cu_ref = {
+                "success": False,
+                "reason": _vendor_reason or "vendor sparse baseline is unavailable",
+                "exec_mode": "unavailable",
+                "attempted_modes": "unavailable",
+                "retry_count": 0,
+                "peak_block_rows": None,
+            }
+        else:
+            cu_ref = _run_reference_with_retries(
+                backend="hipsparse" if vendor_backend == "hipsparse" else "cupy",
+                a_data=a_data,
+                a_indices=a_indices,
+                a_indptr=a_indptr,
+                a_shape=a_shape,
+                b_data=b_data,
+                b_indices=b_indices,
+                b_indptr=b_indptr,
+                b_shape=b_shape,
+                warmup=ref_warmup,
+                iters=ref_iters,
+                blocked_retry=ref_blocked_retry,
+                block_rows=ref_block_rows,
+                isolated_retry=ref_isolated_retry,
+                ref_cleanup=ref_cleanup,
+                mtx_path=mtx_path,
+                value_dtype=value_dtype,
+                input_mode=input_mode,
+                result_device=compare_device,
+            )
         result["cu_exec_mode"] = cu_ref.get("exec_mode")
         result["attempted_modes_cu"] = cu_ref.get("attempted_modes")
         result["cu_retry_count"] = int(cu_ref.get("retry_count", 0))

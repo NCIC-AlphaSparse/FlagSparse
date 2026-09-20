@@ -44,6 +44,14 @@ namespace {
 // Where the worker-count sweep saturates on the reference card; past this the
 // solve stops getting faster and only costs launch width.
 constexpr int64_t kMaxWorkers = 2048;
+// The chain-wave kernel polls global ready flags.  Its CUDA occupancy model is
+// not portable to MUSA: a large persistent grid can exhaust the runtime's
+// context-switch watchdog before the dependency wave completes.
+constexpr int64_t kMusaMaxWorkers = 32;
+
+bool is_musa_backend() {
+    return std::string(adaptor::backend_name()) == "musa";
+}
 
 bool is_sell_alg(flagsparseSpSVAlg_t alg) {
     return alg == FLAGSPARSE_SPSV_SELL_ALG1 || alg == FLAGSPARSE_SPSV_SELL_ALG2;
@@ -194,6 +202,10 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
 // Enough workers to fill the device once; rows are handed out dynamically, so
 // more workers is strictly more parallelism until the machine is full.
 int64_t resolve_worker_count(int64_t n_rows, int device_index) {
+    if (is_musa_backend()) {
+        // Keep the C API aligned with Python's conservative MUSA route.
+        return std::max<int64_t>(1, std::min(n_rows, kMusaMaxWorkers));
+    }
     const int warp = std::max(1, adaptor::warp_size(device_index));
     const int64_t per_mp = std::max<int64_t>(
         1, adaptor::max_threads_per_multiprocessor(device_index) / warp);

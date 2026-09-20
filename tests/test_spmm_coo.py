@@ -559,26 +559,29 @@ def _build_pytorch_reference(
         if prepared is None
         else prepared
     )
+    if fs_common._use_scipy_accuracy_reference():
+        # MUSA can construct COO tensors but has no sparse.mm kernel.  Build the
+        # correctness value directly from the canonical arrays on CPU and leave
+        # the accelerator baseline unavailable.
+        out_dtype = prepared["output_dtype"]
+        ref_dtype = reference_utils.reference_dtype(out_dtype)
+        matrix = reference_utils.scipy_coo(
+            prepared["canonical_data"],
+            prepared["canonical_row"],
+            prepared["canonical_col"],
+            (prepared["n_rows"], prepared["n_cols"]),
+            ref_dtype,
+        )
+        product = reference_utils.spmm(matrix, prepared["canonical_B"], ref_dtype)
+        scipy_ref = reference_utils.as_torch(
+            product, ref_dtype, prepared["canonical_B"].device
+        )
+        return scipy_ref.to(out_dtype), None, "SciPy", None
+
     expected, pytorch_op, fmt, reason = _build_torch_reference_and_timing(
         data, row, col, shape, B, prepared=prepared, op=op, layout=layout
     )
-    if not fs_common._use_scipy_accuracy_reference():
-        return expected, pytorch_op, fmt, reason
-
-    out_dtype = prepared["output_dtype"]
-    ref_dtype = reference_utils.reference_dtype(out_dtype)
-    matrix = reference_utils.scipy_coo(
-        prepared["canonical_data"],
-        prepared["canonical_row"],
-        prepared["canonical_col"],
-        (prepared["n_rows"], prepared["n_cols"]),
-        ref_dtype,
-    )
-    product = reference_utils.spmm(matrix, prepared["canonical_B"], ref_dtype)
-    scipy_ref = reference_utils.as_torch(
-        product, ref_dtype, prepared["canonical_B"].device
-    )
-    return scipy_ref.to(out_dtype), pytorch_op, fmt, reason
+    return expected, pytorch_op, fmt, reason
 
 
 def _build_torch_reference_and_timing(
@@ -859,15 +862,18 @@ def run_one_alg_case(
     )
     _done("prepare canonical reference", stage_t0)
     torch_ms = None
-    try:
-        stage_t0 = _start("time PyTorch COO reference")
-        _torch_out, torch_ms = _cuda_event_benchmark(pytorch_op, warmup, iters)
-        _done("time PyTorch COO reference", stage_t0, f"ms={_fmt_ms(torch_ms)}")
-    except Exception as exc:
-        pytorch_reason = (
-            str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
-        )
-        _done("time PyTorch COO reference", stage_t0, f"failed={exc}")
+    if pytorch_op is None:
+        pytorch_reason = pytorch_reason or "torch.sparse baseline unavailable on MUSA"
+    else:
+        try:
+            stage_t0 = _start("time PyTorch COO reference")
+            _torch_out, torch_ms = _cuda_event_benchmark(pytorch_op, warmup, iters)
+            _done("time PyTorch COO reference", stage_t0, f"ms={_fmt_ms(torch_ms)}")
+        except Exception as exc:
+            pytorch_reason = (
+                str(exc) if pytorch_reason is None else f"{pytorch_reason}; timing: {exc}"
+            )
+            _done("time PyTorch COO reference", stage_t0, f"failed={exc}")
 
     cusparse_out = None
     cusparse_ms = None
