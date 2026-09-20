@@ -166,7 +166,7 @@ def _prepare_sddmm_csr_ref_hipsparse(
         beta_scalar = _hipsparse_scalar(values.dtype, float(beta), 0.0)
         k_dim = int(x.shape[1])
 
-        _hipsparse_create_csr_descriptor(
+        created_spmat = _hipsparse_create_csr_descriptor(
             spmat.createRef(),
             n_rows,
             n_cols,
@@ -179,6 +179,8 @@ def _prepare_sddmm_csr_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hipsparse_create_dnmat_descriptor(
             matx.createRef(),
             n_rows,

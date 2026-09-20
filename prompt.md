@@ -71,6 +71,7 @@ python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
 | `docs/<BACKEND>.md` | 这台机器怎么跑：环境、命令、已知缺陷、排障速查表 |
 | `modified/<BACKEND>.md` | **前人在这个后端上改过哪些文件的哪个函数、为什么** |
 | `modified/README.md` | 改动台账的写法和三条硬规矩 |
+| `docs/REPO_MIGRATION.md` | 只在你之前用 `flpagsparse_cwrapper` 时需要：那个仓库已合并进来并冻结，改动要提到本仓库 |
 
 没有你那个后端的文件，就照 `docs/MUSA.md` 和 `modified/MUSA.md` 的结构新建一份 ——
 那两份是目前最完整的样板。各后端文档的对应关系见 `docs/README.md`（索引）。
