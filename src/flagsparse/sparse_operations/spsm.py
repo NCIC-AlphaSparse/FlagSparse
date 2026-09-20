@@ -1122,6 +1122,208 @@ def _spsm_csr_polling_kernel_complex(
     tl.atomic_or(done_ptr + flag_base + row_i64, 1, sem="release")
 
 
+# MetaX/MACA SpSM route.
+#
+# The generic polling kernels above use acquire/release flags and a program
+# barrier before publishing each row.  That protocol can stall on C550 even for
+# a 16-by-4 solve.  These one-warp kernels follow the SpSV CSR ALG4 publication
+# pattern instead: each RHS tile has an independent row-ready flag, and the
+# producer publishes it with an ordinary atomic add after its stores.  Keeping
+# a tile at no more than 32 RHS columns makes the publication single-warp.
+@triton.jit
+def _spsm_csr_smblk_kernel_real(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    work_ptr,
+    ready_ptr,
+    n_rows,
+    n_rhs,
+    stride_work0,
+    alpha,
+    BLOCK_RHS: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+):
+    logical_row = tl.program_id(0)
+    rhs_tile = tl.program_id(1)
+    row = tl.where(LOWER, logical_row, n_rows - 1 - logical_row)
+    row_i64 = row.to(tl.int64)
+    lanes = tl.arange(0, 64)
+    rhs_offsets = rhs_tile * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    rhs_offsets_i64 = rhs_offsets.to(tl.int64)
+    rhs_mask = rhs_offsets < n_rhs
+    base = row_i64 * stride_work0 + rhs_offsets_i64
+    flag_base = rhs_tile.to(tl.int64) * n_rows
+
+    if USE_FP64_ACC:
+        local_sum = tl.load(work_ptr + base, mask=rhs_mask, other=0.0).to(tl.float64)
+        local_sum *= tl.full((BLOCK_RHS,), alpha, tl.float64)
+        diag = tl.full((), 1.0, tl.float64)
+    else:
+        local_sum = tl.load(work_ptr + base, mask=rhs_mask, other=0.0).to(tl.float32)
+        local_sum *= tl.full((BLOCK_RHS,), alpha, tl.float32)
+        diag = tl.full((), 1.0, tl.float32)
+
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    ptr = start + lanes
+    loop_done = 0
+    while loop_done == 0:
+        active = ptr < end
+        col = tl.load(indices_ptr + ptr, mask=active, other=row)
+        dep_mask = active & (col < row if LOWER else col > row)
+        if tl.sum(dep_mask.to(tl.int32), axis=0) == 0:
+            loop_done = 1
+        else:
+            dep_ready = tl.atomic_add(
+                ready_ptr + flag_base + col.to(tl.int64),
+                tl.zeros((64,), dtype=tl.int32),
+                mask=dep_mask,
+            )
+            advance_mask = dep_mask & (dep_ready != 0)
+            values = tl.load(data_ptr + ptr, mask=advance_mask, other=0.0)
+            values = values.to(tl.float64) if USE_FP64_ACC else values.to(tl.float32)
+            x_base = col.to(tl.int64)[:, None] * stride_work0 + rhs_offsets_i64[None, :]
+            x = tl.load(
+                work_ptr + x_base,
+                mask=advance_mask[:, None] & rhs_mask[None, :],
+                other=0.0,
+            )
+            x = x.to(tl.float64) if USE_FP64_ACC else x.to(tl.float32)
+            local_sum -= tl.sum(values[:, None] * x, axis=0)
+            ptr += tl.where(advance_mask, 64, 0)
+
+    active = ptr < end
+    col = tl.load(indices_ptr + ptr, mask=active, other=row + 1)
+    diag_mask = active & (col == row)
+    diag_values = tl.load(data_ptr + ptr, mask=diag_mask, other=0.0)
+    diag_values = diag_values.to(tl.float64) if USE_FP64_ACC else diag_values.to(tl.float32)
+    if not UNIT_DIAG:
+        diag = tl.sum(diag_values, axis=0)
+
+    out = local_sum if UNIT_DIAG else local_sum / diag
+    out = tl.where(out == out, out, 0.0)
+    tl.store(work_ptr + base, out, mask=rhs_mask)
+    tl.atomic_add(ready_ptr + flag_base + row_i64, 1)
+
+
+@triton.jit
+def _spsm_csr_smblk_kernel_complex(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    work_ri_ptr,
+    ready_ptr,
+    n_rows,
+    n_rhs,
+    stride_work0,
+    alpha_re,
+    alpha_im,
+    BLOCK_RHS: tl.constexpr,
+    USE_FP64_ACC: tl.constexpr,
+    LOWER: tl.constexpr,
+    UNIT_DIAG: tl.constexpr,
+):
+    logical_row = tl.program_id(0)
+    rhs_tile = tl.program_id(1)
+    row = tl.where(LOWER, logical_row, n_rows - 1 - logical_row)
+    row_i64 = row.to(tl.int64)
+    lanes = tl.arange(0, 64)
+    rhs_offsets = rhs_tile * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    rhs_offsets_i64 = rhs_offsets.to(tl.int64)
+    rhs_mask = rhs_offsets < n_rhs
+    base = (row_i64 * stride_work0 + rhs_offsets_i64) * 2
+    flag_base = rhs_tile.to(tl.int64) * n_rows
+
+    rhs_re = tl.load(work_ri_ptr + base, mask=rhs_mask, other=0.0)
+    rhs_im = tl.load(work_ri_ptr + base + 1, mask=rhs_mask, other=0.0)
+    if USE_FP64_ACC:
+        rhs_re = rhs_re.to(tl.float64)
+        rhs_im = rhs_im.to(tl.float64)
+        alpha_re_v = tl.full((BLOCK_RHS,), alpha_re, tl.float64)
+        alpha_im_v = tl.full((BLOCK_RHS,), alpha_im, tl.float64)
+        diag_re = tl.full((), 1.0, tl.float64)
+        diag_im = tl.full((), 0.0, tl.float64)
+    else:
+        rhs_re = rhs_re.to(tl.float32)
+        rhs_im = rhs_im.to(tl.float32)
+        alpha_re_v = tl.full((BLOCK_RHS,), alpha_re, tl.float32)
+        alpha_im_v = tl.full((BLOCK_RHS,), alpha_im, tl.float32)
+        diag_re = tl.full((), 1.0, tl.float32)
+        diag_im = tl.full((), 0.0, tl.float32)
+    sum_re = rhs_re * alpha_re_v - rhs_im * alpha_im_v
+    sum_im = rhs_re * alpha_im_v + rhs_im * alpha_re_v
+
+    start = tl.load(indptr_ptr + row)
+    end = tl.load(indptr_ptr + row + 1)
+    ptr = start + lanes
+    loop_done = 0
+    while loop_done == 0:
+        active = ptr < end
+        col = tl.load(indices_ptr + ptr, mask=active, other=row)
+        dep_mask = active & (col < row if LOWER else col > row)
+        if tl.sum(dep_mask.to(tl.int32), axis=0) == 0:
+            loop_done = 1
+        else:
+            dep_ready = tl.atomic_add(
+                ready_ptr + flag_base + col.to(tl.int64),
+                tl.zeros((64,), dtype=tl.int32),
+                mask=dep_mask,
+            )
+            advance_mask = dep_mask & (dep_ready != 0)
+            value_re = tl.load(data_ri_ptr + ptr * 2, mask=advance_mask, other=0.0)
+            value_im = tl.load(data_ri_ptr + ptr * 2 + 1, mask=advance_mask, other=0.0)
+            if USE_FP64_ACC:
+                value_re = value_re.to(tl.float64)
+                value_im = value_im.to(tl.float64)
+            else:
+                value_re = value_re.to(tl.float32)
+                value_im = value_im.to(tl.float32)
+            x_base = (col.to(tl.int64)[:, None] * stride_work0 + rhs_offsets_i64[None, :]) * 2
+            x_mask = advance_mask[:, None] & rhs_mask[None, :]
+            x_re = tl.load(work_ri_ptr + x_base, mask=x_mask, other=0.0)
+            x_im = tl.load(work_ri_ptr + x_base + 1, mask=x_mask, other=0.0)
+            if USE_FP64_ACC:
+                x_re = x_re.to(tl.float64)
+                x_im = x_im.to(tl.float64)
+            else:
+                x_re = x_re.to(tl.float32)
+                x_im = x_im.to(tl.float32)
+            sum_re -= tl.sum(value_re[:, None] * x_re - value_im[:, None] * x_im, axis=0)
+            sum_im -= tl.sum(value_re[:, None] * x_im + value_im[:, None] * x_re, axis=0)
+            ptr += tl.where(advance_mask, 64, 0)
+
+    active = ptr < end
+    col = tl.load(indices_ptr + ptr, mask=active, other=row + 1)
+    diag_mask = active & (col == row)
+    diag_re_values = tl.load(data_ri_ptr + ptr * 2, mask=diag_mask, other=0.0)
+    diag_im_values = tl.load(data_ri_ptr + ptr * 2 + 1, mask=diag_mask, other=0.0)
+    if USE_FP64_ACC:
+        diag_re_values = diag_re_values.to(tl.float64)
+        diag_im_values = diag_im_values.to(tl.float64)
+    else:
+        diag_re_values = diag_re_values.to(tl.float32)
+        diag_im_values = diag_im_values.to(tl.float32)
+    if not UNIT_DIAG:
+        diag_re = tl.sum(diag_re_values, axis=0)
+        diag_im = tl.sum(diag_im_values, axis=0)
+
+    if UNIT_DIAG:
+        out_re = sum_re
+        out_im = sum_im
+    else:
+        denom = diag_re * diag_re + diag_im * diag_im
+        out_re = (sum_re * diag_re + sum_im * diag_im) / denom
+        out_im = (sum_im * diag_re - sum_re * diag_im) / denom
+    out_re = tl.where(out_re == out_re, out_re, 0.0)
+    out_im = tl.where(out_im == out_im, out_im, 0.0)
+    tl.store(work_ri_ptr + base, out_re, mask=rhs_mask)
+    tl.store(work_ri_ptr + base + 1, out_im, mask=rhs_mask)
+    tl.atomic_add(ready_ptr + flag_base + row_i64, 1)
+
+
 def _prepare_spsm_rhs_work_buffer(rhs):
     # Library-main solves through a dedicated RHS work buffer. In our current
     # row-major NON_TRANS path that buffer already matches the final layout, so
@@ -1330,6 +1532,83 @@ def _use_spsm_ascend_dispatch():
     return _is_ascend_runtime()
 
 
+_MACA_SPSM_SMBLK_RHS_TILE = 32
+
+
+def _spsm_maca_smblk_rhs_tile(n_rhs):
+    """Return the one-warp RHS tile used by the MetaX ALG4-style route."""
+    n_rhs = max(1, int(n_rhs))
+    return min(_MACA_SPSM_SMBLK_RHS_TILE, 1 << (n_rhs - 1).bit_length())
+
+
+def _run_spsm_maca_smblk_core(
+    data,
+    indices32,
+    indptr,
+    rhs,
+    n_rows,
+    *,
+    data_ri=None,
+    alpha=1.0,
+    lower=True,
+    unit_diagonal=False,
+):
+    """MetaX CSR SpSM route based on the one-warp SpSV CSR ALG4 protocol."""
+    rhs_work = _prepare_spsm_rhs_work_buffer(rhs)
+    n_rhs = int(rhs.shape[1])
+    if n_rows == 0 or n_rhs == 0:
+        return rhs_work
+
+    block_rhs = _spsm_maca_smblk_rhs_tile(n_rhs)
+    rhs_tiles = triton.cdiv(n_rhs, block_rhs)
+    ready = torch.zeros((rhs_tiles, n_rows), dtype=torch.int32, device=rhs.device)
+    grid = (n_rows, rhs_tiles)
+    use_fp64 = data.dtype in (torch.float64, torch.complex128)
+    if torch.is_complex(data):
+        data_ri = data_ri if data_ri is not None else _complex_interleaved_view(data)
+        rhs_work_ri = _complex_interleaved_view(rhs_work)
+        alpha_re = float(alpha.real) if isinstance(alpha, complex) else float(alpha)
+        alpha_im = float(alpha.imag) if isinstance(alpha, complex) else 0.0
+        _spsm_csr_smblk_kernel_complex[grid](
+            data_ri,
+            indices32,
+            indptr,
+            rhs_work_ri,
+            ready,
+            n_rows=n_rows,
+            n_rhs=n_rhs,
+            stride_work0=rhs_work.stride(0),
+            alpha_re=alpha_re,
+            alpha_im=alpha_im,
+            BLOCK_RHS=block_rhs,
+            USE_FP64_ACC=use_fp64,
+            LOWER=bool(lower),
+            UNIT_DIAG=bool(unit_diagonal),
+            num_warps=1,
+            num_stages=1,
+        )
+        return torch.view_as_complex(rhs_work_ri.reshape(n_rows, n_rhs, 2).contiguous())
+
+    _spsm_csr_smblk_kernel_real[grid](
+        data,
+        indices32,
+        indptr,
+        rhs_work,
+        ready,
+        n_rows=n_rows,
+        n_rhs=n_rhs,
+        stride_work0=rhs_work.stride(0),
+        alpha=alpha,
+        BLOCK_RHS=block_rhs,
+        USE_FP64_ACC=use_fp64,
+        LOWER=bool(lower),
+        UNIT_DIAG=bool(unit_diagonal),
+        num_warps=1,
+        num_stages=1,
+    )
+    return rhs_work
+
+
 def _run_spsm_csr_core(
     data,
     indices32,
@@ -1342,6 +1621,7 @@ def _run_spsm_csr_core(
     lower=True,
     block_rhs=None,
     unit_diagonal=False,
+    maca_smblk=False,
 ):
     if rhs.ndim != 2:
         raise ValueError("rhs must be 2D")
@@ -1356,6 +1636,18 @@ def _run_spsm_csr_core(
             indptr,
             rhs,
             n_rows,
+            alpha=alpha,
+            lower=lower,
+            unit_diagonal=unit_diagonal,
+        )
+    if maca_smblk and _is_maca_runtime():
+        return _run_spsm_maca_smblk_core(
+            data,
+            indices32,
+            indptr,
+            rhs,
+            n_rows,
+            data_ri=data_ri,
             alpha=alpha,
             lower=lower,
             unit_diagonal=unit_diagonal,
@@ -1478,6 +1770,7 @@ def flagsparse_spsm_csr(
         alpha=alpha_value,
         lower=solve_plan["lower_eff"],
         unit_diagonal=solve_plan["unit_diagonal"],
+        maca_smblk=True,
     )
     if return_time:
         _ACCEL.synchronize()
