@@ -452,7 +452,7 @@ def _prepare_spmm_coo_ref_hipsparse(
             ("HIPSPARSE_INDEX_BASE_ZERO",),
         )
 
-        _hipsparse_create_coo_descriptor(
+        created_spmat = _hipsparse_create_coo_descriptor(
             spmat_ref,
             n_rows,
             n_cols,
@@ -464,6 +464,8 @@ def _prepare_spmm_coo_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hipsparse_create_dnmat_descriptor(
             matb_ref,
             n_cols,

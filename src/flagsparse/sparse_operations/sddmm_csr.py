@@ -166,7 +166,7 @@ def _prepare_sddmm_csr_ref_hipsparse(
         beta_scalar = _hipsparse_scalar(values.dtype, float(beta), 0.0)
         k_dim = int(x.shape[1])
 
-        _hipsparse_create_csr_descriptor(
+        created_spmat = _hipsparse_create_csr_descriptor(
             spmat.createRef(),
             n_rows,
             n_cols,
@@ -179,6 +179,8 @@ def _prepare_sddmm_csr_ref_hipsparse(
             index_base,
             value_type,
         )
+        if created_spmat is not None:
+            spmat = created_spmat
         _hipsparse_create_dnmat_descriptor(
             matx.createRef(),
             n_rows,
@@ -268,6 +270,32 @@ def _prepare_sddmm_csr_ref_hipsparse(
         raise
 
 
+def _hipsparse_sddmm_csr_index_arrays(indices, indptr):
+    """Return CSR indices compatible with the hipSPARSE generic descriptor.
+
+    The FlagSparse SDDMM path accepts a 64-bit row-offset array with 32-bit column
+    indices.  hipSPARSE's generic CSR SDDMM descriptor, however, needs both index
+    arrays to use the same width.  Keep this conversion in the vendor setup path so
+    it is excluded from the timed SDDMM calls and does not change the native input.
+    """
+    if indices.dtype == indptr.dtype:
+        return indices, indptr
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "hipSPARSE CSR SDDMM requires int32 or int64 CSR indices, got "
+            f"{indices.dtype}"
+        )
+    if indptr.numel() and (
+        int(indptr.min().item()) < torch.iinfo(indices.dtype).min
+        or int(indptr.max().item()) > torch.iinfo(indices.dtype).max
+    ):
+        raise ValueError(
+            f"hipSPARSE CSR SDDMM cannot convert indptr from {indptr.dtype} "
+            f"to {indices.dtype} without overflow"
+        )
+    return indices, indptr.to(dtype=indices.dtype).contiguous()
+
+
 def _run_sddmm_csr_ref_hipsparse_prepared(state):
     if state.get("empty"):
         return state["values"]
@@ -354,9 +382,21 @@ def _benchmark_sddmm_csr_sparse_ref(
                 return result
         result["reason"] = "CUDA cuSPARSE SDDMM baseline is implemented in the benchmark runner"
         return result
+    try:
+        vendor_indices, vendor_indptr = _hipsparse_sddmm_csr_index_arrays(indices, indptr)
+    except Exception as exc:
+        result["reason"] = str(exc)
+        return result
     values, ms = _benchmark_prepared_cuda_op(
         lambda: _prepare_sddmm_csr_ref_hipsparse(
-            indices, indptr, shape, x, y, data_in, alpha=alpha, beta=beta
+            vendor_indices,
+            vendor_indptr,
+            shape,
+            x,
+            y,
+            data_in,
+            alpha=alpha,
+            beta=beta,
         ),
         _run_sddmm_csr_ref_hipsparse_prepared,
         _destroy_sddmm_csr_ref_hipsparse_prepared,

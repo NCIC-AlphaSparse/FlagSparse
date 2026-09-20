@@ -32,3 +32,7 @@ test_spmv_bsr_scipy.csv
 # first commit and carried one developer's absolute path, which is useless to
 # everyone else and churns on every machine.
 .vscode/
+
+# Backend delivery notes and staging copies; kept out of the repo by the maintainer.
+/prompt.md
+/modified/
