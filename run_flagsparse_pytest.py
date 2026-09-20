@@ -119,6 +119,10 @@ STATUS_TO_FLAGGEMS = {
 # under --delivery-only, BEFORE --benchmark-args/--op-benchmark-args, so an
 # explicit user flag still wins (argparse keeps the last value). Parents absent
 # here already sweep only delivery axes (sddmm_csr, spgemm_csr, spsm_csr).
+#
+# A script whose default dtypes leave out a delivery dtype gets the list spelled
+# out as well (gather, spmv_csr): spmv_csr defaults to float32,float64, so its
+# c32/c64 delivery variants had no rows at all and reported NotFound.
 DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
     "gather": (
         "--index-dtypes",
@@ -127,7 +131,14 @@ DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
         "float16,float32,float64,complex64,complex128",
     ),
     "scatter": ("--index-dtypes", "int32"),
-    "spmv_csr": ("--index-dtype", "int32", "--ops", "non"),
+    "spmv_csr": (
+        "--index-dtype",
+        "int32",
+        "--ops",
+        "non",
+        "--dtypes",
+        "float32,float64,complex64,complex128",
+    ),
     "spmv_coo": ("--index-dtypes", "int32", "--ops", "non"),
     "spmm_csr": ("--index-dtypes", "int32", "--ops", "non"),
     "spmm_coo": ("--index-dtypes", "int32"),
@@ -3021,6 +3032,38 @@ _DELIVERY_PERF_DTYPES = {
 }
 
 
+# A delivery row is int32-index and non-transposed (`spmv_csr_f32_int_non`). The
+# performance side already slices on those axes (_is_delivery_performance_row);
+# the accuracy side sliced on dtype alone, so every row also carried the int64,
+# trans and conj cases of the shared suite -- and, for spmv_csr, the 3780-case
+# external-matrix suite, which is skipped unless FLAGSPARSE_SPMV_CSR_MTX_DIR is
+# set and which the runner never sets. Any skip makes the whole row `Skipped`, so
+# spmv_csr could not report Passed at all.
+#
+# These are the parameter names the recorded pytest cases use for those axes. A
+# case that does not record an axis is not constrained by it.
+_DELIVERY_ACCURACY_INDEX_KEYS = ("index_dtype", "col_dtype")
+_DELIVERY_ACCURACY_OP_KEYS = ("op", "opA", "op_mode")
+# Optional suites that need data the runner does not supply; not part of a row.
+_DELIVERY_ACCURACY_EXCLUDED_TESTS = ("::test_spmv_csr_external_matrix_regressions",)
+
+
+def _is_delivery_accuracy_case(nodeid: object, item: dict[str, object]) -> bool:
+    """True for a recorded pytest case that lies on the delivery axes."""
+    if any(name in str(nodeid) for name in _DELIVERY_ACCURACY_EXCLUDED_TESTS):
+        return False
+    params = item.get("params") or {}
+    for key in _DELIVERY_ACCURACY_INDEX_KEYS:
+        if key in params:
+            value = str(params[key]).strip().lower().replace("torch.", "")
+            if value != "int32":
+                return False
+    for key in _DELIVERY_ACCURACY_OP_KEYS:
+        if key in params and str(params[key]).strip().lower() not in ("non", "n"):
+            return False
+    return True
+
+
 def _delivery_not_configured_phase(phase: str, reason: str) -> dict[str, object]:
     return {
         "operator": "",
@@ -3064,6 +3107,18 @@ def _delivery_accuracy_phase(
             "accuracy", f"the shared pytest suite recorded no {dtype} cases"
         )
 
+    # Narrow to the delivery axes. If that would leave nothing (a slice made only of
+    # off-axis cases) keep the dtype slice: an empty row would read as NotFound,
+    # which says the suite did not run rather than that it ran off-axis.
+    on_axis = {
+        nodeid: item
+        for nodeid, item in selected.items()
+        if _is_delivery_accuracy_case(nodeid, item)
+    }
+    off_axis = len(selected) - len(on_axis) if on_axis else 0
+    if on_axis:
+        selected = on_axis
+
     # Keep the parent's provenance -- the raw artifact and the two logs -- so a
     # variant row in summary.csv and result.html still points at the pytest run
     # it was sliced from. Only counts, status and details narrow to `dtype`.
@@ -3071,6 +3126,7 @@ def _delivery_accuracy_phase(
     for stale in ("errors", "xfailed", "xpassed", "failures", "tests"):
         projected.pop(stale, None)
     projected.update(summarize_accuracy_cases(selected))
+    projected["off_axis_excluded"] = off_axis
     projected["phase"] = "accuracy"
     projected["duration"] = phase_result.get("duration", 0.0)
     projected["exit_code"] = phase_result.get("exit_code", 0)

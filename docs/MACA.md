@@ -56,6 +56,7 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --op-benchmark-args='sddmm_csr=--no-cusparse' \
+  --op-benchmark-args='spsv_coo=--alg-num 4' \
   --results-dir pytest_results_metax_delivery \
   > pytest_results_metax_delivery.log 2>&1 < /dev/null &
 ```
@@ -63,6 +64,11 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 - `--op-benchmark-args='sddmm_csr=--no-cusparse'`：C550 上没有可用的厂商稀疏库，且 SDDMM 的
   `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
   `--benchmark-args` 会广播给所有性能脚本；SpSV 不接受 `--no-cusparse`，不能在这里使用全局参数；
+- `--op-benchmark-args='spsv_coo=--alg-num 4'`：MACA 侧实测 `spsv_coo` 的性能阶段要固定 ALG4
+  （`csr_smblk`）才能跑出结果，见 5.1 节。它只传给 `spsv_coo` 的性能脚本，排在 `--delivery-only`
+  自动加的 `--index-dtypes int32 --ops NON` 之后，两者叠加，不会互相覆盖；精度阶段不受影响。
+  这一项**只能写在命令行上，不能放进 runner 的 `DELIVERY_BENCHMARK_ARGS`**：那张表对所有后端生效，
+  而 `--alg-num 4` 在 MUSA、Ascend 上不可用（它们只有 ALG1）；
 - `--timeout 4500`：`--delivery-only` 已把 spmv/spmm/spsv 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
   不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
@@ -369,6 +375,49 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog python -m pytest tests/pytest -q -m "spsv_c
 CPU 求解和 host/device 拷贝。设备内核崩溃或挂死时，结果应如实记为 `Error` / `Timeout` /
 `NotFound`。精度测试里的 SciPy **参考解**（`tests/pytest/accuracy_utils.py` 的
 `scipy_triangular_solve()`）是另一回事：它只算 oracle，被测算子仍在设备上跑。
+
+### 5.1 SpSV COO 固定 ALG4
+
+交付复现（第 0.5 节）的命令**已经带上** `--op-benchmark-args='spsv_coo=--alg-num 4'`，跑交付时
+不需要再单独执行本节。下面只是需要单独复跑 `spsv_coo` 时的写法：用 `--ops spsv_coo` 代替
+`--delivery-only`，所以要自己写出 `--index-dtypes int32 --ops NON` 来收窄到交付口径。
+`tests/test_spsv.py --csv-coo` 是 runner 对 `spsv_coo` 用的性能脚本，`--alg-num 4` 让它固定走
+`csr_smblk`（ALG4）。命令同时执行精度和性能，性能输入为 `/root/gcx/matrix` 中的 30 个矩阵：
+
+```bash
+RESULT=pytest_results_metax_spsv_coo_alg4_20260920
+
+setsid env \
+  FLAGSPARSE_BACKEND=metax \
+  FLAGSPARSE_MACA_VENDOR=none \
+  FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog \
+  PYTHONPATH=/root/gcx/FlagSparse/src \
+  timeout -s KILL 43200 \
+  python3 -u run_flagsparse_pytest.py \
+    --phase both \
+    --mode normal \
+    --gpus 0 \
+    --ops spsv_coo \
+    --benchmark-input /root/gcx/matrix \
+    --benchmark-warmup 5 \
+    --benchmark-iters 20 \
+    --op-benchmark-args='spsv_coo=--alg-num 4 --index-dtypes int32 --ops NON' \
+    --timeout 7200 \
+    --results-dir "$RESULT" \
+    > "$RESULT.log" 2>&1 < /dev/null &
+
+echo $! > "$RESULT.pid"
+```
+
+用 `tail -f "$RESULT.log"` 查看日志。`FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog` 显式选择 ALG4 的
+非持久化 row-progress kernel；当前 C550 profile 的默认值也是 `rowprog`，这里显式设置是为了避免
+环境或 profile 变化后误走 persistent 路径。`--alg-num 4` 只传给性能脚本，不能改变 runner 精度
+阶段中 `tests/pytest/test_spsv_coo_accuracy.py` 的测试路由；该阶段仍按用例覆盖的算法执行。
+
+如果你的 checkout 里还缺 `tests/data/spmv_csr_regressions.json`（见第 0.5 节），精度阶段会在
+collection 中断，需要在上面的命令里追加
+`--pytest-args='--ignore=tests/pytest/test_spmv_csr_accuracy.py'`；已拉到该文件时不需要。
+本节对应的详细执行台账待 MACA 侧回传后补入 `modified/MACA.md`。
 
 ---
 

@@ -462,7 +462,14 @@ def main(argv=None):
     finally:
         if csv_file:
             csv_file.close()
-    return 1 if failures else 0
+    # Row-level results live in the `status` column, as in every other benchmark
+    # script. The exit code stays 0: the runner treats a non-zero exit as a failed
+    # phase and the delivery rows inherit that, so one FAIL matrix in one dtype
+    # marked every dtype of spmv_csr Failed. --fail-fast is the explicit way to
+    # stop (and exit non-zero) on the first failing row.
+    if failures:
+        print(f"{failures} row(s) FAILED; see the status column of the results")
+    return 0
 
 
 if __name__ == "__main__":
