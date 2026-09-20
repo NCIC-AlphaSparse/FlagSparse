@@ -2675,7 +2675,7 @@ def benchmark_spmm_coo_case(
     dense_layout = _normalize_dense_layout(dense_layout)
     op_code = _normalize_spmm_coo_op(op)
     op_name = _spmm_coo_op_to_name(op_code)
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE)
     data, row, col = _build_random_coo(
         n_rows, n_cols, nnz, value_dtype, index_dtype, device
     )

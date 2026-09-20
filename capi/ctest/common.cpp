@@ -429,7 +429,12 @@ bool BenchReport::measure_vs_baseline(
     row.status = "ok";
     // The gate: a speedup is written only over an answer we checked and believed.
     // pass_relaxed counts -- 6.3.1 calls it a PASS -- but "unchecked" does not.
-    if (row.baseline_status == "ok" && row.baseline_ms > 0 && row.median_ms > 0 &&
+    const bool host_fallback = std::any_of(
+        row.tags.begin(), row.tags.end(), [](const auto& tag) {
+            return tag.first == "execution" && tag.second == "host_fallback";
+        });
+    if (!host_fallback && row.baseline_status == "ok" && row.baseline_ms > 0 &&
+        row.median_ms > 0 &&
         (row.accuracy == "pass" || row.accuracy == "pass_relaxed")) {
         row.speedup = row.baseline_ms / row.median_ms;
     }

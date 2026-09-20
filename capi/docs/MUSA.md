@@ -142,6 +142,37 @@ CMake 仍照旧回落 `baseline/none` 并打印原因。
 
 ## 注意
 
+### SpSV：MUSA 的 worker 上限、逐 case 异常隔离与交付范围
+
+chain-wave 求解 kernel 在全局 ready flag 上自旋。`resolve_worker_count()` 原先按通用 occupancy 模型最多给
+2048 个 persistent worker；真实 30 矩阵跑批时，首个 case（`2cubes_sphere`）之后 MUSA 触发
+`MUSA_ERROR_LAUNCH_TIMEOUT` / `ContextSwitchTimeout`，context 失效，后面的 case 全部无法执行。
+现在 `backend_name() == "musa"` 时限为 32 个 worker，和 Python 侧 SpSV 的 MUSA 上限一致；
+CSR、COO（CSR view）和 SELL 都经过该函数，因此共享这项防护，CUDA 及其他后端不变。
+没有采用“单 program 串行”作为默认修复：它不适合真实矩阵的性能，而且复数 kernel 会出现独立 lane 的数值错误。
+
+`SpsvBenchmark.CsrOverCorpus` 对每个矩阵/format/dtype case 的设备分配、描述符创建、`SpSV_analysis()`
+和 `measure_vs_baseline()` 建立了完整的 `try/catch`，异常 case 记为 `failed` 并继续下一个。这只保证报告
+完整写出：如果 context 已经失效（例如上面的 watchdog 超时），后续 case 仍会失败。
+
+交付基准只报 CSR 与 COO 的四种 dtype。`spsv_sell` 在 `capi/conf/operators.yaml` 里是
+`reporting: retained`，`benchmark/test_spsv.cpp` 用 `variants_of("spsv", "delivery")` 只取交付变体，
+SELL 不进本轮报告。
+
+**状态**：以上修改只做过 `c++ -fsyntax-only`，**尚未用重新编译的二进制在真机上重跑 30 矩阵**；
+复现前先重新构建 C API（不要沿用旧的 `capi/build`）。
+
+### SpGEMM 当前限制与 fallback
+
+MUSA Triton 3.6 的 SpGEMM shared-memory fill 产物目前存在 ABI/codegen 问题，C API 的 `copy`
+阶段默认使用 host CSR materialization，避免破坏 `C` 的 row offsets。`compute` 的普通矩阵仍走
+设备 hash count，性能测试只计这个 C API compute 阶段。
+
+单行 product work 超过 6144 时，默认返回 `not_supported`，错误信息会给出实际 work 数和上限。
+可用 `FLAGSPARSE_SPGEMM_HOST_FALLBACK=1` 对指定矩阵启用慢速 host structure fallback；该路径会在
+报告中标记 `execution=host_fallback`，只用于精度/可用性验证，不生成 speedup。大展开量矩阵
+（如 TSOPF、mip1、wiki-Talk）不应放进默认性能轮次。
+
 * 复数走实部/虚部交错数组（Triton 没有复数类型），和 Python 侧 `view_as_real` 一致；
 * 原子路线（CSC `non`、BSR 两个方向）在任何后端上 fp32 都不是逐位可复现的 ——
   那是原子累加的性质，不是缺陷；

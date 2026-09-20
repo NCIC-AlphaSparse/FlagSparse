@@ -49,6 +49,11 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
 首次运行会从零构建 C API（`capi/build`），配置日志里应当出现
 `ctest baseline: MUSA -> /usr/local/musa/lib/libmusparse.so`；已经构建过可加 `--skip-capi-build`。
 
+> **拉到 2026-09-19/20 的 C API 改动后，先重新构建一次，不要加 `--skip-capi-build`。**
+> 这批改动包括 SpSV 的 MUSA 32-worker 上限、逐 case 异常隔离，以及 SpGEMM 的限制与 fallback。
+> 复用旧的 `capi/build` 会测到修复前的行为；而且这些修复目前都还没有用重新编译的二进制在真机上验证过
+> （`modified/MUSA.md` 第 16 节），所以复现前先确认二进制是新的。
+
 **参考**：
 
 | | 本后端 |
@@ -56,13 +61,24 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
 | 性能 baseline | **muSPARSE**（C API 侧，`capi/docs/MUSA.md`）；Python 侧没有 |
 | 精度参考 | **CPU 上的 SciPy** —— MUSA 上 `torch.sparse` 能建 CSR/COO 张量但**没注册 sparse matmul** |
 
-**预期会看到的非 Passed**（2026-09-18 在 MTT S5000 上实测，`modified/MUSA.md` 第 13 节）：
+**预期会看到的非 Passed**（2026-09-18 在 MTT S5000 上实测，`modified/MUSA.md` 第 13 节；
+`spgemm_csr_*`、`spsv_*` 两条的原因已被第 15、16 节取代，见下）：
 
 - 精度 40/40 Passed；
 - 性能 `gather_f16_int`、`scatter_f16_int` 为 **`NoBaseline`**：内核跑通、精度通过，只是 muSPARSE 不支持
   fp16 的 gather/scatter；
-- 性能 `spgemm_csr_*`、`spsv_*` 为 `NotFound`（C API benchmark 中 Triton 崩溃），`spsm_csr_*` 为
-  `NotFound`（3600 秒超时）—— 两类原因不同，崩溃日志还在等 MUSA 那边提供。
+- 性能 `spsm_csr_*` 为 `NotFound`（3600 秒超时）。
+- 性能 `spgemm_csr_*`：原先记的“C API benchmark 中 Triton 崩溃”不再成立。2026-09-19 在真实 30 矩阵、
+  f32/f64 上单独跑 C API（`modified/MUSA.md` 第 15.1 节），默认设备路径完成 25 行：14 行严格精度通过、
+  3 行 relaxed 通过、5 行病态矩阵精度失败、**20 行因单行 product work 超过 6144 标为 `not_supported`**
+  （这 20 行不是失败，也不出加速比）；14 行有真实加速比，几何平均 1.09085x。
+  `FLAGSPARSE_SPGEMM_HOST_FALLBACK=1` 能让 `msc10848`、`engine` 完成并通过 relaxed 规则，但报告里带
+  `execution=host_fallback`，**不计加速比**。C API 侧的限制说明见 `capi/docs/MUSA.md`。
+- 性能 `spsv_*`：根因见 `modified/MUSA.md` 第 16.1 节——C API 的 chain-wave 求解 kernel 曾允许最多
+  2048 个 persistent worker 在全局 ready flag 上自旋，首个 case（`2cubes_sphere`）之后 MUSA 触发
+  `MUSA_ERROR_LAUNCH_TIMEOUT`，context 失效，后面的 case 全部无法执行，所以整组记为 `NotFound`。
+  现在 `capi/src/ops/spsv.cpp` 的 `resolve_worker_count()` 在 MUSA 上限为 32 个 worker，并加了逐 case
+  异常隔离。**这两处修正尚未用重新编译的二进制在真机上重跑 30 矩阵，是否恢复以重跑结果为准。**
 
 跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
@@ -524,6 +540,14 @@ done
 **`spsv_sell:404` 的 skip 理由含糊** —— `MUSA SELL validation differs from CUDA`，
 没说差在哪，值得回头看。同组里 `torch_musa does not implement isnan for complex tensors`
 那部分是已知的 torch_musa 能力缺口，窄而具体，可接受。
+
+**`spgemm_csr`：Python 侧参考路径恢复后，`msc10848` 暴露出真实的数值不匹配。** 此前被
+“reference unavailable”掩盖（MUSA 没有可用的 torch sparse 参考，旧路径靠失效的 worker 空等到超时）。
+下一步应按 kernel/CSR 输出逐行排查，不能再当成参考路径的问题。C API 侧的 5 个病态矩阵精度失败、
+20 个超过 6144 的 `not_supported`，见第 0.5 节。
+
+**`spsv`（C API）：32-worker 上限未在真机复测。** 见第 0.5 节。复测前，`spsv_*` 的性能行不能当作
+修复后的结果引用。
 
 **Python 侧的 muSPARSE 基线未接**，见第 3 节。
 

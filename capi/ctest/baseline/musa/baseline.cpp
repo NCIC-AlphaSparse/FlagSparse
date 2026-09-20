@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -244,8 +245,8 @@ void free_csr(BaselineCsrOut* c) {
     c->rows = c->cols = c->nnz = 0;
 }
 
-Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,
-                  int warmup, int iters, Timing* out, BaselineCsrOut* result) {
+Status spgemm_csr_impl(const DeviceCsr& A, const void* alpha, const void* beta,
+                       int warmup, int iters, Timing* out, BaselineCsrOut* result) {
     if (A.rows != A.cols) return Status::no("A*A needs a square A");
     if (A.is_coo()) return Status::no("muSPARSE SpGEMM is CSR only");
     musaDataType_t type;
@@ -316,6 +317,22 @@ Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,
         result->values = c_val.release();
     }
     return cleanup(status);
+}
+
+Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,
+                  int warmup, int iters, Timing* out, BaselineCsrOut* result) {
+    try {
+        return spgemm_csr_impl(A, alpha, beta, warmup, iters, out, result);
+    } catch (musparseStatus_t status) {
+        // SDK 4.3.5 throws its status enum for some unsupported SpGEMM
+        // configurations instead of returning it. Keep the benchmark process
+        // alive and expose the exact vendor status in the row detail.
+        return Status::no(fail("SpGEMM threw status", status));
+    } catch (const std::exception& exc) {
+        return Status::no(std::string("muSPARSE SpGEMM threw: ") + exc.what());
+    } catch (...) {
+        return Status::no("muSPARSE SpGEMM threw an unknown exception");
+    }
 }
 
 Status spsv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,

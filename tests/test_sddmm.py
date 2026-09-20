@@ -232,23 +232,23 @@ def _benchmark_reference_sddmm(
     # Correctness for fp32 is still checked against an fp64 evaluation: an oracle at the
     # same precision as the thing under test cannot separate a real accumulation bug from
     # rounding both sides share.  That evaluation runs once, outside the timed window.
+    if fs_common._use_scipy_accuracy_reference():
+        # MUSA has no torch.sparse.sampled_addmm implementation.  Evaluate the
+        # oracle on CPU and leave the device baseline explicitly unavailable.
+        ref_dtype = reference_utils.reference_dtype(value_dtype)
+        sampled = reference_utils.sddmm_csr_values(indices, indptr64, x, y, ref_dtype)
+        vals = reference_utils.as_torch(sampled, ref_dtype, x.device) * alpha
+        if data is not None:
+            vals = vals + beta * data.to(ref_dtype)
+        return vals.to(value_dtype), None
+
     timing_op = lambda: ast_ops._sddmm_reference(
         indices, indptr64, x, y, data, alpha, beta
     )
     ref_values, ref_ms = ast_ops._benchmark_cuda_op(
         timing_op, warmup=warmup, iters=iters
     )
-    if fs_common._use_scipy_accuracy_reference():
-        # Same formula as _sddmm_reference, evaluated off the accelerator: the
-        # sampled dot is where a half-working vendor dense library shows up as a
-        # "wrong" kernel.  Timing above is untouched.
-        ref_dtype = reference_utils.reference_dtype(value_dtype)
-        sampled = reference_utils.sddmm_csr_values(indices, indptr64, x, y, ref_dtype)
-        vals = reference_utils.as_torch(sampled, ref_dtype, x.device) * alpha
-        if data is not None:
-            vals = vals + beta * data.to(ref_dtype)
-        ref_values = vals.to(value_dtype)
-    elif value_dtype == torch.float32:
+    if value_dtype == torch.float32:
         x_ref = x.to(torch.float64)
         y_ref = y.to(torch.float64)
         data_ref = data.to(torch.float64) if data is not None else None

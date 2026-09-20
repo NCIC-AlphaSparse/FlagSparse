@@ -1072,7 +1072,7 @@ def benchmark_sddmm_case(
     """Benchmark SDDMM and compare with sampled-dot reference."""
     if value_dtype not in SUPPORTED_SDDMM_VALUE_DTYPES:
         raise TypeError("value_dtype must be torch.float32 or torch.float64")
-    device = torch.device("cuda")
+    device = torch.device(_ACCEL_DEVICE_TYPE if _is_mthreads_runtime() else "cuda")
     data, indices, indptr = _build_random_csr(
         n_rows, n_cols, nnz, value_dtype, torch.int32, device
     )

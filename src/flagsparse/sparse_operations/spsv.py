@@ -493,7 +493,7 @@ class FlagSparseDnVecDescr:
 
 def flagsparse_create_spsv_handle(device=None, stream=None):
     if device is None:
-        device = torch.device("cuda")
+        device = torch.device(_ACCEL_DEVICE_TYPE if _is_mthreads_runtime() else "cuda")
     return FlagSparseSpSVHandle(device=torch.device(device), stream=stream)
 
 
