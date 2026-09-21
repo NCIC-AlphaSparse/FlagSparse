@@ -2105,6 +2105,8 @@ def _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
         if skip_reason is None:
             return "hipsparse", None
         return None, skip_reason
+    if vendor == "torch" and _IS_MACA_RUNTIME:
+        return "torch", None
     if vendor != "cupy_cusparse":
         return (
             None,

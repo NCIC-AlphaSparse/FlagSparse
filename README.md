@@ -52,7 +52,7 @@ python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 40-row 
 |---|---|---|---|---|---|
 | CUDA | -- (`pip install cupy-cuda12x`) | -- | cuSPARSE (CuPy) | cuSPARSE + torch | this section |
 | DCU / ROCm | `pip install hip-python` | SpSV/SpSM may deadlock (read as `Timeout`) | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) §0.5 |
-| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spsv_coo=--alg-num 4'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
+| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch` | `--op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spsv_coo=--alg-num 4'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
 | Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
 | Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; others probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (7 ops; others probe only) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
@@ -119,7 +119,7 @@ automatic probe is confirmed:**
 ```bash
 export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | mlu
 export FLAGSPARSE_MACA_MODEL=c550   # overrides model detection
-export FLAGSPARSE_MACA_VENDOR=none  # skip the vendor baseline if CuPy is unusable
+export FLAGSPARSE_MACA_VENDOR=torch  # PyTorch as the baseline when CuPy is unusable; none = no baseline
 
 # Baseline choice for Moore Threads / Ascend
 export FLAGSPARSE_MTHREADS_VENDOR=none       # none (default) | torch | musparse

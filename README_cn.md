@@ -66,7 +66,7 @@ python3 tools/delivery_table.py pytest_results_<后端>_delivery      # 打印 4
 |---|---|---|---|---|---|
 | CUDA | 无（需 `pip install cupy-cuda12x`） | 无 | cuSPARSE（CuPy） | cuSPARSE + torch | 本节 |
 | DCU / ROCm | `pip install hip-python` | SpSV/SpSM 可能死锁（结果记为 `Timeout`） | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) 0.5 节 |
-| 沐曦 C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | 加 `--op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spsv_coo=--alg-num 4'`；SDDMM 的 K sweep 要 `--timeout 4500` | PyTorch | SciPy（CPU） | [docs/MACA.md](docs/MACA.md) 0.5 节 |
+| 沐曦 C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch` | 加 `--op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spsv_coo=--alg-num 4'`；SDDMM 的 K sweep 要 `--timeout 4500` | PyTorch | SciPy（CPU） | [docs/MACA.md](docs/MACA.md) 0.5 节 |
 | 摩尔线程 | `FLAGSPARSE_BACKEND=mthreads` | 改用 `run_flagsparse_split_delivery.py`（性能取自 C API） | muSPARSE（C API） | SciPy（CPU） | [docs/MUSA.md](docs/MUSA.md) 0.5 节 |
 | 昇腾 910B | CANN 的 `set_env.sh`；`FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | 只能用 `--gpus 6,7` | PyTorch-NPU（5 个算子；其余只做能力探测） | SciPy（CPU） | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | 昆仑芯 XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | 无 | PyTorch-XPU（7 个算子；其余只做能力探测） | SciPy（CPU） | [docs/XPU.md](docs/XPU.md) 1.5 节 |
@@ -124,7 +124,7 @@ MetaX 专有的 `torch.version` 属性、MACA SDK 环境变量（`MACA_PATH` / `
 ```bash
 export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | mlu
 export FLAGSPARSE_MACA_MODEL=c550   # 覆盖型号检测
-export FLAGSPARSE_MACA_VENDOR=none  # CuPy 不可用时跳过厂商基线
+export FLAGSPARSE_MACA_VENDOR=torch  # CuPy 不可用时用 PyTorch 作基线；none = 不要基线
 
 # 摩尔线程 / 昇腾的基线选择
 export FLAGSPARSE_MTHREADS_VENDOR=none       # none（默认）| torch | musparse

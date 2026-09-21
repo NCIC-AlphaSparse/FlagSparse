@@ -44,7 +44,7 @@ FlagSparse 按运行时分发**厂商参考实现/基线**和**少数按后端�
 ```bash
 export PYTHONPATH=$PWD/src
 export FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550
-export FLAGSPARSE_MACA_VENDOR=none      # 本机没有 CuPy，不走厂商基线
+export FLAGSPARSE_MACA_VENDOR=torch     # 本机没有 CuPy，用 PyTorch 作基线；不要设 none，否则 spmv_csr 的基线列是 N/A
 python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model(), c._accel_fallback_reason())"
 # 期望：metax c550 None
 ```
@@ -130,7 +130,7 @@ export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ```bash
 cd <仓库>
 export PYTHONPATH=$PWD/src          # 独立脚本需要；pytest 由 pytest.ini 自带
-export FLAGSPARSE_MACA_VENDOR=none  # 本机没有 CuPy，跳过厂商基线
+export FLAGSPARSE_MACA_VENDOR=torch  # 本机没有 CuPy，用 PyTorch 作基线
 export MACA_PATH=/opt/maca
 export LD_LIBRARY_PATH=/opt/mxdriver/lib:$MACA_PATH/lib:$MACA_PATH/mxgpu_llvm/lib:$LD_LIBRARY_PATH
 ```
@@ -264,10 +264,12 @@ MACA 与 CUDA 兼容，CuPy 可能可用也可能不可用：
 python -c "import cupy, cupyx.scipy.sparse as s; print(cupy.__version__); print(s.csr_matrix)"
 ```
 
-不可用就关掉 —— 基线列会变 `N/A`，但**算子照常运行**，正确性仍由 `torch.sparse` 校验：
+不可用就用 PyTorch 作基线（`torch`，没装 CuPy 时的默认值，交付命令也显式设它）。设成 `none` 则完全不要
+基线 —— 基线列会变 `N/A`，但**算子照常运行**，正确性仍由 `torch.sparse` 校验。**交付不要用 `none`**：
+`spmv_csr` 的基线只有 `vendor` 这一列，`none` 时它没有速度比。
 
 ```bash
-export FLAGSPARSE_MACA_VENDOR=none    # torch（本机默认，因为没装 CuPy）| cupy_cusparse | none
+export FLAGSPARSE_MACA_VENDOR=torch   # torch（没装 CuPy 时的默认）| cupy_cusparse | none（不要基线）
 ```
 
 > 与 DCU 不同，MetaX 目前**没有**接原生厂商稀疏库（DCU 接的是 hipSPARSE）。
@@ -400,7 +402,7 @@ RESULT=pytest_results_metax_spsv_coo_alg4_20260920
 
 setsid env \
   FLAGSPARSE_BACKEND=metax \
-  FLAGSPARSE_MACA_VENDOR=none \
+  FLAGSPARSE_MACA_VENDOR=torch \
   FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog \
   PYTHONPATH=/root/gcx/FlagSparse/src \
   timeout -s KILL 43200 \
@@ -462,7 +464,7 @@ You can change insmod metax.ko by specifying parameters: pri_mem_sz=XXX
 
 ## 7. 基准测试
 
-正确性全绿之后再看性能。注意 `FLAGSPARSE_MACA_VENDOR=none` 时厂商基线列是 `N/A`，
+正确性全绿之后再看性能。注意 `FLAGSPARSE_MACA_VENDOR=none` 时厂商基线列是 `N/A`（交付命令用的是 `torch`，基线是 PyTorch），
 那不代表失败，去 `reason` / `cusparse_reason` 字段看原因。表头里
 `cuSPARSE(ms)` / `CSR(ms)` / `CS(ms)` 这一列就是厂商基线列（列名沿用历史命名）。
 

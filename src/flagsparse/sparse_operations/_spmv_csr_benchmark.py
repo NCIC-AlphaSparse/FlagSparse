@@ -86,6 +86,31 @@ def check_result(value, reference, rtol, atol):
     return finite and torch.allclose(actual, reference, rtol=rtol, atol=atol), error
 
 
+def _pytorch_spmv(matrix, x_2d, op):
+    if op == "non":
+        return torch.sparse.mm(matrix, x_2d).squeeze(1)
+    if op == "trans":
+        return torch.sparse.mm(matrix.transpose(0, 1), x_2d).squeeze(1)
+    if op == "conj":
+        if matrix.is_complex():
+            matrix = matrix.conj()
+        return torch.sparse.mm(matrix.transpose(0, 1), x_2d).squeeze(1)
+    raise ValueError(f"unsupported sparse operation: {op}")
+
+
+def _measure_pytorch_spmv(data, indices, indptr, x, shape, op, warmup, iters):
+    """Time MACA's working torch.sparse format after one out-of-band probe."""
+    x_2d = x.unsqueeze(1)
+    _, sparse_format = common._pytorch_sparse_mm(
+        data, indices, indptr, shape, x_2d, op=op
+    )
+    if sparse_format == "COO":
+        matrix = common._pytorch_sparse_coo_matrix(data, indices, indptr, shape)
+    else:
+        matrix, _ = common._pytorch_sparse_matrix(data, indices, indptr, shape)
+    return (*event_benchmark(lambda: _pytorch_spmv(matrix, x_2d, op), warmup, iters), sparse_format)
+
+
 def measure_vendor(data, indices, indptr, x, shape, op, warmup, iters):
     """Native same-device CSR baseline, with descriptors outside event measurement."""
     with _spmv_device_context(data.device):
@@ -150,6 +175,11 @@ def measure_vendor(data, indices, indptr, x, shape, op, warmup, iters):
                     )
                     value = common._torch_from_cupy(value_cp)
             result["vendor_alg"] = "cupy_csr_matvec (library selected)"
+        elif backend == "torch":
+            value, ms, sparse_format = _measure_pytorch_spmv(
+                data, indices, indptr, x, shape, op, warmup, iters
+            )
+            result["vendor_alg"] = f"torch_sparse_{sparse_format.lower()}_matvec"
         else:
             result["vendor_reason"] = f"no event-timed CSR baseline for {backend}"
             return result
