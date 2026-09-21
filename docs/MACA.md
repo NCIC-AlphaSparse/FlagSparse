@@ -37,7 +37,7 @@ FlagSparse 按运行时分发**厂商参考实现/基线**和**少数按后端�
 
 ---
 
-## 0.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
+## 0.5 交付复现：20 个变体 × 10 个矩阵（精度 + 性能）
 
 **环境**（每次开工，第 1 节有逐项说明）：
 
@@ -64,7 +64,7 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
   `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
   `--benchmark-args` 会广播给所有性能脚本，而其他脚本不一定接受 `--no-cusparse`，所以用逐算子的形式；
 - `--timeout 4500`：`--delivery-only` 已把 spmv/spmm 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
-  不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
+  不收窄**（交付名里没有 K），按 30 个矩阵实测推算全量至少 3660 秒（7.4 节；现在交付只用 10 个矩阵，这个数会小一截，没有重新实测）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
   跑满 4 个 K 的后端**不可直接比较**，报告里要注明；
 - 外层 11 小时（`timeout -s KILL 39600`）、`setsid` 后台：内核一旦卡死，Ctrl-C 送不进去，只能靠 KILL。

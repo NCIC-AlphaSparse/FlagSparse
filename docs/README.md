@@ -32,7 +32,7 @@
 > **从 `flpagsparse_cwrapper` 过来的？** 那个仓库的全部内容已于 2026-09-18 合并进本仓库，
 > 之后的工作都在这里做。背景、切换步骤和当初的合并方式见 [`REPO_MIGRATION.md`](REPO_MIGRATION.md)。
 
-## 交付复现入口（20 个变体 × 30 个矩阵）
+## 交付复现入口（20 个变体 × 10 个矩阵）
 
 通用命令、参数说明和各后端差异的总表在仓库根 [`README_cn.md`](../README_cn.md) 的"复现交付测试"一节
 （英文版 [`README.md`](../README.md) "Reproducing the delivery run"）。各后端的确切命令、环境自检和预期会看到的
