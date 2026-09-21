@@ -97,8 +97,14 @@ python3 tools/delivery_table.py pytest_results_xpu_delivery   # 跑完后：40 �
 
 runner 在 XPU 上自动处理：子进程 `CUDA_VISIBLE_DEVICES=<卡号>`、命令行传逻辑设备 `--device 0`；精度阶段
 **强制**用 CPU 上的 SciPy 参考（`FLAGSPARSE_ACCURACY_REFERENCE=scipy`）；gather / scatter / spmv_csr /
-spmm_csr / sddmm_csr 的性能走 `benchmark/benchmark_xpu.py`，每个矩阵一个子进程，对等价的 PyTorch-XPU
-表达式计时；其余 6 个父算子走能力探测，只有能不能跑、没有加速比。
+spmv_coo / spmm_csr / spmm_coo / sddmm_csr 的性能走 `benchmark/benchmark_xpu.py`，每个矩阵一个子进程，
+对等价的 PyTorch-XPU 表达式计时；其余 4 个父算子走能力探测，只有能不能跑、没有加速比。
+
+`--benchmark-input` 要给**目录**：性能阶段对目录下的每个 `*.mtx` 各起一个子进程，再把各矩阵的结果汇总，
+不是只取其中一个矩阵。**目录扫描不递归**，矩阵必须直接放在该目录下，放在子目录里的不会被扫到；
+目录里一个 `*.mtx` 都没有时，这些算子的性能阶段记为未配置（`no .mtx files found`）。
+`--timeout` 是**每个矩阵**的上限，不是整个算子的：任何一个矩阵超时，该算子的性能状态记 `Timeout`，
+其余矩阵已完成的行仍然保留。
 
 **参考**：
 
@@ -147,19 +153,22 @@ python tools/run_backend_tests.py --backend xpu --phase accuracy --mode quick
 精度用例与其他后端**共用** `tests/pytest`，不另起一套 —— 六份同样的 oracle 各自漂移
 是这个仓库明确要避免的。
 
-### 性能阶段：五个算子走自己的脚本，其余走能力探测
+### 性能阶段：七个算子走自己的脚本，其余走能力探测
 
 ```python
 PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")     # xpu 已经不在里面
-XPU_BASELINE_OPS = ("gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr")
+XPU_BASELINE_OPS = ("gather", "scatter", "spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr")
 ```
 
-这五个走 `benchmark/benchmark_xpu.py`，以等价的 PyTorch-XPU tensor expression 为 baseline，
+这七个走 `benchmark/benchmark_xpu.py`，以等价的 PyTorch-XPU tensor expression 为 baseline，
 先核对输出再分别计时，报告 `triton_ms`、`pytorch_ms`、`max_abs_err` 和
 `triton_speedup_vs_pytorch`（也保留兼容列 `speedup`）。其余算子仍走**能力探测**，按算子报
 `PASS` / `REJECTED` / `TRITON_COMPILE` / `ERROR` / `NO_ADAPTER`。在一个内核可能根本
 lower 不出来的平台上，这才是有意义的测量 —— 替代方案是一个空的性能阶段，而空阶段
 读起来和通过一模一样。
+
+有效的 baseline dtype 是 gather/scatter 的 float16、float32，以及其余五个算子的 float32。
+float64 在 shim 中降为 float32，complex 的 index primitive 不受 XDNN 支持，二者均不报告为有效速度比。
 
 > **这是 PyTorch baseline，不是厂商 sparse-library baseline。** XDNN 没有可替代 cuSPARSE
 > 描述符 API 的通用稀疏接口；因此 `speedup` 表示 FlagSparse 相对 PyTorch-XPU expression 的

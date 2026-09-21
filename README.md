@@ -52,10 +52,10 @@ python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 40-row 
 |---|---|---|---|---|---|
 | CUDA | -- (`pip install cupy-cuda12x`) | -- | cuSPARSE (CuPy) | cuSPARSE + torch | this section |
 | DCU / ROCm | `pip install hip-python` | SpSV/SpSM may deadlock (read as `Timeout`) | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) §0.5 |
-| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--op-benchmark-args='sddmm_csr=--no-cusparse'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
+| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spsv_coo=--alg-num 4'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
 | Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
 | Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; others probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
-| Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (5 ops; others probe only) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
+| Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (7 ops; others probe only) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
 
 **Results produced before `86a09cd` (2026-09-18) are not comparable**: the old projection averaged
 int64 and trans/conj rows into each `..._int_non` variant and counted rows without a speedup as 0.
@@ -66,6 +66,18 @@ ran and hit `--timeout`; `NotFound` no row for that variant (not run, or not con
 backend); `NoBaseline` (C API) the kernel ran and passed but the vendor library has no such
 dtype/operator to compare against. On CUDA (RTX 5090, 2026-09-17, before sweep narrowing) the
 full run took 79 minutes, SpSV and SpGEMM being the longest (~20 min each).
+
+An accuracy `Skipped`: **when cases passed and none failed, cases skipped only for a capability
+boundary do not downgrade the status to `Skipped`**; they are still counted in `skipped` and listed
+under `details.skipped`. Exactly two reasons are exempt
+(`EXPECTED_ACCURACY_SKIP_REASONS` in `run_flagsparse_pytest.py`): the external-matrix directory not
+being configured, and the legacy bucket algorithm supporting int32 column indices only. A skip for
+any other reason still reports `Skipped`, as does a run in which nothing passed. The new CSR
+algorithms on a backend with no verified profile (MetaX, XPU) are **not** covered by an exemption:
+`test_spmv_csr_accuracy.py` parametrizes only the algorithms a backend has a profile for
+(`list_spmv_csr_algorithms(backend=...)`), so nothing is collected and nothing skips, and the row
+rests on the legacy-algorithm cases that really run. To judge how much a `Passed` row rests on,
+read its `passed` count, not just the status.
 
 ## Backends (8 registered)
 

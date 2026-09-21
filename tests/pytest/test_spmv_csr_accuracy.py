@@ -21,7 +21,9 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_spmv_csr
+from flagsparse.sparse_operations import _common as common
 from flagsparse.sparse_operations._spmv_csr_benchmark import golden_csr
+from tests import reference_utils
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
     accelerator_available,
@@ -162,8 +164,16 @@ def test_spmv_csr_matches_dense_reference(M, N, name, dtype, index_dtype, op):
     x_len = M if transpose else N
     x = _make_x(x_len, dtype, golden_device())
     ref_dtype = _reference_dtype(dtype)
-    ref_mat = _apply_dense_op(dense, op)
-    ref = (ref_mat.to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
+    if common._use_scipy_accuracy_reference():
+        matrix = reference_utils.scipy_csr(data, indices, indptr, (M, N), ref_dtype)
+        ref = reference_utils.as_torch(
+            reference_utils.spmv(matrix, x, ref_dtype, op=op),
+            ref_dtype,
+            golden_device(),
+        ).to(dtype)
+    else:
+        ref_mat = _apply_dense_op(dense, op)
+        ref = (ref_mat.to(ref_dtype) @ x.to(ref_dtype)).to(dtype)
     out = flagsparse_spmv_csr(
         data,
         indices,
@@ -288,6 +298,14 @@ def test_spmv_csr_int64_auto_does_not_fallback_when_index_exceeds_int32(monkeypa
 
 
 NEW_ALGORITHMS = spmv_mod.SPMV_CSR_NEW_ALGORITHMS
+# The new CSR routes have launch profiles only for CUDA and ROCm.  Keep their
+# coverage on those backends, but do not collect them as skipped XPU tests.
+TESTED_ALGORITHMS = spmv_mod.list_spmv_csr_algorithms(
+    backend=spmv_mod._backend_name()
+)
+TESTED_NEW_ALGORITHMS = tuple(
+    alg for alg in NEW_ALGORITHMS if alg in TESTED_ALGORITHMS
+)
 REGRESSIONS = json.loads(
     (Path(__file__).resolve().parents[1] / "data/spmv_csr_regressions.json").read_text()
 )
@@ -307,13 +325,11 @@ def _native_case(lengths, dtype, col_dtype, ptr_dtype, n=4099):
 
 
 def _new_prepared(data, col, ptr, shape, alg, **kwargs):
-    if spmv_mod._backend_name() not in ("cuda", "rocm"):
-        pytest.skip("new CSR algorithms have no verified profile for this backend")
     return spmv_mod.prepare_spmv_csr(data, col, ptr, shape, alg=alg, **kwargs)
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_NEW_ALGORITHMS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_spmv_csr_default_segment_multilevel(alg, dtype):
     data, col, ptr, x, shape = _native_case(
@@ -328,7 +344,7 @@ def test_spmv_csr_default_segment_multilevel(alg, dtype):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_NEW_ALGORITHMS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize(
     "col_dtype,ptr_dtype",
@@ -367,7 +383,14 @@ def test_spmv_csr_new_boundaries(alg, dtype, col_dtype, ptr_dtype, lengths):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", ["row_split_reduce", "row_adaptive_split"])
+@pytest.mark.parametrize(
+    "alg",
+    tuple(
+        alg
+        for alg in ("row_split_reduce", "row_adaptive_split")
+        if alg in TESTED_NEW_ALGORITHMS
+    ),
+)
 @pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
 def test_spmv_csr_multilevel_and_rebuild(alg, dtype, monkeypatch):
     from flagsparse.sparse_operations import _spmv_csr_kernels as kernels
@@ -404,7 +427,7 @@ def test_spmv_csr_multilevel_and_rebuild(alg, dtype, monkeypatch):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_NEW_ALGORITHMS)
 def test_spmv_csr_cancellation(alg):
     data, col, ptr, x, shape = _native_case(
         [1025, 0, 1031], torch.float32, torch.int64, torch.int64
@@ -453,7 +476,7 @@ def test_spmv_csr_new_out_and_prepared_validation():
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", NEW_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_NEW_ALGORITHMS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.complex64, torch.complex128])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
@@ -486,9 +509,24 @@ def test_spmv_csr_new_fallback_preserves_selection(alg, dtype, op, monkeypatch):
         spmv_mod.flagsparse_spmv_csr_run(prepared, x)
 
 
+if not TESTED_NEW_ALGORITHMS:
+    # Do not leave empty parametrizations behind: an empty parametrization is
+    # reported by pytest as a skipped case, which obscures XPU delivery rows.
+    test_spmv_csr_default_segment_multilevel = None
+    test_spmv_csr_new_boundaries = None
+    test_spmv_csr_multilevel_and_rebuild = None
+    test_spmv_csr_cancellation = None
+    test_spmv_csr_new_out_and_prepared_validation = None
+    test_spmv_csr_new_fallback_preserves_selection = None
+
+
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
-@pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
+@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
+@pytest.mark.parametrize(
+    "dtype",
+    spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES,
+    ids=lambda dtype: str(dtype).removeprefix("torch."),
+)
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize("matrix_name", REGRESSIONS["matrices"])
 def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
@@ -523,7 +561,7 @@ def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
 @pytest.mark.parametrize("dtype", spmv_mod.SUPPORTED_SPMV_VALUE_DTYPES)
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 @pytest.mark.parametrize(
@@ -576,7 +614,7 @@ def test_spmv_csr_full_dtype_op_surface(alg, dtype, op, col_dtype, ptr_dtype):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
 @pytest.mark.parametrize("op", ["trans", "conj"])
 def test_spmv_csr_transpose_rebuilt_inside_each_run(alg, op, monkeypatch):
     data, col, ptr, _, shape = _native_case(
@@ -623,7 +661,7 @@ def test_spmv_csr_transpose_rebuilt_inside_each_run(alg, op, monkeypatch):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.complex64, torch.complex128]
 )
@@ -642,7 +680,7 @@ def test_spmv_csr_empty_dtype_ops(alg, dtype, op, shape):
 
 
 @pytest.mark.spmv_csr
-@pytest.mark.parametrize("alg", spmv_mod.SPMV_CSR_SUPPORTED_ALGORITHMS)
+@pytest.mark.parametrize("alg", TESTED_ALGORITHMS)
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
 @pytest.mark.parametrize("op", ["non", "trans", "conj"])
 def test_spmv_csr_complex_cancellation(alg, dtype, op):

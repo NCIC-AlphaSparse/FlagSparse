@@ -179,6 +179,19 @@ def _run_case(torch, fs, op: str, case: Case, warmup: int, iters: int, device_id
             baseline_out.zero_()
             baseline_out.index_add_(0, row_ids, values[:, None] * dense[columns])
             return baseline_out
+    elif op == "spmm_coo":
+        dense = torch.randn(case.cols, case.dense_cols, dtype=dtype, generator=generator).to(device)
+        fs_out = torch.empty(case.rows, case.dense_cols, dtype=dtype, device=device)
+        baseline_out = torch.empty_like(fs_out)
+        rows = row_ids.to(torch.int32)
+        candidate = lambda: fs.flagsparse_spmm_coo(
+            values, rows, indices, dense, (case.rows, case.cols), out=fs_out
+        )
+
+        def baseline():
+            baseline_out.zero_()
+            baseline_out.index_add_(0, row_ids, values[:, None] * dense[columns])
+            return baseline_out
     elif op == "sddmm_csr":
         left = torch.randn(case.rows, case.dense_cols, dtype=dtype, generator=generator).to(device)
         right = torch.randn(case.cols, case.dense_cols, dtype=dtype, generator=generator).to(device)
@@ -231,7 +244,7 @@ def _run_case(torch, fs, op: str, case: Case, warmup: int, iters: int, device_id
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--op", required=True, choices=("gather", "scatter", "spmv_csr", "spmv_coo", "spmm_csr", "sddmm_csr"))
+    parser.add_argument("--op", required=True, choices=("gather", "scatter", "spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr"))
     parser.add_argument("--m", type=int, default=4096)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--nnz", type=int, default=131072)

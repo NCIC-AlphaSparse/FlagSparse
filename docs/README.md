@@ -45,7 +45,7 @@
 | MACA | [`MACA.md`](MACA.md) 0.5 节 | `--no-cusparse`，`--timeout 4500`（SDDMM 的 K sweep） |
 | MUSA | [`MUSA.md`](MUSA.md) 0.5 节 | 改用 `run_flagsparse_split_delivery.py`，性能取自 C API（muSPARSE） |
 | Ascend | [`ASCEND.md`](ASCEND.md) "交付复现" | 只用 `--gpus 6,7`；5 个算子对 PyTorch-NPU，其余只做能力探测 |
-| XPU | [`XPU.md`](XPU.md) 1.5 节 | `FLAGTREE_BACKEND=xpu` 等环境变量；5 个算子对 PyTorch-XPU，其余只做能力探测 |
+| XPU | [`XPU.md`](XPU.md) 1.5 节 | `FLAGTREE_BACKEND=xpu` 等环境变量；7 个算子对 PyTorch-XPU，其余只做能力探测 |
 
 跑完统一用 `python3 tools/delivery_table.py <结果目录>` 看结果。
 
@@ -57,4 +57,4 @@
 | [`MACA.md`](MACA.md) | C550 bring-up（FlagTree metax 后端、环境指纹）、921 用例的验证范围、SpSV 的两个缺陷、SpMM COO 复数的 4 KB 私有内存上限、调优 A/B |
 | [`MUSA.md`](MUSA.md) | 独立设备类型 `musa` 与兼容后端的区别、`_ACCEL` 抽象、实测能力矩阵（muDNN 的 gemv 缺口）、normal 回归结果、已解决问题的复现记录 |
 | [`ASCEND.md`](ASCEND.md) | 910B 环境检查、Ascend fallback 分发表、算子能力探测、已知限制 |
-| [`XPU.md`](XPU.md) | 昆仑芯：插件探测为什么不能只看 `torch.xpu`、`torch_xmlir` 的 CUDA-shim 路径、5 个算子对 PyTorch-XPU 计时其余能力探测、为什么没有厂商基线、首次上机顺序 |
+| [`XPU.md`](XPU.md) | 昆仑芯：插件探测为什么不能只看 `torch.xpu`、`torch_xmlir` 的 CUDA-shim 路径、7 个算子对 PyTorch-XPU 计时其余能力探测、为什么没有厂商基线、首次上机顺序 |

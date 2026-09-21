@@ -1626,7 +1626,7 @@ def _use_spmm_coo_ascend_dispatch():
         return True
     if forced in ("0", "false", "no", "off"):
         return False
-    return _is_ascend_runtime()
+    return _is_ascend_runtime() or _is_xpu_runtime()
 
 
 def _triton_spmm_coo_impl(
@@ -2400,6 +2400,46 @@ def _run_spmm_coo_route(
             if _spmm_coo_op_transposes(op_code)
             else 0.0
         )
+
+    # XPU's sparse COO coalesce implementation is unavailable and the Triton
+    # COO routes cannot be launched reliably.  Validate/materialize the dense
+    # RHS with ordinary tensor ops, then use the device index_add scatter path
+    # without constructing a torch sparse tensor.
+    if _is_xpu_runtime():
+        native_data, native_row, native_col, native_B, n_rows, _n_cols, n_dense_cols = (
+            _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout=dense_layout)
+        )
+        if do_timing:
+            _ACCEL.synchronize()
+            compute_start = time.perf_counter()
+        C = _spmm_coo_ascend_scatter(
+            native_data,
+            native_row,
+            native_col,
+            native_B,
+            n_rows,
+            n_dense_cols,
+            output_dtype=native_data.dtype,
+            out=out,
+            dense_layout=dense_layout,
+        )
+        if do_timing:
+            _ACCEL.synchronize()
+            compute_ms = (time.perf_counter() - compute_start) * 1000.0
+            op_total_ms = symbolic_ms + compute_ms
+        if return_meta:
+            meta = {
+                "symbolic_ms": symbolic_ms,
+                "compute_ms": compute_ms,
+                "op_total_ms": op_total_ms,
+                "alg": "coo_xpu_scatter",
+                "display_name": "COOXPUScatter",
+                "op": op_name,
+                "dense_layout": dense_layout,
+                "output_layout": _dense_layout_name(C),
+            }
+            return (C, op_total_ms, meta) if return_time else (C, meta)
+        return (C, op_total_ms) if return_time else C
 
     (
         canonical_data,

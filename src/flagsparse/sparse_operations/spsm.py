@@ -1529,7 +1529,7 @@ def _use_spsm_ascend_dispatch():
         return True
     if forced in ("0", "false", "no", "off"):
         return False
-    return _is_ascend_runtime()
+    return _is_ascend_runtime() or _is_xpu_runtime()
 
 
 _MACA_SPSM_SMBLK_RHS_TILE = 32

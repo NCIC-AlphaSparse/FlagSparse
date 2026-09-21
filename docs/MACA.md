@@ -98,6 +98,12 @@ runner 的精度阶段总是先收集整个 `tests/pytest`，而 `test_spmv_csr_
 SMBLK 的实现、精度覆盖、性能运行状态和完整后台命令记录在
 [modified/MACA.md](../modified/MACA.md)。
 
+`--delivery-only` 时，`spsv_csr` / `spsv_coo` 的精度阶段还会给 pytest 加
+`-k "non_trans and int32 and not unit"`，只**执行** `int32 + NON + 非单位对角`（含下三角和上三角）的
+用例；单位对角、转置和共轭是公共 API 的全量回归覆盖，不属于这 40 个变体。这是在执行阶段就不跑，
+而不只是事后不计入：C550 上单位对角会走到 `csr_cw` 的已知缺陷（非法访存或挂死）。这条筛选排在
+`--pytest-args` 之前，你自己传 `-k` 会覆盖它；不带 `--delivery-only` 的全量精度运行不受影响。
+
 跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
 ```bash

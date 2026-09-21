@@ -396,6 +396,7 @@ def _spmv_csr_complex_kernel(
     BLOCK_NNZ: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     HAS_BETA: tl.constexpr,
+    XPU_COMPAT: tl.constexpr,
 ):
     """y = alpha * A @ x + beta * y, with complex alpha/beta.
 
@@ -423,8 +424,14 @@ def _spmv_csr_complex_kernel(
         col = tl.load(indices_ptr + offsets, mask=mask, other=0).to(tl.int64)
         x_re = tl.load(x_ri_ptr + col * 2, mask=mask, other=0.0)
         x_im = tl.load(x_ri_ptr + col * 2 + 1, mask=mask, other=0.0)
-        prod_re = tl.where(mask, a_re * x_re - a_im * x_im, 0.0)
-        prod_im = tl.where(mask, a_re * x_im + a_im * x_re, 0.0)
+        if XPU_COMPAT:
+            # The masked loads above already zero inactive lanes. Avoid the
+            # select emitted by tl.where, which XPU cannot legalize here.
+            prod_re = a_re * x_re - a_im * x_im
+            prod_im = a_re * x_im + a_im * x_re
+        else:
+            prod_re = tl.where(mask, a_re * x_re - a_im * x_im, 0.0)
+            prod_im = tl.where(mask, a_re * x_im + a_im * x_re, 0.0)
         acc_re = acc_re + tl.sum(prod_re)
         acc_im = acc_im + tl.sum(prod_im)
     out_re = alpha_re * acc_re - alpha_im * acc_im
@@ -1090,6 +1097,35 @@ def _spmv_csr_default_backend():
     return "segbin"
 
 
+def _xpu_rowpar_padded_inputs(prepared, data):
+    """Build fixed-width CSR rows for XPU's unreliable masked tail loads."""
+    row_width = prepared.block_nnz * prepared.max_segments
+    if not prepared.n_rows:
+        return data, prepared.kernel_indices, prepared.kernel_indptr
+
+    device = data.device
+    total = prepared.n_rows * row_width
+    padded_data = torch.zeros(total, dtype=data.dtype, device=device)
+    padded_indices = torch.zeros(
+        total, dtype=prepared.kernel_indices.dtype, device=device
+    )
+    indptr_cpu = prepared.kernel_indptr.cpu().tolist()
+    for row, (start, end) in enumerate(zip(indptr_cpu, indptr_cpu[1:])):
+        width = end - start
+        if width:
+            dst = row * row_width
+            padded_data[dst : dst + width].copy_(data[start:end])
+            padded_indices[dst : dst + width].copy_(
+                prepared.kernel_indices[start:end]
+            )
+    padded_indptr = torch.arange(
+        prepared.n_rows + 1,
+        dtype=prepared.kernel_indptr.dtype,
+        device=device,
+    ) * row_width
+    return padded_data, padded_indices, padded_indptr
+
+
 def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
     """DCU/ROCm row-parallel SpMV: one program per row, in-row segment loop."""
     device = prepared.data.device
@@ -1103,13 +1139,22 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
         return y
     _, data_in = _get_spmv_baseline_data(prepared)
     x_in = x if compute_dtype == x.dtype else x.to(compute_dtype)
+    if _is_xpu_runtime():
+        data_in, kernel_indices, kernel_indptr = _xpu_rowpar_padded_inputs(
+            prepared, data_in
+        )
+    else:
+        kernel_indices, kernel_indptr = (
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+        )
     grid = (prepared.n_rows,)
     if not _is_complex_dtype(compute_dtype):
         y_out = y
         _spmv_csr_real_kernel[grid](
             data_in,
-            prepared.kernel_indices,
-            prepared.kernel_indptr,
+            kernel_indices,
+            kernel_indptr,
             x_in,
             y_out,
             # This operator computes y = A @ x; alpha/beta exist for the C API's
@@ -1124,13 +1169,53 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
             XPU_COMPAT=_is_xpu_runtime(),
         )
         return y
+    if _is_xpu_runtime():
+        # XPU's complex row-parallel kernel lowers but its paired tl.sum
+        # reductions multiply every component by four. Its real counterpart
+        # has correct reduction semantics, so express the complex product as
+        # four real SpMVs: (Ar + iAi)(xr + ixi).
+        data_components = torch.view_as_real(data_in)
+        x_components = torch.view_as_real(x_in)
+        data_re = data_components.select(-1, 0).contiguous()
+        data_im = data_components.select(-1, 1).contiguous()
+        x_re = x_components.select(-1, 0).contiguous()
+        x_im = x_components.select(-1, 1).contiguous()
+        terms = [
+            torch.empty(prepared.n_rows, dtype=data_re.dtype, device=device)
+            for _ in range(4)
+        ]
+        for values, vector, result in (
+            (data_re, x_re, terms[0]),
+            (data_im, x_im, terms[1]),
+            (data_re, x_im, terms[2]),
+            (data_im, x_re, terms[3]),
+        ):
+            _spmv_csr_real_kernel[grid](
+                values,
+                kernel_indices,
+                kernel_indptr,
+                vector,
+                result,
+                1,
+                0,
+                n_rows=prepared.n_rows,
+                BLOCK_NNZ=prepared.block_nnz,
+                MAX_SEGMENTS=prepared.max_segments,
+                HAS_BETA=False,
+                XPU_COMPAT=True,
+            )
+        result = torch.complex(terms[0] - terms[1], terms[2] + terms[3])
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     data_ri = torch.view_as_real(data_in).reshape(-1)
     x_ri = torch.view_as_real(x_in).reshape(-1)
     y_ri = torch.view_as_real(y).reshape(-1)
     _spmv_csr_complex_kernel[grid](
         data_ri,
-        prepared.kernel_indices,
-        prepared.kernel_indptr,
+        kernel_indices,
+        kernel_indptr,
         x_ri,
         y_ri,
         # y = A @ x here; alpha/beta exist for the C API's
@@ -1143,6 +1228,7 @@ def _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=None):
         BLOCK_NNZ=prepared.block_nnz,
         MAX_SEGMENTS=prepared.max_segments,
         HAS_BETA=False,
+        XPU_COMPAT=_is_xpu_runtime(),
     )
     return y
 
