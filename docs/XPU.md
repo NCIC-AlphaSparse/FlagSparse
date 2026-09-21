@@ -72,7 +72,7 @@ PY
 
 ---
 
-## 1.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
+## 1.5 交付复现：20 个变体 × 10 个矩阵（精度 + 性能）
 
 **环境**（第 1 节自检通过后）：
 
@@ -182,7 +182,7 @@ float64 在 shim 中降为 float32，complex 的 index primitive 不受 XDNN 支
 里。runner 因此用 `_capability_probe_status()` 折叠行状态（全同取之、混合取 `MIXED`、
 无行取 `NO_TESTS`）而不是看退出码 —— 看退出码会把每一行都报成 pass。
 
-交付测试的完整命令见 **1.5 节**（`--mode normal --delivery-only`，带 `--timeout` 和 30 个矩阵）。只想确认链路
+交付测试的完整命令见 **1.5 节**（`--mode normal --delivery-only`，带 `--timeout` 和矩阵目录）。只想确认链路
 能通时，可以先跑一次冒烟（结果不能当交付数据）：
 
 ```bash

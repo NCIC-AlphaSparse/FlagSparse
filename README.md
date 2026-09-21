@@ -20,13 +20,16 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
-## Reproducing the delivery run (20 variants, 30 matrices)
+## Reproducing the delivery run (20 variants, 10 matrices)
 
 This is the run whose `summary.json` is the deliverable: **accuracy and performance for the 20
 registered delivery variants** in `conf/operators.yaml` (`delivery_variants`): gather and scatter
 in f16/f32/f64/c32/c64, and spmv_csr, spmv_coo, spmm_csr, spmm_coo, sddmm_csr in f32/f64.
-Performance is measured on a directory of **30 MatrixMarket matrices** with 5 warmup and 20 timed
-iterations. Every backend runs the same
+Performance is measured on **10 MatrixMarket matrices** (`delivery_matrices` in `conf/operators.yaml`)
+with 5 warmup and 20 timed iterations. `--benchmark-input` still takes the directory holding the
+30 delivery `.mtx` files: `--delivery-only` keeps only the 10 listed ones, so no extra option is
+needed. If the directory lacks any of the 10 (a smoke run on `tests/data`, a partial copy) nothing
+is filtered, and the runner says so on its first lines. Every backend runs the same
 command; the table below lists what changes per backend, and each `docs/<BACKEND>.md` has the full
 recipe in its "交付复现" section.
 
@@ -44,7 +47,7 @@ python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 20-row 
 
 | Flag | Why it is not optional |
 |---|---|
-| `--delivery-only` | Runs exactly the 7 parents behind the 20 variants, and narrows each benchmark sweep to the delivery axes (int32 indices, `non` op). Without it the runner reads the 18-operator superset and the full int64/trans/conj grid |
+| `--delivery-only` | Runs exactly the 7 parents behind the 20 variants, narrows each benchmark sweep to the delivery axes (int32 indices, `non` op), and keeps only the 10 delivery matrices of the input directory. Without it the runner reads the 18-operator superset and the full int64/trans/conj grid |
 | `--mode normal` | `quick` keeps one shape per class, drops ~40% of the cases and skips the two historically failing ones |
 | `--timeout 3600` | Per operator per phase (per matrix for per-matrix routes). The default `0` never gives up on a hung kernel |
 | outer `timeout -s KILL` | A hung kernel blocks in the driver; Ctrl-C does not reach it |
@@ -217,7 +220,7 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 Make sure no other job is competing for the GPU before trusting the timings.
 
 **5. Unified runner.** For the delivery run use the command in
-[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-30-matrices). Its
+[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-10-matrices). Its
 `--timeout 3600` keeps a hung operator from stalling the sweep: the operator is recorded as
 `Timeout` and the run moves on. SpSV/SpSM, which deadlock on DCU, are no longer in the delivery list,
 but an explicit `--ops spsv_csr,...` still reaches them; `--gpus 0,1` does not help there on its own:
@@ -231,7 +234,7 @@ confirm hipSPARSE was actually selected, known limits, and a troubleshooting tab
 ### Running the tests on MetaX / MACA C550
 
 For the **delivery run** (20 variants) use the command in
-[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-30-matrices) with the
+[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-10-matrices) with the
 MetaX settings from its table; [docs/MACA.md](docs/MACA.md) §0.5 has the exact command.
 
 The command below is a different thing: a **full sweep** of the other operators as well
@@ -297,7 +300,7 @@ baseline, not this PyTorch CSC baseline. The COO path remains a correctness refe
 ### Running the tests on Ascend 910B
 
 Only NPU cards 6 and 7 may be used. The delivery run is the command in
-[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-30-matrices) with the
+[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-10-matrices) with the
 Ascend settings from its table; [docs/ASCEND.md](docs/ASCEND.md) has the exact command, the
 five operators that are benchmarked against PyTorch-NPU (the rest are capability probes),
 environment checks and known limits.

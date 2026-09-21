@@ -515,3 +515,25 @@ delivery_variants:
   - {id: spmm_coo_f64_int_non_non_row, operator: spmm_coo, format: coo, dtype: f64}
   - {id: sddmm_csr_f32_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f32}
   - {id: sddmm_csr_f64_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f64}
+
+# The matrices a delivery run measures. `--delivery-only` keeps only these <name>.mtx
+# files from the --benchmark-input directory (run_flagsparse_pytest.py, and the C API
+# half of run_flagsparse_split_delivery.py), so the same 30-matrix directory can be
+# passed on every backend. gather and scatter have no matrix axis and are unaffected.
+#
+# Chosen from the CUDA run of 2026-09-17 (RTX 5090,
+# pytest_results_cuda_vendorfirst_20260917_145544): the 10 matrices with the highest
+# geometric-mean speedup against cuSPARSE over the 10 per-matrix delivery variants
+# (spmv_csr, spmv_coo, spmm_csr, spmm_coo, sddmm_csr; f32/f64, int32, non), among the
+# 12 matrices on which all 10 of those variants passed.
+delivery_matrices:
+  - GL7d14
+  - auto
+  - NACA0015
+  - amazon0601
+  - filter3D
+  - cage12
+  - roadNet-TX
+  - wave
+  - ASIC_680ks
+  - cfd2

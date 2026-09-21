@@ -61,6 +61,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tools.delivery_variants import select_delivery_matrices
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 CAPI_SRC_DIR = PROJECT_ROOT / "capi"
 
@@ -179,7 +181,16 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     recipe does (tools/write_summary.py + tools/check_manifest.py)."""
     bench_out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env["FLAGSPARSE_MATRIX_DIR"] = str(Path(args.benchmark_input).resolve())
+    matrix_dir, note = select_delivery_matrices(
+        Path(args.benchmark_input).resolve(), bench_out.resolve().parent / "delivery_matrices"
+    )
+    print(
+        f"delivery matrices: {matrix_dir}"
+        if note is None
+        else f"delivery matrix filter NOT applied: {note}",
+        flush=True,
+    )
+    env["FLAGSPARSE_MATRIX_DIR"] = str(matrix_dir)
     env["FLAGSPARSE_BENCH_OUT"] = str(bench_out.resolve())
     pattern, families = delivery_ctest_regex()
     print(f"ctest: running the delivery benchmark families {families}", flush=True)

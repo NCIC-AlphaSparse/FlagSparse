@@ -20,14 +20,16 @@ python -c "import flagsparse.sparse_operations._common as C; print(C._backend_na
 
 ---
 
-## 0.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
+## 0.5 交付复现：20 个变体 × 10 个矩阵（精度 + 性能）
 
 **MUSA 用 `run_flagsparse_split_delivery.py`，不用 `run_flagsparse_pytest.py --phase both`。**
 Python 侧在 MUSA 上没有厂商稀疏库（第 3 节），性能阶段只有 FlagSparse 自己的耗时、没有加速比；
 muSPARSE 基线在 C API 侧。这个 runner 精度取 pytest（SciPy 参考），性能取 C API 的 `ctest`
 （对 muSPARSE），合成一份 `summary_split.json`。C API 这一半只启动交付清单涉及的 5 个 benchmark 族
 （`gather`、`scatter`、`sddmm`、`spmm`、`spmv`，正则 `^benchmark\.(gather|scatter|sddmm|spmm|spmv)$`），
-`spsv` / `spsm` / `spgemm` 的 ctest 不会被拉起；构建仍然是整个 C API。
+`spsv` / `spsm` / `spgemm` 的 ctest 不会被拉起；构建仍然是整个 C API。矩阵同样只用 `conf/operators.yaml`
+的 `delivery_matrices` 里的 10 个：`--benchmark-input` 给 30 个 `.mtx` 的目录，runner 在
+`capi/build/delivery_matrices/` 下建一个只含这 10 个的目录交给 `FLAGSPARSE_MATRIX_DIR`。
 
 **环境**：
 

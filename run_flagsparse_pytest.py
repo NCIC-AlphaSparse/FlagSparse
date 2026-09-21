@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from tools.delivery_variants import load_delivery_variants
+from tools.delivery_variants import load_delivery_variants, select_delivery_matrices
 
 # XPU compiler diagnostics can include an MLIR reproducer and exceed the
 # csv module's conservative 128 KiB default.  They are part of the execution
@@ -4233,6 +4233,23 @@ def main(
         if include_performance_args
         else None
     )
+    if (
+        args.delivery_only
+        and include_performance_args
+        and phase_arg in ("performance", "both")
+        and benchmark_input is not None
+    ):
+        # The delivery matrices are a filter over the directory, so every backend
+        # passes the same --benchmark-input.
+        benchmark_input, note = select_delivery_matrices(
+            benchmark_input, results_dir / "delivery_matrices"
+        )
+        print(
+            f"delivery-only: matrices from {benchmark_input}"
+            if note is None
+            else f"delivery-only: matrix filter NOT applied: {note}",
+            flush=True,
+        )
     benchmark_warmup = args.benchmark_warmup if include_performance_args else 5
     benchmark_iters = args.benchmark_iters if include_performance_args else 20
     extra_pytest_args = (

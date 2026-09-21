@@ -32,7 +32,7 @@ PY
 **精度参考是 CPU 上的 SciPy**（见仓库根 `README.md` 的 `FLAGSPARSE_ACCURACY_REFERENCE`）：
 昇腾上的 torch.sparse 本身就是被测对象而不是参考。
 
-## 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
+## 交付复现：20 个变体 × 10 个矩阵（精度 + 性能）
 
 只能用 NPU 6、7。先 `npu-smi info` 确认这两张卡上没有别的任务。
 
@@ -69,14 +69,14 @@ runner 在 Ascend 上自动做三件事，不需要手动处理：
 - **卡隔离**：每个子进程设 `ASCEND_RT_VISIBLE_DEVICES=<6 或 7>`、命令行传逻辑设备 `--device 0`
   （torch_npu 不认 `CUDA_VISIBLE_DEVICES`，不设的话默认会落到物理 NPU 0）；
 - **路由**：gather / scatter / spmv_csr / spmm_csr / sddmm_csr 的性能走 `benchmark/benchmark_ascend.py`，
-  对 PyTorch-NPU 计时，并通过 `--input` 拿到 `--benchmark-input` 的 30 个 `.mtx`；spmm_csr、sddmm_csr
+  对 PyTorch-NPU 计时，并通过 `--input` 拿到 `--benchmark-input` 里的 10 个交付矩阵；spmm_csr、sddmm_csr
   每个矩阵单独一个子进程（`--timeout` 是每个矩阵的上限）。其余 2 个父算子（`spmv_coo`、`spmm_coo`）走能力探测
   `benchmark/benchmark_ascend_probe.py`，**只有能不能跑、没有加速比**；
 - **精度**：上面 5 个算子用 `benchmark/benchmark_ascend_accuracy.py`（每个 dtype 一个合成用例，对 SciPy），
   `spmv_coo`、`spmm_coo` 走 `tests/pytest`，参考同样是 CPU 上的 SciPy。
 
 **跑完先核对真实矩阵确实传进去了**：`pytest_results_ascend_delivery/spmm_csr/performance.csv` 的 `matrix`
-列应当是 30 个 `.mtx` 文件名，而不是 `synthetic`。
+列应当是 10 个交付矩阵的 `.mtx` 文件名（`conf/operators.yaml` 的 `delivery_matrices`），而不是 `synthetic`。
 
 **预期会看到的非 Passed**（2026-09-17/18 在 910B4 上实测，`modified/ASCEND.md` 第 3、7 节，当时是 40 变体的清单）：
 
