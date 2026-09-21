@@ -72,9 +72,9 @@ STATUS_TO_FLAGGEMS = {
 # rather than being mangled into a real dtype it is not.
 DTYPE_ALIASES = {"f32": "fp32", "f64": "fp64", "f16": "fp16", "bf16": "bf16"}
 
-# The delivery list (算子列表注册修改.xlsx, "新算子列表") names each VARIANT as an
+# The delivery list (fork/list.xlsx) names each VARIANT as an
 # operator: `spmv_csr_f32_int_non`, not `spmv`. Keying `result` that way is what
-# makes the 40 rows appear in a FlagGems-shaped summary and HTML without changing
+# makes the delivery rows appear in a FlagGems-shaped summary and HTML without changing
 # either format -- one entry per variant, exactly as the list is written.
 #
 # The trailing parts encode what the delivery list fixes: `int` (index type,

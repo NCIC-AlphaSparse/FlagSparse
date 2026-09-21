@@ -68,7 +68,7 @@ ctest --test-dir build -R accuracy --output-on-failure
 FLAGSPARSE_MATRIX_DIR=/path/to/mtx FLAGSPARSE_BENCH_OUT=./bench \
     ctest --test-dir build -R benchmark
 
-# 汇总：40+ 变体一张表 / 与 FlagSparse Python 侧同 schema 的 summary.json
+# 汇总：交付清单（20 个变体）一张表 / 与 FlagSparse Python 侧同 schema 的 summary.json
 python3 tools/report.py --bench-dir ./bench
 python3 tools/write_summary.py --bench-dir ./bench --out ./bench
 
@@ -155,9 +155,10 @@ CSR、COO（CSR view）和 SELL 都经过该函数，因此共享这项防护，
 和 `measure_vs_baseline()` 建立了完整的 `try/catch`，异常 case 记为 `failed` 并继续下一个。这只保证报告
 完整写出：如果 context 已经失效（例如上面的 watchdog 超时），后续 case 仍会失败。
 
-交付基准只报 CSR 与 COO 的四种 dtype。`spsv_sell` 在 `capi/conf/operators.yaml` 里是
-`reporting: retained`，`benchmark/test_spsv.cpp` 用 `variants_of("spsv", "delivery")` 只取交付变体，
-SELL 不进本轮报告。
+**SpSV 已不在交付清单里**（2026-09-21，`fork/list.xlsx`）：`spsv_csr` / `spsv_coo` 在 `capi/conf/operators.yaml`
+里和 `spsv_sell` 一样是 `reporting: retained`，`benchmark/test_spsv.cpp` 仍然扫 CSR 与 COO（每行带
+`reporting` 标签），只是默认报告不含它们，`run_flagsparse_split_delivery.py` 也不会再拉起 `benchmark.spsv`。
+要验证上面这些修复，直接 `ctest -R benchmark.spsv`；SELL 没有 benchmark 的算子构造，不在这个扫描里。
 
 **状态**：以上修改只做过 `c++ -fsyntax-only`，**尚未用重新编译的二进制在真机上重跑 30 矩阵**；
 复现前先重新构建 C API（不要沿用旧的 `capi/build`）。

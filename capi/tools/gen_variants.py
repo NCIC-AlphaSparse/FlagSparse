@@ -47,9 +47,34 @@ FORMATS = {
 
 
 def family_of(op_id):
-    """Which benchmark binary owns this entry. Taken from the manifest's own
-    `tests:` field, falling back to the id's first token."""
+    """Which benchmark binary owns this entry, from the id alone (first token)."""
     return op_id.split("_")[0]
+
+
+def family_of_operator(op):
+    """Which benchmark binary owns this manifest entry. Taken from the entry's own
+    `tests:` field (`ctest/benchmark/test_<family>.cpp`), falling back to the id's
+    first token. Shared with run_flagsparse_split_delivery.py, which uses it to
+    run only the benchmark binaries that carry delivery variants."""
+    fam = None
+    for t in op.get("tests") or []:
+        if "benchmark/test_" in t:
+            fam = t.split("benchmark/test_")[1].replace(".cpp", "")
+    return fam or family_of(op["id"])
+
+
+def benchmark_families(doc, reporting="delivery"):
+    """The benchmark binaries with at least one implemented variant of this
+    reporting scope, sorted. `delivery_dtypes` only narrows which dtypes count, so
+    an operator with it set still puts its family in."""
+    return sorted(
+        {
+            family_of_operator(op)
+            for op in doc["operators"]
+            if op.get("status") == "implemented"
+            and op.get("reporting", "retained") == reporting
+        }
+    )
 
 
 def main():
@@ -65,11 +90,7 @@ def main():
             continue
         fmts = op.get("formats") or []
         dts = op.get("dtypes") or []
-        fam = None
-        for t in op.get("tests") or []:
-            if "benchmark/test_" in t:
-                fam = t.split("benchmark/test_")[1].replace(".cpp", "")
-        fam = fam or family_of(op["id"])
+        fam = family_of_operator(op)
         # Delivery scope. `delivery_dtypes` narrows an operator that is in the
         # list for only some of its dtypes; absent means all of them.
         reporting = op.get("reporting", "retained")

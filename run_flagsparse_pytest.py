@@ -118,11 +118,15 @@ STATUS_TO_FLAGGEMS = {
 # them delivery), which on MetaX C550 ran past a 900 s --timeout. Injected only
 # under --delivery-only, BEFORE --benchmark-args/--op-benchmark-args, so an
 # explicit user flag still wins (argparse keeps the last value). Parents absent
-# here already sweep only delivery axes (sddmm_csr, spgemm_csr, spsm_csr).
+# here (sddmm_csr) already sweep only delivery axes.
 #
-# A script whose default dtypes leave out a delivery dtype gets the list spelled
-# out as well (gather, spmv_csr): spmv_csr defaults to float32,float64, so its
-# c32/c64 delivery variants had no rows at all and reported NotFound.
+# The dtype list is spelled out too, in both directions. gather/scatter deliver
+# every dtype the script knows. spmv_csr/spmv_coo/spmm_csr/spmm_coo deliver only
+# float32 and float64 (the complex variants left the delivery list on 2026-09-21),
+# while the scripts sweep complex by default; benchmarking it would only produce
+# rows no delivery variant reads. When a dtype is added to the delivery list, add
+# it here as well: a script whose default omits it reports NotFound for the
+# variant ("the benchmark recorded no <dtype> rows"), which reads like a pass.
 DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
     "gather": (
         "--index-dtypes",
@@ -137,14 +141,54 @@ DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
         "--ops",
         "non",
         "--dtypes",
-        "float32,float64,complex64,complex128",
+        "float32,float64",
     ),
-    "spmv_coo": ("--index-dtypes", "int32", "--ops", "non"),
-    "spmm_csr": ("--index-dtypes", "int32", "--ops", "non"),
-    "spmm_coo": ("--index-dtypes", "int32"),
-    "spsv_csr": ("--index-dtypes", "int32", "--ops", "NON"),
-    "spsv_coo": ("--index-dtypes", "int32", "--ops", "NON"),
+    "spmv_coo": (
+        "--index-dtypes",
+        "int32",
+        "--ops",
+        "non",
+        "--dtypes",
+        "float32,float64",
+    ),
+    "spmm_csr": (
+        "--index-dtypes",
+        "int32",
+        "--ops",
+        "non",
+        "--dtypes",
+        "float32,float64",
+    ),
+    "spmm_coo": ("--index-dtypes", "int32", "--dtypes", "float32,float64"),
 }
+# SpSV is not a delivery parent any more (the delivery list dropped it on
+# 2026-09-21), so `--delivery-only` no longer selects spsv_csr/spsv_coo and this
+# narrowing only applies when they are selected explicitly, e.g. `--ops spsv_csr
+# --delivery-only` to re-check the int32 / NON / non-unit contract it used to have.
+#
+# That contract: the shared pytest files also exercise transpose/conjugate and
+# unit-diagonal APIs -- valuable full-suite coverage, but not int32 NON non-unit.
+# They have to be left out of the run itself, not only out of the recorded result:
+# on a C550 the unit-diagonal cases reach the known CW defect (illegal access /
+# hang), so a run that merely filtered afterwards would still execute them.
+#
+# pytest `-k` matches substrings of the test name and its parameter ids. "non_trans"
+# keeps the lower and the upper NON tests (`..._non_trans_supported_combos`,
+# `..._non_trans_upper_supported_combos`; a longer keyword such as
+# "non_trans_supported_combos" would silently drop the upper ones), and "not unit"
+# drops every unit-diagonal test (`..._non_trans_unit_supported_combos`,
+# `..._unit_transpose_family_...`). It goes in front of --pytest-args, so an
+# explicit `-k` from the user still wins.
+_DELIVERY_SPSV_PYTEST_FILTER = "non_trans and int32 and not unit"
+
+
+def _delivery_accuracy_pytest_args(op: str, delivery_only: bool) -> list[str]:
+    """Extra pytest arguments that narrow an accuracy run to the delivery contract."""
+    if delivery_only and op in {"spsv_csr", "spsv_coo"}:
+        return ["-k", _DELIVERY_SPSV_PYTEST_FILTER]
+    return []
+
+
 PYTEST_STATUS_TO_FLAGGEMS = {
     "PASSED": "Passed",
     "FAILED": "Failed",
@@ -559,7 +603,7 @@ GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metax", "mthread
 # measurement that matters, and it beats reporting nothing.
 PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")
 
-# The XPU SDK has no cuSPARSE-shaped generic sparse API, so these five run
+# The XPU SDK has no cuSPARSE-shaped generic sparse API, so these seven run
 # through benchmark_xpu.py instead of the probe.  The script compares each
 # FlagSparse result with an equivalent PyTorch-XPU expression and reports both
 # latencies and their ratio; it is not a vendor/XDNN sparse-library comparison.
@@ -567,9 +611,24 @@ XPU_BASELINE_OPS: tuple[str, ...] = (
     "gather",
     "scatter",
     "spmv_csr",
+    "spmv_coo",
     "spmm_csr",
+    "spmm_coo",
     "sddmm_csr",
 )
+
+# These are the XPU dtypes whose PyTorch expression is both executable and a
+# valid comparison.  The shim accepts float64 but computes it as float32, while
+# its complex index primitives are unsupported.
+XPU_BASELINE_DTYPES: dict[str, str] = {
+    "gather": "float16,float32",
+    "scatter": "float16,float32",
+    "spmv_csr": "float32",
+    "spmv_coo": "float32",
+    "spmm_csr": "float32",
+    "spmm_coo": "float32",
+    "sddmm_csr": "float32",
+}
 
 
 ASCEND_BASELINE_OPS: tuple[str, ...] = (
@@ -615,11 +674,13 @@ PROBE_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {}
 
 
 def _xpu_baseline_command(op: str) -> tuple[str, ...]:
-    """Measured baseline for the five operators PyTorch-XPU can express."""
+    """Measured baseline for the XPU operators PyTorch can express."""
     return (
         "benchmark/benchmark_xpu.py",
         "--op",
         op,
+        "--dtypes",
+        XPU_BASELINE_DTYPES[op],
         "--device",
         "{device}",
         # XPU baselines are isolated one matrix per subprocess by
@@ -1373,6 +1434,32 @@ def parse_accuracy_json(path: Path) -> dict[str, object]:
     return summarize_accuracy_cases(raw_data)
 
 
+# Skip reasons that state a capability boundary -- of an optional suite or of one
+# algorithm -- rather than coverage that went missing. They are still counted and
+# listed under details["skipped"], but they do not by themselves downgrade a run in
+# which cases passed and none failed to `Skipped`.
+#
+# Only these named reasons are exempt. Any other skip still yields Skipped, so a
+# guard that silently skips most of a suite (the CUDA-only skipif that once turned
+# 2056 cases into "341 skipped") is not turned into a pass.
+#
+# "The new CSR algorithms have no verified profile for this backend" used to be a
+# third entry: spmv_csr reported Skipped on MetaX and XPU because those cases skipped
+# on purpose. The spmv_csr accuracy tests now parametrize only the algorithms a
+# backend has a profile for (list_spmv_csr_algorithms(backend=...)), so nothing is
+# collected and nothing skips -- the row rests on the legacy algorithms that really
+# run, instead of on an exemption.
+EXPECTED_ACCURACY_SKIP_REASONS = (
+    "external matrix regression directory not configured",
+    "legacy bucket requires int32 column indices",
+)
+
+
+def _is_expected_accuracy_skip(reason: str) -> bool:
+    lowered = reason.lower()
+    return any(text in lowered for text in EXPECTED_ACCURACY_SKIP_REASONS)
+
+
 def summarize_accuracy_cases(raw_data: dict[str, object]) -> dict[str, object]:
     """Classify recorded pytest cases into counts, a status and failure details.
 
@@ -1411,15 +1498,19 @@ def summarize_accuracy_cases(raw_data: dict[str, object]) -> dict[str, object]:
         details["failed"] = failed
     if skipped:
         details["skipped"] = skipped
+    unexpected_skips = any(not _is_expected_accuracy_skip(r) for r in skipped)
 
     if failed_count:
         status = "Failed"
     elif skipped_with_issue:
         status = "Failed"
-    elif skipped_count:
+    elif unexpected_skips:
         status = "Skipped"
     elif passed:
         status = "Passed"
+    elif skipped_count:
+        # Everything that could run was a capability skip and nothing passed.
+        status = "Skipped"
     else:
         status = "NotFound"
 
@@ -1574,6 +1665,7 @@ def run_accuracy(
     op_dir: Path,
     extra_pytest_args: list[str],
     timeout: int,
+    delivery_only: bool = False,
 ) -> dict[str, object]:
     if not marker:
         return _not_configured(op, "accuracy", "no pytest marker mapping")
@@ -1667,6 +1759,7 @@ def run_accuracy(
         "-vs",
         "-p",
         "no:cacheprovider",
+        *_delivery_accuracy_pytest_args(op, delivery_only),
         *extra_pytest_args,
     ]
     returncode, stdout, stderr, duration, timed_out = run_subprocess(
@@ -2859,6 +2952,7 @@ def run_one_op(
     extra_pytest_args: list[str],
     extra_benchmark_args: list[str],
     op_benchmark_args: dict[str, list[str]],
+    delivery_only: bool = False,
 ) -> dict[str, object]:
     op_dir = results_dir / op
     ensure_dir(op_dir)
@@ -2876,6 +2970,7 @@ def run_one_op(
                 op_dir=op_dir,
                 extra_pytest_args=extra_pytest_args,
                 timeout=timeout,
+                delivery_only=delivery_only,
             )
             write_phase_result(op_dir, "accuracy", result["accuracy"])
         elif phase == "performance":
@@ -2913,6 +3008,7 @@ def run_gpu_ops(
     env_info: dict[str, object],
     operator_metadata: dict[str, dict[str, object]],
     results: list[dict[str, object]],
+    delivery_only: bool = False,
 ) -> None:
     for op in ops:
         result = run_one_op(
@@ -2929,6 +3025,7 @@ def run_gpu_ops(
             extra_pytest_args=extra_pytest_args,
             extra_benchmark_args=extra_benchmark_args,
             op_benchmark_args=op_benchmark_args,
+            delivery_only=delivery_only,
         )
         result.update(operator_metadata.get(op, {"customized": True, "labels": []}))
         with SUMMARY_LOCK:
@@ -4209,6 +4306,7 @@ def main(
                 env_info=env_info,
                 operator_metadata=operator_metadata,
                 results=results,
+                delivery_only=args.delivery_only,
             )
             for gpu, gpu_ops in tasks.items()
             if gpu_ops

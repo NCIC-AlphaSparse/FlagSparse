@@ -20,12 +20,13 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
-## Reproducing the delivery run (40 variants, 30 matrices)
+## Reproducing the delivery run (20 variants, 30 matrices)
 
-This is the run whose `summary.json` is the deliverable: **accuracy and performance for the 40
-registered delivery variants** in `conf/operators.yaml` (`delivery_variants`; the delivery list
-has 42 -- `sddmm_csr` c32/c64 wait for a complex kernel), performance measured on a directory of
-**30 MatrixMarket matrices** with 5 warmup and 20 timed iterations. Every backend runs the same
+This is the run whose `summary.json` is the deliverable: **accuracy and performance for the 20
+registered delivery variants** in `conf/operators.yaml` (`delivery_variants`): gather and scatter
+in f16/f32/f64/c32/c64, and spmv_csr, spmv_coo, spmm_csr, spmm_coo, sddmm_csr in f32/f64.
+Performance is measured on a directory of **30 MatrixMarket matrices** with 5 warmup and 20 timed
+iterations. Every backend runs the same
 command; the table below lists what changes per backend, and each `docs/<BACKEND>.md` has the full
 recipe in its "交付复现" section.
 
@@ -38,24 +39,24 @@ timeout -s KILL 21600 python3 run_flagsparse_pytest.py \
   --benchmark-input <dir with the 30 .mtx> --benchmark-warmup 5 --benchmark-iters 20 \
   --results-dir pytest_results_<backend>_delivery
 
-python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 40-row table, exit 1 if any is missing
+python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 20-row table, exit 1 if any is missing
 ```
 
 | Flag | Why it is not optional |
 |---|---|
-| `--delivery-only` | Runs exactly the 11 parents behind the 40 variants, and narrows each benchmark sweep to the delivery axes (int32 indices, `non` op). Without it the runner reads the 18-operator superset and the full int64/trans/conj grid |
+| `--delivery-only` | Runs exactly the 7 parents behind the 20 variants, and narrows each benchmark sweep to the delivery axes (int32 indices, `non` op). Without it the runner reads the 18-operator superset and the full int64/trans/conj grid |
 | `--mode normal` | `quick` keeps one shape per class, drops ~40% of the cases and skips the two historically failing ones |
 | `--timeout 3600` | Per operator per phase (per matrix for per-matrix routes). The default `0` never gives up on a hung kernel |
-| outer `timeout -s KILL` | A deadlocked triangular solve blocks in the driver; Ctrl-C does not reach it |
+| outer `timeout -s KILL` | A hung kernel blocks in the driver; Ctrl-C does not reach it |
 
 | Backend | Set before the command | Differs from the command above | Speedup is against | Accuracy reference | Recipe |
 |---|---|---|---|---|---|
 | CUDA | -- (`pip install cupy-cuda12x`) | -- | cuSPARSE (CuPy) | cuSPARSE + torch | this section |
-| DCU / ROCm | `pip install hip-python` | SpSV/SpSM may deadlock (read as `Timeout`) | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) §0.5 |
-| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--op-benchmark-args='sddmm_csr=--no-cusparse'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
+| DCU / ROCm | `pip install hip-python` | -- | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) §0.5 |
+| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch` | `--op-benchmark-args='sddmm_csr=--no-cusparse'`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
 | Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
-| Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; others probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
-| Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (5 ops; others probe only) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
+| Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; `spmv_coo` and `spmm_coo` probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
+| Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (7 ops) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
 
 **Results produced before `86a09cd` (2026-09-18) are not comparable**: the old projection averaged
 int64 and trans/conj rows into each `..._int_non` variant and counted rows without a speedup as 0.
@@ -64,8 +65,21 @@ Rerun with the current runner; see `prompt.md` section 2.
 What the statuses mean in `summary.json`: `Passed` / `Failed` as measured; `Timeout` the operator
 ran and hit `--timeout`; `NotFound` no row for that variant (not run, or not configured on this
 backend); `NoBaseline` (C API) the kernel ran and passed but the vendor library has no such
-dtype/operator to compare against. On CUDA (RTX 5090, 2026-09-17, before sweep narrowing) the
-full run took 79 minutes, SpSV and SpGEMM being the longest (~20 min each).
+dtype/operator to compare against. On CUDA (RTX 5090, 2026-09-17, before sweep narrowing, and with the
+40-variant list of the time) the full run took 79 minutes, SpSV and SpGEMM being the longest (~20 min each);
+neither is in the 20-variant list any more, and that list has not been timed as a whole.
+
+An accuracy `Skipped`: **when cases passed and none failed, cases skipped only for a capability
+boundary do not downgrade the status to `Skipped`**; they are still counted in `skipped` and listed
+under `details.skipped`. Exactly two reasons are exempt
+(`EXPECTED_ACCURACY_SKIP_REASONS` in `run_flagsparse_pytest.py`): the external-matrix directory not
+being configured, and the legacy bucket algorithm supporting int32 column indices only. A skip for
+any other reason still reports `Skipped`, as does a run in which nothing passed. The new CSR
+algorithms on a backend with no verified profile (MetaX, XPU) are **not** covered by an exemption:
+`test_spmv_csr_accuracy.py` parametrizes only the algorithms a backend has a profile for
+(`list_spmv_csr_algorithms(backend=...)`), so nothing is collected and nothing skips, and the row
+rests on the legacy-algorithm cases that really run. To judge how much a `Passed` row rests on,
+read its `passed` count, not just the status.
 
 ## Backends (8 registered)
 
@@ -107,7 +121,7 @@ automatic probe is confirmed:**
 ```bash
 export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | mlu
 export FLAGSPARSE_MACA_MODEL=c550   # overrides model detection
-export FLAGSPARSE_MACA_VENDOR=none  # skip the vendor baseline if CuPy is unusable
+export FLAGSPARSE_MACA_VENDOR=torch  # PyTorch as the baseline when CuPy is unusable; none = no baseline
 
 # Baseline choice for Moore Threads / Ascend
 export FLAGSPARSE_MTHREADS_VENDOR=none       # none (default) | torch | musparse
@@ -203,10 +217,11 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 Make sure no other job is competing for the GPU before trusting the timings.
 
 **5. Unified runner.** For the delivery run use the command in
-[Reproducing the delivery run](#reproducing-the-delivery-run-40-variants-30-matrices). Its
-`--timeout 3600` is what keeps a deadlocked SpSV/SpSM from stalling the sweep: the operator is
-recorded as `Timeout` and the run moves on. Note that `--gpus 0,1` does not help on its own: it
-splits the operators into two queues, and whichever queue holds SpSV/SpSM still blocks until the
+[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-30-matrices). Its
+`--timeout 3600` keeps a hung operator from stalling the sweep: the operator is recorded as
+`Timeout` and the run moves on. SpSV/SpSM, which deadlock on DCU, are no longer in the delivery list,
+but an explicit `--ops spsv_csr,...` still reaches them; `--gpus 0,1` does not help there on its own:
+it splits the operators into two queues, and whichever queue holds SpSV/SpSM still blocks until the
 timeout fires.
 
 For the full DCU bring-up procedure — environment checks, the stale-install trap, how to
@@ -215,8 +230,8 @@ confirm hipSPARSE was actually selected, known limits, and a troubleshooting tab
 
 ### Running the tests on MetaX / MACA C550
 
-For the **delivery run** (40 variants) use the command in
-[Reproducing the delivery run](#reproducing-the-delivery-run-40-variants-30-matrices) with the
+For the **delivery run** (20 variants) use the command in
+[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-30-matrices) with the
 MetaX settings from its table; [docs/MACA.md](docs/MACA.md) §0.5 has the exact command.
 
 The command below is a different thing: a **full sweep** of the other operators as well
@@ -282,7 +297,7 @@ baseline, not this PyTorch CSC baseline. The COO path remains a correctness refe
 ### Running the tests on Ascend 910B
 
 Only NPU cards 6 and 7 may be used. The delivery run is the command in
-[Reproducing the delivery run](#reproducing-the-delivery-run-40-variants-30-matrices) with the
+[Reproducing the delivery run](#reproducing-the-delivery-run-20-variants-30-matrices) with the
 Ascend settings from its table; [docs/ASCEND.md](docs/ASCEND.md) has the exact command, the
 five operators that are benchmarked against PyTorch-NPU (the rest are capability probes),
 environment checks and known limits.
@@ -292,7 +307,7 @@ environment checks and known limits.
 | Path | What it is |
 | --- | --- |
 | `src/flagsparse/` | Core package. `sparse_operations/` holds **one shared implementation** per operator; `sparse_operations/backends/<backend>/` is an override layer that is **empty by default**, so only a file that genuinely diverged shows up there |
-| `conf/operators.yaml` | The operator inventory, and the single source of truth for the **40 registered delivery variants** (the delivery list has 42; `sddmm_csr` c32/c64 wait for a complex kernel) (`gather_f32_int`, `spmv_csr_f32_int_non`, ...). Both front ends read it through `tools/delivery_variants.py` |
+| `conf/operators.yaml` | The operator inventory, and the single source of truth for the **20 registered delivery variants** (`gather_f32_int`, `spmv_csr_f32_int_non`, ...). Both front ends read it through `tools/delivery_variants.py` |
 | `run_flagsparse_pytest.py` | The unified runner: accuracy and performance per operator, writes `summary.json` / `summary.csv` / `result.html` keyed by delivery variant |
 | `tests/pytest/` | Accuracy suites (shared across backends; the golden reference stays on CPU) |
 | `tests/ci/` | Policy and contract tests. No GPU needed |
@@ -344,7 +359,7 @@ Their corresponding C API profiles live in `capi/ctest/backends/`; only CUDA
 and MUSA currently have C API adaptors, so the other four remain Python-only.
 
 **Delivery report variants** - Python and C API summaries use the same
-40-entry `delivery_variants` registry in
+20-entry `delivery_variants` registry in
 [`conf/operators.yaml`](conf/operators.yaml).
 The summary always has every registry key. A selected parent operator contributes
 only its own dtype's measured cases; a missing run is reported as `NotFound`.

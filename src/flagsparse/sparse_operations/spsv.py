@@ -7321,8 +7321,38 @@ def _execute_spsv_csr_plan(
     alpha_in = _coerce_spsv_alpha(alpha, compute_dtype, b.device)
     if not _spsv_alpha_is_identity(alpha):
         b_in = b_in * alpha_in
-    if _is_ascend_runtime():
+    if _is_ascend_runtime() or _is_xpu_runtime():
         if trans_mode != "N":
+            # XPU's triangular-solve Triton routes fail integer/atomic lowering.
+            # Materialize the small triangular matrix with device index_add and
+            # use the framework triangular solver for transpose/conjugate modes.
+            if _is_xpu_runtime():
+                dense = torch.zeros(
+                    (n_rows, n_rows), dtype=compute_dtype, device=b.device
+                )
+                rows = torch.repeat_interleave(
+                    torch.arange(n_rows, dtype=torch.int64, device=b.device),
+                    kernel_indptr[1:] - kernel_indptr[:-1],
+                )
+                dense.index_put_((rows, kernel_indices.to(torch.int64)), data_in, accumulate=True)
+                if trans_mode == "T":
+                    dense = dense.t()
+                elif trans_mode == "C":
+                    dense = dense.conj().t()
+                solved = torch.linalg.solve_triangular(
+                    dense,
+                    b_in.unsqueeze(-1),
+                    upper=not lower_eff,
+                    unitriangular=unit_diagonal,
+                ).squeeze(-1)
+                if solved.dtype != (original_output_dtype or data.dtype):
+                    solved = solved.to(original_output_dtype or data.dtype)
+                if out is not None:
+                    if out.shape != solved.shape or out.dtype != solved.dtype:
+                        raise ValueError("out shape/dtype must match result")
+                    out.copy_(solved)
+                    solved = out
+                return solved
             raise NotImplementedError(
                 "Ascend SpSV fallback currently supports non-transpose solves only"
             )

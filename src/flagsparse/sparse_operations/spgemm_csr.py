@@ -1144,8 +1144,10 @@ def _spgemm_compute(prepared):
     # S5000 for ordinary random CSR inputs.  The capability probes for the
     # individual CAS and cross-lane while primitives pass, so keep this guard
     # local to the algorithm and use the globally synchronized ESC path on MUSA.
-    # CUDA and other backends retain the optimized TLE route.
-    tle_hash_safe = not _is_mthreads_runtime()
+    # CUDA and other backends retain the optimized TLE route.  XPU's Triton
+    # lowering cannot legalize TLE's shared-memory local_ptr/make_range path;
+    # ESC uses ordinary device tensor operations and remains fully on-device.
+    tle_hash_safe = not (_is_mthreads_runtime() or _is_xpu_runtime())
     if tle_hash_safe and _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
         try:
             result = _spgemm_hash_hybrid_compute(prepared)
@@ -1987,7 +1989,8 @@ def _spgemm_csr_sparse_ref_backend(
     b_indices_dtype=None,
     b_indptr_dtype=None,
 ):
-    if _is_rocm_runtime():
+    vendor = _expected_vendor_sparse_backend()
+    if vendor == "hipsparse":
         reason = _hipsparse_spgemm_csr_skip_reason(
             value_dtype,
             a_indices_dtype,
@@ -1998,6 +2001,11 @@ def _spgemm_csr_sparse_ref_backend(
         if reason is None:
             return "hipsparse", None
         return None, reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} CSR SpGEMM baseline is not wired for this runner",
+        )
     if cp is None or cpx_sparse is None:
         return None, "CuPy/cuSPARSE is not available"
     return "cupy_cusparse", None

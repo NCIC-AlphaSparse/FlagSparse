@@ -27,6 +27,14 @@ _ASCEND_ROW_IDS_CACHE = {}
 
 def _ascend_csr_row_ids(indptr, n_rows):
     """Per-nonzero row index for the Ascend fallbacks (repeat_interleave, not Triton)."""
+    # XPU's caching allocator can recycle a just-freed indptr storage address for
+    # a different CSR pattern.  The legacy cache is address-keyed, so use a fresh
+    # device-side expansion there rather than risking stale row IDs.
+    if _is_xpu_runtime():
+        return torch.repeat_interleave(
+            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
+            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
+        )
     key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
     cached = _ASCEND_ROW_IDS_CACHE.get(key)
     if cached is None:
@@ -4271,9 +4279,10 @@ def flagsparse_spmm_csr(
     ):
         raise ValueError("transpose conflicts with op")
 
-    # Ascend 910B does not lower the Triton CSR kernels reliably (and its SparseCSR addmm
-    # dispatcher is unavailable).  Same CSR reduction via torch_npu index_add, Ascend only.
-    if _is_ascend_runtime():
+    # Ascend 910B and XPU do not lower the Triton CSR kernels reliably (and their
+    # SparseCSR addmm dispatchers are unavailable).  Use the same CSR reduction
+    # through device-resident index_add_ on both runtimes.
+    if _is_ascend_runtime() or _is_xpu_runtime():
         if any(arg is None for arg in (data, indices, indptr, B, shape)):
             raise ValueError("data, indices, indptr, B, and shape are required")
         if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or B.ndim != 2:
@@ -4288,7 +4297,14 @@ def flagsparse_spmm_csr(
         transposed = _spmm_op_transposes(op_code)
         expected = n_rows if transposed else n_cols
         if B.shape[0] != expected:
-            raise ValueError(f"B.shape[0] must be {expected}, got {B.shape[0]}")
+            raise ValueError(f"B.shape[0] must be n_cols={expected}, got {B.shape[0]}")
+        if out is not None:
+            if not _is_accel_tensor(out):
+                raise ValueError("out must be a CUDA tensor")
+            if out.device != data.device:
+                raise ValueError("out must be on the same CUDA device as the inputs")
+            if out.shape != ((n_cols if transposed else n_rows), B.shape[1]) or out.dtype != data.dtype:
+                raise ValueError("out shape/dtype must match result")
         ascend_timed = bool(return_time or return_meta)
         if ascend_timed:
             _ACCEL.synchronize()
@@ -4517,6 +4533,52 @@ def _flagsparse_spmm_csr_opt_alg1_impl(
             or out.dtype != prepared.data.dtype
         ):
             raise ValueError("out shape/dtype must match result")
+
+    # XPU cannot lower the alg1 symbolic bucket builder's atomic scan.  Its
+    # index_add_ implementation is available, and this route preserves the
+    # public alg1 API while keeping all inputs and the result on the device.
+    if _is_xpu_runtime():
+        if B.ndim != 2:
+            raise ValueError("B must be a 2D dense tensor")
+        if B.shape[0] != prepared.n_cols:
+            raise ValueError(
+                f"B.shape[0] must be n_cols={prepared.n_cols}, got {B.shape[0]}"
+            )
+        if B.dtype != prepared.data.dtype:
+            raise TypeError("B dtype must match data dtype")
+        do_timing = bool(return_time or return_meta)
+        if do_timing:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        row_ids = _ascend_csr_row_ids(prepared.kernel_indptr, prepared.n_rows)
+        C = torch.zeros(
+            (prepared.n_rows, B.shape[1]), device=B.device, dtype=prepared.data.dtype
+        )
+        C.index_add_(
+            0,
+            row_ids,
+            prepared.data[:, None] * B[prepared.kernel_indices.to(torch.int64)],
+        )
+        if out is not None:
+            out.copy_(C)
+            C = out
+        if do_timing:
+            _ACCEL.synchronize()
+            op_total_ms = (time.perf_counter() - t0) * 1000.0
+        else:
+            op_total_ms = None
+        if return_meta:
+            meta = {
+                "symbolic_ms": 0.0 if do_timing else None,
+                "compute_ms": op_total_ms,
+                "op_total_ms": op_total_ms,
+                "long_part_count": 0,
+                "long_row_count": 0,
+                "bucket_count": 0,
+            }
+            return (C, op_total_ms, meta) if return_time else (C, meta)
+        return (C, op_total_ms) if return_time else C
+
     do_timing = bool(return_time or return_meta)
     symbolic_ms = None
     compute_ms = None

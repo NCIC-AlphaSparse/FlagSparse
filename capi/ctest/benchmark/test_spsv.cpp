@@ -46,9 +46,10 @@ TEST(SpsvBenchmark, CsrOverCorpus) {
     report_corpus_failures(g_report, "csr");
 
     const Scalars sc;
-    // This is a delivery-corpus report. Retained variants (currently SELL)
-    // remain covered by their dedicated accuracy test but are not deliverables.
-    const auto declared = variants_of("spsv", "delivery");
+    // SpSV is not in the delivery list, so its variants are `retained`: still
+    // measured and stored (each row carries its `reporting` tag), just kept out
+    // of the default report. Filtering on "delivery" here would sweep nothing.
+    const auto declared = variants_of("spsv");
 
     for (const auto& entry : corpus()) {
         const CsrMatrix L = lower_triangle(entry.A);
@@ -64,7 +65,8 @@ TEST(SpsvBenchmark, CsrOverCorpus) {
         for (const registry::Variant* v : declared) {
             const bool is_coo = std::string(v->format) == "coo";
             const bool is_csr = std::string(v->format) == "csr";
-            ASSERT_TRUE(is_csr || is_coo);
+            // SELL has its own accuracy test and no operand builder here.
+            if (!is_csr && !is_coo) continue;
             const auto dt = v->dt;
             BenchRow row;
             row.name = std::string("spsv_") + v->format + "_" + v->dtype + "_" +

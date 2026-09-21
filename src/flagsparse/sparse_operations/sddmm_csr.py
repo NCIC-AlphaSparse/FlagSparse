@@ -781,6 +781,27 @@ def _run_sddmm_prepared(
             "out_dtype": str(target_out_dtype).replace("torch.", ""),
         }
 
+    # XPU's Triton lowering rejects the reduction accumulator in the generic
+    # kernel (the accumulator and reduction result receive incompatible
+    # encodings).  Advanced indexing and reduction are supported by the XPU
+    # runtime, so compute the same sampled dot product directly on-device.
+    if _is_xpu_runtime():
+        row_ids = prepared.row_ids.to(torch.int64)
+        vals = torch.sum(x[row_ids] * y[prepared.indices.to(torch.int64)], dim=1)
+        vals = vals * float(alpha)
+        if data is not None:
+            vals = vals + float(beta) * data
+        out.copy_(vals.to(out.dtype))
+        return out, {
+            "block_p": None,
+            "block_k": None,
+            "num_warps": None,
+            "fallback_used": True,
+            "variant": variant,
+            "acc_dtype": "float64" if x.dtype == torch.float64 else "float32",
+            "out_dtype": str(out.dtype).replace("torch.", ""),
+        }
+
     k_dim = int(x.shape[1])
     mean_row_len = nnz / prepared.n_rows if prepared.n_rows > 0 else float(nnz)
     block_p, block_k, num_warps = _resolve_sddmm_launch_config(

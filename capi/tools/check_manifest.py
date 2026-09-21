@@ -9,7 +9,7 @@ working directory. The repo-root `conf/operators.yaml` is the Python side's
 delivery registry (`delivery_variants`, loaded by tools/delivery_variants.py);
 this one is the C API manifest: paths, c_api symbols, formats, dtypes, baselines.
 
-The manifest is the declared operator list -- 40 variants today, 115 later -- and
+The manifest is the declared operator list -- 60 variants today (20 of them delivery), 115 later -- and
 everything else in the repo is supposed to follow it. Nothing enforces that today,
 so it has drifted in BOTH directions: it declares variants nothing tests, and the
 code supports variants it still calls pending. This prints every such disagreement.
@@ -25,7 +25,7 @@ Four checks, each answering a different question:
 check that cannot run says so rather than passing silently.
 
 Usage:
-    python3 tools/check_manifest.py [--bench-dir DIR] [--strict]
+    python3 tools/check_manifest.py [--bench-dir DIR] [--scope all|delivery] [--strict]
 
 --strict exits non-zero on any drift, for CI.
 """
@@ -76,18 +76,28 @@ def load_manifest():
         return yaml.safe_load(fh), path
 
 
-def declared_variants(manifest):
+def declared_variants(manifest, scope="all"):
     """(op_id, format_tag, dtype_tag) for every variant the manifest declares.
 
     An entry with no formats or no dtypes (the descriptor-API and constructor
     groups) declares no variants; it is still checked for paths and symbols.
+
+    ``scope="delivery"`` keeps only the delivery variants: entries marked
+    `reporting: delivery`, narrowed to `delivery_dtypes` where that is set. A run
+    that launches only the delivery benchmark families (run_flagsparse_split_
+    delivery.py) never measures the retained ones, and under ``scope="all"`` would
+    report every one of them as NOT MEASURED.
     """
     out = []
     for op in manifest["operators"]:
         if op.get("status") != "implemented":
             continue
+        if scope == "delivery" and op.get("reporting") != "delivery":
+            continue
         fmts = op.get("formats") or []
         dts = op.get("dtypes") or []
+        if scope == "delivery" and op.get("delivery_dtypes"):
+            dts = op["delivery_dtypes"]
         for f in fmts:
             for d in dts:
                 out.append(
@@ -132,8 +142,12 @@ def check_symbols(manifest):
     return bad
 
 
-def tested_variants(bench_dir):
+def tested_variants(bench_dir, scope="all"):
     """(op_id-ish, format, dtype) actually present in benchmark JSON rows.
+
+    ``scope="delivery"`` reads only rows tagged `reporting: delivery`, the same
+    filter write_summary.py applies, so the retained variants a family also sweeps
+    (spmv's complex and csc/bsr rows) are not reported as undeclared.
 
     Rows are keyed by the tags the benchmarks emit, not by manifest id: one
     benchmark binary covers several manifest entries (test_spmv covers spmv_csr
@@ -154,6 +168,8 @@ def tested_variants(bench_dir):
             dt = row.get("dtype")
             if not fmt or not dt:
                 continue
+            if scope == "delivery" and row.get("reporting") != "delivery":
+                continue
             found.setdefault((family, fmt, dt), []).append(row.get("status"))
     return found
 
@@ -166,6 +182,14 @@ def main():
         default=pathlib.Path("capi_results"),
         help="directory of *_benchmark.json (default: capi_results/)",
     )
+    ap.add_argument(
+        "--scope",
+        choices=("all", "delivery"),
+        default="all",
+        help="which variants the coverage check expects a row for: every declared "
+        "one (default), or only the delivery variants -- use the latter after a "
+        "run that launched only the delivery benchmark families",
+    )
     ap.add_argument("--strict", action="store_true")
     args = ap.parse_args()
 
@@ -173,7 +197,7 @@ def main():
     print(f"manifest: {mpath.relative_to(ROOT)}")
     groups = manifest["operators"]
     impl = [o for o in groups if o.get("status") == "implemented"]
-    variants = declared_variants(manifest)
+    variants = declared_variants(manifest, args.scope)
     print(
         f"  {len(groups)} groups, {len(impl)} implemented, "
         f"{len(variants)} declared variants\n"
@@ -196,7 +220,7 @@ def main():
     drift += len(bad)
 
     print("== coverage ==")
-    tested = tested_variants(args.bench_dir)
+    tested = tested_variants(args.bench_dir, args.scope)
     if tested is None:
         print("  SKIPPED: no --bench-dir given, so no benchmark JSON to read.")
         print("  Run:  FLAGSPARSE_MATRIX_DIR=... FLAGSPARSE_BENCH_OUT=./bench \\")

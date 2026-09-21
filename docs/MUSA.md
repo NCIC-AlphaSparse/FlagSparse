@@ -20,12 +20,14 @@ python -c "import flagsparse.sparse_operations._common as C; print(C._backend_na
 
 ---
 
-## 0.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
+## 0.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
 
 **MUSA 用 `run_flagsparse_split_delivery.py`，不用 `run_flagsparse_pytest.py --phase both`。**
 Python 侧在 MUSA 上没有厂商稀疏库（第 3 节），性能阶段只有 FlagSparse 自己的耗时、没有加速比；
-muSPARSE 基线在 C API 侧。这个 runner 精度取 pytest（SciPy 参考），性能取 C API 的 `ctest -R benchmark`
-（对 muSPARSE），合成一份 `summary_split.json`。
+muSPARSE 基线在 C API 侧。这个 runner 精度取 pytest（SciPy 参考），性能取 C API 的 `ctest`
+（对 muSPARSE），合成一份 `summary_split.json`。C API 这一半只启动交付清单涉及的 5 个 benchmark 族
+（`gather`、`scatter`、`sddmm`、`spmm`、`spmv`，正则 `^benchmark\.(gather|scatter|sddmm|spmm|spmv)$`），
+`spsv` / `spsm` / `spgemm` 的 ctest 不会被拉起；构建仍然是整个 C API。
 
 **环境**：
 
@@ -51,8 +53,9 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
 
 > **拉到 2026-09-19/20 的 C API 改动后，先重新构建一次，不要加 `--skip-capi-build`。**
 > 这批改动包括 SpSV 的 MUSA 32-worker 上限、逐 case 异常隔离，以及 SpGEMM 的限制与 fallback。
-> 复用旧的 `capi/build` 会测到修复前的行为；而且这些修复目前都还没有用重新编译的二进制在真机上验证过
-> （`modified/MUSA.md` 第 16 节），所以复现前先确认二进制是新的。
+> SpSV / SpGEMM 已不在交付清单里，交付跑不会再执行它们；但复用旧的 `capi/build` 仍会带着旧的二进制，
+> 这些修复也都还没有用重新编译的二进制在真机上验证过（`modified/MUSA.md` 第 16 节），
+> 所以复现前先确认二进制是新的。
 
 **参考**：
 
@@ -61,26 +64,19 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
 | 性能 baseline | **muSPARSE**（C API 侧，`capi/docs/MUSA.md`）；Python 侧没有 |
 | 精度参考 | **CPU 上的 SciPy** —— MUSA 上 `torch.sparse` 能建 CSR/COO 张量但**没注册 sparse matmul** |
 
-**预期会看到的非 Passed**（2026-09-18 在 MTT S5000 上实测，`modified/MUSA.md` 第 13 节；
-`spgemm_csr_*`、`spsv_*` 两条的原因已被第 15、16 节取代，见下）：
+**预期会看到的非 Passed**（2026-09-18 在 MTT S5000 上实测，`modified/MUSA.md` 第 13 节，当时是 40 变体的清单）：
 
-- 精度 40/40 Passed；
+- 精度：那一轮 40/40 Passed，其中包含现在的 20 个；
 - 性能 `gather_f16_int`、`scatter_f16_int` 为 **`NoBaseline`**：内核跑通、精度通过，只是 muSPARSE 不支持
-  fp16 的 gather/scatter；
-- 性能 `spsm_csr_*` 为 `NotFound`（3600 秒超时）。
-- 性能 `spgemm_csr_*`：原先记的“C API benchmark 中 Triton 崩溃”不再成立。2026-09-19 在真实 30 矩阵、
-  f32/f64 上单独跑 C API（`modified/MUSA.md` 第 15.1 节），默认设备路径完成 25 行：14 行严格精度通过、
-  3 行 relaxed 通过、5 行病态矩阵精度失败、**20 行因单行 product work 超过 6144 标为 `not_supported`**
-  （这 20 行不是失败，也不出加速比）；14 行有真实加速比，几何平均 1.09085x。
-  `FLAGSPARSE_SPGEMM_HOST_FALLBACK=1` 能让 `msc10848`、`engine` 完成并通过 relaxed 规则，但报告里带
-  `execution=host_fallback`，**不计加速比**。C API 侧的限制说明见 `capi/docs/MUSA.md`。
-- 性能 `spsv_*`：根因见 `modified/MUSA.md` 第 16.1 节——C API 的 chain-wave 求解 kernel 曾允许最多
-  2048 个 persistent worker 在全局 ready flag 上自旋，首个 case（`2cubes_sphere`）之后 MUSA 触发
-  `MUSA_ERROR_LAUNCH_TIMEOUT`，context 失效，后面的 case 全部无法执行，所以整组记为 `NotFound`。
-  现在 `capi/src/ops/spsv.cpp` 的 `resolve_worker_count()` 在 MUSA 上限为 32 个 worker，并加了逐 case
-  异常隔离。**这两处修正尚未用重新编译的二进制在真机上重跑 30 矩阵，是否恢复以重跑结果为准。**
+  fp16 的 gather/scatter。
 
-跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
+当时另有三类状态出在**已经不交付**的算子上，这一版清单不会再出现：`spsm_csr_*` 性能 `NotFound`（3600 秒超时）、
+`spgemm_csr_*`（大部分行因单行 product work 超过 6144 标 `not_supported`）、`spsv_*` 性能 `NotFound`
+（`MUSA_ERROR_LAUNCH_TIMEOUT` 使 context 失效）。它们的根因和 2026-09-19/20 的修复记录在
+`modified/MUSA.md` 第 15、16 节和 `capi/docs/MUSA.md`，要单独验证就直接跑 C API 的 `ctest -R benchmark.spsv`
+等，不要指望交付 runner。
+
+跑完用同一个工具看 20 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
 ```bash
 python3 tools/delivery_table.py pytest_results_mthreads_split              # 加 --markdown 输出 Markdown 表
