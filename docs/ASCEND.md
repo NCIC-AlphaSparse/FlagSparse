@@ -32,7 +32,7 @@ PY
 **精度参考是 CPU 上的 SciPy**（见仓库根 `README.md` 的 `FLAGSPARSE_ACCURACY_REFERENCE`）：
 昇腾上的 torch.sparse 本身就是被测对象而不是参考。
 
-## 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
+## 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
 
 只能用 NPU 6、7。先 `npu-smi info` 确认这两张卡上没有别的任务。
 
@@ -48,7 +48,7 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --results-dir pytest_results_ascend_delivery \
   > pytest_results_ascend_delivery.log 2>&1 < /dev/null &
 
-python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：40 行结果，缺变体时退出码为 1
+python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：20 行结果，缺变体时退出码为 1
 ```
 
 **两个 timeout 不是一回事**：外层 `timeout -s KILL 43200` 是**整条命令**的总限时（12 小时），到点
@@ -56,13 +56,13 @@ python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：4
 各 3600 秒，`spmm_csr` / `sddmm_csr` 的性能是逐矩阵路径，则是每个矩阵 3600 秒。外层必须写，
 因为内核卡死时 Ctrl-C 送不进去，只能靠 `KILL`。
 
-只用一张卡时（例如 6 号，命令里写 `--gpus 6`），11 个算子在那张卡上依次串行，双卡时则分到两张卡上
+只用一张卡时（例如 6 号，命令里写 `--gpus 6`），7 个算子在那张卡上依次串行，双卡时则分到两张卡上
 交替执行，同样的工作量耗时更长。有一次单卡运行把外层限时设成 `28800`（8 小时）。**外层限时到点被杀时**，
 runner 每完成一个算子就写一次 `summary.json`，所以已完成算子的结果保留，正在跑的那个算子丢失，
 排在它后面还没轮到的算子在 `delivery_table.py` 里是 `NotFound`（缺变体，退出码为 1）。算子按
-gather、scatter、spmv_csr、spmv_coo、spmm_csr、spmm_coo、spgemm_csr、sddmm_csr、spsv_csr、spsv_coo、
-spsm_csr 的顺序执行，两个逐矩阵的重头算子在中段和靠后。本文没有记录过 Ascend 完整交付的耗时，外层限时该
-取多大要按实际情况定。
+gather、scatter、spmv_csr、spmv_coo、spmm_csr、spmm_coo、sddmm_csr 的顺序执行，两个逐矩阵的重头算子
+（spmm_csr、sddmm_csr）在中段和末尾。43200 / 28800 都是 40 变体清单时期用的值（当时还有 spgemm / spsv /
+spsm）；本文没有记录过 20 变体清单在 Ascend 上的完整耗时，外层限时该取多大要按实际情况定。
 
 runner 在 Ascend 上自动做三件事，不需要手动处理：
 
@@ -70,21 +70,23 @@ runner 在 Ascend 上自动做三件事，不需要手动处理：
   （torch_npu 不认 `CUDA_VISIBLE_DEVICES`，不设的话默认会落到物理 NPU 0）；
 - **路由**：gather / scatter / spmv_csr / spmm_csr / sddmm_csr 的性能走 `benchmark/benchmark_ascend.py`，
   对 PyTorch-NPU 计时，并通过 `--input` 拿到 `--benchmark-input` 的 30 个 `.mtx`；spmm_csr、sddmm_csr
-  每个矩阵单独一个子进程（`--timeout` 是每个矩阵的上限）。其余 6 个父算子走能力探测
+  每个矩阵单独一个子进程（`--timeout` 是每个矩阵的上限）。其余 2 个父算子（`spmv_coo`、`spmm_coo`）走能力探测
   `benchmark/benchmark_ascend_probe.py`，**只有能不能跑、没有加速比**；
 - **精度**：上面 5 个算子用 `benchmark/benchmark_ascend_accuracy.py`（每个 dtype 一个合成用例，对 SciPy），
-  其余走 `tests/pytest`，参考同样是 CPU 上的 SciPy。
+  `spmv_coo`、`spmm_coo` 走 `tests/pytest`，参考同样是 CPU 上的 SciPy。
 
 **跑完先核对真实矩阵确实传进去了**：`pytest_results_ascend_delivery/spmm_csr/performance.csv` 的 `matrix`
 列应当是 30 个 `.mtx` 文件名，而不是 `synthetic`。
 
-**预期会看到的非 Passed**（2026-09-17/18 在 910B4 上实测，`modified/ASCEND.md` 第 3、7 节）：
+**预期会看到的非 Passed**（2026-09-17/18 在 910B4 上实测，`modified/ASCEND.md` 第 3、7 节，当时是 40 变体的清单）：
 
 - float64 / complex128 的不少变体失败：NPU 对 double 的 matmul 等算子不支持（`DT_DOUBLE`）。
-  SDDMM 分块改写后 `sddmm_csr_f64` 精度已通过；
-- SpSV 在 Ascend 上是逐行求解的正确性兜底（`_spsv_ascend_row_sweep`），只支持非转置，转置/共轭用例报
-  `NotImplementedError`；它在百万行矩阵上很慢，而且性能走探测脚本，**不要**把它的耗时当成内核性能；
-- 走探测脚本的 6 个父算子，性能状态可以是 Passed，但没有加速比，`delivery_table.py` 里显示为 `-`。
+  SDDMM 分块改写后 `sddmm_csr_f64` 精度已通过；复数 spmv / spmm 已不在交付清单里；
+- 走探测脚本的 2 个父算子（`spmv_coo`、`spmm_coo`），性能状态可以是 Passed，但没有加速比，
+  `delivery_table.py` 里显示为 `-`；
+- SpSV / SpSM / SpGEMM 已不交付，它们在 Ascend 上的逐行求解兜底（`_spsv_ascend_row_sweep` 只支持非转置，
+  转置/共轭报 `NotImplementedError`，百万行矩阵上很慢）只在显式 `--ops` 指名时才会遇到，
+  且性能走探测脚本，**不要**把它的耗时当成内核性能。
 
 **`86a09cd`（2026-09-18）之前跑出的性能结果作废**，原因见 `prompt.md` 第 2 节；2026-09-17 那一轮的
 Ascend benchmark 实际用的是合成矩阵（`modified/ASCEND.md` 第 3 节），也不能当作 30 矩阵结果。

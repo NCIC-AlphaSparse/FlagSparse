@@ -23,7 +23,7 @@ Triton 内核在两个后端是同一份代码，**只有"厂商参考实现/基
 
 ---
 
-## 0.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
+## 0.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
 
 **环境自检**（三行都对了再往下）：
 
@@ -44,9 +44,12 @@ timeout -s KILL 43200 python3 run_flagsparse_pytest.py \
   --results-dir pytest_results_rocm_delivery
 ```
 
-外层给到 12 小时，是因为 SpSV/SpSM 若仍死锁（第 7 节，2026-08 在 gfx936 上实测），`spsv_csr`、
-`spsv_coo`、`spsm_csr` 的精度和性能阶段各要等满 3600 秒才记为 `Timeout`，最坏多花 6 小时。之后合入的
-ALG3 persistent 路由（4.6 节）是否已经解决死锁，**还没有在交付测试里复核**，跑完请回报这三个算子的状态。
+外层的 12 小时是 40 变体清单时期定下的：当时 SpSV/SpSM 若死锁（第 7 节，2026-08 在 gfx936 上实测），
+`spsv_csr`、`spsv_coo`、`spsm_csr` 的精度和性能阶段各要等满 3600 秒才记为 `Timeout`，最坏多花 6 小时。
+这三个算子和 `spgemm_csr` 已经不在交付清单里，`--delivery-only` 不会再跑到它们；20 个变体的完整耗时
+**没有在 DCU 上实测过**，外层限时按实际情况调整。SpSV/SpSM 的死锁状态（ALG3 persistent 路由，4.6 节）
+仍未复核，要验证就显式 `--ops spsv_csr,spsv_coo,spsm_csr`（显式 `--ops` 会跑到清单外的算子，结果不进
+`delivery_table.py` 的 20 行）。
 
 **参考**：
 
@@ -55,13 +58,11 @@ ALG3 persistent 路由（4.6 节）是否已经解决死锁，**还没有在交�
 | 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | `hipsparse`（hip-python）；fp16/bf16 没有厂商基线，回落 PyTorch（第 7 节） |
 | 精度参考（内核被比对的那个值） | **PyTorch** —— DCU 与 CUDA 是仅有的两个比对厂商库加 torch 的后端 |
 
-**预期会看到的非 Passed**：
+**预期会看到的非 Passed**：20 个交付变体里没有已知的必然失败项。此前记录的两类问题都出在已经不交付的算子上
+（SpSV/SpSM 可能 `Timeout`；`spgemm_csr` 的 `mip1.mtx` 触发 rocSPARSE 内部 SpGEMM 内核的 VMFault，见第 7 节），
+显式 `--ops` 指名它们时才会再遇到。
 
-- `spsv_*`、`spsm_csr`：可能 `Timeout`（见上）；
-- `spgemm_csr_*`：`mip1.mtx` 会触发 rocSPARSE 内部 SpGEMM 内核的 VMFault，表现为"部分性能数据 +
-  `Failed`"（第 7 节），这是 rocSPARSE 的问题，不是 Triton 内核的。
-
-跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
+跑完用同一个工具看 20 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
 ```bash
 python3 tools/delivery_table.py pytest_results_rocm_delivery              # 加 --markdown 输出 Markdown 表

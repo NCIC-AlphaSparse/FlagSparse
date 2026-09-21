@@ -37,7 +37,7 @@ FlagSparse 按运行时分发**厂商参考实现/基线**和**少数按后端�
 
 ---
 
-## 0.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
+## 0.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
 
 **环境**（每次开工，第 1 节有逐项说明）：
 
@@ -56,29 +56,24 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --op-benchmark-args='sddmm_csr=--no-cusparse' \
-  --op-benchmark-args='spsv_coo=--alg-num 4' \
   --results-dir pytest_results_metax_delivery \
   > pytest_results_metax_delivery.log 2>&1 < /dev/null &
 ```
 
 - `--op-benchmark-args='sddmm_csr=--no-cusparse'`：C550 上没有可用的厂商稀疏库，且 SDDMM 的
   `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
-  `--benchmark-args` 会广播给所有性能脚本；SpSV 不接受 `--no-cusparse`，不能在这里使用全局参数；
-- `--op-benchmark-args='spsv_coo=--alg-num 4'`：MACA 侧实测 `spsv_coo` 的性能阶段要固定 ALG4
-  （`csr_smblk`）才能跑出结果，见 5.1 节。它只传给 `spsv_coo` 的性能脚本，排在 `--delivery-only`
-  自动加的 `--index-dtypes int32 --ops NON` 之后，两者叠加，不会互相覆盖；精度阶段不受影响。
-  这一项**只能写在命令行上，不能放进 runner 的 `DELIVERY_BENCHMARK_ARGS`**：那张表对所有后端生效，
-  而 `--alg-num 4` 在 MUSA、Ascend 上不可用（它们只有 ALG1）；
-- `--timeout 4500`：`--delivery-only` 已把 spmv/spmm/spsv 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
+  `--benchmark-args` 会广播给所有性能脚本，而其他脚本不一定接受 `--no-cusparse`，所以用逐算子的形式；
+- `--timeout 4500`：`--delivery-only` 已把 spmv/spmm 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
   不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
   跑满 4 个 K 的后端**不可直接比较**，报告里要注明；
-- 外层 11 小时（`timeout -s KILL 39600`）、`setsid` 后台：三角类算子在 C550 上可能挂死（第 5 节），
-  挂死时只能靠 KILL。它是**整条命令**的总限时，到点强制杀掉整个进程；内层 `--timeout 4500` 是每个算子
-  每个阶段的限时（`spgemm_csr` 的性能阶段按 float32、float64 拆成两个子进程，各有一份，上限是两倍）。
+- 外层 11 小时（`timeout -s KILL 39600`）、`setsid` 后台：内核一旦卡死，Ctrl-C 送不进去，只能靠 KILL。
+  它是**整条命令**的总限时，到点强制杀掉整个进程；内层 `--timeout 4500` 是每个算子每个阶段的限时。
+  这个数是 40 变体清单时期定的（当时含三角求解类算子，它们在 C550 上可能挂死，第 5 节）；现在的 7 个父算子
+  **没有在 C550 上按 20 变体清单完整计时过**，外层限时按实际调整。
   外层到点时，已完成算子的结果保留（每完成一个算子就写一次 `summary.json`），正在跑的算子丢失，
   还没轮到的在 `delivery_table.py` 里是 `NotFound`；算子按 gather、scatter、spmv_csr、spmv_coo、
-  spmm_csr、spmm_coo、spgemm_csr、sddmm_csr、spsv_csr、spsv_coo、spsm_csr 的顺序执行。
+  spmm_csr、spmm_coo、sddmm_csr 的顺序执行。
 
 **参考**：
 
@@ -89,10 +84,9 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
 
 精度不走 torch.sparse 是有实测原因的：MACA 的 fp32 CSR 路径会返回非有限值，拿它当参考会把好内核报成错的。
 
-**预期会看到的非 Passed**：`spsv_*` 在走到 `csr_cw`（ALG1，unit 对角）时可能非法访存或挂死，
-记为 `Error` / `Timeout`（第 5 节）；`spsm_csr` 已改走 MetaX 的 SMBLK 路径。**不要**用 CPU 求解顶替。
-所有加速比的分母都是 PyTorch，不能和
-CUDA/MUSA 对厂商库的数放在一起比。
+**预期会看到的非 Passed**：20 个交付变体里没有已知的必然失败项。三角求解类（`spsv_*`、`spsm_csr`，第 5 节的
+`csr_cw` 非法访存 / 挂死）和 `spgemm_csr` 已不在交付清单里，`--delivery-only` 不会再跑到它们。
+所有加速比的分母都是 PyTorch，不能和 CUDA/MUSA 对厂商库的数放在一起比。
 
 runner 的精度阶段总是先收集整个 `tests/pytest`，而 `test_spmv_csr_accuracy.py` 在**导入时**就读
 `tests/data/spmv_csr_regressions.json`。这个文件曾在 09-18 被一次 revert 删掉，测试却留了下来，
@@ -103,13 +97,11 @@ runner 的精度阶段总是先收集整个 `tests/pytest`，而 `test_spmv_csr_
 SMBLK 的实现、精度覆盖、性能运行状态和完整后台命令记录在
 [modified/MACA.md](../modified/MACA.md)。
 
-`--delivery-only` 时，`spsv_csr` / `spsv_coo` 的精度阶段还会给 pytest 加
-`-k "non_trans and int32 and not unit"`，只**执行** `int32 + NON + 非单位对角`（含下三角和上三角）的
-用例；单位对角、转置和共轭是公共 API 的全量回归覆盖，不属于这 40 个变体。这是在执行阶段就不跑，
-而不只是事后不计入：C550 上单位对角会走到 `csr_cw` 的已知缺陷（非法访存或挂死）。这条筛选排在
-`--pytest-args` 之前，你自己传 `-k` 会覆盖它；不带 `--delivery-only` 的全量精度运行不受影响。
+runner 里仍保留一条只对 `spsv_csr` / `spsv_coo` 生效的 `-k "non_trans and int32 and not unit"` 筛选，
+但它只在显式 `--ops spsv_csr,... --delivery-only` 时才会起作用：这两个算子已不在交付清单里，
+默认的 `--delivery-only` 选不到它们。要在 C550 上单独复核 SpSV，见 5.1 节。
 
-跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
+跑完用同一个工具看 20 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
 
 ```bash
 python3 tools/delivery_table.py pytest_results_metax_delivery              # 加 --markdown 输出 Markdown 表
@@ -391,9 +383,9 @@ CPU 求解和 host/device 拷贝。设备内核崩溃或挂死时，结果应如
 
 ### 5.1 SpSV COO 固定 ALG4
 
-交付复现（第 0.5 节）的命令**已经带上** `--op-benchmark-args='spsv_coo=--alg-num 4'`，跑交付时
-不需要再单独执行本节。下面只是需要单独复跑 `spsv_coo` 时的写法：用 `--ops spsv_coo` 代替
-`--delivery-only`，所以要自己写出 `--index-dtypes int32 --ops NON` 来收窄到交付口径。
+`spsv_coo` 已不在交付清单里（第 0.5 节的命令不再带它），但 MACA 侧的实测结论保留：`spsv_coo` 的性能阶段要固定
+ALG4（`csr_smblk`）才能跑出结果。下面是单独复跑 `spsv_coo` 的写法：用 `--ops spsv_coo` 显式指名（不加
+`--delivery-only`），所以要自己写出 `--index-dtypes int32 --ops NON` 来收窄到 int32 + non。
 `tests/test_spsv.py --csv-coo` 是 runner 对 `spsv_coo` 用的性能脚本，`--alg-num 4` 让它固定走
 `csr_smblk`（ALG4）。命令同时执行精度和性能，性能输入为 `/root/gcx/matrix` 中的 30 个矩阵：
 
@@ -581,7 +573,7 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --g
 
 ### 7.4 交付性能：只跑交付范围（2026-09-18 实测）
 
-7.1–7.3 是**全量** sweep。交付的 40 个变体只要 `int32` 索引和 `non` 操作，而默认 sweep 远大于此，
+7.1–7.3 是**全量** sweep。交付的 20 个变体只要 `int32` 索引和 `non` 操作，而默认 sweep 远大于此，
 `--timeout 900`（每个父算子每个阶段）下实测跑不完：
 
 | 父算子 | 默认 CSV sweep | 900 秒内进度 | 推断全量耗时 |

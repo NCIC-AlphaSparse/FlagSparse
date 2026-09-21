@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Run the 40-variant delivery report with accuracy from pytest and
-performance from the C API.
+"""Run the delivery report (the variants in conf/operators.yaml) with accuracy
+from pytest and performance from the C API.
 
 Why split: on a backend with no Python-side vendor sparse library -- MUSA is
 the first case, torch.sparse has no working matmul there, see
@@ -27,11 +27,16 @@ harness hardcodes its own warmup/iters (capi/ctest/common.hpp: kWarmup=10,
 kIters=100) with no env/CLI override, so a flag that implied control over it
 would be misleading.
 
-This always runs the full 40-variant delivery set on both sides (no
---ops/--delivery-only): narrowing one side without the other would produce a
-report where the two halves cover different variants, and prompt.md's rule
-against trimming the 40-variant list to dodge a failing operator applies
-here too.
+This always runs the full delivery set on both sides (no --ops/--delivery-only):
+narrowing one side without the other would produce a report where the two halves
+cover different variants, and prompt.md's rule against trimming the delivery list
+to dodge a failing operator applies here too. "The full delivery set" is the
+registry's, on both sides: the pytest half runs the registry's parent operators
+(--delivery-only), and the C API half runs only the benchmark binaries whose
+family carries a `reporting: delivery` variant in capi/conf/operators.yaml. An
+operator that is not delivered (spsv, spsm, spgemm since 2026-09-21) is therefore
+never launched -- on MUSA a SpSV benchmark can take the whole GPU context down
+with it, which would cost every later case its result.
 
 Run from the repository root:
 
@@ -88,7 +93,7 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None, check: bool = Fals
 
 
 def run_pytest_accuracy(args: argparse.Namespace, results_dir: Path) -> int:
-    """40-variant accuracy via run_flagsparse_pytest.py; SciPy reference on
+    """Delivery-variant accuracy via run_flagsparse_pytest.py; SciPy reference on
     non-CUDA backends is that script's own default, not something this
     wrapper sets."""
     cmd = [
@@ -136,8 +141,39 @@ def configure_and_build_capi(args: argparse.Namespace) -> int:
     return run(["cmake", "--build", str(PROJECT_ROOT / args.capi_build_dir), "-j"], check=True)
 
 
+def delivery_ctest_regex() -> tuple[str, list[str]]:
+    """The `ctest -R` pattern for the benchmark binaries that carry delivery
+    variants, and the families it names.
+
+    ctest names its cases `<phase>.<family>` (capi/ctest/CMakeLists.txt), so
+    `benchmark` alone -- what this ran before -- launched every family, delivered
+    or not. The families come from the same manifest, through the same function,
+    that generates the variant registry the benchmarks sweep
+    (capi/tools/gen_variants.py), so the two cannot disagree about which family
+    owns which operator.
+    """
+    import importlib.util
+
+    import yaml
+
+    spec = importlib.util.spec_from_file_location(
+        "_capi_gen_variants", CAPI_SRC_DIR / "tools" / "gen_variants.py"
+    )
+    gen_variants = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen_variants)
+    manifest = yaml.safe_load(
+        (CAPI_SRC_DIR / "conf" / "operators.yaml").read_text(encoding="utf-8")
+    )
+    families = gen_variants.benchmark_families(manifest, "delivery")
+    if not families:
+        raise SystemExit(
+            "capi/conf/operators.yaml marks no operator `reporting: delivery`"
+        )
+    return r"^benchmark\.(" + "|".join(families) + r")$", families
+
+
 def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
-    """40-variant performance via `ctest -R benchmark`, vendor baseline
+    """Delivery-variant performance via `ctest -R benchmark.<family>`, vendor baseline
     (muSPARSE on MUSA -- capi/ctest/baseline/<backend>/baseline.cpp), then
     project onto the delivery list the same way capi/docs/MUSA.md's own
     recipe does (tools/write_summary.py + tools/check_manifest.py)."""
@@ -145,9 +181,11 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     env = dict(os.environ)
     env["FLAGSPARSE_MATRIX_DIR"] = str(Path(args.benchmark_input).resolve())
     env["FLAGSPARSE_BENCH_OUT"] = str(bench_out.resolve())
+    pattern, families = delivery_ctest_regex()
+    print(f"ctest: running the delivery benchmark families {families}", flush=True)
     rc = run(
         ["ctest", "--test-dir", str(PROJECT_ROOT / args.capi_build_dir),
-         "-R", "benchmark", "--output-on-failure"],
+         "-R", pattern, "--output-on-failure"],
         env=env,
     )
     run([sys.executable, str(CAPI_SRC_DIR / "tools" / "write_summary.py"),
@@ -155,6 +193,9 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     check_manifest_cmd = [
         sys.executable, str(CAPI_SRC_DIR / "tools" / "check_manifest.py"),
         "--bench-dir", str(bench_out),
+        # Only the delivery families were launched (delivery_ctest_regex), so the
+        # retained variants of the others have no rows by design.
+        "--scope", "delivery",
     ]
     if args.strict:
         check_manifest_cmd.append("--strict")

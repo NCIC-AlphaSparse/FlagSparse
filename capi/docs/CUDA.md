@@ -43,7 +43,7 @@ ctest --test-dir build -R spsv               # 一个算子的三份一起
 FLAGSPARSE_MATRIX_DIR=/path/to/mtx FLAGSPARSE_BENCH_OUT=./bench \
     ctest --test-dir build -R benchmark
 
-# 汇总成一张 40 变体的表，以及与 FlagSparse Python 侧同 schema 的 summary.json
+# 汇总成一张 20 变体的交付表（加 --all 看全部 60 个），以及与 FlagSparse Python 侧同 schema 的 summary.json
 python3 tools/report.py --bench-dir ./bench
 python3 tools/write_summary.py --bench-dir ./bench --out ./bench
 ```

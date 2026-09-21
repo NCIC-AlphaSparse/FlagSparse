@@ -36,10 +36,11 @@ pip install . --no-deps --no-build-isolation
 pip install torch triton cupy-cuda12x
 ```
 
-## 复现交付测试（40 个变体 × 30 个矩阵）
+## 复现交付测试（20 个变体 × 30 个矩阵）
 
-交付物就是这一轮跑出的 `summary.json`：`conf/operators.yaml` 里登记的 **40 个交付变体**
-（`delivery_variants`；交付清单共 42 个，`sddmm_csr` 的 c32/c64 等复数内核）的**精度和性能**，
+交付物就是这一轮跑出的 `summary.json`：`conf/operators.yaml` 里登记的 **20 个交付变体**
+（`delivery_variants`：gather、scatter 的 f16/f32/f64/c32/c64，以及 spmv_csr、spmv_coo、spmm_csr、
+spmm_coo、sddmm_csr 的 f32/f64）的**精度和性能**，
 性能用一个装有 **30 个 MatrixMarket 矩阵**的目录测，热身 5 次、计时 20 次。各后端用同一条命令，
 下表列出各后端要改的地方，完整做法见各 `docs/<后端>.md` 的"交付复现"一节。
 
@@ -52,24 +53,24 @@ timeout -s KILL 21600 python3 run_flagsparse_pytest.py \
   --benchmark-input <30 个 .mtx 所在目录> --benchmark-warmup 5 --benchmark-iters 20 \
   --results-dir pytest_results_<后端>_delivery
 
-python3 tools/delivery_table.py pytest_results_<后端>_delivery      # 打印 40 行结果表，缺变体时退出码为 1
+python3 tools/delivery_table.py pytest_results_<后端>_delivery      # 打印 20 行结果表，缺变体时退出码为 1
 ```
 
 | 参数 | 为什么不能省 |
 |---|---|
-| `--delivery-only` | 只跑 40 个变体背后的 11 个父算子，并把每个 benchmark 的 sweep 收窄到交付范围（int32 索引、`non` 操作）。不加会读 18 个算子的超集，并跑完整的 int64/trans/conj 组合 |
+| `--delivery-only` | 只跑 20 个变体背后的 7 个父算子，并把每个 benchmark 的 sweep 收窄到交付范围（int32 索引、`non` 操作）。不加会读 18 个算子的超集，并跑完整的 int64/trans/conj 组合 |
 | `--mode normal` | `quick` 每类 shape 只留一个，少跑约四成用例，还恰好跳过两个历史上出过问题的用例 |
 | `--timeout 3600` | 每个算子每个阶段的超时（逐矩阵运行的路径是每个矩阵）。默认 `0` 表示内核挂住就永远等下去 |
-| 外层 `timeout -s KILL` | 三角求解死锁时进程卡在驱动里，Ctrl-C 送不进去 |
+| 外层 `timeout -s KILL` | 内核卡死时进程卡在驱动里，Ctrl-C 送不进去 |
 
 | 后端 | 运行前设置 | 与上面命令的差别 | 加速比的分母 | 精度参考 | 完整做法 |
 |---|---|---|---|---|---|
 | CUDA | 无（需 `pip install cupy-cuda12x`） | 无 | cuSPARSE（CuPy） | cuSPARSE + torch | 本节 |
-| DCU / ROCm | `pip install hip-python` | SpSV/SpSM 可能死锁（结果记为 `Timeout`） | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) 0.5 节 |
-| 沐曦 C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch` | 加 `--op-benchmark-args='sddmm_csr=--no-cusparse' --op-benchmark-args='spsv_coo=--alg-num 4'`；SDDMM 的 K sweep 要 `--timeout 4500` | PyTorch | SciPy（CPU） | [docs/MACA.md](docs/MACA.md) 0.5 节 |
+| DCU / ROCm | `pip install hip-python` | 无 | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) 0.5 节 |
+| 沐曦 C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch` | 加 `--op-benchmark-args='sddmm_csr=--no-cusparse'`；SDDMM 的 K sweep 要 `--timeout 4500` | PyTorch | SciPy（CPU） | [docs/MACA.md](docs/MACA.md) 0.5 节 |
 | 摩尔线程 | `FLAGSPARSE_BACKEND=mthreads` | 改用 `run_flagsparse_split_delivery.py`（性能取自 C API） | muSPARSE（C API） | SciPy（CPU） | [docs/MUSA.md](docs/MUSA.md) 0.5 节 |
-| 昇腾 910B | CANN 的 `set_env.sh`；`FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | 只能用 `--gpus 6,7` | PyTorch-NPU（5 个算子；其余只做能力探测） | SciPy（CPU） | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
-| 昆仑芯 XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | 无 | PyTorch-XPU（7 个算子；其余只做能力探测） | SciPy（CPU） | [docs/XPU.md](docs/XPU.md) 1.5 节 |
+| 昇腾 910B | CANN 的 `set_env.sh`；`FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | 只能用 `--gpus 6,7` | PyTorch-NPU（5 个算子；`spmv_coo`、`spmm_coo` 只做能力探测） | SciPy（CPU） | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
+| 昆仑芯 XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | 无 | PyTorch-XPU（7 个算子） | SciPy（CPU） | [docs/XPU.md](docs/XPU.md) 1.5 节 |
 
 **`86a09cd`（2026-09-18）之前跑出的结果不能拿来比较**：旧版把 int64、trans/conj 的行也平均进了
 `..._int_non` 变体，还把没有加速比的行当作 0。请用当前 runner 重跑，见 `prompt.md` 第 2 节。
@@ -77,7 +78,8 @@ python3 tools/delivery_table.py pytest_results_<后端>_delivery      # 打印 4
 `summary.json` 里各状态的含义：`Passed` / `Failed` 为实测结果；`Timeout` 表示算子跑了但触发了
 `--timeout`；`NotFound` 表示没有该变体的行（没跑，或本后端没有配置）；`NoBaseline`（C API）表示
 内核跑通且精度通过，只是厂商库没有这个 dtype/算子可比。CUDA 上（RTX 5090，2026-09-17，sweep
-收窄之前）全程 79 分钟，最慢的是 SpSV 和 SpGEMM，各约 20 分钟。
+收窄之前，当时的清单是 40 个变体）全程 79 分钟，最慢的是 SpSV 和 SpGEMM，各约 20 分钟；
+这两个现在都不在 20 个变体的清单里，整份清单还没有完整计时过。
 
 精度阶段的 `Skipped`：**有通过、无失败时，只因“能力边界”而跳过的用例不会把状态降成 `Skipped`**，
 它们仍计入 `skipped` 并列在 `details.skipped` 里。目前豁免的只有两条原因
@@ -215,16 +217,17 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 
 看时间数据前先确认没有别的任务在争抢 GPU。
 
-**5. 统一运行器。** 交付测试用[复现交付测试](#复现交付测试40-个变体--30-个矩阵)一节的命令。
-其中的 `--timeout 3600` 保证死锁的 SpSV/SpSM 不会让整轮停摆：该算子记为 `Timeout`，然后继续往下跑。
-注意 `--gpus 0,1` 单独用没有用 —— 它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样要等到超时。
+**5. 统一运行器。** 交付测试用[复现交付测试](#复现交付测试20-个变体--30-个矩阵)一节的命令。
+其中的 `--timeout 3600` 保证卡住的算子不会让整轮停摆：该算子记为 `Timeout`，然后继续往下跑。
+在 DCU 上会死锁的 SpSV/SpSM 已不在交付清单里，但显式 `--ops spsv_csr,...` 仍会跑到它们；
+那时 `--gpus 0,1` 单独用没有用 —— 它只是把算子分成两条队列，含 SpSV/SpSM 的那条照样要等到超时。
 
 DCU 上的完整验证流程（环境检查、旧安装包陷阱、如何确认真的走了 hipSPARSE、
 已知限制、排查速查表）见 [docs/DCU.md](docs/DCU.md)。
 
 ### 在 MetaX / MACA C550 上跑测试
 
-**交付测试**（40 个变体）用[复现交付测试](#复现交付测试40-个变体--30-个矩阵)一节的命令，
+**交付测试**（20 个变体）用[复现交付测试](#复现交付测试20-个变体--30-个矩阵)一节的命令，
 按表中沐曦那一行设置；确切命令见 [docs/MACA.md](docs/MACA.md) 0.5 节。
 
 下面这条是另一回事：连同 CSC、BSR 等其他算子一起的**全量 sweep**，PyTorch 基线，30 个
@@ -255,7 +258,7 @@ BSR 脚本会保留已完成的 `PASS`/`FAIL` case、重试此前的 `ERROR` cas
 
 ### 在昇腾 910B 上跑测试
 
-只能使用 6、7 号 NPU。交付测试用[复现交付测试](#复现交付测试40-个变体--30-个矩阵)一节的命令，
+只能使用 6、7 号 NPU。交付测试用[复现交付测试](#复现交付测试20-个变体--30-个矩阵)一节的命令，
 按表中昇腾那一行设置；确切命令、以 PyTorch-NPU 为基线的 5 个算子（其余只做能力探测）、
 环境检查和已知限制见 [docs/ASCEND.md](docs/ASCEND.md)。
 
@@ -264,7 +267,7 @@ BSR 脚本会保留已完成的 `PASS`/`FAIL` case、重试此前的 `ERROR` cas
 | 路径 | 是什么 |
 | --- | --- |
 | `src/flagsparse/` | 核心包。`sparse_operations/` 下每个算子只有**一份共享实现**；`sparse_operations/backends/<后端>/` 是**默认为空**的覆盖层，只有真正分叉的文件才会出现在里面 |
-| `conf/operators.yaml` | 算子清单，也是 **40 个已登记交付变体**（交付清单共 42 个，`sddmm_csr` 的 c32/c64 等复数内核）（`gather_f32_int`、`spmv_csr_f32_int_non` …）的单一真源。Python 侧和 C API 侧都通过 `tools/delivery_variants.py` 读它 |
+| `conf/operators.yaml` | 算子清单，也是 **20 个已登记交付变体**（`gather_f32_int`、`spmv_csr_f32_int_non` …）的单一真源。Python 侧和 C API 侧都通过 `tools/delivery_variants.py` 读它 |
 | `run_flagsparse_pytest.py` | 统一 runner：逐算子跑精度与性能，产出按变体名做键的 `summary.json` / `summary.csv` / `result.html` |
 | `tests/pytest/` | 精度用例（各后端共用；golden reference 恒在 CPU） |
 | `tests/ci/` | 策略与契约测试，不需要 GPU |

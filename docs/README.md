@@ -24,7 +24,7 @@
 走共享实现。没有覆盖不等于不能跑，只是没人在真机上验过，也就没有可写的文档。
 
 **`XPU.md` 的实测最少**：DCU / MACA / MUSA / ASCEND 都有完整的实机验证结果；XPU 在 P800 上有
-2026-09-17/18 的有限实测和一轮 40 变体精度，性能还没有可用的交付数据，文件顶部标了出来。
+2026-09-17/18 的有限实测和一轮 40 变体精度（当时的清单，现已缩成 20 个），性能还没有可用的交付数据，文件顶部标了出来。
 
 `cuda` 没有单独文件是因为它是参照路径 —— 环境、跑法、算子清单都在仓库根的
 `README.md` / `README_cn.md` 里，后端文档只记"与 CUDA 不同的地方"。
@@ -32,7 +32,7 @@
 > **从 `flpagsparse_cwrapper` 过来的？** 那个仓库的全部内容已于 2026-09-18 合并进本仓库，
 > 之后的工作都在这里做。背景、切换步骤和当初的合并方式见 [`REPO_MIGRATION.md`](REPO_MIGRATION.md)。
 
-## 交付复现入口（40 个变体 × 30 个矩阵）
+## 交付复现入口（20 个变体 × 30 个矩阵）
 
 通用命令、参数说明和各后端差异的总表在仓库根 [`README_cn.md`](../README_cn.md) 的"复现交付测试"一节
 （英文版 [`README.md`](../README.md) "Reproducing the delivery run"）。各后端的确切命令、环境自检和预期会看到的
@@ -41,11 +41,11 @@
 | 后端 | 章节 | 与通用命令的主要差别 |
 |---|---|---|
 | CUDA | 仓库根 README 的那一节 | 无 |
-| DCU | [`DCU.md`](DCU.md) 0.5 节 | SpSV/SpSM 可能死锁（记为 `Timeout`），外层超时给足 |
+| DCU | [`DCU.md`](DCU.md) 0.5 节 | 外层超时给足 |
 | MACA | [`MACA.md`](MACA.md) 0.5 节 | `--no-cusparse`，`--timeout 4500`（SDDMM 的 K sweep） |
 | MUSA | [`MUSA.md`](MUSA.md) 0.5 节 | 改用 `run_flagsparse_split_delivery.py`，性能取自 C API（muSPARSE） |
-| Ascend | [`ASCEND.md`](ASCEND.md) "交付复现" | 只用 `--gpus 6,7`；5 个算子对 PyTorch-NPU，其余只做能力探测 |
-| XPU | [`XPU.md`](XPU.md) 1.5 节 | `FLAGTREE_BACKEND=xpu` 等环境变量；7 个算子对 PyTorch-XPU，其余只做能力探测 |
+| Ascend | [`ASCEND.md`](ASCEND.md) "交付复现" | 只用 `--gpus 6,7`；5 个算子对 PyTorch-NPU，`spmv_coo` / `spmm_coo` 只做能力探测 |
+| XPU | [`XPU.md`](XPU.md) 1.5 节 | `FLAGTREE_BACKEND=xpu` 等环境变量；7 个算子全部对 PyTorch-XPU 计时 |
 
 跑完统一用 `python3 tools/delivery_table.py <结果目录>` 看结果。
 

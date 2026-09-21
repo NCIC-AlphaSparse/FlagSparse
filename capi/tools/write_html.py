@@ -10,7 +10,7 @@ would have nowhere to land. So the layout is reproduced (environment table, stat
 filter, sortable columns, one row per entry) while the columns follow the data.
 
 ONE ROW PER VARIANT. `summary.json` is keyed by delivery-list name
-(`spmv_csr_f32_int_non`), which is how 算子列表注册修改.xlsx names them, so the 40
+(`spmv_csr_f32_int_non`), which is how the delivery list (fork/list.xlsx) names them, so the
 rows fall out of the format rather than being forced into it.
 
 Usage:

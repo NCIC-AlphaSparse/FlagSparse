@@ -61,10 +61,12 @@ ctest --test-dir build -L cuda --output-on-failure
 ## 交付变体清单
 
 Python runner 与本目录的 `tools/write_summary.py` 都读取同一份顶层清单：
-`../conf/operators.yaml` 的 `delivery_variants` 字段。当前登记 40 个变体（交付清单共 42 个，`sddmm_csr` 的 c32/c64 等复数内核，见下文"三份文件，三种口径"），两个 `summary.json` 的
+`../conf/operators.yaml` 的 `delivery_variants` 字段。当前登记 20 个变体（gather / scatter 的 f16、f32、f64、c32、c64 各一，spmv / spmm 的 CSR 与 COO 各 f32、f64，
+sddmm_csr 的 f32、f64），两个 `summary.json` 的
 `result` key 集合完全相同。未运行的变体保留 key 并标为 `NotFound`，不从其他 dtype 或
 算子借用结果。后续扩展时先向该清单加入一个带 `id`、`operator`、`format`、`dtype` 的条目，
-再接测试和 benchmark 生产端。
+再接测试和 benchmark 生产端，并在 `../capi/conf/operators.yaml` 里把对应算子标成 `reporting: delivery`
+（`tests/ci` 会核对两份清单一致）。
 
 ## 这个库离不开 FlagSparse
 
@@ -228,22 +230,19 @@ JIT 里一句 `number of argument mismatch`，两个副本的名字一个都没�
 
 | 文件 | 内容 | 作用 |
 |---|---|---|
-| `算子列表注册修改.xlsx`（仓库外） | 40 个变体，"新算子列表"一列；**漏了 gather/scatter 的 f16**（见下） | 交付口径的原始来源 |
+| `fork/list.xlsx`（仓库外） | 20 个变体，2026-09-21 起的交付清单 | 交付口径的原始来源 |
 | `算子对比结果_合并变体.csv`（仓库外） | 115 个变体，含 trans/conj/col 布局 | 对齐 cuSPARSE 的完整矩阵，未来目标 |
 | `conf/operators.yaml`（本仓库） | 22 个算子组 → 60 个变体 | 实现细节 + 归属标记 |
 
 三个数不是包含关系，别混：**115** 是完整口径（含 `non`/`trans`/`conj` 与 row/col 布局），
-**60** 是本仓库能生成的变体（已登记交付 40 + 保留 20）。
+**60** 是本仓库能生成的变体（已登记交付 **20** + 保留 **40**）。
 
-**交付清单是 42 个，已登记、会出报告的是 40 个**，两者的差别说清楚：
+**交付清单曾经是 40 个**（2026-09-18，`算子列表注册修改.xlsx`，加上 gather/scatter 的 f16 两条补录），
+2026-09-21 换成 `fork/list.xlsx` 的 20 个。退出交付的是：spmv / spmm 的复数变体、`spgemm_csr`、`spsv_csr`、
+`spsv_coo`、`spsm_csr`。它们**没有被删除**，在清单里改标为 `retained`（见下）。原先"清单要 42 个、
+sddmm_csr 的复数变体缺内核"那条缺口随之消失：新清单里 sddmm_csr 只要 f32、f64。
 
-| | 个数 | 组成 |
-|---|---|---|
-| 交付清单 | **42** | xlsx 的 40 + `gather_f16_int` + `scatter_f16_int`。xlsx 漏写了这两个 f16，属于清单的笔误（2026-09-18 与需求方确认），它们**是交付算子**，不是清单外的附加项 |
-| 已登记（`delivery_variants`） | **40** | 交付清单 42 − `sddmm_csr_c32_int_non_non_row` − `sddmm_csr_c64_int_non_non_row` |
-| 待补 | **2** | 上面两个 sddmm 复数变体：交付清单要，但**还没有复数 SDDMM 内核**（实测 `x dtype must be torch.float32 or torch.float64`）。内核补上后再在 `delivery_variants` 里登记，报告随之变成 42 行 |
-
-所以现在报告里的"40/40"读作**交付清单 42 个中已实现的 40 个全部通过**，不是"交付清单全部通过"。
+所以现在报告里的"20/20"读作**交付清单的 20 个变体全部通过**。
 
 ### `reporting` 字段
 
@@ -254,11 +253,13 @@ JIT 里一句 `number of argument mismatch`，两个副本的名字一个都没�
   reporting: delivery          # 在交付清单里，进默认报告
 - id: spmv_csc
   reporting: retained          # 有实现、ctest/accuracy 有覆盖，但不进默认报告
-- id: spsm_csr
+- id: spmv_csr
   reporting: delivery
   delivery_dtypes: [f32, f64]  # 内核也支持复数，但交付清单只要这两档
-- id: sddmm_csr
-  delivery_gaps: [c64, c128]   # 交付清单要，但没有内核
+- id: spsv_csr
+  reporting: retained          # 2026-09-21 起不再交付；照常构建、照常测试
+- id: some_op
+  delivery_gaps: [c64, c128]   # 交付清单要，但没有内核（目前没有算子在用这个字段）
 ```
 
 `retained` **不是"删掉"**：那些算子有实现也有通过的精度测试，从清单里删会让已有的测试
@@ -278,7 +279,7 @@ python3 tools/gen_variants.py --manifest conf/operators.yaml \
 FLAGSPARSE_MATRIX_DIR=/path/to/mtx FLAGSPARSE_BENCH_OUT=./bench \
     ctest --test-dir build -R benchmark
 
-# 3. 交付报告：默认只出 40 行；--all 看全部 60
+# 3. 交付报告：默认只出 20 行；--all 看全部 60
 python3 tools/report.py --bench-dir ./bench --csv delivery.csv
 
 # 4. summary.json + result.html：与 FlagSparse 的 run_flagsparse_pytest.py 同 schema
@@ -290,7 +291,7 @@ python3 tools/write_html.py                 # 只重渲染 HTML
 python3 tools/check_manifest.py --bench-dir ./bench
 ```
 
-**加一个算子 = 改 YAML + 重新构建**，测试代码不动。这也是 40 → 115 的路径：
+**加一个算子 = 改 YAML + 重新构建**，测试代码不动。这也是 20 → 115 的路径：
 `gen_variants.py` 改成按 CSV 的切分展开即可，但那需要 benchmark 增加 `trans`/`conj`
 方向和 col 布局的代码路径，那是实打实的工作量。
 
@@ -298,7 +299,7 @@ python3 tools/check_manifest.py --bench-dir ./bench
 
 ```
 FlagSparse/pytest_results/summary.json     25 个算子条目（Python 侧）
-c_fs/capi_results/summary.json             40 个变体条目（C API 侧）
+c_fs/capi_results/summary.json             20 个变体条目（C API 侧）
 c_fs/capi_results/result.html              同上，变体粒度的表格
 ```
 
@@ -306,7 +307,7 @@ c_fs/capi_results/result.html              同上，变体粒度的表格
 整个上传的，分开才能两份都留住。
 
 `summary.json` 的 `result` **按变体名做键**（`spmv_csr_f32_int_non`），不是按算子聚合。
-这不是另创的格式——算子列表注册修改.xlsx 的"新算子列表"本来就是这么命名的，所以 40 行
+这不是另创的格式——算子列表注册修改.xlsx 的"新算子列表"本来就是这么命名的，所以 20 行
 是从格式里自然落出来的，FlagGems 那套 json/html 结构一个字都不用改。
 
 HTML 没有复用 `run_flagsparse_pytest.py:2994` 的生成器，原因有两条：它吃的是 runner 的

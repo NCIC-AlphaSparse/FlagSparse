@@ -40,7 +40,7 @@ performance_baseline:
   default: none
 
 # REPORTING SCOPE. `reporting` says whether a variant belongs to the delivery
-# list (算子列表注册修改.xlsx, "新算子列表" column) or is merely retained.
+# list (fork/list.xlsx, 20 variants) or is merely retained.
 #
 #   delivery  in the delivery list; appears in the default report.
 #   retained  implemented and covered by ctest/accuracy, but NOT in the delivery
@@ -48,9 +48,11 @@ performance_baseline:
 #             would orphan tests that exist and pass. It is filtered out of the
 #             default report instead.
 #
-# `delivery_dtypes` narrows it when only some dtypes are in the list (spsm_csr
+# `delivery_dtypes` narrows it when only some dtypes are in the list (spmv_csr
 # delivers f32/f64 while the kernel also does complex). Absent means "all of
-# `dtypes`".
+# `dtypes`". The delivery scope here must match `delivery_variants` in the
+# repo-root conf/operators.yaml; tests/ci/test_delivery_variant_registry.py
+# checks it.
 
 operators:
   - id: gather
@@ -107,6 +109,7 @@ operators:
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
     reporting: delivery
+    delivery_dtypes: [f32, f64]   # complex is implemented, not delivered
 
   - id: spmv_coo
     zhiyuan_name: SpMV_COO
@@ -125,6 +128,7 @@ operators:
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
     reporting: delivery
+    delivery_dtypes: [f32, f64]   # complex is implemented, not delivered
     notes: >
       The deterministic segment route, run with SEG_IS_ROW=True so seg_starts is
       a full row-offsets array and a row with no nonzeros still picks up beta*y.
@@ -219,6 +223,7 @@ operators:
     tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
     status: implemented
     reporting: delivery
+    delivery_dtypes: [f32, f64]   # complex is implemented, not delivered
     notes: >
       Both dense operands carry explicit strides, so FLAGSPARSE_ORDER_COL and
       op(B) = B^T are the same kernel with different strides -- the column-major
@@ -246,6 +251,7 @@ operators:
     tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
     status: implemented
     reporting: delivery
+    delivery_dtypes: [f32, f64]   # complex is implemented, not delivered
     notes: >
       The rowrun route only. Unlike CSR this one needs scratch:
       flagsparseSpMM_bufferSize reports rows + 1 int32 for a row-offsets array,
@@ -304,7 +310,7 @@ operators:
     dispatch: src/ops/spgemm.cpp
     tests: [ctest/accuracy/test_spgemm.cpp, ctest/benchmark/test_spgemm.cpp]
     status: implemented
-    reporting: delivery
+    reporting: retained
     notes: >
       The only operator whose result SIZE is discovered rather than given, so it
       follows cuSPARSE's five-call dance exactly. flagsparseCsrSetPointers had to
@@ -325,9 +331,8 @@ operators:
     c_api: [flagsparseSDDMM, flagsparseSDDMM_bufferSize, flagsparseSDDMM_preprocess]
     python_impl: [flagsparse_sddmm_csr, prepare_sddmm_csr]
     formats: [csr]
-    # c32/c64 are in the delivery list but not registered yet: the operator
-    # package has no complex SDDMM kernel. Add them here and to delivery_variants
-    # in conf/operators.yaml when it lands.
+    # No complex SDDMM: the operator package has no complex kernel, and the
+    # delivery list (conf/operators.yaml) does not include sddmm c32/c64.
     dtypes: [f32, f64]
     index_types: [int]
     ops: [non, trans]           # for BOTH dense operands; conj pending
@@ -336,13 +341,13 @@ operators:
     kernel_module: flagsparse_codegen/sddmm_csr.py
     kernel_name: [sddmm_csr_real, _row_ids_kernel]
     dispatch: src/ops/sddmm.cpp
-    # The delivery list asks for c32/c64 here too, but there is no complex SDDMM
-    # kernel: flagsparse_sddmm_csr rejects them with "x dtype must be
-    # torch.float32 or torch.float64" (measured 2026-09-15). Recording the gap
-    # instead of listing the dtypes keeps `dtypes` truthful about the kernel --
-    # listing them would generate variants that fail at runtime and read as a
-    # regression rather than as work not yet done.
-    delivery_gaps: [c64, c128]
+    # No complex SDDMM kernel: flagsparse_sddmm_csr rejects them with "x dtype
+    # must be torch.float32 or torch.float64" (measured 2026-09-15), so `dtypes`
+    # stays f32/f64. The delivery list no longer asks for sddmm c32/c64 (it did
+    # until 2026-09-21). If a delivery list asks for a dtype no kernel serves,
+    # record it as `delivery_gaps: [...]` rather than listing it in `dtypes`:
+    # check_manifest.py reports gaps, and listing them would generate variants that
+    # fail at runtime and read as a regression rather than as work not yet done.
     tests: [ctest/accuracy/test_sddmm.cpp, ctest/benchmark/test_sddmm.cpp]
     status: implemented
     reporting: delivery
@@ -372,7 +377,7 @@ operators:
     dispatch: src/ops/spsv.cpp
     tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
-    reporting: delivery
+    reporting: retained
     notes: >
       The chain-wave route: workers take rows from an atomic counter and spin on
       a per-row ready flag, so one launch solves the system and no level table is
@@ -407,7 +412,7 @@ operators:
     dispatch: src/ops/spsv.cpp
     tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
-    reporting: delivery
+    reporting: retained
     notes: >
       No second kernel and no converted copy: _analysis builds the row-offsets
       array into the second half of the scratch, and a row-sorted COO plus that
@@ -496,8 +501,7 @@ operators:
     dispatch: src/ops/spsm.cpp
     tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
     status: implemented
-    reporting: delivery
-    delivery_dtypes: [f32, f64]
+    reporting: retained
     notes: >
       Polling route: one program per (row, RHS tile), spinning on a per-(tile,
       row) done flag. Unlike SpSV it does not care about column order -- it

@@ -118,11 +118,15 @@ STATUS_TO_FLAGGEMS = {
 # them delivery), which on MetaX C550 ran past a 900 s --timeout. Injected only
 # under --delivery-only, BEFORE --benchmark-args/--op-benchmark-args, so an
 # explicit user flag still wins (argparse keeps the last value). Parents absent
-# here already sweep only delivery axes (sddmm_csr, spgemm_csr, spsm_csr).
+# here (sddmm_csr) already sweep only delivery axes.
 #
-# A script whose default dtypes leave out a delivery dtype gets the list spelled
-# out as well (gather, spmv_csr): spmv_csr defaults to float32,float64, so its
-# c32/c64 delivery variants had no rows at all and reported NotFound.
+# The dtype list is spelled out too, in both directions. gather/scatter deliver
+# every dtype the script knows. spmv_csr/spmv_coo/spmm_csr/spmm_coo deliver only
+# float32 and float64 (the complex variants left the delivery list on 2026-09-21),
+# while the scripts sweep complex by default; benchmarking it would only produce
+# rows no delivery variant reads. When a dtype is added to the delivery list, add
+# it here as well: a script whose default omits it reports NotFound for the
+# variant ("the benchmark recorded no <dtype> rows"), which reads like a pass.
 DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
     "gather": (
         "--index-dtypes",
@@ -137,20 +141,36 @@ DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
         "--ops",
         "non",
         "--dtypes",
-        "float32,float64,complex64,complex128",
+        "float32,float64",
     ),
-    "spmv_coo": ("--index-dtypes", "int32", "--ops", "non"),
-    "spmm_csr": ("--index-dtypes", "int32", "--ops", "non"),
-    "spmm_coo": ("--index-dtypes", "int32"),
-    "spsv_csr": ("--index-dtypes", "int32", "--ops", "NON"),
-    "spsv_coo": ("--index-dtypes", "int32", "--ops", "NON"),
+    "spmv_coo": (
+        "--index-dtypes",
+        "int32",
+        "--ops",
+        "non",
+        "--dtypes",
+        "float32,float64",
+    ),
+    "spmm_csr": (
+        "--index-dtypes",
+        "int32",
+        "--ops",
+        "non",
+        "--dtypes",
+        "float32,float64",
+    ),
+    "spmm_coo": ("--index-dtypes", "int32", "--dtypes", "float32,float64"),
 }
-# The delivery registry names only int32, NON, non-unit SpSV variants. The shared
-# pytest files also exercise transpose/conjugate and unit-diagonal APIs: valuable
-# full-suite coverage, but not part of the 40 delivery variants. They have to be
-# left out of the run itself, not only out of the recorded result -- on a C550 the
-# unit-diagonal cases reach the known CW defect (illegal access / hang), so a
-# delivery run that merely filtered afterwards would still execute them.
+# SpSV is not a delivery parent any more (the delivery list dropped it on
+# 2026-09-21), so `--delivery-only` no longer selects spsv_csr/spsv_coo and this
+# narrowing only applies when they are selected explicitly, e.g. `--ops spsv_csr
+# --delivery-only` to re-check the int32 / NON / non-unit contract it used to have.
+#
+# That contract: the shared pytest files also exercise transpose/conjugate and
+# unit-diagonal APIs -- valuable full-suite coverage, but not int32 NON non-unit.
+# They have to be left out of the run itself, not only out of the recorded result:
+# on a C550 the unit-diagonal cases reach the known CW defect (illegal access /
+# hang), so a run that merely filtered afterwards would still execute them.
 #
 # pytest `-k` matches substrings of the test name and its parameter ids. "non_trans"
 # keeps the lower and the upper NON tests (`..._non_trans_supported_combos`,

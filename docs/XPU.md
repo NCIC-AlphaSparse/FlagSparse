@@ -10,8 +10,9 @@ C API 那一层见
 > 路径上，当前仓库的 `gather` normal 精度中 f16/f32/c32 通过、f64/c64 因厂商 eager
 > 降精度失败；`spmv_csr` fp32 小矩阵独立参考通过（最大绝对误差 `1.43e-6`）。上层仓库的
 > `results/xpu_variants_40.csv` 保存了 40 个变体的历史状态。2026-09-18 跑过一轮 `--delivery-only`
-> 的 40 变体精度（逐变体结果见 `modified/XPU.md` 第 8 节）；那一轮的性能数字出自 `86a09cd` 之前的 runner，
-> 不能用，要按 1.5 节重跑。下面未标明实测的内容不能当作通过率结论。
+> 的精度（当时的交付清单是 40 个变体，逐变体结果见 `modified/XPU.md` 第 8 节；交付清单后来缩成 20 个，
+> 那张表里 spsv / spsm / spgemm 和复数 spmv / spmm 的行不再属于交付）；那一轮的性能数字出自 `86a09cd`
+> 之前的 runner，不能用，要按 1.5 节重跑。下面未标明实测的内容不能当作通过率结论。
 
 ---
 
@@ -71,7 +72,7 @@ PY
 
 ---
 
-## 1.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
+## 1.5 交付复现：20 个变体 × 30 个矩阵（精度 + 性能）
 
 **环境**（第 1 节自检通过后）：
 
@@ -92,13 +93,14 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --results-dir pytest_results_xpu_delivery \
   > pytest_results_xpu_delivery.log 2>&1 < /dev/null &
 
-python3 tools/delivery_table.py pytest_results_xpu_delivery   # 跑完后：40 行结果，缺变体时退出码为 1
+python3 tools/delivery_table.py pytest_results_xpu_delivery   # 跑完后：20 行结果，缺变体时退出码为 1
 ```
 
 runner 在 XPU 上自动处理：子进程 `CUDA_VISIBLE_DEVICES=<卡号>`、命令行传逻辑设备 `--device 0`；精度阶段
 **强制**用 CPU 上的 SciPy 参考（`FLAGSPARSE_ACCURACY_REFERENCE=scipy`）；gather / scatter / spmv_csr /
 spmv_coo / spmm_csr / spmm_coo / sddmm_csr 的性能走 `benchmark/benchmark_xpu.py`，每个矩阵一个子进程，
-对等价的 PyTorch-XPU 表达式计时；其余 4 个父算子走能力探测，只有能不能跑、没有加速比。
+对等价的 PyTorch-XPU 表达式计时。交付清单的 7 个父算子正好就是这 7 个，全部有加速比列；能力探测只在
+显式 `--ops` 指名清单外的算子时才用到。
 
 `--benchmark-input` 要给**目录**：性能阶段对目录下的每个 `*.mtx` 各起一个子进程，再把各矩阵的结果汇总，
 不是只取其中一个矩阵。**目录扫描不递归**，矩阵必须直接放在该目录下，放在子目录里的不会被扫到；
@@ -116,9 +118,11 @@ spmv_coo / spmm_csr / spmm_coo / sddmm_csr 的性能走 `benchmark/benchmark_xpu
 `benchmark_xpu.py` 自己也会先核对输出再计时：超出容差的矩阵记为 `MISMATCH`，不计入加速比。这是性能脚本的
 门禁，不是交付的精度结果。
 
-**预期会看到的非 Passed**（2026-09-18 在 P800 上实测，`modified/XPU.md` 第 8 节）：40 个变体里只有 gather /
-scatter 的 f16、f32、c32 和 spmv_csr 部分用例通过精度，其余多为 Triton XPU lowering 资源不足（`uni_sram`）、
-legalization 失败或找不到可执行函数。这是平台当前的真实状态，如实回报即可。
+**预期会看到的非 Passed**（2026-09-18 在 P800 上实测，`modified/XPU.md` 第 8 节，当时是 40 变体的清单）：
+现在的 20 个变体里，只有 gather / scatter 的 f16、f32、c32 和 spmv_csr 的 f32、f64（部分用例）通过精度；
+gather / scatter 的 f64、c64 是 `assertion`（shim 把 double 降成 float32），spmv_coo 是 `uni_sram`，
+spmm_coo 是 `invalid_device_function`，spmm_csr 是 `assertion` / `dtype_mismatch` / `uni_sram`，
+sddmm_csr 是 `uni_sram`。这是平台当前的真实状态，如实回报即可。
 
 **`86a09cd`（2026-09-18）之前跑出的性能结果作废**，原因见 `prompt.md` 第 2 节。
 
@@ -153,7 +157,7 @@ python tools/run_backend_tests.py --backend xpu --phase accuracy --mode quick
 精度用例与其他后端**共用** `tests/pytest`，不另起一套 —— 六份同样的 oracle 各自漂移
 是这个仓库明确要避免的。
 
-### 性能阶段：七个算子走自己的脚本，其余走能力探测
+### 性能阶段：七个算子走自己的脚本（正好是交付清单），清单外的走能力探测
 
 ```python
 PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")     # xpu 已经不在里面
@@ -162,7 +166,7 @@ XPU_BASELINE_OPS = ("gather", "scatter", "spmv_csr", "spmv_coo", "spmm_csr", "sp
 
 这七个走 `benchmark/benchmark_xpu.py`，以等价的 PyTorch-XPU tensor expression 为 baseline，
 先核对输出再分别计时，报告 `triton_ms`、`pytorch_ms`、`max_abs_err` 和
-`triton_speedup_vs_pytorch`（也保留兼容列 `speedup`）。其余算子仍走**能力探测**，按算子报
+`triton_speedup_vs_pytorch`（也保留兼容列 `speedup`）。清单外的算子（显式 `--ops` 才会跑到）仍走**能力探测**，按算子报
 `PASS` / `REJECTED` / `TRITON_COMPILE` / `ERROR` / `NO_ADAPTER`。在一个内核可能根本
 lower 不出来的平台上，这才是有意义的测量 —— 替代方案是一个空的性能阶段，而空阶段
 读起来和通过一模一样。

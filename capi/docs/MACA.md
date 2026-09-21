@@ -54,7 +54,7 @@ ctest --test-dir build -R accuracy --output-on-failure
 FLAGSPARSE_MATRIX_DIR=/path/to/mtx FLAGSPARSE_BENCH_OUT=./bench \
     ctest --test-dir build -R benchmark
 
-# 汇总：40+ 变体一张表 / 与 FlagSparse Python 侧同 schema 的 summary.json
+# 汇总：交付清单（20 个变体）一张表 / 与 FlagSparse Python 侧同 schema 的 summary.json
 python3 tools/report.py --bench-dir ./bench
 python3 tools/write_summary.py --bench-dir ./bench --out ./bench
 
