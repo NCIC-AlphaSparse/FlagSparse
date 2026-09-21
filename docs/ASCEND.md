@@ -51,6 +51,19 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：40 行结果，缺变体时退出码为 1
 ```
 
+**两个 timeout 不是一回事**：外层 `timeout -s KILL 43200` 是**整条命令**的总限时（12 小时），到点
+直接强制杀掉整个进程；`--timeout 3600` 是**每个子任务**的限时，大多数算子是每个阶段（精度、性能）
+各 3600 秒，`spmm_csr` / `sddmm_csr` 的性能是逐矩阵路径，则是每个矩阵 3600 秒。外层必须写，
+因为内核卡死时 Ctrl-C 送不进去，只能靠 `KILL`。
+
+只用一张卡时（例如 6 号，命令里写 `--gpus 6`），11 个算子在那张卡上依次串行，双卡时则分到两张卡上
+交替执行，同样的工作量耗时更长。有一次单卡运行把外层限时设成 `28800`（8 小时）。**外层限时到点被杀时**，
+runner 每完成一个算子就写一次 `summary.json`，所以已完成算子的结果保留，正在跑的那个算子丢失，
+排在它后面还没轮到的算子在 `delivery_table.py` 里是 `NotFound`（缺变体，退出码为 1）。算子按
+gather、scatter、spmv_csr、spmv_coo、spmm_csr、spmm_coo、spgemm_csr、sddmm_csr、spsv_csr、spsv_coo、
+spsm_csr 的顺序执行，两个逐矩阵的重头算子在中段和靠后。本文没有记录过 Ascend 完整交付的耗时，外层限时该
+取多大要按实际情况定。
+
 runner 在 Ascend 上自动做三件事，不需要手动处理：
 
 - **卡隔离**：每个子进程设 `ASCEND_RT_VISIBLE_DEVICES=<6 或 7>`、命令行传逻辑设备 `--device 0`

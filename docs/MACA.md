@@ -52,7 +52,7 @@ python3 -c "from flagsparse.sparse_operations import _common as c; print(c._back
 **命令**：
 
 ```bash
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --op-benchmark-args='sddmm_csr=--no-cusparse' \
@@ -73,7 +73,12 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
   跑满 4 个 K 的后端**不可直接比较**，报告里要注明；
-- 外层 12 小时、`setsid` 后台：三角类算子在 C550 上可能挂死（第 5 节），挂死时只能靠 KILL。
+- 外层 11 小时（`timeout -s KILL 39600`）、`setsid` 后台：三角类算子在 C550 上可能挂死（第 5 节），
+  挂死时只能靠 KILL。它是**整条命令**的总限时，到点强制杀掉整个进程；内层 `--timeout 4500` 是每个算子
+  每个阶段的限时（`spgemm_csr` 的性能阶段按 float32、float64 拆成两个子进程，各有一份，上限是两倍）。
+  外层到点时，已完成算子的结果保留（每完成一个算子就写一次 `summary.json`），正在跑的算子丢失，
+  还没轮到的在 `delivery_table.py` 里是 `NotFound`；算子按 gather、scatter、spmv_csr、spmv_coo、
+  spmm_csr、spmm_coo、spgemm_csr、sddmm_csr、spsv_csr、spsv_coo、spsm_csr 的顺序执行。
 
 **参考**：
 
