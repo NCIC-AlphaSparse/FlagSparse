@@ -304,7 +304,11 @@ def build_probe(flagsparse, torch, op: str, m: Matrix, dtype, device, dense_cols
     """Inputs and a CPU reference for one (operator, matrix) pair."""
     fs = flagsparse
     dense = _dense(torch, m, dtype, device)
-    ref64 = dense.to(torch.float64).cpu()
+    # .cpu() FIRST: casting on the device is what Ascend cannot do -- 910B has no
+    # DT_DOUBLE, so `dense.to(float64)` there comes back still fp32 and every
+    # matmul against a real CPU fp64 operand below raises a dtype mismatch, which
+    # the probe reports as ERROR for the operator rather than for the reference.
+    ref64 = dense.cpu().to(torch.float64)
 
     if op == "gather":
         n = max(1, m.rows * m.cols // 4)
@@ -566,8 +570,13 @@ def main() -> int:
                    help="operator to probe; repeatable. Default: all.")
     p.add_argument("--matrix", action="append", default=None,
                    help="matrix name to probe; repeatable. Default: all 20.")
-    p.add_argument("--dtype", default="float32",
-                   choices=("float32", "float64"))
+    # Plural, comma-separated, like benchmark_ascend.py's own --dtypes. A probe
+    # of one dtype leaves the other dtype's delivery variant with no row at all,
+    # which the report shows as NotFound -- indistinguishable from "did not run".
+    # `--dtype` stays as the old singular spelling of the same flag.
+    p.add_argument("--dtypes", "--dtype", dest="dtypes", default="float32",
+                   help="comma-separated dtypes to probe: float32, float64. "
+                        "Default: float32.")
     p.add_argument("--dense-cols", type=int, default=32)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--warmup", type=int, default=3)
@@ -579,6 +588,13 @@ def main() -> int:
     p.add_argument("--fail-on-error", action="store_true",
                    help="exit non-zero if any case is not PASS or REJECTED")
     args = p.parse_args()
+
+    allowed_dtypes = ("float32", "float64")
+    dtype_names = [name.strip() for name in args.dtypes.split(",") if name.strip()]
+    unknown = sorted(set(dtype_names) - set(allowed_dtypes))
+    if unknown or not dtype_names:
+        p.error("--dtypes must be a comma-separated subset of: "
+                + ", ".join(allowed_dtypes))
 
     cache_dir = Path(tempfile.mkdtemp(prefix="flagsparse_probe_cache_"))
     os.environ["TRITON_CACHE_DIR"] = str(cache_dir)
@@ -592,20 +608,20 @@ def main() -> int:
             accel.set_device(args.device)
         except Exception:
             pass
-    dtype = getattr(torch, args.dtype)
-
     ops = tuple(args.op) if args.op else OPERATORS
     names = set(args.matrix) if args.matrix else None
     matrices = tuple(m for m in MATRICES if names is None or m.name in names)
 
     rows = []
-    for op in ops:
-        for matrix in matrices:
-            row = probe_one(flagsparse, torch, op, matrix, dtype, device, accel,
-                            args, cache_dir)
-            rows.append(row)
-            print(f"{row['status']:<15} {op:<20} {matrix.name:<18} "
-                  f"{row['reason'][:90]}", flush=True)
+    for dtype_name in dtype_names:
+        dtype = getattr(torch, dtype_name)
+        for op in ops:
+            for matrix in matrices:
+                row = probe_one(flagsparse, torch, op, matrix, dtype, device,
+                                accel, args, cache_dir)
+                rows.append(row)
+                print(f"{row['status']:<15} {op:<20} {matrix.name:<18} "
+                      f"{dtype_name:<9} {row['reason'][:80]}", flush=True)
 
     tally: dict[str, int] = {}
     for row in rows:
@@ -616,7 +632,8 @@ def main() -> int:
         backend = _backend_name()
     except Exception:
         backend = "unknown"
-    print(f"backend: {backend}  device: {device.type}  dtype: {args.dtype}  "
+    print(f"backend: {backend}  device: {device.type}  "
+          f"dtypes: {','.join(dtype_names)}  "
           f"cases: {len(rows)}", flush=True)
     for status in ("PASS", "REJECTED", "TRITON_COMPILE", "MISMATCH", "ERROR",
                    "NO_ADAPTER"):

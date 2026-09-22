@@ -163,6 +163,23 @@ def _torch_npu_sddmm_sampled(x, y, row_ids, indices, chunk_nnz=262144):
     return out
 
 
+def row_status(fs_time) -> str:
+    """The `status` cell, in the vocabulary the runner aggregates on.
+
+    This column used to carry the descriptive string that is now `reason` -- on a
+    fully successful case, "PyTorch-NPU: PASS", because the FlagSparse branch
+    appends nothing when it works. _performance_row_status_is_usable() compares
+    the whole cell against {PASS, PASSED, OK, SUCCESS}, so every Ascend row was
+    ineligible for the per-dtype aggregate however good the measurement was, and
+    the delivery table printed `-` beside a healthy operator.
+
+    Module level, and not inlined at its one call site, so the contract with that
+    gate is testable away from an NPU: this defect is invisible on any box that
+    cannot run this script.
+    """
+    return "PASS" if fs_time is not None else "FAIL"
+
+
 def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None = None):
     import torch
     import flagsparse as fs
@@ -236,7 +253,8 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
                         "shape": f"{case.m}x{case.n};nnz={case.nnz}",
                         "flagsparse": fs_time, "pytorch": pt_time,
                         "scipy_max_abs_error": {"flagsparse": fs_err, "pytorch": pt_err},
-                        "status": "; ".join(status_parts) if status_parts else "unknown"})
+                        "status": row_status(fs_time),
+                        "reason": "; ".join(status_parts) if status_parts else "unknown"})
 
     if op in (None, "spmv_csr"):
         x = torch.randn(case.n, device=device, dtype=dtype)
@@ -348,12 +366,13 @@ def main():
                 "speedup": "" if fs_ms is None or not fs_ms else (pt_ms / fs_ms if pt_ms is not None else ""),
                 "max_abs_err": "" if err.get("flagsparse") is None else err.get("flagsparse"),
                 "status": item.get("status", ""),
+                "reason": item.get("reason", ""),
             })
         with open(args.csv_summary, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
                 fieldnames=["dtype", "matrix", "shape", "triton_ms", "pytorch_ms",
-                            "speedup", "max_abs_err", "status"],
+                            "speedup", "max_abs_err", "status", "reason"],
             )
             writer.writeheader()
             writer.writerows(rows)

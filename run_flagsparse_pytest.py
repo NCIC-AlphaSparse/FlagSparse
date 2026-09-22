@@ -232,6 +232,12 @@ PERFORMANCE_METRIC_COLUMNS = {
 # pytorch_ms/ms -- so each layout is listed and _performance_schema prefers the
 # entry whose measurement columns the row actually carries.
 PERFORMANCE_SPEEDUP_SCHEMAS = (
+    # benchmark_ascend.py names its ratio plainly `speedup` over pytorch_ms/triton_ms.
+    # Ahead of the generic `speedup` entry below: without a schema of its own every
+    # Ascend row fell through to latency_base/latency, which that CSV does not carry,
+    # so _performance_row_has_complete_speedup rejected all of them and each dtype
+    # aggregate stayed 0 -- printed as `-` while the CSV held a full measurement.
+    ("speedup", "pytorch_ms", "triton_ms"),
     ("speedup", "latency_base", "latency"),
     ("speedup_vs_vendor", "vendor_ms", "ms"),
     ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
@@ -696,6 +702,15 @@ def _xpu_baseline_command(op: str) -> tuple[str, ...]:
     )
 
 
+# Both delivery dtypes, for every probe command below. The probe itself defaults
+# to float32 alone, and DELIVERY_BENCHMARK_ARGS cannot narrow a probe command --
+# _uses_generic_benchmark_script() is False for these operators, by design, since
+# the delivery flags belong to the per-operator scripts. So without passing this
+# here the f64 variant of a probed operator had no row at all, and the delivery
+# report showed it as NotFound: the same cell it uses for "never ran".
+PROBE_DTYPE_ARGS: tuple[str, ...] = ("--dtypes", "float32,float64")
+
+
 def _probe_command(op: str) -> tuple[str, ...]:
     return (
         "benchmark/benchmark_ascend_probe.py",
@@ -705,6 +720,7 @@ def _probe_command(op: str) -> tuple[str, ...]:
         "{device}",
         "--csv-summary",
         "{csv}",
+        *PROBE_DTYPE_ARGS,
         "--warmup",
         "{warmup}",
         "--iters",
@@ -745,6 +761,7 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "{device}",
             "--csv-summary",
             "{csv}",
+            *PROBE_DTYPE_ARGS,
             "--warmup",
             "{warmup}",
             "--iters",

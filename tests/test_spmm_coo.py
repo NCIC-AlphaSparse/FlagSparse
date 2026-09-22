@@ -560,9 +560,12 @@ def _build_pytorch_reference(
         else prepared
     )
     if fs_common._use_scipy_accuracy_reference():
-        # MUSA can construct COO tensors but has no sparse.mm kernel.  Build the
-        # correctness value directly from the canonical arrays on CPU and leave
-        # the accelerator baseline unavailable.
+        # SciPy is the oracle wherever torch.sparse is itself under test, which
+        # says nothing about whether a torch.sparse route RUNS. MUSA can build a
+        # COO tensor but has no sparse.mm kernel, so there is nothing to time.
+        # MACA's route runs, and its latency is that backend's delivery
+        # baseline -- taking the oracle choice as the answer to both questions
+        # left all four SpMM delivery variants there with an empty speedup.
         out_dtype = prepared["output_dtype"]
         ref_dtype = reference_utils.reference_dtype(out_dtype)
         matrix = reference_utils.scipy_coo(
@@ -576,7 +579,17 @@ def _build_pytorch_reference(
         scipy_ref = reference_utils.as_torch(
             product, ref_dtype, prepared["canonical_B"].device
         )
-        return scipy_ref.to(out_dtype), None, "SciPy", None
+        if fs_common._is_mthreads_runtime():
+            return (
+                scipy_ref.to(out_dtype),
+                None,
+                "SciPy",
+                "torch.sparse registers no matmul on MUSA",
+            )
+        pytorch_op = lambda: torch.sparse.mm(  # noqa: E731
+            prepared["native_coo"], prepared["native_B"]
+        )
+        return scipy_ref.to(out_dtype), pytorch_op, "SciPy", None
 
     expected, pytorch_op, fmt, reason = _build_torch_reference_and_timing(
         data, row, col, shape, B, prepared=prepared, op=op, layout=layout
@@ -863,7 +876,9 @@ def run_one_alg_case(
     _done("prepare canonical reference", stage_t0)
     torch_ms = None
     if pytorch_op is None:
-        pytorch_reason = pytorch_reason or "torch.sparse baseline unavailable on MUSA"
+        # _build_pytorch_reference names the backend when it declines to build a
+        # closure; this only covers a caller that passed none.
+        pytorch_reason = pytorch_reason or "no PyTorch baseline on this backend"
     else:
         try:
             stage_t0 = _start("time PyTorch COO reference")
