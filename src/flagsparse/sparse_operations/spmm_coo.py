@@ -1225,13 +1225,15 @@ def _resolve_spmm_coo_launch_config(
         # simply take more trips round the outer ``tl.range`` loop, which is cheap.
         # Measured effect on the operator: 0.052 -> 0.364 of native cuSPARSE COO SpMM.
         #
-        # The ROCm override is left as upstream tuned it on gfx936; this box cannot
-        # re-measure it.
-        block_nnz = (
-            int(rocm_launch["block_nnz"])
-            if rocm_launch is not None and rocm_launch.get("block_nnz") is not None
-            else 4
-        )
+        # The ROCm override is deliberately NOT consulted for BLOCK_NNZ. It comes
+        # from a table shared with CSR (_backend_launch_overrides: 128 for a
+        # non-CSR format, 256 once max_row_nnz >= 512 or nnz >= 1e6), and those
+        # values are sized for CSR's dynamically-tiled rows. Feeding them to a
+        # kernel that unrolls ``tl.static_range(0, BLOCK_NNZ)`` reproduces on DCU
+        # exactly the cost the sweep above measured away. The sweep constant holds
+        # for gfx936 too; an explicit ``block_nnz=`` argument still overrides it,
+        # since this whole branch only runs when the caller passed none.
+        block_nnz = 4
 
     # MetaX/MACA: the rowrun kernels unroll ``tl.static_range(0, BLOCK_NNZ)``, so
     # BLOCK_NNZ multiplies the kernel's per-thread private memory.  C550's driver caps
