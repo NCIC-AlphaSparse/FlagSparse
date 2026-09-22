@@ -187,15 +187,25 @@ def test_the_old_singular_dtype_spelling_still_works():
     assert '"--dtypes", "--dtype", dest="dtypes"' in source
 
 
-def _ascend_benchmark():
-    """benchmark_ascend.py imports cleanly off an NPU: torch is imported in run()."""
-    spec = importlib.util.spec_from_file_location(
-        "_benchmark_ascend_under_test", ROOT / "benchmark" / "benchmark_ascend.py"
+def _ascend_row_status():
+    """Compile just row_status() out of the benchmark, without importing it.
+
+    benchmark_ascend.py imports numpy and scipy at module level and tests/ci runs
+    on an environment with neither, so importing the module skips this test in
+    the one place it has to run: the value of a producer/consumer contract test is
+    that it holds where the producer cannot execute. row_status() is a pure
+    function of its argument, so its own definition is enough.
+    """
+    source = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(encoding="utf-8")
+    definition = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "row_status"
     )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    module = ast.Module(body=[definition], type_ignores=[])
+    namespace: dict = {}
+    exec(compile(module, "<benchmark_ascend.row_status>", "exec"), namespace)
+    return namespace["row_status"]
 
 
 def test_the_status_the_benchmark_writes_is_one_the_runner_accepts():
@@ -207,22 +217,22 @@ def test_the_status_the_benchmark_writes_is_one_the_runner_accepts():
     every row was ineligible and each aggregate stayed 0, printed as `-`.
     """
     runner = _runner()
-    benchmark = _ascend_benchmark()
-    measured = benchmark.row_status({"mean_ms": 1.0})
+    row_status = _ascend_row_status()
+    measured = row_status({"mean_ms": 1.0})
     assert measured == "PASS"
     assert runner._performance_row_status_is_usable({"status": measured})
-    failed = benchmark.row_status(None)
+    failed = row_status(None)
     assert failed == "FAIL"
     assert not runner._performance_row_status_is_usable({"status": failed})
 
 
 def test_a_measured_ascend_row_reaches_the_dtype_aggregate():
     runner = _runner()
-    benchmark = _ascend_benchmark()
+    row_status = _ascend_row_status()
     row = _ascend_row("float32", "auto.mtx", 1.0, 0.99774)
-    row["status"] = benchmark.row_status({"mean_ms": 1.0})
+    row["status"] = row_status({"mean_ms": 1.0})
     assert runner._flaggems_perf_data([row])["float32"]["speedup"] == 0.99774
-    row["status"] = benchmark.row_status(None)
+    row["status"] = row_status(None)
     assert not runner._performance_row_has_complete_speedup(row)
 
 
