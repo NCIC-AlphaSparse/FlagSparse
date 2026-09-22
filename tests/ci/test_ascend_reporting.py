@@ -185,3 +185,50 @@ def test_the_old_singular_dtype_spelling_still_works():
         encoding="utf-8"
     )
     assert '"--dtypes", "--dtype", dest="dtypes"' in source
+
+
+def _ascend_benchmark():
+    """benchmark_ascend.py imports cleanly off an NPU: torch is imported in run()."""
+    spec = importlib.util.spec_from_file_location(
+        "_benchmark_ascend_under_test", ROOT / "benchmark" / "benchmark_ascend.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_status_the_benchmark_writes_is_one_the_runner_accepts():
+    """The contract between the two files, which is where this broke.
+
+    benchmark_ascend.py used to write the whole descriptive string as `status`:
+    on success "PyTorch-NPU: PASS", because the FlagSparse branch appends nothing
+    when it works. The runner compares that cell against a fixed vocabulary, so
+    every row was ineligible and each aggregate stayed 0, printed as `-`.
+    """
+    runner = _runner()
+    benchmark = _ascend_benchmark()
+    measured = benchmark.row_status({"mean_ms": 1.0})
+    assert measured == "PASS"
+    assert runner._performance_row_status_is_usable({"status": measured})
+    failed = benchmark.row_status(None)
+    assert failed == "FAIL"
+    assert not runner._performance_row_status_is_usable({"status": failed})
+
+
+def test_a_measured_ascend_row_reaches_the_dtype_aggregate():
+    runner = _runner()
+    benchmark = _ascend_benchmark()
+    row = _ascend_row("float32", "auto.mtx", 1.0, 0.99774)
+    row["status"] = benchmark.row_status({"mean_ms": 1.0})
+    assert runner._flaggems_perf_data([row])["float32"]["speedup"] == 0.99774
+    row["status"] = benchmark.row_status(None)
+    assert not runner._performance_row_has_complete_speedup(row)
+
+
+def test_the_prose_moved_to_a_reason_column_and_is_still_written():
+    """Losing the diagnosis would trade one blind spot for another."""
+    source = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(encoding="utf-8")
+    assert '"status": row_status(fs_time),' in source
+    assert '"reason": "; ".join(status_parts) if status_parts else "unknown"' in source
+    assert '"status", "reason"' in source
