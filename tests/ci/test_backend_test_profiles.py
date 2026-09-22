@@ -15,6 +15,11 @@ EXPECTED = {
     "musa": {"selector": "mthreads", "capi_backend": "MUSA", "capi_buildable": True},
     "ascend": {"selector": "ascend", "capi_backend": "NPU", "capi_buildable": False},
     "xpu": {"selector": "xpu", "capi_backend": "XPU", "capi_buildable": False},
+    "iluvatar": {
+        "selector": "iluvatar",
+        "capi_backend": "IX",
+        "capi_buildable": False,
+    },
 }
 
 

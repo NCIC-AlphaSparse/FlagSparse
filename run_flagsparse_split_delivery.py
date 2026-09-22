@@ -77,6 +77,7 @@ CAPI_BACKEND_BY_PYTEST_BACKEND = {
     "cuda": "CUDA",
     "ascend": "NPU",
     "xpu": "XPU",
+    "iluvatar": "IX",
 }
 
 

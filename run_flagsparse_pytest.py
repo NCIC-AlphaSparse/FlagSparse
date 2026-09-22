@@ -592,7 +592,7 @@ def _load_backend_names() -> tuple[str, ...]:
 
         return tuple(spec.name for spec in backend_specs())
     except Exception:
-        return ("cuda", "rocm", "metax", "mthreads", "ascend", "xpu", "gcu", "mlu")
+        return ("cuda", "rocm", "metax", "mthreads", "ascend", "xpu", "gcu", "iluvatar")
 
 
 SUPPORTED_BACKENDS: tuple[str, ...] = _load_backend_names()
@@ -601,13 +601,19 @@ SUPPORTED_BACKENDS: tuple[str, ...] = _load_backend_names()
 # benchmark scripts.  A backend absent from here needs its own entry below --
 # and the point of listing them is that "not yet wired up" becomes visible
 # instead of arriving as an empty result.
-GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metax", "mthreads")
+GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = (
+    "cuda",
+    "rocm",
+    "metax",
+    "mthreads",
+    "iluvatar",
+)
 
 # Backends with no per-operator benchmark of their own yet.  They fall back to
 # the capability probe, which reports PASS / REJECTED / TRITON_COMPILE per
 # operator -- on a platform where a kernel may not lower at all, that is the
 # measurement that matters, and it beats reporting nothing.
-PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")
+PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu",)
 
 # The XPU SDK has no cuSPARSE-shaped generic sparse API, so these seven run
 # through benchmark_xpu.py instead of the probe.  The script compares each

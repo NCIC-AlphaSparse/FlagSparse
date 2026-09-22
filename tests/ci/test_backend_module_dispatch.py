@@ -10,7 +10,8 @@ byte-identical. The operators live once now, and a backend directory holds only
 what genuinely diverges, so the assertions here are:
 
   * with no override, every backend resolves to the SHARED module;
-  * all eight registered backends resolve (gcu and mlu used to raise);
+  * all eight registered backends resolve (gcu and the old mlu slot used to
+    raise);
   * an override, when one exists, does shadow the shared module.
 """
 
@@ -35,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BACKENDS_DIR = ROOT / "src" / "flagsparse" / "sparse_operations" / "backends"
 
 # Every backend in _common._BACKEND_SPECS, and the directory it maps to.
-# gcu and mlu are here deliberately: they are declared slots with no tuned
+# gcu and iluvatar are here deliberately: they are declared slots with no tuned
 # kernels, and "declared" has to mean "runs on the shared implementation"
 # rather than "raises".
 EXPECTED = {
@@ -46,7 +47,7 @@ EXPECTED = {
     "ascend": "ascend",
     "xpu": "xpu",
     "gcu": "gcu",
-    "mlu": "mlu",
+    "iluvatar": "iluvatar",
 }
 
 

@@ -29,6 +29,7 @@ Triton 内核在两个后端是同一份代码，**只有"厂商参考实现/基
 
 ```bash
 export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=rocm       # 显式指定；探测靠 torch.version.hip，下一行仍要确认它非 None
 python3 -c "import torch; print(torch.version.hip)"          # 必须非 None
 python3 -c "import hip; print('hip-python ok')"             # 性能基线 hipSPARSE 依赖它
 python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_fallback_reason())"
@@ -81,13 +82,18 @@ export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ## 1. 环境准备
 
 ```bash
-# 1) 确认 torch 是 ROCm 版本 —— 这是后端分发的唯一判据
+# 1) 确认 torch 是 ROCm 版本 —— 这是自动探测的判据
 python -c "import torch; print('hip=', torch.version.hip, '| cuda=', torch.version.cuda)"
 # 期望：hip= 6.x.xxxxx  | cuda= None
+export FLAGSPARSE_BACKEND=rocm
 ```
 
 `torch.version.hip` 为 `None` 时，**所有 hipSPARSE 分支都不会被走到**，
 测试会静默回到 CUDA/torch 路径——这时你测的根本不是 DCU 代码。
+
+`FLAGSPARSE_BACKEND=rocm` 会跳过探测、直接选 ROCm 后端，和其他后端文档的写法一致。它**不能**
+代替上面的检查：在非 ROCm 的 torch 上强行指定，hipSPARSE 调用照样失败。所以两者都要：先确认
+`torch.version.hip` 非 `None`，再显式指定。
 
 ```bash
 # 2) 安装 hip-python（版本需与 ROCm 大版本匹配）

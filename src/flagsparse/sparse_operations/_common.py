@@ -82,9 +82,10 @@ _INDEX_LIMIT_INT32 = 2**31 - 1
 #   device_tokens    substrings of the device name, for stacks that install no
 #                    namespace of their own (MetaX ships a CUDA-compatible one).
 #
-# ``reserved`` marks the spare slot: it is routed by FLAGSPARSE_BACKEND alone and
+# ``reserved`` marks a spare slot: it is routed by FLAGSPARSE_BACKEND alone and
 # never auto-detected, so a vendor with no entry of its own can be driven through
-# it without touching this file.
+# it without touching this file.  No entry uses it today -- "mlu" did until the
+# Iluvatar slot replaced it -- but the mechanism stays for the next one.
 # ---------------------------------------------------------------------------
 
 
@@ -122,11 +123,12 @@ _BACKEND_SPECS = (
     _BackendSpec("xpu", "Kunlunxin XPU", "xpu", ("torch_xmlir", "torch_xpu"),
                  ("kunlun", "xpu")),
     _BackendSpec("gcu", "Enflame GCU", "gcu", ("torch_gcu",), ("enflame", "gcu")),
-    # The spare. Named for Cambricon because that is the slot the C++ side
-    # already reserves (BACKEND=MLU), but its contract is "generic reserve":
-    # env-routed only, so any vendor without an entry can be driven through it.
-    _BackendSpec("mlu", "Cambricon MLU (generic reserve slot)", "mlu",
-                 ("torch_mlu",), ("cambricon", "mlu"), reserved=True),
+    # Iluvatar CoreX (BI-V150 and siblings). CUDA-compatible like MetaX: the CoreX
+    # torch build answers to torch.cuda with torch.version.cuda set, so it has no
+    # namespace or plugin of its own and is told apart by its torch version tag
+    # and device name -- see _detect_iluvatar_runtime(). This slot replaced the
+    # Cambricon "mlu" generic reserve; the C API spells it BACKEND=IX.
+    _BackendSpec("iluvatar", "Iluvatar CoreX", device_tokens=("iluvatar", "bi-v", "corex")),
 )
 
 _BACKEND_SPEC_BY_NAME = {spec.name: spec for spec in _BACKEND_SPECS}
@@ -209,6 +211,33 @@ def _detect_maca_runtime():
 
 
 _IS_MACA_RUNTIME = _detect_maca_runtime()
+
+
+# Iluvatar CoreX (BI-V150) is the second CUDA-compatible stack, with the same
+# problem as MetaX: torch.version.cuda is set and torch.version.hip is None, so
+# neither says "Iluvatar". The signals, most explicit first, are the CoreX tag
+# in the torch build's local version ("2.x.y+corex.<sdk>") and the device name.
+# NOT verified on hardware yet -- FLAGSPARSE_BACKEND=iluvatar is the documented
+# way in, and the check the backend doc prints the device name for.
+_ILUVATAR_DEVICE_NAME_TOKENS = _BACKEND_SPEC_BY_NAME["iluvatar"].device_tokens
+
+
+def _detect_iluvatar_runtime():
+    override = _backend_override()
+    if override:
+        return override == "iluvatar"
+    if "corex" in str(getattr(torch, "__version__", "")).lower():
+        return True
+    try:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_properties(0).name.lower()
+            return any(tok in name for tok in _ILUVATAR_DEVICE_NAME_TOKENS)
+    except Exception:
+        pass
+    return False
+
+
+_IS_ILUVATAR_RUNTIME = _detect_iluvatar_runtime()
 
 
 # ── Moore Threads (MUSA) and Ascend (CANN) ──────────────────────────
@@ -327,7 +356,6 @@ _IS_MTHREADS_RUNTIME = _detect_mthreads_runtime()
 _IS_ASCEND_RUNTIME = _detect_ascend_runtime()
 _IS_XPU_RUNTIME = _detect_backend_by_spec("xpu")
 _IS_GCU_RUNTIME = _detect_backend_by_spec("gcu")
-_IS_MLU_RUNTIME = _detect_backend_by_spec("mlu")
 _CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -353,6 +381,7 @@ __all__ = (
     "_spmm_rocm_launch_overrides",
     "_spmv_rocm_launch_overrides",
     "_is_maca_runtime",
+    "_is_iluvatar_runtime",
     "_is_mthreads_runtime",
     "_is_ascend_runtime",
     "_is_xpu_runtime",
@@ -371,6 +400,7 @@ __all__ = (
     "_backend_name",
     "_maca_device_model",
     "_maca_vendor_sparse_library",
+    "_iluvatar_vendor_sparse_library",
     "_mthreads_vendor_sparse_library",
     "_ascend_vendor_sparse_library",
     "_xpu_vendor_sparse_library",
@@ -767,9 +797,9 @@ def _is_gcu_runtime():
     return bool(_IS_GCU_RUNTIME)
 
 
-def _is_mlu_runtime():
-    """True on the reserve slot (Cambricon MLU, or whatever is routed there)."""
-    return bool(_IS_MLU_RUNTIME)
+def _is_iluvatar_runtime():
+    """True on Iluvatar CoreX (BI-V150)."""
+    return bool(_IS_ILUVATAR_RUNTIME)
 
 
 def backend_specs():
@@ -783,16 +813,16 @@ def backend_specs():
 
 
 # Probe order matters and is not alphabetical: the most specific signal first.
-# CUDA is last because it is the fallthrough -- a MetaX or Kunlunxin stack also
-# answers to torch.version.cuda, so claiming CUDA early would shadow them.
+# CUDA is last because it is the fallthrough -- a MetaX, Iluvatar or Kunlunxin
+# stack also answers to torch.version.cuda, so claiming CUDA early would shadow them.
 _BACKEND_PROBES = (
     ("rocm", lambda: _IS_ROCM_RUNTIME),
     ("metax", lambda: _IS_MACA_RUNTIME),
+    ("iluvatar", lambda: _IS_ILUVATAR_RUNTIME),
     ("mthreads", lambda: _IS_MTHREADS_RUNTIME),
     ("ascend", lambda: _IS_ASCEND_RUNTIME),
     ("xpu", lambda: _IS_XPU_RUNTIME),
     ("gcu", lambda: _IS_GCU_RUNTIME),
-    ("mlu", lambda: _IS_MLU_RUNTIME),
 )
 
 
@@ -807,11 +837,11 @@ def _backend_name():
 def _resolve_accel():
     """Resolve (module, device_type) together, so they can never disagree.
 
-    CUDA, ROCm and MACA all present themselves as torch.cuda. Every other backend
-    in the registry is a separate device type supplied by an out-of-tree torch
-    extension; when that extension is not importable we fall back to
-    torch.cuda/"cuda" *as a pair* — returning torch.cuda while claiming device
-    type "musa" would make _is_accel_tensor() reject every tensor.
+    CUDA, ROCm, MACA and Iluvatar all present themselves as torch.cuda. Every
+    other backend in the registry is a separate device type supplied by an
+    out-of-tree torch extension; when that extension is not importable we fall
+    back to torch.cuda/"cuda" *as a pair* — returning torch.cuda while claiming
+    device type "musa" would make _is_accel_tensor() reject every tensor.
 
     Driven from the registry rather than an if-chain, so a backend added there
     does not end up reporting its own name while running on torch.cuda.
@@ -822,8 +852,8 @@ def _resolve_accel():
         # FlagTree's Kunlunxin stack is torch_xmlir: it rewrites torch.cuda
         # calls onto XPU. Native torch.xpu is an unsupported stub in this build.
         return torch.cuda, "cuda"
-    # cuda / rocm / metax carry no namespace of their own: they all answer to
-    # torch.cuda, which is why the registry leaves torch_namespace unset for them.
+    # cuda / rocm / metax / iluvatar carry no namespace of their own: they all
+    # answer to torch.cuda, which is why the registry leaves torch_namespace unset for them.
     if (
         spec is not None
         and spec.torch_namespace
@@ -833,7 +863,7 @@ def _resolve_accel():
         mod = getattr(torch, spec.torch_namespace, None)
         if mod is not None:
             # The namespace name doubles as the torch device type for every
-            # out-of-tree backend here (musa, npu, xpu, gcu, mlu).
+            # out-of-tree backend here (musa, npu, xpu, gcu).
             return mod, spec.torch_namespace
     return torch.cuda, "cuda"
 
@@ -858,8 +888,8 @@ def _accel_fallback_reason():
     and ascend only, so FLAGSPARSE_BACKEND=xpu on a box with no Kunlunxin plugin
     reported backend "xpu", ran every kernel on torch.cuda, and answered None
     here -- the one check the docs tell people to run before trusting a result.
-    gcu and mlu had the same hole. Every backend that declares a torch namespace
-    is covered now, including ones added later.
+    gcu and the old mlu slot had the same hole. Every backend that declares a
+    torch namespace is covered now, including ones added later.
     """
     name = _backend_name()
     spec = _BACKEND_SPEC_BY_NAME.get(name)
@@ -1016,6 +1046,29 @@ def _maca_vendor_sparse_library():
     return "cupy_cusparse" if _is_cupy_available() else "torch"
 
 
+def _iluvatar_vendor_sparse_library():
+    """Baseline library on Iluvatar CoreX: CuPy when it is really installed, else PyTorch.
+
+    The same policy as MetaX, for the same reason: CoreX is CUDA-compatible, so
+    torch.sparse runs on its cuSPARSE-compatible library and CuPy works where it
+    is installed. Neither has been MEASURED on a BI-V150 yet -- if torch.sparse
+    turns out to be broken there, as it was on MUSA, the baseline column says N/A
+    with a reason rather than failing, and the default should be flipped to None
+    by that measurement.
+
+    Override with FLAGSPARSE_ILUVATAR_VENDOR=torch|cupy_cusparse|none.
+    """
+    override = os.environ.get("FLAGSPARSE_ILUVATAR_VENDOR", "").strip().lower()
+    if override in ("torch", "cupy_cusparse", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_ILUVATAR_VENDOR must be 'torch', 'cupy_cusparse' or 'none'; "
+            f"got {override!r}"
+        )
+    return "cupy_cusparse" if _is_cupy_available() else "torch"
+
+
 def _mthreads_vendor_sparse_library():
     """Baseline library on Moore Threads: none by default.
 
@@ -1154,10 +1207,11 @@ def _vendor_sparse_library():
         CUDA      cupy_cusparse   (plus the torch reference every backend has)
         ROCm/DCU  hipsparse       (hip-python)
         MACA      cupy_cusparse when CuPy is installed, else torch
+        Iluvatar  cupy_cusparse when CuPy is installed, else torch (unmeasured)
         Ascend    torch
         MUSA      None            -- muSPARSE is wired on the C API side only
         XPU       torch
-        gcu/mlu   None            -- registered, but nothing measured there yet
+        gcu       None            -- registered, but nothing measured there yet
 
     CUDA is the fallthrough because it is the reference path; every other
     backend answers for itself. A backend that falls through by accident would
@@ -1167,6 +1221,8 @@ def _vendor_sparse_library():
         return "hipsparse"
     if _IS_MACA_RUNTIME:
         return _maca_vendor_sparse_library()
+    if _IS_ILUVATAR_RUNTIME:
+        return _iluvatar_vendor_sparse_library()
     if _IS_MTHREADS_RUNTIME:
         return _mthreads_vendor_sparse_library()
     if _IS_ASCEND_RUNTIME:
@@ -1188,7 +1244,7 @@ def _runtime_backend_label():
         "ascend": "Ascend/CANN",
         "xpu": "Kunlunxin/XPU",
         "gcu": "Enflame/GCU",
-        "mlu": "Cambricon/MLU",
+        "iluvatar": "Iluvatar/CoreX",
     }.get(_backend_name(), _backend_name())
 
 

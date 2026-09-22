@@ -35,7 +35,7 @@ _IMPLEMENTATION_BACKENDS = {
     "ascend": "ascend",
     "xpu": "xpu",
     "gcu": "gcu",
-    "mlu": "mlu",
+    "iluvatar": "iluvatar",
 }
 
 # The operator modules an override may shadow. Listed explicitly rather than

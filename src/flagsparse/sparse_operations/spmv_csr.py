@@ -281,6 +281,8 @@ def _normalize_spmv_opt_device_props(device):
             else (
                 "metax"
                 if _is_maca_runtime()
+                else "iluvatar"
+                if _is_iluvatar_runtime()
                 else (
                     "mthreads"
                     if _is_mthreads_runtime()

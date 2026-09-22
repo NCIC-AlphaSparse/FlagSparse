@@ -62,14 +62,15 @@ add_subdirectory(baseline)
 
 # One profile owns the test policy for the backend selected at configure time.
 # The Python selector and C API spelling intentionally differ for MACA, MUSA,
-# DCU, and Ascend, so keep the mapping explicit.
+# DCU, Ascend and Iluvatar, so keep the mapping explicit.
 set(_fs_ctest_profile_by_backend
     "CUDA=cuda"
     "MUSA=musa"
     "MACA=maca"
     "HCU=rocm"
     "NPU=ascend"
-    "XPU=xpu")
+    "XPU=xpu"
+    "IX=iluvatar")
 set(_fs_ctest_profile "")
 foreach(_entry IN LISTS _fs_ctest_profile_by_backend)
     string(REPLACE "=" ";" _entry_parts "${_entry}")

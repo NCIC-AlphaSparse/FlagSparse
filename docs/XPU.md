@@ -40,6 +40,10 @@ C API 那一层见
 ```bash
 export PYTHONPATH=$PWD/src
 export FLAGSPARSE_BACKEND=xpu
+export FLAGTREE_BACKEND=xpu          # torch_xmlir 构建必须设：不设时 FlagSparse 不认 torch.cuda shim（_xpu_cuda_shim_present）
+export TRITON_BACKEND=xpu
+export XPU_EVENT_KL3_ENABLE=1
+# 另按厂商运行时要求设置 LD_LIBRARY_PATH
 
 python3 - <<'PY'
 import importlib, torch
@@ -57,8 +61,8 @@ python3 - <<'PY'
 import flagsparse.sparse_operations._common as C
 print("backend          :", C._backend_name())        # 期望 xpu
 print("is_xpu_runtime   :", C._is_xpu_runtime())      # 期望 True
-print("accel device type:", C._accel_device_type())   # 期望 xpu
-print("fallback reason  :", C._accel_fallback_reason())
+print("accel device type:", C._accel_device_type())   # torch_xmlir 构建期望 cuda；torch_xpu 构建期望 xpu
+print("fallback reason  :", C._accel_fallback_reason())  # 期望 None
 PY
 ```
 
@@ -66,8 +70,9 @@ PY
 `torch.xpu` 仍是上游 PyTorch 的不支持 stub，`torch.xpu.is_available()` 可为 `False` 且
 `torch.device("xpu")` 会报 `Torch not compiled with XPU enabled`。这是该构建的预期行为，
 不是 CUDA 回退；此时自检的正确结果是 `backend=xpu`、`accel device type=cuda`、
-`fallback reason=None`。同时设置 `FLAGTREE_BACKEND=xpu`、`TRITON_BACKEND=xpu` 和
-`XPU_EVENT_KL3_ENABLE=1`，并使用厂商运行时要求的 `LD_LIBRARY_PATH`。2026-09-17 已以该
+`fallback reason=None`。上面自检里的 `FLAGTREE_BACKEND=xpu` 不能省：不设时 FlagSparse 不把 `torch.cuda`
+当作昆仑芯的 shim，只能退回检查原生 `torch.xpu`，而这个构建里它是 stub，结果是退回 `torch.cuda` 并给出非 `None`
+的 fallback reason。runner 也直接读 `FLAGSPARSE_BACKEND`（选卡号、强制 SciPy 精度参考），同样不能省。2026-09-17 已以该
 路径在 P800 的设备 1 跑通 `gather float32`（256x256、nnz=4096）。
 
 ---
@@ -160,7 +165,7 @@ python tools/run_backend_tests.py --backend xpu --phase accuracy --mode quick
 ### 性能阶段：七个算子走自己的脚本（正好是交付清单），清单外的走能力探测
 
 ```python
-PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")     # xpu 已经不在里面
+PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu",)     # xpu 已经不在里面
 XPU_BASELINE_OPS = ("gather", "scatter", "spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr")
 ```
 

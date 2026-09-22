@@ -1,0 +1,8 @@
+{
+  "backend": "iluvatar",
+  "selector": "iluvatar",
+  "capi_backend": "IX",
+  "capi_buildable": false,
+  "pytest_paths": ["tests/pytest"],
+  "benchmark_runner": "run_flagsparse_pytest.py"
+}

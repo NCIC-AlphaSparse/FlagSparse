@@ -17,8 +17,8 @@ false alarm.
 
 The regression this guards is narrower than it looks: `_vendor_sparse_library()`
 used to end in an unconditional `return "cupy_cusparse"`, so every backend that
-was not explicitly listed -- xpu, gcu, mlu -- claimed CuPy on hardware that has
-never had it.
+was not explicitly listed -- xpu, gcu, and the old mlu slot -- claimed CuPy on
+hardware that has never had it.
 """
 
 import json
@@ -51,7 +51,7 @@ EXPECTED = {
     "ascend": ("torch", "scipy"),
     "xpu": ("torch", "scipy"),
     "gcu": (None, "scipy"),
-    "mlu": (None, "scipy"),
+    # iluvatar is probed like metax -- see test_iluvatar_baseline_is_probed_not_assumed.
 }
 
 _PROBE = """
@@ -87,7 +87,7 @@ def _probe(backends):
 
 
 def test_every_backend_reports_the_agreed_baselines():
-    probed = _probe(list(EXPECTED) + ["metax"])
+    probed = _probe(list(EXPECTED) + ["metax", "iluvatar"])
     for backend, (vendor, reference) in EXPECTED.items():
         assert probed[backend]["vendor"] == vendor, backend
         assert probed[backend]["reference"] == reference, backend
@@ -100,6 +100,18 @@ def test_maca_baseline_is_probed_not_assumed():
     would be wrong on one of the two machines.
     """
     probed = _probe(["metax"])["metax"]
+    assert probed["vendor"] == ("cupy_cusparse" if probed["cupy"] else "torch")
+    assert probed["reference"] == "scipy"
+
+
+def test_iluvatar_baseline_is_probed_not_assumed():
+    """Iluvatar CoreX follows the MetaX policy: CuPy when installed, else torch.
+
+    Both are CUDA-compatible stacks, so neither can claim CuPy on the strength of
+    torch.version.cuda alone. The accuracy reference is SciPy, like every backend
+    other than CUDA and ROCm.
+    """
+    probed = _probe(["iluvatar"])["iluvatar"]
     assert probed["vendor"] == ("cupy_cusparse" if probed["cupy"] else "torch")
     assert probed["reference"] == "scipy"
 
@@ -212,7 +224,7 @@ def test_every_out_of_tree_backend_reports_its_own_fallback():
     FLAGSPARSE_BACKEND=xpu on a box with no Kunlunxin plugin reported backend
     "xpu", ran every kernel on torch.cuda, and answered None here -- the one
     check the backend docs tell people to run before trusting a number. gcu and
-    mlu had the same hole.
+    the old mlu slot had the same hole.
 
     XPU is the case that makes the namespace check insufficient on its own:
     upstream PyTorch ships `torch.xpu` for Intel GPUs, so the namespace exists
@@ -227,7 +239,7 @@ def test_every_out_of_tree_backend_reports_its_own_fallback():
         from flagsparse.sparse_operations import _common
         print(_common._accel_fallback_reason() or "")
     """
-    for backend in ("mthreads", "ascend", "xpu", "gcu", "mlu"):
+    for backend in ("mthreads", "ascend", "xpu", "gcu"):
         env = os.environ.copy()
         env["FLAGSPARSE_BACKEND"] = backend
         out = subprocess.run(
@@ -242,8 +254,9 @@ def test_every_out_of_tree_backend_reports_its_own_fallback():
         assert reason, f"{backend}: no fallback reason on a CUDA box"
         assert backend in reason, f"{backend}: reason does not name it: {reason}"
 
-    # CUDA, ROCm and MACA legitimately run on torch.cuda: silence is correct.
-    for backend in ("cuda", "rocm", "metax"):
+    # CUDA, ROCm, MACA and Iluvatar legitimately run on torch.cuda: silence is
+    # correct.
+    for backend in ("cuda", "rocm", "metax", "iluvatar"):
         env = os.environ.copy()
         env["FLAGSPARSE_BACKEND"] = backend
         out = subprocess.run(
