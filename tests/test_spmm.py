@@ -230,27 +230,49 @@ def _apply_torch_sparse_op(sparse_matrix, B, op):
 
 
 def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
-    """(reference, timing closure, format), with the reference per backend policy.
+    """(reference, timing closure, format, reason), reference per backend policy.
 
     Only the VALUE compared against moves to SciPy on non-CUDA/ROCm backends; the
     timing closure and its format stay exactly as the PyTorch path built them, so
     the baseline column measures the same thing everywhere.
+
+    That second sentence is the contract, and this function used to break it: it
+    returned no closure at all whenever SciPy was the oracle, which is every
+    backend outside CUDA and ROCm. The two questions are separate. "Is the
+    torch.sparse VALUE trustworthy here" is false on MACA, whose fp32 CSR path
+    returns non-finite output. "Does a torch.sparse route RUN here" is still true
+    there, and its latency is what the MACA delivery report uses as the baseline.
+    Only MUSA answers no to both: it registers no sparse matmul in any layout or
+    dtype. Conflating them left all four SpMM delivery variants on MACA with a
+    `Passed` status and an empty speedup.
     """
     if fs_common._use_scipy_accuracy_reference():
-        # Do not construct a MUSA torch.sparse tensor just to discard it: sparse
-        # matmul is not registered on that backend.  The CPU SciPy result is the
-        # complete oracle and the performance baseline is intentionally absent.
         ref_dtype = reference_utils.reference_dtype(data.dtype)
         matrix = reference_utils.scipy_csr(data, indices, indptr, shape, ref_dtype)
         product = reference_utils.spmm(
             matrix, B, ref_dtype, op=ast_ops._spmm_op_to_name(op)
         )
         scipy_ref = reference_utils.as_torch(product, ref_dtype, B.device)
-        return scipy_ref.to(data.dtype), None, "SciPy"
+        value = scipy_ref.to(data.dtype)
+        if fs_common._is_mthreads_runtime():
+            # Do not construct a MUSA torch.sparse tensor just to discard it.
+            return value, None, "SciPy", "torch.sparse registers no matmul on MUSA"
+        # Take the closure the PyTorch path builds -- it carries that path's
+        # MACA-specific int32 CSR/COO selection -- and discard only its value.
+        # A backend where building it fails keeps the SciPy oracle and reports
+        # why the baseline is missing, rather than failing the whole case.
+        try:
+            _, timing_op, timing_format = _build_torch_reference_and_timing(
+                data, indices, indptr, shape, B, op=op
+            )
+        except Exception as exc:
+            return value, None, "SciPy", f"PyTorch baseline unavailable: {exc}"
+        return value, timing_op, timing_format, None
 
-    return _build_torch_reference_and_timing(
+    ref, timing_op, timing_format = _build_torch_reference_and_timing(
         data, indices, indptr, shape, B, op=op
     )
+    return ref, timing_op, timing_format, None
 
 
 def _build_torch_reference_and_timing(data, indices, indptr, shape, B, op="non"):
@@ -446,7 +468,9 @@ def _assert_spmm_matches_reference(
         out=out,
         op=op,
     )
-    ref_C, _, _ = _build_pytorch_reference(data, indices, indptr, shape, B, op=op)
+    ref_C, _, _, _ = _build_pytorch_reference(
+        data, indices, indptr, shape, B, op=op
+    )
     atol, rtol = _tolerance_for_dtype(value_dtype)
     if not torch.allclose(result, ref_C, atol=atol, rtol=rtol):
         metrics = ast_ops._spmm_validation_metrics(result, ref_C)
@@ -533,10 +557,12 @@ def run_one_mtx(
     }
 
     try:
-        ref_C, pytorch_op, pytorch_format = _build_pytorch_reference(
+        ref_C, pytorch_op, pytorch_format, pytorch_reason = _build_pytorch_reference(
             data, indices, indptr, shape, B, op=op
         )
         result["pytorch_format"] = pytorch_format
+        if pytorch_reason:
+            result["pytorch_reason"] = pytorch_reason
     except Exception as exc:
         result["error"] = f"ref: {exc}"
         result["status"] = "REF_FAIL"
@@ -573,10 +599,10 @@ def run_one_mtx(
     else:
         result["triton_ok_pt"] = False
 
-    if fs_common._use_scipy_accuracy_reference():
-        # MUSA torch.sparse.mm is not registered.  The SciPy result above is
-        # the correctness oracle; there is deliberately no PyTorch baseline.
-        result["pytorch_reason"] = "torch.sparse baseline unavailable on MUSA"
+    if pytorch_op is None:
+        # Whether there is something to time, not which oracle was used: see
+        # _build_pytorch_reference. The reason it gave is already recorded.
+        result.setdefault("pytorch_reason", "no PyTorch baseline on this backend")
     else:
         try:
             _, result["pytorch_ms"] = ast_ops._benchmark_cuda_op(
