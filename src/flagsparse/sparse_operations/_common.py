@@ -213,12 +213,21 @@ def _detect_maca_runtime():
 _IS_MACA_RUNTIME = _detect_maca_runtime()
 
 
-# Iluvatar CoreX (BI-V150) is the second CUDA-compatible stack, with the same
-# problem as MetaX: torch.version.cuda is set and torch.version.hip is None, so
-# neither says "Iluvatar". The signals, most explicit first, are the CoreX tag
-# in the torch build's local version ("2.x.y+corex.<sdk>") and the device name.
-# NOT verified on hardware yet -- FLAGSPARSE_BACKEND=iluvatar is the documented
-# way in, and the check the backend doc prints the device name for.
+# Iluvatar CoreX (BI-V100 / BI-V150) is the second CUDA-compatible stack, with the
+# same problem as MetaX: torch.version.cuda is set and torch.version.hip is None,
+# so neither says "Iluvatar". Three signals, most explicit first:
+#
+#   1. a CoreX tag in the torch build's local version ("2.x.y+corex.<sdk>").
+#      MEASURED 2026-09-22 on a BI-V100 box: the vendor container's torch reports
+#      a BARE "2.10.0", so this signal does NOT fire there. Kept because other
+#      CoreX wheels do carry the tag, but it cannot be the only one.
+#   2. the CoreX SDK environment, present on a configured host. COREX_HOME is the
+#      same variable the C API's IX slot reads (capi/src/adaptor/CMakeLists.txt).
+#   3. the device name, which needs a working runtime: on that same box CUDA
+#      initialization failed (error 803, container CoreX newer than the host
+#      driver), so get_device_properties() raises and only 2 can answer.
+#
+# FLAGSPARSE_BACKEND=iluvatar remains the documented way in; see docs/ILUVATAR.md.
 _ILUVATAR_DEVICE_NAME_TOKENS = _BACKEND_SPEC_BY_NAME["iluvatar"].device_tokens
 
 
@@ -228,6 +237,9 @@ def _detect_iluvatar_runtime():
         return override == "iluvatar"
     if "corex" in str(getattr(torch, "__version__", "")).lower():
         return True
+    for env in ("COREX_HOME", "COREX_PATH"):
+        if os.environ.get(env):
+            return True
     try:
         if torch.cuda.is_available():
             name = torch.cuda.get_device_properties(0).name.lower()
