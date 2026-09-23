@@ -375,6 +375,10 @@ def compute(prepared, x, y, alg, config, plan=None):
     native_rocm_fp32 = (
         prepared.data.dtype == torch.float32
         and getattr(prepared.backend_caps, "backend", None) == "rocm"
+        # A long serial reduction accumulates enough FP32 rounding error to
+        # exceed the public SpMV tolerance. Delivery matrices stay on the
+        # faster FP32 path; exceptional long rows retain FP64 accumulation.
+        and prepared.max_row_nnz <= 8192
     )
     acc_dtype = (
         torch.float32
