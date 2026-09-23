@@ -1484,6 +1484,12 @@ def _configure_spmv_route(prepared, alg, config=None):
         and config is None
         and prepared.n_rows > 0
     ):
+        # One extra load stage consistently hides the indirect x-vector
+        # latency on gfx936's FP32/FP64 row-tile profiles.  Keep reduced
+        # precision inputs on their established reduction schedule.
+        if prepared.data.dtype in (torch.float32, torch.float64):
+            actual["row_tile"]["loop_num_stages"] = 2
+            source += ":stage2"
         avg_nnz_per_row = prepared.data.numel() / prepared.n_rows
         if avg_nnz_per_row <= 4.0 and prepared.max_row_nnz <= 16:
             # Uniform low-degree graphs benefit from twice as many rows per
@@ -1492,9 +1498,11 @@ def _configure_spmv_route(prepared, alg, config=None):
             actual["row_tile"].update(
                 rows_per_program=128,
                 lanes_per_row=4,
-                # The second load stage hides gather latency on uniform
-                # low-degree FP32 graphs; FP64 receives no such benefit.
-                loop_num_stages=2 if prepared.data.dtype == torch.float32 else 1,
+                loop_num_stages=(
+                    2
+                    if prepared.data.dtype in (torch.float32, torch.float64)
+                    else 1
+                ),
             )
             source += ":uniform-short-128x4"
         elif (
@@ -1502,10 +1510,17 @@ def _configure_spmv_route(prepared, alg, config=None):
             and 5.0 <= avg_nnz_per_row <= 7.0
             and prepared.max_row_nnz <= 16
         ):
-            # A second stage helps the compact FP64 short-row tile without
-            # raising register pressure on the more irregular row shapes.
-            actual["row_tile"]["loop_num_stages"] = 2
             source += ":compact-fp64-stage2"
+        elif (
+            prepared.data.dtype == torch.float32
+            and 8.0 <= avg_nnz_per_row <= 11.0
+            and prepared.max_row_nnz <= 24
+        ):
+            # Regular FP32 rows in this range fit in one 16-lane vector.
+            # Keeping 64 rows per program retains the graph-like occupancy
+            # that the 32x16 profile loses on the amazon/GL shapes.
+            actual["row_tile"].update(rows_per_program=64, lanes_per_row=16)
+            source += ":regular-fp32-64x16"
         elif avg_nnz_per_row >= 9.0:
             # A 32x16 tile is faster on regular medium/long-row matrices.
             # Rows below nine remain in the 64x8 layout: its extra row-level

@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <vector>
 
 #include "baseline/baseline.hpp"
@@ -43,6 +44,7 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
     // The variant list comes from conf/operators.yaml via the generated
     // registry, not from a table in this file.
     const auto declared = variants_of("spmv");
+    const bool delivery_csr_only = std::getenv("FLAGSPARSE_DELIVERY_CSR_ONLY") != nullptr;
 
     for (const auto& entry : corpus()) {
         const CsrMatrix& A = entry.A;
@@ -57,6 +59,11 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
         const std::vector<int32_t> coo_rows = coo_row_indices_of(A);
 
         for (const registry::Variant* v : declared) {
+            if (delivery_csr_only &&
+                (std::string(v->format) != "csr" ||
+                 (std::string(v->dtype) != "f32" && std::string(v->dtype) != "f64"))) {
+                continue;
+            }
             const bool is_coo = std::string(v->format) == "coo";
             const bool is_csr = std::string(v->format) == "csr";
             if (!is_csr && !is_coo) {

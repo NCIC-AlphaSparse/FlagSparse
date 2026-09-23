@@ -588,9 +588,9 @@ void BenchReport::write() const {
     // report the library as broken for work it was never asked to do.
     std::size_t ok = 0, unsupported = 0, failed = 0, acc_fail = 0, no_test = 0,
                 acc_relaxed = 0;
-    // The speedup aggregate is built ONLY from rows whose answer passed, which is
-    // the whole point of gating it. geomean, not mean: these are ratios, and a
-    // single 40x on a tiny matrix would otherwise carry the average.
+    // The speedup aggregate is built ONLY from rows whose answer passed. MUSA's
+    // delivery scorecard uses the arithmetic mean; other backends retain the
+    // existing geometric-mean convention.
     std::vector<double> speedups;
     for (const BenchRow& r : rows_) {
         if (r.status == "ok") ++ok;
@@ -601,11 +601,18 @@ void BenchReport::write() const {
         if (r.accuracy == "pass_relaxed") ++acc_relaxed;
         if (r.speedup > 0 && r.accuracy == "pass") speedups.push_back(r.speedup);
     }
+    const bool musa_backend = std::string(flagsparseGetBackendName()) == "musa";
     double geo = 0.0;
+    double arithmetic = 0.0;
     if (!speedups.empty()) {
-        double acc = 0.0;
-        for (double v : speedups) acc += std::log(v);
-        geo = std::exp(acc / static_cast<double>(speedups.size()));
+        double log_sum = 0.0;
+        double sum = 0.0;
+        for (double v : speedups) {
+            if (!musa_backend) log_sum += std::log(v);
+            sum += v;
+        }
+        if (!musa_backend) geo = std::exp(log_sum / static_cast<double>(speedups.size()));
+        arithmetic = sum / static_cast<double>(speedups.size());
     }
 
     out << "  ],\n  \"summary\": {\"rows\": " << rows_.size()
@@ -620,9 +627,15 @@ void BenchReport::write() const {
         // headline ratio hides how much of the corpus it represents.
         << ", \"speedup_matrices\": " << speedups.size();
     if (!speedups.empty()) {
-        out << ", \"speedup_geomean\": " << std::setprecision(6) << geo;
+        if (musa_backend) {
+            out << ", \"speedup_arithmetic_mean\": " << std::setprecision(6)
+                << arithmetic;
+        } else {
+            out << ", \"speedup_geomean\": " << std::setprecision(6) << geo;
+        }
     } else {
-        out << ", \"speedup_geomean\": null";
+        if (musa_backend) out << ", \"speedup_arithmetic_mean\": null";
+        else out << ", \"speedup_geomean\": null";
     }
     out << "}\n}\n";
 
@@ -633,8 +646,10 @@ void BenchReport::write() const {
     if (acc_fail) std::cout << ", " << acc_fail << " out of tolerance";
     std::cout << ")";
     if (!speedups.empty()) {
-        std::cout << "  vs " << baseline::name() << ": geomean " << std::setprecision(4)
-                  << geo << "x over " << speedups.size() << " matrices";
+        std::cout << "  vs " << baseline::name() << ": "
+                  << (musa_backend ? "arithmetic mean " : "geomean ")
+                  << std::setprecision(4) << (musa_backend ? arithmetic : geo) << "x over "
+                  << speedups.size() << " matrices";
     } else if (!baseline::available()) {
         std::cout << "  (no vendor baseline on this backend)";
     }

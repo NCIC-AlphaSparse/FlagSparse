@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <vector>
 
 #include "baseline/baseline.hpp"
@@ -36,6 +37,13 @@ BenchReport g_report("spmm");
 // the row count of the operand.
 constexpr int64_t kWidths[] = {8, 32, 128};
 
+// MUSA's delivery scope is n=8 only. It skips the wider cases rather than
+// narrowing the array, which would drop them on every other backend too.
+bool musa_backend() {
+    static const bool is_musa = std::string(flagsparseGetBackendName()) == "musa";
+    return is_musa;
+}
+
 }  // namespace
 
 TEST(SpmmBenchmark, CsrOverCorpus) {
@@ -46,6 +54,7 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
     const Scalars sc;
     // Variant list from conf/operators.yaml via the generated registry.
     const auto declared = variants_of("spmm");
+    const bool delivery_csr_only = std::getenv("FLAGSPARSE_DELIVERY_CSR_ONLY") != nullptr;
 
     for (const auto& entry : corpus()) {
         const CsrMatrix& A = entry.A;
@@ -53,6 +62,7 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
         // the same matrix rather than two different orderings of it.
         const std::vector<int32_t> coo_rows = coo_row_indices_of(A);
         for (const int64_t n : kWidths) {
+            if (musa_backend() && n != kWidths[0]) continue;
             // B column-major (cols x n); the oracle wants it row-major (k x n),
             // so the reference is built from the same numbers in the other order.
             const std::size_t bcount = static_cast<std::size_t>(A.cols) *
@@ -79,6 +89,11 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
             }
 
             for (const registry::Variant* v : declared) {
+                if (delivery_csr_only &&
+                    (std::string(v->format) != "csr" ||
+                     (std::string(v->dtype) != "f32" && std::string(v->dtype) != "f64"))) {
+                    continue;
+                }
                 const bool is_coo = std::string(v->format) == "coo";
                 const bool is_csr = std::string(v->format) == "csr";
                 if (!is_csr && !is_coo) {

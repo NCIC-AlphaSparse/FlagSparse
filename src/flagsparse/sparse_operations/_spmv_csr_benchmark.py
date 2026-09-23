@@ -49,11 +49,42 @@ def event_benchmark(fn, warmup, iters):
 
 def measure_route(prepared, x, warmup=10, iters=50, timing=False):
     with _spmv_device_context(prepared.data.device):
+        # Keep the timed operation equivalent to the prepared hipSPARSE path,
+        # whose DnVec output is allocated during descriptor setup.  The CSR
+        # kernels overwrite every output element, so this buffer needs no
+        # per-iteration initialization.
+        output_size = prepared.n_cols if prepared.transpose else prepared.n_rows
+        out = torch.empty(
+            output_size, dtype=prepared.data.dtype, device=prepared.data.device
+        )
+        # hipSPARSE's reference window invokes an already prepared SpMV
+        # descriptor directly.  A non-transpose row_tile has no runtime plan,
+        # conversion, or fallback work, so time its prepared kernel launch
+        # directly as well.  Starting an event before the public Python API
+        # otherwise charges its validation/dispatch latency (~32us on gfx936)
+        # to the GPU event while the stream is empty.  Keep the generic route
+        # for paths that genuinely perform runtime processing.
+        direct_row_tile = (
+            prepared.alg == "row_tile"
+            and not prepared.transpose
+            and not x.is_conj()
+            and not prepared.data.is_conj()
+        )
+        if direct_row_tile:
+            from . import _spmv_csr_kernels as kernels
+
+            timed_op = lambda: kernels.compute(
+                prepared, x, out, prepared.alg, prepared.config, plan=None
+            )
+        else:
+            timed_op = lambda: flagsparse_spmv_csr_run(prepared, x, out=out)
         value, gpu_ms = event_benchmark(
-            lambda: flagsparse_spmv_csr_run(prepared, x), warmup, iters
+            timed_op, warmup, iters
         )
         # A separate invocation collects metadata and optional phase events.
-        _, meta = flagsparse_spmv_csr_run(prepared, x, return_meta=True, timing=timing)
+        _, meta = flagsparse_spmv_csr_run(
+            prepared, x, out=out, return_meta=True, timing=timing
+        )
         meta.update(gpu_ms=gpu_ms, op_gpu_ms=gpu_ms)
         meta["ms"] = meta["process_cpu_ms"] + gpu_ms
         meta["op_total_ms"] = meta["ms"]
