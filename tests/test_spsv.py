@@ -209,7 +209,7 @@ def _vendor_backend_name():
     names with: on Ascend and XPU the vendor sparse library IS torch.sparse, so
     the label is "PyTorch" and `f"{name}_ms"` produced a second "PyTorch_ms" --
     one dict key written twice, the vendor timing and the PyTorch timing
-    overwriting each other. On MUSA, GCU and MLU there is no vendor at all and
+    overwriting each other. On MUSA and GCU there is no vendor at all and
     the label is "N/A", which produced columns literally named "N/A_ms".
 
     CUDA and DCU keep their real names (CuPy/cuSPARSE, hipSPARSE) so their CSVs

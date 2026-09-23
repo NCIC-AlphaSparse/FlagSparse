@@ -1,10 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""MLU overrides for the shared Triton operators.
+"""Iluvatar CoreX overrides for the shared Triton operators.
 
 EMPTY ON PURPOSE. The operators live once, in
 :mod:`flagsparse.sparse_operations`; this package holds only the files that
-genuinely diverge for Cambricon MLU. A module dropped in here shadows the shared one
+genuinely diverge for Iluvatar CoreX (BI-V150). A module dropped in here shadows the shared one
 of the same name -- see _dispatch.operator_module().
 
 Before adding a file here, prefer the cheaper mechanisms the shared

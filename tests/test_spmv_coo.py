@@ -282,8 +282,6 @@ def _spd(num, den):
 
 
 # FlagSparse native COO SpMV: see sparse_operations.spmv_coo
-COO_ATOMIC_BLOCK = 256
-COO_ATOMIC_WARPS = 4
 COO_SEG_BLOCK_INNER = 128
 
 
@@ -308,11 +306,14 @@ def _run_flagsparse_coo_launch(
     x,
 ):
     x = spmv_coo_mod._validate_x_coo(x, launch)
+    block_size, num_warps = spmv_coo_mod._resolve_spmv_coo_kernel_launch(
+        launch, None, None
+    )
     return spmv_coo_mod._run_spmv_coo_prepared_with_fallback(
         launch,
         x,
-        block_size=COO_ATOMIC_BLOCK,
-        num_warps=COO_ATOMIC_WARPS,
+        block_size=block_size,
+        num_warps=num_warps,
         block_inner=COO_SEG_BLOCK_INNER,
     )
 

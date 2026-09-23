@@ -156,7 +156,13 @@ def _defaults(caps):
 
 
 # Architecture-specific overrides may be added only with a recorded benchmark.
-ARCH_PROFILES = {}
+# On gfx936, 64 independent rows in a single wave hide FP64 reduction latency
+# better than the conservative 16-row/two-wave default on the delivery corpus.
+ARCH_PROFILES = {
+    ("rocm", "gfx936"): {
+        "row_tile": {"rows_per_program": 64, "num_warps": 1},
+    },
+}
 
 
 def _merge(base, overrides):

@@ -592,7 +592,7 @@ def _load_backend_names() -> tuple[str, ...]:
 
         return tuple(spec.name for spec in backend_specs())
     except Exception:
-        return ("cuda", "rocm", "metax", "mthreads", "ascend", "xpu", "gcu", "mlu")
+        return ("cuda", "rocm", "metax", "mthreads", "ascend", "xpu", "gcu", "iluvatar")
 
 
 SUPPORTED_BACKENDS: tuple[str, ...] = _load_backend_names()
@@ -601,13 +601,19 @@ SUPPORTED_BACKENDS: tuple[str, ...] = _load_backend_names()
 # benchmark scripts.  A backend absent from here needs its own entry below --
 # and the point of listing them is that "not yet wired up" becomes visible
 # instead of arriving as an empty result.
-GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metax", "mthreads")
+GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = (
+    "cuda",
+    "rocm",
+    "metax",
+    "mthreads",
+    "iluvatar",
+)
 
 # Backends with no per-operator benchmark of their own yet.  They fall back to
 # the capability probe, which reports PASS / REJECTED / TRITON_COMPILE per
 # operator -- on a platform where a kernel may not lower at all, that is the
 # measurement that matters, and it beats reporting nothing.
-PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")
+PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu",)
 
 # The XPU SDK has no cuSPARSE-shaped generic sparse API, so these seven run
 # through benchmark_xpu.py instead of the probe.  The script compares each
@@ -1590,6 +1596,13 @@ def write_phase_result(
 def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Batch schedulers can leave these variables pointing at a cleaned-up job
+    # scratch directory. Triton's ROCm compiler delegates assembly to clang,
+    # which then fails before a kernel is built. Keep valid user directories,
+    # but use the standard writable temporary directory for stale or unset ones.
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        if not env.get(key) or not os.path.isdir(env[key]):
+            env[key] = "/tmp"
     if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
         # torch_npu ignores CUDA_VISIBLE_DEVICES: without this every child landed
         # on physical NPU 0 whatever --gpus said (measured on 910B, 2026-09-17).

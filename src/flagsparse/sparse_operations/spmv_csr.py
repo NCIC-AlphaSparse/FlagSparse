@@ -281,6 +281,8 @@ def _normalize_spmv_opt_device_props(device):
             else (
                 "metax"
                 if _is_maca_runtime()
+                else "iluvatar"
+                if _is_iluvatar_runtime()
                 else (
                     "mthreads"
                     if _is_mthreads_runtime()
@@ -1456,7 +1458,14 @@ def _configure_spmv_route(prepared, alg, config=None):
     requested = _csr_config.normalize_alg(alg)
     resolved = requested
     if resolved == "auto":
-        resolved = "legacy_" + _spmv_csr_default_backend()
+        # On gfx936 the row-tile kernel is the fastest validated no-preprocess
+        # route across the delivery matrix sweep. Keep legacy selection for the
+        # other backends, whose row-tile profiles have not been measured here.
+        resolved = (
+            "row_tile"
+            if _is_rocm_runtime()
+            else "legacy_" + _spmv_csr_default_backend()
+        )
     caps = _spmv_backend_caps(prepared.data.device)
     _csr_config.validate_support(
         resolved,
@@ -1469,6 +1478,40 @@ def _configure_spmv_route(prepared, alg, config=None):
     actual, source, rejections = _csr_config.resolve_config(
         resolved, caps, config, return_rejections=True
     )
+    if (
+        resolved == "row_tile"
+        and caps.backend == "rocm"
+        and config is None
+        and prepared.n_rows > 0
+    ):
+        avg_nnz_per_row = prepared.data.numel() / prepared.n_rows
+        if avg_nnz_per_row <= 4.0 and prepared.max_row_nnz <= 16:
+            # Uniform low-degree graphs benefit from twice as many rows per
+            # program and a four-lane reduction.  Keep the tight max-row
+            # guard: heavy-tailed graphs with the same average regress here.
+            actual["row_tile"].update(
+                rows_per_program=128,
+                lanes_per_row=4,
+                # The second load stage hides gather latency on uniform
+                # low-degree FP32 graphs; FP64 receives no such benefit.
+                loop_num_stages=2 if prepared.data.dtype == torch.float32 else 1,
+            )
+            source += ":uniform-short-128x4"
+        elif (
+            prepared.data.dtype == torch.float64
+            and 5.0 <= avg_nnz_per_row <= 7.0
+            and prepared.max_row_nnz <= 16
+        ):
+            # A second stage helps the compact FP64 short-row tile without
+            # raising register pressure on the more irregular row shapes.
+            actual["row_tile"]["loop_num_stages"] = 2
+            source += ":compact-fp64-stage2"
+        elif avg_nnz_per_row >= 9.0:
+            # A 32x16 tile is faster on regular medium/long-row matrices.
+            # Rows below nine remain in the 64x8 layout: its extra row-level
+            # parallelism matters for the short, nearly uniform NACA shape.
+            actual["row_tile"].update(rows_per_program=32, lanes_per_row=16)
+            source += ":rowlen-32x16"
     prepared.alg_requested, prepared.alg = requested, resolved
     prepared.config, prepared.config_source, prepared.backend_caps = (
         actual,

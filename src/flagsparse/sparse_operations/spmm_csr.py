@@ -647,11 +647,19 @@ def _spmm_hip_base_launch_overrides(
     else:
         block_n = min(int(block_n), 64)
     if block_nnz is None:
-        block_nnz = 64 if max_row_nnz < 512 else 128
+        # The delivery DenseN=32 base path is register/occupancy limited on
+        # gfx936. A 16-NNZ tile with one wave outperforms the former
+        # 32-NNZ/one-wave profile across the delivery matrices while retaining
+        # the 32-column output tile that avoids redundant output programs.
+        block_nnz = (
+            16
+            if n_dense_cols == 32
+            else (64 if max_row_nnz < 512 else 128)
+        )
     else:
         block_nnz = min(int(block_nnz), 512)
     if num_warps is None:
-        if n_dense_cols <= 16:
+        if n_dense_cols <= 16 or n_dense_cols == 32:
             num_warps = 1
         elif n_dense_cols <= 64:
             num_warps = 2
@@ -1053,21 +1061,35 @@ def _run_spmm_csr_base_route_impl(
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    C = _triton_spmm_csr_impl(
-        prepared.data,
-        prepared.kernel_indices,
-        prepared.kernel_indptr,
-        B,
-        prepared.n_rows,
-        int(B.shape[1]),
-        block_n=launch["block_n"],
-        block_nnz=launch["block_nnz"],
-        num_warps=launch["num_warps"],
-        num_stages=launch["num_stages"],
-        out=C_out,
-        dense_layout=dense_layout,
-        accuracy=accuracy,
+    use_batched_short_rows = (
+        _spmm_is_hip_device(device_props)
+        # The batched kernels accumulate in the value dtype, so they cannot serve
+        # the accuracy route -- csr_base_accuracy exists to accumulate wider.
+        and not accuracy
+        and dense_layout == "row"
+        and prepared.data.dtype in (torch.float32, torch.float64)
+        and int(B.shape[1]) == 32
+        and prepared.avg_nnz_per_row <= 32.0
+        and prepared.max_row_nnz <= 256
     )
+    if use_batched_short_rows:
+        C = _triton_spmm_csr_batched_short_rows_impl(prepared, B, C_out)
+    else:
+        C = _triton_spmm_csr_impl(
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            prepared.n_rows,
+            int(B.shape[1]),
+            block_n=launch["block_n"],
+            block_nnz=launch["block_nnz"],
+            num_warps=launch["num_warps"],
+            num_stages=launch["num_stages"],
+            out=C_out,
+            dense_layout=dense_layout,
+            accuracy=accuracy,
+        )
     if timing:
         end.record()
         _ACCEL.synchronize()
@@ -3786,6 +3808,128 @@ def _spmm_csr_batched_rows_f64_kernel(
 
 
 @triton.jit
+def _spmm_csr_two_rows_f32_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_rows,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BATCH_ROWS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Compute short CSR rows and 32 dense columns concurrently in one wave."""
+    rows = tl.program_id(0) * BATCH_ROWS + tl.arange(0, BATCH_ROWS)
+    active = rows < n_rows
+    start = tl.load(indptr_ptr + rows, mask=active, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0)
+    max_row_nnz = tl.max(end - start)
+    offs_n = tl.arange(0, 32)
+    acc = tl.zeros((BATCH_ROWS, 32), dtype=tl.float32)
+    for chunk_start in tl.range(0, max_row_nnz, BLOCK_K):
+        offs_k = chunk_start + tl.arange(0, BLOCK_K)
+        positions = start[:, None] + offs_k[None, :]
+        valid = active[:, None] & (positions < end[:, None])
+        values = tl.load(data_ptr + positions, mask=valid, other=0.0)
+        cols = tl.load(indices_ptr + positions, mask=valid, other=0)
+        dense = tl.load(
+            b_ptr
+            + cols[:, :, None] * stride_bk
+            + offs_n[None, None, :] * stride_bn,
+            mask=valid[:, :, None],
+            other=0.0,
+        )
+        acc += tl.sum(values[:, :, None] * dense, axis=1)
+    tl.store(
+        c_ptr + rows[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=active[:, None],
+    )
+
+
+@triton.jit
+def _spmm_csr_two_rows_f64_kernel(
+    data_ptr,
+    indices_ptr,
+    indptr_ptr,
+    b_ptr,
+    c_ptr,
+    n_rows,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BATCH_ROWS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    rows = tl.program_id(0) * BATCH_ROWS + tl.arange(0, BATCH_ROWS)
+    active = rows < n_rows
+    start = tl.load(indptr_ptr + rows, mask=active, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0)
+    max_row_nnz = tl.max(end - start)
+    offs_n = tl.arange(0, 32)
+    acc = tl.zeros((BATCH_ROWS, 32), dtype=tl.float64)
+    for chunk_start in tl.range(0, max_row_nnz, BLOCK_K):
+        offs_k = chunk_start + tl.arange(0, BLOCK_K)
+        positions = start[:, None] + offs_k[None, :]
+        valid = active[:, None] & (positions < end[:, None])
+        values = tl.load(data_ptr + positions, mask=valid, other=0.0)
+        cols = tl.load(indices_ptr + positions, mask=valid, other=0)
+        dense = tl.load(
+            b_ptr
+            + cols[:, :, None] * stride_bk
+            + offs_n[None, None, :] * stride_bn,
+            mask=valid[:, :, None],
+            other=0.0,
+        )
+        acc += tl.sum(values[:, :, None] * dense, axis=1)
+    tl.store(
+        c_ptr + rows[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=active[:, None],
+    )
+
+
+def _triton_spmm_csr_batched_short_rows_impl(prepared, B, C_out):
+    """Native multi-row CSR SpMM tile for ROCm's short-row DenseN=32 cases."""
+    kernel = (
+        _spmm_csr_two_rows_f64_kernel
+        if prepared.data.dtype == torch.float64
+        else _spmm_csr_two_rows_f32_kernel
+    )
+    # More rows amortize dispatch and CSR metadata traffic for extremely short
+    # fp32 rows. Float64 and less sparse matrices use two rows to avoid the
+    # much larger accumulator footprint.
+    if prepared.data.dtype == torch.float32 and prepared.avg_nnz_per_row <= 4.0:
+        batch_rows = 8
+    elif prepared.data.dtype == torch.float32 and prepared.avg_nnz_per_row <= 32.0:
+        batch_rows = 4
+    else:
+        batch_rows = 2
+    kernel[(triton.cdiv(prepared.n_rows, batch_rows),)](
+        prepared.data,
+        prepared.kernel_indices,
+        prepared.kernel_indptr,
+        B,
+        C_out,
+        prepared.n_rows,
+        B.stride(0),
+        B.stride(1),
+        C_out.stride(0),
+        C_out.stride(1),
+        BATCH_ROWS=batch_rows,
+        BLOCK_K=16,
+        num_warps=1,
+        num_stages=1,
+    )
+    return C_out
+
+
+@triton.jit
 def _spmm_csr_vector_rows_f32_kernel(
     data_ptr,
     indices_ptr,
@@ -4237,6 +4381,11 @@ def _spmm_csr_auto_prefers_alg1(data, indptr, shape):
     if n_rows <= 0 or nnz <= 0:
         return True
     mean = nnz / n_rows
+    if _is_rocm_runtime():
+        # ROCm's native base route chooses a two-row Triton tile for short
+        # rows and the regular row tile otherwise. Legacy ALG1 pays runtime
+        # symbolic bucketing and loses on the delivery matrices.
+        return False
     if mean < 3.5:
         return True
     if indptr.numel() < 2:

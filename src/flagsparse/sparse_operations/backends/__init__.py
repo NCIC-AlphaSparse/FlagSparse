@@ -13,8 +13,9 @@ files were byte-identical across all six (the only difference was one docstring
 line). That layout costs more than it buys:
 
   * a kernel fix has to be applied six times;
-  * `gcu` and `mlu` were dropped on the way, because a backend without a
-    directory became a hard RuntimeError instead of falling back;
+  * `gcu` and `mlu` (the slot Iluvatar now holds) were dropped on the way,
+    because a backend without a directory became a hard RuntimeError instead
+    of falling back;
   * it cannot express per-DEVICE-MODEL tuning (_MACA_SPSV_PROFILES keys off
     _maca_device_model(), which is finer than "the backend");
   * worst, it makes divergence INVISIBLE: when two copies differ, a diff cannot
@@ -28,4 +29,4 @@ here is the last resort, and being the only occupant of an otherwise empty
 directory is exactly the visibility that resort should have.
 """
 
-__all__ = ("ascend", "cuda", "gcu", "maca", "mlu", "musa", "rocm", "xpu")
+__all__ = ("ascend", "cuda", "gcu", "iluvatar", "maca", "musa", "rocm", "xpu")

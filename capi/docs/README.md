@@ -12,9 +12,10 @@
 | [DCU.md](DCU.md) | `HCU` | 海光 | 预留槽位，缺 adaptor.cpp |
 | [ASCEND.md](ASCEND.md) | `NPU` | 昇腾 | 预留槽位，缺 adaptor.cpp |
 
-还有三个 BACKEND 名字存在但本目录没有单独文档：`GCU`（燧原）、`MLU`（寒武纪，
-**通用备用槽**）、`IX`（天数智芯）—— 都是预留槽位，填法与上面三个相同，见
-[../README.md](../README.md) 的平台矩阵。`XPU`（昆仑芯）是另一回事：
+还有两个 BACKEND 名字存在但本目录没有单独文档：`GCU`（燧原）和 `IX`（天数智芯）——
+都是预留槽位，填法与上面三个相同，见 [../README.md](../README.md) 的平台矩阵。
+天数的 Python 侧接入见 [../../docs/ILUVATAR.md](../../docs/ILUVATAR.md)；`MLU`（寒武纪）
+这个槽位已经去掉，`deps/libtriton_jit` 仍带 MLU 后端，需要时按平台矩阵那节补回即可。`XPU`（昆仑芯）是另一回事：
 `deps/libtriton_jit` 根本没有 XPU 后端，所以 C wrapper 现在编不了它；Python 侧可以。
 
 ## 两层，别混淆

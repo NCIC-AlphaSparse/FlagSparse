@@ -16,13 +16,15 @@ cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
 
 # BACKEND must be decided before project(): libtriton_jit switches its enabled
 # languages on it.
-# CUDA plus the domestic accelerators. XPU (Kunlunxin) and GCU (Enflame) are the
-# two slots added alongside the four already named; MLU (Cambricon) doubles as
-# the generic reserve. Which of these are actually BUILT is src/adaptor's
-# business -- see the reserved-slot message there.
+# CUDA plus the domestic accelerators. XPU (Kunlunxin), GCU (Enflame) and IX
+# (Iluvatar) are the slots added alongside the four already named. Which of
+# these are actually BUILT is src/adaptor's business -- see the reserved-slot
+# message there.  MLU (Cambricon) was dropped: nobody has such a box, and the
+# Python side gave its generic-reserve role to iluvatar. deps/libtriton_jit
+# still has an MLU backend, so restoring the slot is a table entry, not work.
 set(BACKEND "CUDA" CACHE STRING
-    "Target backend: CUDA, MUSA, MACA, NPU, HCU, IX, GCU, MLU, XPU")
-set_property(CACHE BACKEND PROPERTY STRINGS CUDA MUSA MACA NPU HCU IX GCU MLU XPU)
+    "Target backend: CUDA, MUSA, MACA, NPU, HCU, IX, GCU, XPU")
+set_property(CACHE BACKEND PROPERTY STRINGS CUDA MUSA MACA NPU HCU IX GCU XPU)
 
 # XPU is listed but cannot build: deps/libtriton_jit has no XPU backend. Catching
 # it HERE matters -- add_subdirectory(libtriton_jit) comes first and would fail

@@ -412,11 +412,9 @@ def _benchmark_triton_spmm(
     # work: prepare measured 72-89% of the timed window at op=non, and the resulting
     # ratios read 0.13-0.37 where the kernel alone is 1.19-1.42.
     #
-    # Routing must be preserved, not just timing: ``flagsparse_spmm_csr`` sends the
-    # non-transposed float32/float64 case (with no tuning overrides) to the optimized
-    # alg1 kernel and everything else to the base path, whereas the route registry's
-    # ``alg="auto"`` resolves to ``csr_base`` for every op/dtype.  Mirror the library's
-    # own condition so the same kernel is measured as before.
+    # Routing must be preserved, not just timing: the public API uses a
+    # matrix-aware policy while the route registry's ``alg="auto"`` resolves
+    # to ``csr_base``. Mirror the library's own condition here.
     use_opt_alg1 = (
         op == "non"
         and block_n is None
@@ -424,6 +422,7 @@ def _benchmark_triton_spmm(
         and max_segments is None
         and torch.is_tensor(data)
         and data.dtype in (torch.float32, torch.float64)
+        and ast_ops._spmm_csr_auto_prefers_alg1(data, indptr, shape)
     )
     if use_opt_alg1:
         prepared = ast.prepare_spmm_csr_opt_alg1(data, indices, indptr, shape)

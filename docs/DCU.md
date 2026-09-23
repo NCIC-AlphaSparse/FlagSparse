@@ -29,6 +29,7 @@ Triton 内核在两个后端是同一份代码，**只有"厂商参考实现/基
 
 ```bash
 export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=rocm       # 显式指定；探测靠 torch.version.hip，下一行仍要确认它非 None
 python3 -c "import torch; print(torch.version.hip)"          # 必须非 None
 python3 -c "import hip; print('hip-python ok')"             # 性能基线 hipSPARSE 依赖它
 python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_fallback_reason())"
@@ -58,6 +59,11 @@ timeout -s KILL 43200 python3 run_flagsparse_pytest.py \
 | 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | `hipsparse`（hip-python）；fp16/bf16 没有厂商基线，回落 PyTorch（第 7 节） |
 | 精度参考（内核被比对的那个值） | **PyTorch** —— DCU 与 CUDA 是仅有的两个比对厂商库加 torch 的后端 |
 
+**scatter 的计时口径**：两边都把输出清零算在计时区内。Triton 路径的 `reset_output=True`
+每次调用都会 `zero_()`，所以 hipSPARSE 基线每轮迭代也清一次同一块输出缓冲区，两边语义一致；
+hipSPARSE 的描述符仍在计时区外准备。2026-09-23 随 DCU 调优一并改的，此前基线不清零，
+两边测的不是同一件事。
+
 **预期会看到的非 Passed**：20 个交付变体里没有已知的必然失败项。此前记录的两类问题都出在已经不交付的算子上
 （SpSV/SpSM 可能 `Timeout`；`spgemm_csr` 的 `mip1.mtx` 触发 rocSPARSE 内部 SpGEMM 内核的 VMFault，见第 7 节），
 显式 `--ops` 指名它们时才会再遇到。
@@ -81,13 +87,18 @@ export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ## 1. 环境准备
 
 ```bash
-# 1) 确认 torch 是 ROCm 版本 —— 这是后端分发的唯一判据
+# 1) 确认 torch 是 ROCm 版本 —— 这是自动探测的判据
 python -c "import torch; print('hip=', torch.version.hip, '| cuda=', torch.version.cuda)"
 # 期望：hip= 6.x.xxxxx  | cuda= None
+export FLAGSPARSE_BACKEND=rocm
 ```
 
 `torch.version.hip` 为 `None` 时，**所有 hipSPARSE 分支都不会被走到**，
 测试会静默回到 CUDA/torch 路径——这时你测的根本不是 DCU 代码。
+
+`FLAGSPARSE_BACKEND=rocm` 会跳过探测、直接选 ROCm 后端，和其他后端文档的写法一致。它**不能**
+代替上面的检查：在非 ROCm 的 torch 上强行指定，hipSPARSE 调用照样失败。所以两者都要：先确认
+`torch.version.hip` 非 `None`，再显式指定。
 
 ```bash
 # 2) 安装 hip-python（版本需与 ROCm 大版本匹配）

@@ -39,14 +39,14 @@ FlagSparse 按运行时分发**厂商参考实现/基线**和**少数按后端�
 
 ## 0.5 交付复现：20 个变体 × 10 个矩阵（精度 + 性能）
 
-**环境**（每次开工，第 1 节有逐项说明）：
+**环境**：先照第 1 节把环境变量全部设好（后端和型号都显式指定），再做开跑前的检查：
 
 ```bash
-export PYTHONPATH=$PWD/src
-export FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550
-export FLAGSPARSE_MACA_VENDOR=torch     # 本机没有 CuPy，用 PyTorch 作基线；不要设 none，否则 spmv_csr 的基线列是 N/A
-python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model(), c._accel_fallback_reason())"
-# 期望：metax c550 None
+python3 -c "import flagsparse; print(flagsparse.__file__)"
+# 期望：<仓库>/src/flagsparse/__init__.py
+python3 -c "import torch; print(torch.cuda.get_device_properties(0).name); from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model(), c._accel_fallback_reason())"
+# 期望：MetaX C550
+#       metax c550 None
 ```
 
 **命令**：
@@ -117,26 +117,37 @@ export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 
 ---
 
-## 1. 每次开工的四行
+## 1. 每次开工的环境
 
 ```bash
 cd <仓库>
-export PYTHONPATH=$PWD/src          # 独立脚本需要；pytest 由 pytest.ini 自带
-export FLAGSPARSE_MACA_VENDOR=torch  # 本机没有 CuPy，用 PyTorch 作基线
+
+# MACA SDK（不带 env.sh，只能手动设）
 export MACA_PATH=/opt/maca
 export LD_LIBRARY_PATH=/opt/mxdriver/lib:$MACA_PATH/lib:$MACA_PATH/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+export PATH=$MACA_PATH/bin:$MACA_PATH/mxgpu_llvm/bin:$PATH
+
+# FlagSparse：后端、型号、基线全部显式指定
+export PYTHONPATH=$PWD/src               # 独立脚本需要；pytest 由 pytest.ini 自带
+export FLAGSPARSE_BACKEND=metax
+export FLAGSPARSE_MACA_MODEL=c550
+export FLAGSPARSE_MACA_VENDOR=torch      # 本机没有 CuPy，用 PyTorch 作基线；不要设 none，否则 spmv_csr 的基线列是 N/A
+unset FLAGSPARSE_ACCURACY_REFERENCE      # 用默认的 auto（CPU 上的 SciPy），防止上次调试残留的设置
 ```
 
-后端探测**不需要**再设 `FLAGSPARSE_BACKEND` / `FLAGSPARSE_MACA_MODEL`：C550 上
-`torch.version.maca` 存在、设备名是 `'MetaX C550'`，两条探测路径都能命中。确认：
+C550 上本来也能自动探测（2.2 节），这里显式指定，是为了不依赖 `torch.version.maca` 和设备名的识别。
+代价是探测被跳过，所以检查里要打印**真实设备名**：只有它是 `MetaX C550`，写死 `c550` 才对；
+换了型号或机器，要先删掉 `FLAGSPARSE_BACKEND` / `FLAGSPARSE_MACA_MODEL` 这两行。
 
 ```bash
 python -c "import flagsparse; print(flagsparse.__file__)"   # 必须指向 <仓库>/src/
-python -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model())"
-# 期望：metax c550
+python -c "import torch; print(torch.cuda.get_device_properties(0).name); from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model(), c._accel_fallback_reason())"
+# 期望：MetaX C550
+#       metax c550 None
 ```
 
 `flagsparse.__file__` 指到 `site-packages` 就说明跑的是别的副本，任何结果都不算数。
+容器重新分配后只有 `/opt`、`/opt/conda` 保留，上面的 export 会丢失，可以写进 `~/.bashrc`，但每次开跑前仍要做这两条检查。
 
 ---
 
@@ -221,7 +232,7 @@ EOF
 | 显存 | 65120 MB | |
 | torch | `2.10.0+metax3.8.1.0`（SDK 3.8.2.6 上可用） | 小版本错配不影响 |
 
-**结论：自动探测可用**，`FLAGSPARSE_BACKEND` / `FLAGSPARSE_MACA_MODEL` 都不必显式指定。
+**结论：自动探测可用**，`FLAGSPARSE_BACKEND` / `FLAGSPARSE_MACA_MODEL` 不设也能认出来；第 1 节仍然显式指定，理由见那里。
 
 ### 2.3 确认分发确实走到 metax
 

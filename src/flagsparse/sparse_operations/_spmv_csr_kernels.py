@@ -369,10 +369,21 @@ def compute(prepared, x, y, alg, config, plan=None):
     if not m:
         return y
     complex_input = prepared.data.is_complex()
+    # gfx936's FP64 accumulation doubles value traffic and register pressure for
+    # FP32 SpMV. The native FP32 reduction remains within the operator's FP32
+    # tolerance, so keep the high-precision path for other backends only.
+    native_rocm_fp32 = (
+        prepared.data.dtype == torch.float32
+        and getattr(prepared.backend_caps, "backend", None) == "rocm"
+    )
     acc_dtype = (
-        torch.float64
-        if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
-        else torch.float32
+        torch.float32
+        if native_rocm_fp32
+        else (
+            torch.float64
+            if prepared.data.dtype in (torch.float32, torch.float64, torch.complex128)
+            else torch.float32
+        )
     )
     acc = tl.float64 if acc_dtype == torch.float64 else tl.float32
     view = lambda t: (
