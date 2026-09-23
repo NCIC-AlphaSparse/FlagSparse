@@ -528,6 +528,7 @@ PYTHONPATH=src python run_flagsparse_pytest.py --mode quick --phase accuracy
 
 | 现象 | 首先检查 |
 | --- | --- |
+| **精度阶段全是 `CRASH`，性能却 Passed** | `PYTHONPATH` 里混进了 `$PWD/tests`：仓库有个 `tests/pytest` 目录，会把真正的 pytest 包遮掉，收集阶段就崩、一行汇总都没有。`python3 -c "import pytest; print(pytest.__file__)"` 打印出仓库内的路径即是。只设 `PYTHONPATH=$PWD/src` |
 | 基线列全是 `N/A` | `flagsparse.__file__` 是否指向 `src/`（见第 2 节）；再看 `reason` 字段 |
 | `requires a ROCm runtime` | `torch.version.hip` 是否为 `None`——装的可能是 CUDA 版 torch |
 | `No module named 'hip'` | `pip install hip-python` |
