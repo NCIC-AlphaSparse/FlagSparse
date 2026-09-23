@@ -28,6 +28,12 @@ import triton.language as tl
 SUPPORTED_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
 DEFAULT_GATHER_BLOCK_SIZE = 256
 DEFAULT_GATHER_NUM_WARPS = 8
+DEFAULT_SCATTER_BLOCK_SIZE = 1024
+ROCM_SCATTER_BLOCK_SIZE = 128
+ROCM_SCATTER_BLOCK_SIZE_BY_DTYPE = {
+    torch.float32: 64,
+    torch.float64: 256,
+}
 
 # ``_gather_*_kernel`` carries a grid-stride loop, so the grid is deliberately capped
 # and each program may cover several tiles.  The cap used to be the literal ``2``,
@@ -118,6 +124,42 @@ def _scatter_dtype_error_message():
         str(dtype).replace("torch.", "") for dtype in SUPPORTED_SCATTER_VALUE_DTYPES
     )
     return "Scatter benchmark supports value dtypes: " f"{supported}."
+
+
+def _resolve_scatter_block_size(block_size, value_dtype=None, nnz=None):
+    """Choose the backend default while preserving explicit launch overrides."""
+    if block_size is None:
+        if _is_rocm_runtime():
+            # gfx936 needs different program counts for sparse puts: fp32's
+            # 4K/64K cases favor 64 elements per program, while its 16K case
+            # benefits from a wider tile. FP64 needs a narrower small-case
+            # tile but retains the 256-element large-case tile.
+            if value_dtype == torch.float32 and nnz is not None:
+                if nnz <= 2_048:
+                    return 64
+                if 8_192 < nnz <= 32_768:
+                    return 512
+                return 64
+            if value_dtype == torch.float64 and nnz is not None:
+                if nnz <= 4_096:
+                    return 64
+                return 128 if nnz <= 32_768 else 256
+            return ROCM_SCATTER_BLOCK_SIZE_BY_DTYPE.get(
+                value_dtype, ROCM_SCATTER_BLOCK_SIZE
+            )
+        return DEFAULT_SCATTER_BLOCK_SIZE
+    return int(block_size)
+
+
+def _resolve_scatter_num_warps(value_dtype, nnz):
+    """Use extra waves only for the latency-bound fp64 SpVec micro-case."""
+    if (
+        _is_rocm_runtime()
+        and value_dtype == torch.float64
+        and int(nnz) <= 4_096
+    ):
+        return 4
+    return 1
 
 
 @triton.jit
@@ -280,7 +322,7 @@ def _triton_scatter_impl(
     kernel_indices,
     dense_size,
     out=None,
-    block_size=1024,
+    block_size=None,
     reset_output=True,
     index_fallback_policy="auto",
     return_metadata=False,
@@ -288,6 +330,9 @@ def _triton_scatter_impl(
     index_fallback_policy = str(index_fallback_policy).lower()
     if index_fallback_policy not in ("auto", "strict"):
         raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+    block_size = _resolve_scatter_block_size(
+        block_size, sparse_values.dtype, kernel_indices.numel()
+    )
 
     if out is None:
         dense_values = torch.zeros(
@@ -358,16 +403,22 @@ def _triton_scatter_impl(
 
 
 def _launch_triton_scatter_kernel(
-    dense_values, sparse_values, kernel_indices, nnz, block_size=1024
+    dense_values, sparse_values, kernel_indices, nnz, block_size=None
 ):
+    block_size = _resolve_scatter_block_size(block_size, sparse_values.dtype, nnz)
     grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
+    launch_kwargs = {"BLOCK_SIZE": block_size}
+    if _is_rocm_runtime():
+        launch_kwargs["num_warps"] = _resolve_scatter_num_warps(
+            sparse_values.dtype, nnz
+        )
     if not _is_complex_dtype(sparse_values.dtype):
         _scatter_real_kernel[grid](
             dense_values,
             sparse_values,
             kernel_indices,
             nnz,
-            BLOCK_SIZE=block_size,
+            **launch_kwargs,
         )
         return
     dense_values_ri = torch.view_as_real(dense_values).reshape(-1)
@@ -377,7 +428,7 @@ def _launch_triton_scatter_kernel(
         sparse_values_ri,
         kernel_indices,
         nnz,
-        BLOCK_SIZE=block_size,
+        **launch_kwargs,
     )
 
 
@@ -1161,6 +1212,14 @@ def benchmark_hipsparse_scatter(
     warmup=20,
     iters=200,
 ):
+    def run_with_reset(state):
+        # Triton's hot path includes reset_output on every iteration. Keep the
+        # hipSPARSE descriptors prepared, but reset the same output buffer here
+        # so the two measurements have identical semantics.
+        if reset_output:
+            state["values"].zero_()
+        return _run_hipsparse_scatter_prepared(state)
+
     return _benchmark_prepared_cuda_op(
         lambda: _prepare_hipsparse_scatter(
             sparse_values,
@@ -1170,7 +1229,7 @@ def benchmark_hipsparse_scatter(
             reset_output=reset_output,
             dtype_policy=dtype_policy,
         ),
-        _run_hipsparse_scatter_prepared,
+        run_with_reset,
         _destroy_hipsparse_scatter_prepared,
         warmup=warmup,
         iters=iters,
@@ -1422,7 +1481,7 @@ def flagsparse_scatter(
     indices,
     values,
     mode="raise",
-    block_size=1024,
+    block_size=None,
     return_time=False,
     reset_output=True,
     dtype_policy="auto",
@@ -1509,7 +1568,7 @@ def triton_cusparse_scatter(
     indices,
     dense_size=None,
     out=None,
-    block_size=1024,
+    block_size=None,
     reset_output=True,
     dtype_policy="auto",
     index_fallback_policy="auto",

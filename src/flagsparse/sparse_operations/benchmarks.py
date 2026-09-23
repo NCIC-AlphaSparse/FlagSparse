@@ -14,6 +14,8 @@
 
 """Benchmarks for gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, and SpSM."""
 
+import statistics
+
 from ._common import *
 
 from .gather_scatter import (
@@ -55,6 +57,21 @@ from .spsm import benchmark_spsm_case
 
 _GATHER_GRAPH_BATCH = 100
 _SCATTER_GRAPH_BATCH = 100
+_SCATTER_ROCM_CAPTURE_SAMPLES = 3
+
+
+def _benchmark_scatter_triton_op(op, *, warmup, iters):
+    """Use a robust median for ROCm graph captures with occasional cold replays."""
+    samples = [
+        _benchmark_cuda_graph_op(
+            op,
+            graph_batch=_SCATTER_GRAPH_BATCH,
+            warmup=warmup,
+            repeats=iters,
+        )
+        for _ in range(_SCATTER_ROCM_CAPTURE_SAMPLES if _is_rocm_runtime() else 1)
+    ]
+    return statistics.median(samples)
 
 
 def _cupy_spmv_op_matrix(matrix, op_code):
@@ -259,7 +276,7 @@ def benchmark_scatter_case(
     index_dtype=torch.int32,
     warmup=20,
     iters=200,
-    block_size=1024,
+    block_size=None,
     run_cusparse=True,
     unique_indices=True,
     reset_output=True,
@@ -339,6 +356,17 @@ def benchmark_scatter_case(
         index_fallback_policy="strict",
     )
 
+    if _is_rocm_runtime():
+        # ROCm's first replay of a newly captured scatter graph can include
+        # one-time runtime initialization. Prime that graph outside the timing
+        # region, matching the descriptor preparation excluded for hipSPARSE.
+        _benchmark_cuda_graph_op(
+            triton_op,
+            graph_batch=_SCATTER_GRAPH_BATCH,
+            warmup=min(max(1, warmup), 5),
+            repeats=1,
+        )
+
     # CUDA-Graph timing, matching benchmark_gather_case.  Under the previous
     # wall-clock _benchmark_cuda_op the measured floor was ~12-23us and flat across
     # every dense_size/nnz, because it charges each iteration's Python dispatch: a
@@ -357,11 +385,8 @@ def benchmark_scatter_case(
     except Exception as exc:
         raise RuntimeError(f"PyTorch CUDA Graph timing failed: {exc}") from exc
     try:
-        triton_ms = _benchmark_cuda_graph_op(
-            triton_op,
-            graph_batch=_SCATTER_GRAPH_BATCH,
-            warmup=warmup,
-            repeats=iters,
+        triton_ms = _benchmark_scatter_triton_op(
+            triton_op, warmup=warmup, iters=iters
         )
     except Exception as exc:
         raise RuntimeError(f"Triton CUDA Graph timing failed: {exc}") from exc

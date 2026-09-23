@@ -825,6 +825,14 @@ def _ascend_spmv_coo_index_add(launch, x):
 
 
 def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
+    # gfx936's atomic COO kernel is memory/atomic bound. A 512-element tile
+    # with two waves outperformed the former 256-element/four-wave default on
+    # every delivery matrix for both fp32 and fp64. Preserve explicit callers'
+    # launch choices; this policy is only the public default.
+    if block_size is None:
+        block_size = 512 if _is_rocm_runtime() else 256
+    if num_warps is None:
+        num_warps = 2 if _is_rocm_runtime() else 4
     launch = _spmv_rocm_launch_overrides(
         fmt="coo",
         dtype=prepared.data.dtype,
@@ -848,8 +856,8 @@ def flagsparse_spmv_coo(
     return_time=False,
     prepared=None,
     sort_by_row=True,
-    block_size=256,
-    num_warps=4,
+    block_size=None,
+    num_warps=None,
     block_inner=128,
     transpose=None,
     op=None,
@@ -898,7 +906,7 @@ def flagsparse_spmv_coo(
             op_code = _normalize_spmv_coo_op(None, transpose=transpose_flag)
     launch = _resolve_spmv_coo_launch(prepared, op_code)
     x = _validate_x_coo(x, launch)
-    if num_warps not in (1, 2, 4, 8, 16, 32):
+    if num_warps is not None and num_warps not in (1, 2, 4, 8, 16, 32):
         raise ValueError("num_warps must be a power of 2 in [1, 32]")
     if block_inner <= 0 or (block_inner & (block_inner - 1)) != 0:
         raise ValueError("block_inner must be a positive power of 2")
