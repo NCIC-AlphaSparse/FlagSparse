@@ -1,6 +1,8 @@
+# Copyright 2026 FlagOS Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -80,7 +82,7 @@ _INDEX_LIMIT_INT32 = 2**31 - 1
 #   device_tokens    substrings of the device name, for stacks that install no
 #                    namespace of their own (MetaX ships a CUDA-compatible one).
 #
-# ``reserved`` marks the spare slot: it is routed by FLAGSPARSE_BACKEND alone and
+# ``reserved`` marks a spare slot: it is routed by FLAGSPARSE_BACKEND alone and
 # never auto-detected, so a vendor with no entry of its own can be driven through
 # it without touching this file.  No entry uses it today -- "mlu" did until the
 # Iluvatar slot replaced it -- but the mechanism stays for the next one.
@@ -209,6 +211,65 @@ def _detect_maca_runtime():
 
 
 _IS_MACA_RUNTIME = _detect_maca_runtime()
+
+
+# Iluvatar CoreX (BI-V100 / BI-V150) is the second CUDA-compatible stack, with the
+# same problem as MetaX: torch.version.cuda is set and torch.version.hip is None,
+# so neither says "Iluvatar". Three signals, most explicit first:
+#
+#   1. a CoreX tag in the torch build's version, checked in BOTH places, because
+#      they disagree. MEASURED 2026-09-22 on a BI-V100 box: torch.__version__ is
+#      a bare "2.10.0" while the pip metadata says "2.10.0+corex.4.5.0" -- the
+#      wheel carries the tag and the module attribute has it stripped. Reading
+#      only the attribute is what made this signal look unusable.
+#   2. the CoreX SDK environment, present on a configured host. COREX_HOME is the
+#      same variable the C API's IX slot reads (capi/src/adaptor/CMakeLists.txt).
+#      Unlike MetaX, which ships torch.version.maca, the CoreX torch exposes no
+#      vendor attribute at all -- torch.version.__all__ is the stock
+#      cuda/hip/rocm/xpu set -- so there is nothing cheaper to key off.
+#   3. the device name, which needs a working runtime: on that same box CUDA
+#      initialization failed (error 803, container CoreX newer than the host
+#      driver), so get_device_properties() raises and cannot be relied on.
+#
+# FLAGSPARSE_BACKEND=iluvatar remains the documented way in; see docs/ILUVATAR.md.
+_ILUVATAR_DEVICE_NAME_TOKENS = _BACKEND_SPEC_BY_NAME["iluvatar"].device_tokens
+
+
+def _torch_distribution_version():
+    """torch's version as PACKAGING sees it, which can differ from the module.
+
+    Iluvatar's wheel is "2.10.0+corex.4.5.0" but its torch.__version__ is a bare
+    "2.10.0"; the local-version segment survives only in the installed metadata.
+    Returns "" when the metadata is unavailable (a source tree, a vendored copy).
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("torch")
+    except Exception:
+        return ""
+
+
+def _detect_iluvatar_runtime():
+    override = _backend_override()
+    if override:
+        return override == "iluvatar"
+    for candidate in (getattr(torch, "__version__", ""), _torch_distribution_version()):
+        if "corex" in str(candidate).lower():
+            return True
+    for env in ("COREX_HOME", "COREX_PATH"):
+        if os.environ.get(env):
+            return True
+    try:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_properties(0).name.lower()
+            return any(tok in name for tok in _ILUVATAR_DEVICE_NAME_TOKENS)
+    except Exception:
+        pass
+    return False
+
+
+_IS_ILUVATAR_RUNTIME = _detect_iluvatar_runtime()
 
 
 # ── Moore Threads (MUSA) and Ascend (CANN) ──────────────────────────
