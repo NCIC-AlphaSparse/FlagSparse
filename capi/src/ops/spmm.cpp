@@ -49,6 +49,13 @@ struct LaunchConfig {
     int num_stages = 2;
 };
 
+// Resolved once: the backend cannot change under a running process, and this
+// sits on the per-call launch path.
+bool musa_backend() {
+    static const bool is_musa = std::string(adaptor::backend_name()) == "musa";
+    return is_musa;
+}
+
 // AlphaSparse's csrspmm_rb_sr warp/factor choice, as the Python package uses it
 // for row-major dense operands (_select_alpha_spmm_alg1_warp_and_factor).
 // BLOCK_N = warp_size * factor and BLOCK_NNZ = warp_size, so both stay powers
@@ -90,6 +97,17 @@ LaunchConfig resolve_launch(flagsparseDataType_t compute_type, int64_t n_dense_c
     LaunchConfig cfg;
     cfg.block_n = warp_size * factor;
     cfg.block_nnz = warp_size;
+    // Tuned on Moore Threads MUSA. Other backends keep the CUDA-mirrored value
+    // above, which is what the comment on this function describes.
+    if (musa_backend()) {
+        if (n_dense_cols == 32) cfg.block_nnz = 16;
+        if (n_dense_cols == 8) cfg.block_nnz = 4;
+        if (n_dense_cols >= 128 &&
+            (compute_type == FLAGSPARSE_R_64F || compute_type == FLAGSPARSE_C_64F)) {
+            cfg.block_nnz = 16;
+        }
+    }
+
 
     int desired_warps;
     if (n_dense_cols <= 16)      desired_warps = 1;
@@ -347,6 +365,11 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     if (flagsparseStatus_t s = ensure_max_row_nnz(A, &max_row_nnz)) return s;
     const LaunchConfig cfg =
         resolve_launch(computeType, ops.n, max_row_nnz, ctx(handle)->device_index);
+    // MUSA-only, for the same reason as the launch overrides above: this kernel
+    // and its 1-warp launch were measured there and nowhere else.
+    const bool batched8 =
+        musa_backend() && !ops.complex_op && ops.n == 8 && max_row_nnz <= 256;
+    const int batch_rows = 4;
 
     const char* it = triton_index_dtype(A->indices_type);
     const char* ot = triton_index_dtype(A->offsets_type);
@@ -359,15 +382,21 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     sig += "*"; sig += ops.vt; sig += ":16,";   // B
     sig += "*"; sig += ops.vt; sig += ":16,";   // C
     append_dense_signature(ops, &sig);
-    sig += std::to_string(cfg.block_n) + ",";
-    sig += std::to_string(cfg.block_nnz) + ",";
-    sig += ops.acc_is_fp64 ? "True," : "False,";     // ACC_IS_FP64
-    // ACCURACY selects the blocked dot-product accumulation. The Python path
-    // leaves it off by default and so does this one: turning it on here would
-    // make the C API's result differ from the operator library's for the same
-    // input, which is a worse surprise than the extra rounding.
-    if (!ops.complex_op) sig += "False,";            // ACCURACY
-    sig += ops.has_beta ? "True" : "False";          // HAS_BETA
+    if (batched8) {
+        sig += std::to_string(batch_rows) + ",";
+        sig += ops.acc_is_fp64 ? "True," : "False,";
+        sig += ops.has_beta ? "True" : "False";
+    } else {
+        sig += std::to_string(cfg.block_n) + ",";
+        sig += std::to_string(cfg.block_nnz) + ",";
+        sig += ops.acc_is_fp64 ? "True," : "False,";     // ACC_IS_FP64
+        // ACCURACY selects the blocked dot-product accumulation. The Python path
+        // leaves it off by default and so does this one: turning it on here would
+        // make the C API's result differ from the operator library's for the same
+        // input, which is a worse surprise than the extra rounding.
+        if (!ops.complex_op) sig += "False,";            // ACCURACY
+        sig += ops.has_beta ? "True" : "False";          // HAS_BETA
+    }
 
     std::vector<jit::Arg> args;
     args.reserve(18);
@@ -382,8 +411,11 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     std::string err;
     const flagsparseStatus_t st = jit::launch(
         jit::codegen_module("spmm_csr.py"),
-        ops.complex_op ? "spmm_csr_complex" : "spmm_csr_real", sig,
-        ctx(handle)->stream, ops.m, grid_n, 1, cfg.num_warps, cfg.num_stages, args, &err);
+        ops.complex_op ? "spmm_csr_complex"
+                       : (batched8 ? "spmm_csr_batched8_real" : "spmm_csr_real"), sig,
+        ctx(handle)->stream, batched8 ? (ops.m + batch_rows - 1) / batch_rows : ops.m,
+        grid_n, 1, batched8 ? 1 : cfg.num_warps, batched8 ? 1 : cfg.num_stages,
+        args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
 }

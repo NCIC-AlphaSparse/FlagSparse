@@ -32,6 +32,7 @@ namespace {
 constexpr int kCsrBlockNnz = 128;
 constexpr int kCsrNumWarps = 4;
 constexpr int kCsrNumStages = 2;
+constexpr int kCsrShortRowLimit = 256;
 // COO's segment kernel walks a row with a `while pos < end` loop over
 // BLOCK_INNER-wide tiles, so this is a tile width, not an unroll factor -- the
 // BLOCK_NNZ=4 lesson from SpMM COO does not apply here.
@@ -47,6 +48,10 @@ constexpr int kDefaultNumStages = 2;
 
 bool transposes(flagsparseOperation_t op) {
     return op != FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+}
+
+bool musa_backend() {
+    return std::string(adaptor::backend_name()) == "musa";
 }
 
 // alpha/beta arrive as void* under the handle's pointer mode. DEVICE mode would
@@ -249,10 +254,9 @@ flagsparseStatus_t launch_csr_rowpar(flagsparseHandle_t handle, SpMatDescr* A,
     sig += std::to_string(kCsrBlockNnz) + ",";
     sig += std::to_string(segments) + ",";
     sig += ops.has_beta ? "True" : "False";
-    // XPU_COMPAT (real kernel only): the Python side sets it on Kunlunxin XPU,
-    // where the C API does not run, so it is always False here. Leaving it out
-    // of the signature fails every real CSR / COO_ALG2 launch on every backend.
-    if (!ops.complex_op) sig += ",False";
+    // The real and complex kernels both carry XPU_COMPAT. The C API does not
+    // target XPU, so the compile-time branch is always disabled.
+    sig += ",False";
 
     std::vector<jit::Arg> args;
     args.reserve(8);
@@ -276,10 +280,60 @@ flagsparseStatus_t launch_csr_rowpar(flagsparseHandle_t handle, SpMatDescr* A,
     return st;
 }
 
+flagsparseStatus_t launch_csr_row_tile_short(flagsparseHandle_t handle, SpMatDescr* A,
+                                              const DnVecDescr* X, DnVecDescr* Y,
+                                              const Operands& ops,
+                                              int64_t max_row_nnz) {
+    const double avg_row_nnz = A->rows > 0
+                                   ? static_cast<double>(A->nnz) / A->rows
+                                   : 0.0;
+    const bool long_tail = max_row_nnz > 64;
+    const bool ultra_short = !long_tail && avg_row_nnz <= 2.0;
+    const bool short_rows = avg_row_nnz <= 8.0;
+    const int rows_per_program = ultra_short ? 128 : (short_rows ? 64 : 32);
+    const int lanes_per_row = ultra_short ? 4 : (short_rows ? 8 : 16);
+    const int num_warps = 4;
+    std::string sig;
+    sig.reserve(160);
+    sig += "*"; sig += ops.vt; sig += ":16,";
+    sig += "*"; sig += ops.it; sig += ":16,";
+    sig += "*"; sig += ops.ot; sig += ":16,";
+    sig += "*"; sig += ops.vt; sig += ":16,";
+    sig += "*"; sig += ops.vt; sig += ":16,";
+    sig += ops.vt; sig += ",";
+    sig += ops.vt; sig += ",i32,";
+    sig += std::to_string(rows_per_program) + ",";
+    sig += std::to_string(lanes_per_row) + ",";
+    sig += ops.acc_is_fp64 ? "True," : "False,";
+    sig += ops.has_beta ? "True" : "False";
+    std::vector<jit::Arg> args;
+    args.reserve(8);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    push_scalar(ops, ops.alpha_re, &args);
+    push_scalar(ops, ops.beta_re, &args);
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spmv_csr.py"), "spmv_csr_row_tile_real", sig,
+        ctx(handle)->stream, (A->rows + rows_per_program - 1) / rows_per_program, 1, 1,
+        num_warps, /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
 flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A,
                            const DnVecDescr* X, DnVecDescr* Y, const Operands& ops) {
     int64_t max_row_nnz = 0;
     if (flagsparseStatus_t s = ensure_max_row_nnz(A, &max_row_nnz)) return s;
+    // This tile shape is tuned on Moore Threads MUSA. Other backends retain the
+    // portable row-parallel route so their launch configuration does not shift.
+    if (musa_backend() && !ops.complex_op && max_row_nnz <= kCsrShortRowLimit) {
+        return launch_csr_row_tile_short(handle, A, X, Y, ops, max_row_nnz);
+    }
     return launch_csr_rowpar(handle, A, A->offsets, ops.ot, A->rows, max_row_nnz, X, Y,
                              ops);
 }

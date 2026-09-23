@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 
+#include "adaptor/adaptor.hpp"
 #include "flagsparse.h"
 
 namespace flagsparse {

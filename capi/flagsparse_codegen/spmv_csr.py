@@ -39,14 +39,48 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402  -- import side effect puts flagsparse on sys.path
 
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
 from flagsparse.sparse_operations.spmv_csr import (  # noqa: E402,F401
     _spmv_csr_complex_kernel,
     _spmv_csr_real_kernel,
 )
+
+
+@triton.jit
+def spmv_csr_row_tile_real(
+    data_ptr, indices_ptr, indptr_ptr, x_ptr, y_ptr, alpha, beta, n_rows,
+    ROWS_PER_PROGRAM: tl.constexpr, LANES_PER_ROW: tl.constexpr,
+    ACC_IS_FP64: tl.constexpr, HAS_BETA: tl.constexpr,
+):
+    rows = tl.program_id(0).to(tl.int64) * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
+    active = rows < n_rows
+    start = tl.load(indptr_ptr + rows, mask=active, other=0).to(tl.int64)
+    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0).to(tl.int64)
+    steps = tl.max(tl.cdiv(end - start, LANES_PER_ROW), 0)
+    lane = tl.arange(0, LANES_PER_ROW)
+    acc_dtype = tl.float64 if ACC_IS_FP64 else tl.float32
+    acc = tl.zeros((ROWS_PER_PROGRAM, LANES_PER_ROW), dtype=acc_dtype)
+    for step in tl.range(0, steps, num_stages=1):
+        positions = start[:, None] + step * LANES_PER_ROW + lane[None, :]
+        mask = active[:, None] & (positions < end[:, None])
+        values = tl.load(data_ptr + positions, mask=mask, other=0.0).to(acc_dtype)
+        cols = tl.load(indices_ptr + positions, mask=mask, other=0).to(tl.int64)
+        acc += values * tl.load(x_ptr + cols, mask=mask, other=0.0).to(acc_dtype)
+    out = alpha * tl.sum(acc, axis=1)
+    if HAS_BETA:
+        out += beta * tl.load(y_ptr + rows, mask=active, other=0.0).to(acc_dtype)
+    tl.store(y_ptr + rows, out, mask=active)
+
 
 # The complex kernel is a separate function rather than a dtype constexpr on the
 # real one, so no jit wrapper is involved: the dispatch layer picks by name.
 # Complex operands are interleaved real/imag pairs of the component dtype, and
 # alpha/beta arrive split the same way -- Triton has no complex type, and this is
 # what the Python package already does (torch.view_as_real).
-__all__ = ["_spmv_csr_real_kernel", "_spmv_csr_complex_kernel"]
+__all__ = [
+    "_spmv_csr_real_kernel",
+    "_spmv_csr_complex_kernel",
+    "spmv_csr_row_tile_real",
+]
