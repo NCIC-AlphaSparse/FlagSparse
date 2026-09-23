@@ -17,11 +17,12 @@
 | `ascend` | 昇腾 / CANN | [`ASCEND.md`](ASCEND.md) | [`capi/docs/ASCEND.md`](../capi/docs/ASCEND.md) |
 | `xpu` | 昆仑芯 | [`XPU.md`](XPU.md) | [`capi/docs/XPU.md`](../capi/docs/XPU.md) |
 | `gcu` | 燧原 | — 尚无 | — 尚无 |
-| `mlu` | 寒武纪 | — 尚无 | — 尚无 |
+| `iluvatar` | 天数智芯 Iluvatar CoreX（BI-V150） | [`ILUVATAR.md`](ILUVATAR.md)（**未实测**） | — 尚无（`BACKEND=IX` 编不起来，见 ILUVATAR.md 第 5 节） |
 
-最后两行是**已注册但没有任何文档**的槽位：`_BACKEND_NAMES` 和 `_dispatch.py` 的
-`_IMPLEMENTATION_BACKENDS` 都是 8 条，`backends/gcu`、`backends/mlu` 目录已建好但代码留空，
+`gcu` 是**已注册但没有任何文档**的槽位：`_BACKEND_NAMES` 和 `_dispatch.py` 的
+`_IMPLEMENTATION_BACKENDS` 都是 8 条，`backends/gcu` 目录已建好但代码留空，
 走共享实现。没有覆盖不等于不能跑，只是没人在真机上验过，也就没有可写的文档。
+`iluvatar` 占用的是原来寒武纪 `mlu` 备用槽位的位置，有接入文档，但同样还没在真机上跑过。
 
 **`XPU.md` 的实测最少**：DCU / MACA / MUSA / ASCEND 都有完整的实机验证结果；XPU 在 P800 上有
 2026-09-17/18 的有限实测和一轮 40 变体精度（当时的清单，现已缩成 20 个），性能还没有可用的交付数据，文件顶部标了出来。
@@ -46,6 +47,7 @@
 | MUSA | [`MUSA.md`](MUSA.md) 0.5 节 | 改用 `run_flagsparse_split_delivery.py`，性能取自 C API（muSPARSE） |
 | Ascend | [`ASCEND.md`](ASCEND.md) "交付复现" | 只用 `--gpus 6,7`；5 个算子对 PyTorch-NPU，`spmv_coo` / `spmm_coo` 只做能力探测 |
 | XPU | [`XPU.md`](XPU.md) 1.5 节 | `FLAGTREE_BACKEND=xpu` 等环境变量；7 个算子全部对 PyTorch-XPU 计时 |
+| Iluvatar | [`ILUVATAR.md`](ILUVATAR.md) 第 2 节 | **未实测**；与 MACA 相同的通用 runner，基线默认 PyTorch |
 
 跑完统一用 `python3 tools/delivery_table.py <结果目录>` 看结果。
 
@@ -58,3 +60,4 @@
 | [`MUSA.md`](MUSA.md) | 独立设备类型 `musa` 与兼容后端的区别、`_ACCEL` 抽象、实测能力矩阵（muDNN 的 gemv 缺口）、normal 回归结果、已解决问题的复现记录 |
 | [`ASCEND.md`](ASCEND.md) | 910B 环境检查、Ascend fallback 分发表、算子能力探测、已知限制 |
 | [`XPU.md`](XPU.md) | 昆仑芯：插件探测为什么不能只看 `torch.xpu`、`torch_xmlir` 的 CUDA-shim 路径、7 个算子对 PyTorch-XPU 计时其余能力探测、为什么没有厂商基线、首次上机顺序 |
+| [`ILUVATAR.md`](ILUVATAR.md) | 天数 BI-V150：CUDA 兼容栈的接入方式（同 MetaX）、显式指定与探测、交付命令、第一次上机要实测的项目；C API 的 `IX` 槽位为什么编不起来 |

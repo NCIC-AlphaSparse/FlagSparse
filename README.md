@@ -60,6 +60,7 @@ python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 20-row 
 | Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
 | Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; `spmv_coo` and `spmm_coo` probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (7 ops) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
+| Iluvatar BI-V150 (**unmeasured**) | `FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=torch` | -- | PyTorch (CuPy when installed) | SciPy (CPU) | [docs/ILUVATAR.md](docs/ILUVATAR.md) §2 |
 
 **Results produced before `86a09cd` (2026-09-18) are not comparable**: the old projection averaged
 int64 and trans/conj rows into each `..._int_non` variant and counted rows without a speedup as 0.
@@ -98,11 +99,12 @@ runtime; the Triton kernels themselves are unchanged across backends.
 | Ascend / CANN (910B) | `torch.npu` available | **`torch`** -- ops-sparse stays one env var away for a vendor A/B | torch_npu |
 | Kunlunxin XPU | vendor plugin importable (`torch_xmlir` / `torch_xpu`) | **none** -- XDNN is a fixed operator set, not a descriptor API, so there is nothing to bind | torch_xmlir |
 | Enflame GCU | `torch_gcu` importable | none yet | torch_gcu |
-| Cambricon MLU | **env-routed only**, never auto-detected: it is the generic reserve slot, so a vendor with no entry of its own can be driven through it | none yet | torch_mlu |
+| Iluvatar CoreX (BI-V150) | see `_detect_iluvatar_runtime()` (a `+corex` torch build, or the device name); **unmeasured** | CuPy when it is really installed, else `torch` -- the MetaX policy, unmeasured | none (CUDA-compatible, runs on `torch.cuda`) |
 
-The last three carry no per-operator kernels of their own: `backends/{xpu,gcu,mlu}/` hold only
-`__init__.py`, so they resolve to the shared implementation. The XPU namespace check is not
-excess caution -- upstream PyTorch ships a `torch.xpu` namespace for Intel GPUs, so accepting
+The last three carry no per-operator kernels of their own: `backends/{xpu,gcu,iluvatar}/` hold only
+`__init__.py`, so they resolve to the shared implementation. Iluvatar is a CUDA-compatible
+stack like MetaX, and took over the slot of the former Cambricon `mlu` generic reserve. The XPU
+namespace check is not excess caution -- upstream PyTorch ships a `torch.xpu` namespace for Intel GPUs, so accepting
 the namespace alone would claim an Intel card as Kunlunxin silicon.
 
 > ⚠️ **Moore Threads and Ascend are not CUDA-compatible**: torch exposes them as
@@ -122,7 +124,7 @@ environment (`MACA_PATH` / `MACA_HOME`), then the device name (vendor tokens, th
 automatic probe is confirmed:**
 
 ```bash
-export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | mlu
+export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | iluvatar
 export FLAGSPARSE_MACA_MODEL=c550   # overrides model detection
 export FLAGSPARSE_MACA_VENDOR=torch  # PyTorch as the baseline when CuPy is unusable; none = no baseline
 

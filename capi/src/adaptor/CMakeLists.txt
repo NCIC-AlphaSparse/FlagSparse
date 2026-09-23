@@ -21,8 +21,8 @@
 # What differs per vendor is only where its toolkit lives and what the two
 # libraries are called, which is exactly what the table carries.
 #
-# RESERVED SLOTS. XPU (Kunlunxin), GCU (Enflame) and MLU (Cambricon, the generic
-# reserve) are declared but NOT configured: their library names are not guessed
+# RESERVED SLOTS. XPU (Kunlunxin), GCU (Enflame) and IX (Iluvatar) are declared
+# but NOT configured: their library names are not guessed
 # here.  A wrong library name fails at link time with a missing symbol that names
 # neither the vendor nor the mistake, which is worse than not having the entry --
 # so configuring one of these stops with a message naming the three things to
@@ -53,13 +53,6 @@ set(FLAGSPARSE_GCU_RUNTIME    "topsrt")
 set(FLAGSPARSE_GCU_DRIVER     "topsrt")
 set(FLAGSPARSE_GCU_HEADER     "tops_runtime_api.h")
 
-# Cambricon MLU (the generic reserve) -- BackendMLU.cmake: NEUWARE_HOME, cn_api.h.
-set(FLAGSPARSE_MLU_HOME_VAR   "NEUWARE_HOME")
-set(FLAGSPARSE_MLU_HOME_DEF   "/usr/local/neuware")
-set(FLAGSPARSE_MLU_RUNTIME    "cnrt")
-set(FLAGSPARSE_MLU_DRIVER     "cndrv")
-set(FLAGSPARSE_MLU_HEADER     "cn_api.h")
-
 # Ascend NPU -- BackendNPU.cmake: ASCEND_TOOLKIT_HOME. Its driver API is ACL, not
 # a CUDA mirror, so its adaptor.cpp will not come from _template.inc.
 set(FLAGSPARSE_NPU_HOME_VAR   "ASCEND_TOOLKIT_HOME")
@@ -84,7 +77,11 @@ set(FLAGSPARSE_IX_DRIVER      "cuda")
 set(FLAGSPARSE_IX_HEADER      "cuda.h")
 
 # Declared, located, but with no adaptor source yet.
-set(FLAGSPARSE_RESERVED_BACKENDS "MACA" "NPU" "HCU" "GCU" "MLU" "IX")
+# Cambricon MLU is deliberately absent: deps/libtriton_jit still carries a
+# BackendMLU.cmake (NEUWARE_HOME, cnrt/cndrv, cn_api.h), so re-adding the slot is
+# five set() lines above plus a name here -- but no one has the hardware, and the
+# Python side replaced its generic-reserve role with iluvatar.
+set(FLAGSPARSE_RESERVED_BACKENDS "MACA" "NPU" "HCU" "GCU" "IX")
 
 # Kunlunxin XPU is a special case and gets its own message: the blocker is not
 # here. deps/libtriton_jit accepts CUDA, IX, MUSA, MACA, MLU, NPU, GCU and HCU

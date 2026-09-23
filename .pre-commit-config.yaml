@@ -16,7 +16,10 @@
 # whitespace hooks rewrite 9 files under libtriton_jit on every run and
 # `pre-commit run --all-files` can never come back clean -- CI has not noticed
 # only because format-check runs first and was failing before it.
-exclude: '^capi/deps/'
+# MatrixMarket inputs are data, not source: SuiteSparse ships them with trailing
+# spaces in the % header, and rewriting 400 MB of matrices to satisfy a lint hook
+# would make them differ from the published originals.
+exclude: '^(capi/deps/|tests/data/.*\.mtx$)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

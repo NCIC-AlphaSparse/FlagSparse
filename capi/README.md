@@ -250,7 +250,6 @@ cmake --build build -j
 | `NPU` | 昇腾 | ✓ | — | 同上（驱动 API 是 ACL，不套 `_template.inc`） |
 | `HCU` | 海光 | ✓ | — | 同上（走 HIP，不是两库形状） |
 | `GCU` | 燧原 | ✓ | — | 同上，TOPS_ROOT |
-| `MLU` | 寒武纪（**通用备用槽**） | ✓ | — | 同上，NEUWARE_HOME |
 | `IX` | 天数智芯 | ✓ | — | 同上 |
 | `XPU` | 昆仑芯 | **✗** | — | **被依赖卡住**，见下 |
 

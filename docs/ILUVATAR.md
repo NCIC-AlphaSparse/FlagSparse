@@ -20,15 +20,15 @@ Python 侧的天数后端：怎么选中、每次开工的环境、交付复现�
 
 后端名是 **`iluvatar`**（与 FlagTree 的后端名一致），占用的是原来寒武纪 `mlu` 备用槽位的位置。
 
-| 项目 | 取值 |
-|---|---|
-| torch 设备 | `torch.cuda` / 设备类型 `cuda`（CoreX 的 torch 构建与 CUDA 源码兼容，没有独立命名空间和插件） |
-| 自动探测 | 三个信号，任一命中即可（`_detect_iluvatar_runtime()`）：torch 版本带 `+corex` 标记（`torch.__version__` **和** pip 元数据都查）、`COREX_HOME` / `COREX_PATH` 环境变量、设备名含 `iluvatar` / `bi-v` / `corex` |
-| 显式指定 | `FLAGSPARSE_BACKEND=iluvatar`，**优先于探测** |
-| 算子内核 | 共享实现，`backends/iluvatar/` 下只有 `__init__.py`，没有覆盖 |
-| 性能基线 | 交付跑用 **`torch`**（第 1 节显式设 `FLAGSPARSE_ILUVATAR_VENDOR=torch`），与其余国产后端同口径。不设这个变量时是探测：CuPy 真装了就用 `cupy_cusparse`，否则 `torch`（同 MetaX 的策略，**未实测**） |
-| 精度参考 | CPU 上的 SciPy（CUDA、ROCm 以外的后端都是这样） |
-| runner 路由 | 与 CUDA / MetaX 相同的通用性能脚本（`GENERIC_BENCHMARK_BACKENDS`） |
+| 项目        | 取值                                                                                                                                                                                                                                |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| torch 设备  | `torch.cuda` / 设备类型 `cuda`（CoreX 的 torch 构建与 CUDA 源码兼容，没有独立命名空间和插件）                                                                                                                                   |
+| 自动探测    | 三个信号，任一命中即可（`_detect_iluvatar_runtime()`）：torch 版本带 `+corex` 标记（`torch.__version__` **和** pip 元数据都查）、`COREX_HOME` / `COREX_PATH` 环境变量、设备名含 `iluvatar` / `bi-v` / `corex` |
+| 显式指定    | `FLAGSPARSE_BACKEND=iluvatar`，**优先于探测**                                                                                                                                                                               |
+| 算子内核    | 共享实现，`backends/iluvatar/` 下只有 `__init__.py`，没有覆盖                                                                                                                                                                   |
+| 性能基线    | 交付跑用**`torch`**（第 1 节显式设 `FLAGSPARSE_ILUVATAR_VENDOR=torch`），与其余国产后端同口径。不设这个变量时是探测：CuPy 真装了就用 `cupy_cusparse`，否则 `torch`（同 MetaX 的策略，**未实测**）               |
+| 精度参考    | CPU 上的 SciPy（CUDA、ROCm 以外的后端都是这样）                                                                                                                                                                                     |
+| runner 路由 | 与 CUDA / MetaX 相同的通用性能脚本（`GENERIC_BENCHMARK_BACKENDS`）                                                                                                                                                                |
 
 因为 `torch.version.cuda` 有值、`torch.version.hip` 为 `None`，**只看这两个判据分不出天数和
 NVIDIA**，所以要靠上面那三个较弱的信号。为什么是三个而不是一个，有实测原因（2026-09-22，BI-V100）：
@@ -261,24 +261,24 @@ python tools/run_backend_tests.py --backend iluvatar --phase accuracy --mode qui
 `torch.cuda.is_available()` 为 `True`，dense matmul 和 `torch.sparse` CSR matmul 都跑通。
 之前的 Error 803 纯粹是镜像与驱动版本错配（4.2 节），不是硬件或容器权限问题。
 
-| 项目 | 实测值 |
-|---|---|
-| 卡 | `Iluvatar BI-V100` × 8，单卡 32768 MiB（`ixsmi -L`） |
-| 设备名（torch 侧） | **`'Iluvatar BI-V100'`** —— 命中探测的 `iluvatar` 和 `bi-v` 两个匹配串 |
-| **`warp_size`** | **属性不存在**（`getattr` 返回默认值）—— 见 4.3 节，这是目前最需要查实的一项 |
-| MP count | 16 |
-| `torch.sparse` CSR matmul | **可用**（有 beta 警告，但能算出结果），所以 `FLAGSPARSE_ILUVATAR_VENDOR=torch` 这个基线是站得住的 |
-| 3.2.3 镜像里的 torch / triton | `torch 2.1.0+corex.3.2.3`（模块属性又是裸的 `2.1.0`）、**`triton 2.3.1`** —— 比 FlagTree 镜像的 Triton 3.6 老得多，这个镜像只适合做指纹，不适合跑算子 |
-| 宿主机驱动 / IX-ML | **3.2.3 / 3.2.3**；呈现的 CUDA 兼容级别是 **10.2** |
-| 宿主机 CoreX 安装 | `/usr/local/corex` → `corex-3.2.3`，另有 3.1.1 / 4.4.0 / 4.5.0 未启用 |
-| 厂商镜像里的 CoreX | 4.5.0（`/usr/local/corex-4.5.0`），容器内 `ixsmi` 报 IX-ML 4.4.0 |
-| 容器里的 torch | `torch.__version__` 是裸的 **`2.10.0`**，但 pip 元数据是 **`2.10.0+corex.4.5.0`** —— 标记只在 wheel 元数据里，模块属性被剥掉了。探测因此**两个地方都读** |
-| `torch.version` 的属性 | `__all__` 只有 `__version__ / debug / cuda / git_version / hip / rocm / xpu`，**没有任何厂商属性**。沐曦有 `torch.version.maca`，天数没有对应物 |
-| `torch.version.cuda` / `.hip` / `.rocm` | `'10.2'` / `None` / `None`（`git_version` 是 `509100cb`） |
-| Triton | **`flagtree 0.7.0rc2+iluvatar3.6` 镜像里已装**，不用自己编；能否编译执行内核仍待验证（1.5 节第 1 步） |
-| 其余厂商包 | `torch_sparse 0.6.16+corex.4.5.0`、`torch_scatter`、`torch_cluster`、`pyg_lib`、`apex`、`ixformer`、`dali` 等都带 `+corex.4.5.0`；**没有** `torch_corex` / `torch_ixuca` 这类插件模块，符合 CUDA 兼容栈的预期 |
-| 设备名（torch 侧） | **读不到**，CUDA 初始化就失败了 |
-| CuPy | 不适用：CUDA 兼容级别 10.2，`cupy-cuda12x` 对不上，`cupy-cuda102` 已停更。基线实际会落到 PyTorch |
+| 项目                                          | 实测值                                                                                                                                                                                                                                  |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 卡                                            | `Iluvatar BI-V100` × 8，单卡 32768 MiB（`ixsmi -L`）                                                                                                                                                                               |
+| 设备名（torch 侧）                            | **`'Iluvatar BI-V100'`** —— 命中探测的 `iluvatar` 和 `bi-v` 两个匹配串                                                                                                                                                    |
+| **`warp_size`**                       | **属性不存在**（`getattr` 返回默认值）—— 见 4.3 节，这是目前最需要查实的一项                                                                                                                                                  |
+| MP count                                      | 16                                                                                                                                                                                                                                      |
+| `torch.sparse` CSR matmul                   | **可用**（有 beta 警告，但能算出结果），所以 `FLAGSPARSE_ILUVATAR_VENDOR=torch` 这个基线是站得住的                                                                                                                              |
+| 3.2.3 镜像里的 torch / triton                 | `torch 2.1.0+corex.3.2.3`（模块属性又是裸的 `2.1.0`）、**`triton 2.3.1`** —— 比 FlagTree 镜像的 Triton 3.6 老得多，这个镜像只适合做指纹，不适合跑算子                                                                     |
+| 宿主机驱动 / IX-ML                            | **3.2.3 / 3.2.3**；呈现的 CUDA 兼容级别是 **10.2**                                                                                                                                                                          |
+| 宿主机 CoreX 安装                             | `/usr/local/corex` → `corex-3.2.3`，另有 3.1.1 / 4.4.0 / 4.5.0 未启用                                                                                                                                                              |
+| 厂商镜像里的 CoreX                            | 4.5.0（`/usr/local/corex-4.5.0`），容器内 `ixsmi` 报 IX-ML 4.4.0                                                                                                                                                                    |
+| 容器里的 torch                                | `torch.__version__` 是裸的 **`2.10.0`**，但 pip 元数据是 **`2.10.0+corex.4.5.0`** —— 标记只在 wheel 元数据里，模块属性被剥掉了。探测因此**两个地方都读**                                                      |
+| `torch.version` 的属性                      | `__all__` 只有 `__version__ / debug / cuda / git_version / hip / rocm / xpu`，**没有任何厂商属性**。沐曦有 `torch.version.maca`，天数没有对应物                                                                             |
+| `torch.version.cuda` / `.hip` / `.rocm` | `'10.2'` / `None` / `None`（`git_version` 是 `509100cb`）                                                                                                                                                                     |
+| Triton                                        | **`flagtree 0.7.0rc2+iluvatar3.6` 镜像里已装**，不用自己编；能否编译执行内核仍待验证（1.5 节第 1 步）                                                                                                                           |
+| 其余厂商包                                    | `torch_sparse 0.6.16+corex.4.5.0`、`torch_scatter`、`torch_cluster`、`pyg_lib`、`apex`、`ixformer`、`dali` 等都带 `+corex.4.5.0`；**没有** `torch_corex` / `torch_ixuca` 这类插件模块，符合 CUDA 兼容栈的预期 |
+| 设备名（torch 侧）                            | **读不到**，CUDA 初始化就失败了                                                                                                                                                                                                   |
+| CuPy                                          | 不适用：CUDA 兼容级别 10.2，`cupy-cuda12x` 对不上，`cupy-cuda102` 已停更。基线实际会落到 PyTorch                                                                                                                                    |
 
 ### 4.2 当前阻塞：驱动与运行时版本错配
 
@@ -305,14 +305,14 @@ torch.cuda.is_available() -> False        # 但 device_count() -> 8
 
 ### 4.3 仍未验证
 
-| 项目 | 状态 |
-|---|---|
-| **`warp_size` 的真实值** | **属性不存在，代码会静默取 32**。`_common.py` 的 `_get_device_backend_info()` 里 `default_warp = 64 if backend == "hip" else 32`，天数走 `cuda` 分支；`spmv_csr.py`、`spmm_csr.py`（三处）、`spmm_csr_opt_alg2.py` 各自也 `getattr(props, "warp_size", 32)`。**若实际是 64，整套启动几何都偏，而且不报错、只掉性能**（MetaX C550 就是 64）。查法：`ixsmi -q` 里找 warp/core 相关字段，或在 Triton 3.x 下 `triton.runtime.driver.active.get_current_target()` |
-| 自动探测能否命中（元数据里的 `+corex` 应当命中，未在真机跑过 `_backend_name()`） | 未验证 |
-| FlagTree 的 `iluvatar` 后端能否编译执行最小 Triton 内核 | 未验证 |
-| `torch.sparse` CSR/COO matmul 能否作为基线 | 未验证 |
-| `CUDA_VISIBLE_DEVICES` 选卡（八卡机，务必确认落在哪张） | 未验证 |
-| 20 变体交付结果 | 无 |
+| 项目                                                                                | 状态                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`warp_size` 的真实值**                                                    | **属性不存在，代码会静默取 32**。`_common.py` 的 `_get_device_backend_info()` 里 `default_warp = 64 if backend == "hip" else 32`，天数走 `cuda` 分支；`spmv_csr.py`、`spmm_csr.py`（三处）、`spmm_csr_opt_alg2.py` 各自也 `getattr(props, "warp_size", 32)`。**若实际是 64，整套启动几何都偏，而且不报错、只掉性能**（MetaX C550 就是 64）。查法：`ixsmi -q` 里找 warp/core 相关字段，或在 Triton 3.x 下 `triton.runtime.driver.active.get_current_target()` |
+| 自动探测能否命中（元数据里的`+corex` 应当命中，未在真机跑过 `_backend_name()`） | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| FlagTree 的`iluvatar` 后端能否编译执行最小 Triton 内核                            | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `torch.sparse` CSR/COO matmul 能否作为基线                                        | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `CUDA_VISIBLE_DEVICES` 选卡（八卡机，务必确认落在哪张）                           | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 20 变体交付结果                                                                     | 无                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ---
 

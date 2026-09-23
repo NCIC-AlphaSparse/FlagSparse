@@ -127,7 +127,12 @@ pytest 套件用 `tests/pytest/accuracy_utils.py`。
 ```bash
 export PYTHONPATH=$PWD/src
 export FLAGSPARSE_BACKEND=mthreads
+export MUSA_HOME=/usr/local/musa     # 只跑 Python 侧不需要；交付复现（0.5 节）要构建 C API 时才用到
 ```
+
+`MUSA_HOME` 给 C API 的 cmake 找 MUSA 工具链，也给 ctest 找 muSPARSE 基线用（`capi/ctest/baseline/CMakeLists.txt`）。
+没设时默认 `/usr/local/musa`；工具链装在别处却没设这个变量，基线**不会报错**，而是悄悄退成 `none`，
+加速比那一列变成 `N/A`。所以交付复现时显式设上，路径以本机实际安装位置为准。
 
 后端名是 **`mthreads`**，不是 `musa` —— `musa` 是设备类型字符串，两者不要混。
 `FLAGSPARSE_BACKEND` 写错会直接抛 `ValueError` 而不是静默回退。

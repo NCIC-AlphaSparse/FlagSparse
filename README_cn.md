@@ -74,6 +74,7 @@ python3 tools/delivery_table.py pytest_results_<后端>_delivery      # 打印 2
 | 摩尔线程 | `FLAGSPARSE_BACKEND=mthreads` | 改用 `run_flagsparse_split_delivery.py`（性能取自 C API） | muSPARSE（C API） | SciPy（CPU） | [docs/MUSA.md](docs/MUSA.md) 0.5 节 |
 | 昇腾 910B | CANN 的 `set_env.sh`；`FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | 只能用 `--gpus 6,7` | PyTorch-NPU（5 个算子；`spmv_coo`、`spmm_coo` 只做能力探测） | SciPy（CPU） | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | 昆仑芯 XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | 无 | PyTorch-XPU（7 个算子） | SciPy（CPU） | [docs/XPU.md](docs/XPU.md) 1.5 节 |
+| 天数 BI-V150（**未实测**） | `FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=torch` | 无 | PyTorch（CuPy 装了则用 CuPy） | SciPy（CPU） | [docs/ILUVATAR.md](docs/ILUVATAR.md) 第 2 节 |
 
 **`86a09cd`（2026-09-18）之前跑出的结果不能拿来比较**：旧版把 int64、trans/conj 的行也平均进了
 `..._int_non` 变体，还把没有加速比的行当作 0。请用当前 runner 重跑，见 `prompt.md` 第 2 节。
@@ -106,9 +107,10 @@ FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分�
 | 昇腾 / CANN（910B） | `torch.npu` 可用 | **`torch`** —— ops-sparse 仍可用环境变量选回做 A/B | torch_npu |
 | 昆仑芯 XPU | 厂商插件可 import（`torch_xmlir` / `torch_xpu`） | **无** —— XDNN 是固定算子集而非描述符 API，没有可绑的通用入口 | torch_xmlir |
 | 燧原 GCU | `torch_gcu` 可 import | 暂无 | torch_gcu |
-| 寒武纪 MLU | **只能由环境变量选中**，从不自动探测：它是通用备用槽位，没有自己条目的厂商可以从这里走 | 暂无 | torch_mlu |
+| 天数 Iluvatar CoreX（BI-V150） | 见 `_detect_iluvatar_runtime()`（torch 版本带 `+corex`，或设备名）；**未实测** | CuPy 真装了就用，否则 `torch` —— 同 MetaX 的策略，未实测 | 无（CUDA 兼容，走 `torch.cuda`） |
 
-后三个没有自己的算子内核：`backends/{xpu,gcu,mlu}/` 下只有 `__init__.py`，走共享实现。
+后三个没有自己的算子内核：`backends/{xpu,gcu,iluvatar}/` 下只有 `__init__.py`，走共享实现。天数和 MetaX 一样是 CUDA 兼容栈，
+占用的是原来寒武纪 `mlu` 备用槽位的位置。
 昆仑芯那条"插件必须可 import"不是多余的谨慎 —— 上游 PyTorch 给 Intel GPU 也装了
 `torch.xpu` 命名空间，只看命名空间会把一块 Intel 卡认成昆仑芯。
 
@@ -127,7 +129,7 @@ MetaX 专有的 `torch.version` 属性、MACA SDK 环境变量（`MACA_PATH` / `
 **在真机上先显式指定，等自动探测确认无误后再依赖它：**
 
 ```bash
-export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | mlu
+export FLAGSPARSE_BACKEND=metax     # cuda | rocm | metax | mthreads | ascend | xpu | gcu | iluvatar
 export FLAGSPARSE_MACA_MODEL=c550   # 覆盖型号检测
 export FLAGSPARSE_MACA_VENDOR=torch  # CuPy 不可用时用 PyTorch 作基线；none = 不要基线
 
