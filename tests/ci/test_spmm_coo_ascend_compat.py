@@ -9,7 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 
-from flagsparse.sparse_operations import spmm_coo as impl
+from flagsparse.sparse_operations import spmm_coo as impl  # noqa: E402
 
 
 def _fake_prepare_inputs(data, row, col, B, shape, dense_layout="row"):

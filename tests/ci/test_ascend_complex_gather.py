@@ -6,16 +6,20 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
+# tests/ci runs on an environment with neither numpy nor scipy (see the note in
+# test_ascend_reporting.py::_ascend_row_status), so both have to be guarded before
+# any module-level use -- an unguarded `import numpy` errors collection instead of
+# skipping, which takes the whole tests/ci run down with it.
 torch = pytest.importorskip("torch")
+np = pytest.importorskip("numpy")
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from flagsparse.sparse_operations import gather_scatter as impl
+from flagsparse.sparse_operations import gather_scatter as impl  # noqa: E402
 
 
 def _benchmark_module():

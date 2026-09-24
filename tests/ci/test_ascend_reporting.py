@@ -183,18 +183,18 @@ def test_measured_benchmark_row_failures_reach_the_phase_status():
     runner = _runner()
     assert runner._measured_benchmark_status([{"status": "PASS"}]) == "PASS"
     assert runner._measured_benchmark_status([{"status": "FAIL"}]) == "FAIL"
-    assert runner._measured_benchmark_status(
-        [{"status": "PASS"}, {"status": "FAIL"}]
-    ) == "FAIL"
-    assert runner._measured_benchmark_status(
-        [{"status": "PASS"}, {"status": "SKIP"}]
-    ) == "MIXED"
+    assert (
+        runner._measured_benchmark_status([{"status": "PASS"}, {"status": "FAIL"}])
+        == "FAIL"
+    )
+    assert (
+        runner._measured_benchmark_status([{"status": "PASS"}, {"status": "SKIP"}])
+        == "MIXED"
+    )
 
 
 def test_complex_index_capability_skip_is_narrowly_classified():
-    source = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(encoding="utf-8")
     node = next(
         item
         for item in ast.parse(source).body
@@ -202,7 +202,10 @@ def test_complex_index_capability_skip_is_narrowly_classified():
         and item.name == "_ascend_complex_index_capability_reason"
     )
     namespace = {}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<capability>", "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), "<capability>", "exec"),
+        namespace,
+    )
     classify = namespace["_ascend_complex_index_capability_reason"]
     assert classify(RuntimeError("aclnnIndex does not support ComplexDouble"))
     assert classify(RuntimeError("Index kernel not implemented for complex64"))
@@ -216,9 +219,7 @@ def test_complex_delivery_rows_are_capability_skips_not_missing():
     )
     for op in ("gather", "scatter"):
         command = runner.ASCEND_PERFORMANCE_COMMANDS[op]
-        assert command[command.index("--dtypes") + 1].endswith(
-            "complex64,complex128"
-        )
+        assert command[command.index("--dtypes") + 1].endswith("complex64,complex128")
     reason = "Ascend complex gather/scatter capability unavailable: Index unsupported"
     rows = [
         {
