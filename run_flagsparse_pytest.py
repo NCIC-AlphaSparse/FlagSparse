@@ -45,7 +45,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from tools.delivery_variants import load_delivery_variants, select_delivery_matrices
+from tools.delivery_variants import (
+    cleanup_delivery_matrices,
+    load_delivery_variants,
+    select_delivery_matrices,
+)
 
 # XPU compiler diagnostics can include an MLIR reproducer and exceed the
 # csv module's conservative 128 KiB default.  They are part of the execution
@@ -4340,6 +4344,7 @@ def main(
         if include_performance_args
         else None
     )
+    delivery_matrix_dir = None
     if (
         args.delivery_only
         and include_performance_args
@@ -4351,6 +4356,9 @@ def main(
         benchmark_input, note = select_delivery_matrices(
             benchmark_input, results_dir / "delivery_matrices"
         )
+        # Only ours to remove when the filter actually built it; when it did not,
+        # benchmark_input is the caller's own corpus directory.
+        delivery_matrix_dir = results_dir / "delivery_matrices" if note is None else None
         print(
             f"delivery-only: matrices from {benchmark_input}"
             if note is None
@@ -4439,6 +4447,8 @@ def main(
             future.result()
 
     write_summary(results, results_dir, env_info)
+    if delivery_matrix_dir is not None:
+        cleanup_delivery_matrices(delivery_matrix_dir)
     return 1 if _should_fail(results, args.strict) else 0
 
 

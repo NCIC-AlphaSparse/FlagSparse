@@ -55,13 +55,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from tools.delivery_variants import select_delivery_matrices
+from tools.delivery_variants import cleanup_delivery_matrices, select_delivery_matrices
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CAPI_SRC_DIR = PROJECT_ROOT / "capi"
@@ -182,8 +183,9 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     recipe does (tools/write_summary.py + tools/check_manifest.py)."""
     bench_out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    delivery_matrix_dir = bench_out.resolve().parent / "delivery_matrices"
     matrix_dir, note = select_delivery_matrices(
-        Path(args.benchmark_input).resolve(), bench_out.resolve().parent / "delivery_matrices"
+        Path(args.benchmark_input).resolve(), delivery_matrix_dir
     )
     print(
         f"delivery matrices: {matrix_dir}"
@@ -212,8 +214,22 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     if args.strict:
         check_manifest_cmd.append("--strict")
     run(check_manifest_cmd)
+    # Only ours to remove when the filter actually built it; otherwise matrix_dir
+    # is the caller's own corpus directory.
+    if note is None:
+        cleanup_delivery_matrices(delivery_matrix_dir)
     return rc
 
+
+
+# Mirrors run_flagsparse_pytest.write_summary()'s header list so the merged CSV
+# keeps the same columns a single-runner delivery produces.
+_SUMMARY_CSV_HEADERS = (
+    "operator", "gpu", "phase", "status", "configured", "passed", "failed",
+    "skipped", "errors", "total", "exit_code", "returncode", "duration",
+    "duration_sec", "row_count", "speedup", "data_file", "log_path",
+    "stdout_log_path", "stderr_log_path", "data_path", "reason", "command",
+)
 
 def merge_summaries(py_summary_path: Path, capi_summary_path: Path, out_path: Path) -> None:
     """One summary.json: accuracy from the pytest run, performance from the
@@ -262,6 +278,7 @@ def merge_summaries(py_summary_path: Path, capi_summary_path: Path, out_path: Pa
         "sources": {"accuracy": str(py_summary_path), "performance": str(capi_summary_path)},
     }
     out_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    _publish_merged_reports(merged, py_summary_path)
 
     total = len(merged_result)
     acc_pass = sum(1 for e in merged_result.values() if e.get("accuracy", {}).get("status") == "Passed")
@@ -269,6 +286,60 @@ def merge_summaries(py_summary_path: Path, capi_summary_path: Path, out_path: Pa
     perf_nobase = sum(1 for e in merged_result.values() if e.get("performance", {}).get("status") == "NoBaseline")
     log(f"wrote {out_path}: {total} variants, accuracy Passed={acc_pass}, performance Passed={perf_pass}, "
         f"NoBaseline={perf_nobase} (ran and passed, no vendor baseline to compare)")
+
+
+
+def _publish_merged_reports(merged: dict, py_summary_path: Path) -> None:
+    """Rewrite the results dir's own reports from the merged data.
+
+    The pytest phase writes summary.json / summary.csv / summary.xlsx /
+    result.html while the performance half does not exist yet, so every one of
+    them reports performance as NotFound -- including result.html, which is the
+    artifact most people actually open.  summary_split.json alone does not help
+    them: nothing regenerates the HTML from it.  So overwrite the results dir's
+    reports here, from the merged variants, once both halves are in.
+
+    Failure is non-fatal: summary_split.json is already written and is the
+    authoritative merge, so a missing openpyxl or a renamed helper must not sink
+    a delivery run that otherwise finished.
+    """
+    try:
+        import run_flagsparse_pytest as runner
+    except Exception as exc:  # pragma: no cover - import-environment dependent
+        log(f"could not import the runner to regenerate reports: {exc}")
+        return
+
+    results_dir = py_summary_path.parent
+    # write_summary() cannot be reused: it re-projects onto the delivery registry
+    # keyed by PARENT operator, and these entries are already per-variant.
+    ordered = [
+        {"operator": variant_id, **entry}
+        for variant_id, entry in sorted(merged["result"].items())
+    ]
+    env_info = (merged.get("env") or {}).get("pytest_accuracy") or {}
+    written = []
+    try:
+        py_summary_path.write_text(
+            json.dumps(merged, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        written.append(py_summary_path.name)
+
+        rows = runner._phase_rows(ordered)
+        csv_path = results_dir / "summary.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=_SUMMARY_CSV_HEADERS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in _SUMMARY_CSV_HEADERS})
+        written.append(csv_path.name)
+
+        runner.write_result_html(ordered, results_dir, env_info)
+        written.append("result.html")
+    except Exception as exc:  # pragma: no cover - defensive
+        log(f"regenerating reports failed after {written or 'nothing'}: {exc}")
+        return
+    log(f"regenerated from the merge: {', '.join(written)}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

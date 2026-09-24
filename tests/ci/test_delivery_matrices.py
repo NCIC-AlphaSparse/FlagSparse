@@ -116,7 +116,35 @@ def test_the_runner_filters_under_delivery_only_without_any_extra_option(tmp_pat
         cwd=ROOT,
     )
     assert "matrices from" in done.stdout, done.stdout + done.stderr
-    kept = sorted(
-        p.stem for p in (tmp_path / "res" / "delivery_matrices").glob("*.mtx")
+    # WHICH matrices the filter picks is pinned by
+    # test_the_filter_keeps_only_the_delivery_matrices, at the unit level where the
+    # directory still exists.  Here the point is the runner reaching that code path
+    # and then clearing up after itself: the entries are symlinks into the source
+    # corpus, so a results directory that outlives them carries dangling links.
+    assert not (tmp_path / "res" / "delivery_matrices").exists(), (
+        "the delivery matrix symlink directory outlived the run"
     )
-    assert kept == sorted(DELIVERY_MATRICES)
+    assert sorted(p.stem for p in source.glob("*.mtx")) == sorted(
+        [*DELIVERY_MATRICES, "net150"]
+    ), "cleanup must never touch the source corpus"
+
+
+def test_cleanup_only_removes_the_symlinks_it_made(tmp_path):
+    """Pointing cleanup at a real corpus, or a dirtied dir, must remove nothing."""
+    source = _corpus(tmp_path, DELIVERY_MATRICES)
+    dest = tmp_path / "out"
+    delivery_variants.select_delivery_matrices(source, dest)
+
+    delivery_variants.cleanup_delivery_matrices(source)
+    assert sorted(p.stem for p in source.glob("*.mtx")) == sorted(DELIVERY_MATRICES)
+    assert source.is_dir()
+
+    (dest / "notes.txt").write_text("keep me", encoding="utf-8")
+    delivery_variants.cleanup_delivery_matrices(dest)
+    assert dest.is_dir(), "a directory holding anything else must survive"
+    assert list(dest.glob("*.mtx")) == []
+    assert (dest / "notes.txt").exists()
+
+    (dest / "notes.txt").unlink()
+    delivery_variants.cleanup_delivery_matrices(dest)
+    assert not dest.exists()
