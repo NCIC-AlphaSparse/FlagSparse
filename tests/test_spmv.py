@@ -292,13 +292,15 @@ def _scipy_spmv_reference(
     ref_dtype = _reference_dtype(out_dtype)
     matrix = sp.csr_matrix(
         (
-            data.to(ref_dtype).detach().cpu().numpy(),
+            # Cast on the CPU, not on the accelerator: an on-device
+            # float32 -> float64 cast returns zeros on Iluvatar BI-V150.
+            data.detach().cpu().to(ref_dtype).numpy(),
             indices.detach().cpu().numpy().astype(np.int64, copy=False),
             indptr.detach().cpu().numpy().astype(np.int64, copy=False),
         ),
         shape=shape,
     )
-    x_ref = x.to(ref_dtype).detach().cpu().numpy()
+    x_ref = x.detach().cpu().to(ref_dtype).numpy()
     if op == "non":
         result = matrix @ x_ref
     elif op == "trans":
