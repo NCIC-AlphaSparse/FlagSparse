@@ -48,7 +48,7 @@ Sparse matrix operators (SpMM, SpMV, sampled dense-dense) for FlagOS-supported a
 %pyproject_save_files flagsparse
 %else
 %{__python3} -m pip install --no-deps --no-index --no-warn-script-location \
-    --root %{buildroot} dist/*.whl
+    --root %{buildroot} --prefix /usr dist/*.whl
 %endif
 
 %check
@@ -67,7 +67,13 @@ PYTHONDONTWRITEBYTECODE=1 \
 %files
 %license LICENSE
 %{python3_sitelib}/flagsparse/
-%{python3_sitelib}/flagsparse-%{version}.dist-info/
+# Globbed, not %%{version}: the dist-info directory is named for the version in
+# pyproject.toml, which is not necessarily this spec's Version -- a release
+# pipeline may stamp the spec to the version the release manifest names while
+# the Python metadata keeps its own. Binding the two made the build fail with
+# "Directory not found" rather than produce a package with a mismatched
+# version, which is the better failure but still a failure.
+%{python3_sitelib}/flagsparse-*.dist-info/
 %endif
 
 %changelog
