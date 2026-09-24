@@ -15,7 +15,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from flagsparse.sparse_operations import gather_scatter as impl
+from flagsparse.sparse_operations import gather_scatter as impl  # noqa: E402
 
 
 def _benchmark_module():

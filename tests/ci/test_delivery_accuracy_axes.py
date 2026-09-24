@@ -260,8 +260,10 @@ def test_the_exempt_reasons_are_the_ones_the_tests_actually_emit():
     sources = "\n".join(
         p.read_text(encoding="utf-8")
         for p in sorted(
-            [*(root / "tests" / "pytest").glob("*.py"),
-             *(root / "benchmark").glob("benchmark_ascend*.py")]
+            [
+                *(root / "tests" / "pytest").glob("*.py"),
+                *(root / "benchmark").glob("benchmark_ascend*.py"),
+            ]
         )
     )
     # Case-insensitive, matching _is_expected_accuracy_skip: the exempt list is stored

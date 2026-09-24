@@ -5,7 +5,6 @@
 import ast
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_PATH = ROOT / "src/flagsparse/sparse_operations/spmm_coo.py"
 SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
