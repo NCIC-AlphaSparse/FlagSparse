@@ -70,7 +70,7 @@ def test_gpu_benchmark_workflow_uploads_artifacts():
     assert "mkdir -p benchmark_results" in text
     assert "run_flagsparse_performance.py" in text
     assert "matrix_dir:" in text
-    assert "actions/upload-artifact@v4" in text
+    assert "actions/upload-artifact@v7" in text
 
 
 def test_gpu_dependency_bundle_leaves_triton_to_flagtree():

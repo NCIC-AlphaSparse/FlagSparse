@@ -57,6 +57,33 @@ def load_delivery_matrices(path: Path | None = None) -> list[str]:
     return names
 
 
+def cleanup_delivery_matrices(dest_dir: Path) -> None:
+    """Remove the symlink directory `select_delivery_matrices` built, if it is ours.
+
+    The directory is an intermediate: the benchmark scripts glob it during the
+    run and nothing reads it afterwards, while `performance.csv`'s `matrix`
+    column already records which matrices a row used.  Leaving it behind is
+    worse than clutter -- the entries are symlinks into the source corpus, so a
+    results directory that gets copied or archived carries dangling links that
+    look like missing data.
+
+    Only ever removes symlinks this module creates, and then `rmdir`s, which
+    fails on a non-empty directory.  That is the safety property: pass it a real
+    matrix directory (which happens when the filter was NOT applied and the
+    caller got the source back) and it removes nothing.
+    """
+    if not dest_dir.is_dir():
+        return
+    for entry in dest_dir.glob("*.mtx"):
+        if entry.is_symlink():
+            entry.unlink()
+    try:
+        dest_dir.rmdir()
+    except OSError:
+        # Something else lives here; leave it alone rather than guess.
+        pass
+
+
 def select_delivery_matrices(
     source_dir: Path, dest_dir: Path, names: list[str] | None = None
 ) -> tuple[Path, str | None]:

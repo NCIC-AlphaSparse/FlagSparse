@@ -9,6 +9,11 @@ so a helper that returned a status here would replace the descriptor with it.
 
 import pytest
 
+pytest.importorskip(
+    "torch",
+    reason="tests/ci runs on a CPU-only runner without torch",
+)
+
 common = pytest.importorskip(
     "flagsparse.sparse_operations._common",
     reason="tests/ci runs on a CPU-only runner without torch",

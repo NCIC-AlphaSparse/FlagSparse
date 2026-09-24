@@ -44,7 +44,7 @@ def test_installed_wheel_import_resolves_outside_repo_tree():
 
     lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
     assert lines, proc.stdout
-    assert lines[0] == "1.0.0"
+    assert lines[0] == "0.4.0"
     module_path = Path(lines[1]).resolve()
     assert PROJECT_ROOT not in module_path.parents
     assert module_path.is_file()

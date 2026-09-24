@@ -18,7 +18,7 @@ import flagsparse
 
 
 def test_package_version_is_exposed():
-    assert flagsparse.__version__ == "1.0.0"
+    assert flagsparse.__version__ == "0.4.0"
 
 
 def test_public_exports_are_listed():
