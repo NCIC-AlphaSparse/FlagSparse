@@ -149,7 +149,10 @@ def _materialize_dense_layout(tensor, layout):
 
 
 def _spmm_coo_compute_dtype(value_dtype):
-    if _is_ascend_runtime():
+    if _is_ascend_runtime() or _is_iluvatar_runtime():
+        # CoreX 4.4 silently zeroes device-side fp32-to-fp64 conversions.
+        # Preserve native precision rather than feeding a known-invalid fp64
+        # intermediate to either the Triton or torch fallback path.
         if value_dtype in (torch.float16, torch.bfloat16):
             return torch.float32
         return value_dtype

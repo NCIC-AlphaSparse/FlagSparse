@@ -176,12 +176,7 @@ class PreparedCsrSpmv:
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
-        if data.dtype in (torch.float16, torch.bfloat16):
-            self._baseline_compute_dtype = torch.float32
-        elif data.dtype == torch.float32:
-            self._baseline_compute_dtype = torch.float64
-        else:
-            self._baseline_compute_dtype = data.dtype
+        self._baseline_compute_dtype = _spmv_baseline_compute_dtype(data.dtype)
         self._baseline_data = None
         self.alg_requested = "auto"
         self.alg = None
@@ -189,6 +184,20 @@ class PreparedCsrSpmv:
         self.config_source = "legacy"
         self.backend_caps = None
         self.config_rejections = []
+
+
+def _spmv_baseline_compute_dtype(value_dtype):
+    """Select the legacy row-parallel accumulation dtype.
+
+    CoreX 4.4 silently zeroes device-side fp32-to-fp64 conversions. Keeping an
+    fp32 input native avoids poisoning the legacy rowpar route on Iluvatar;
+    every other runtime retains the higher-precision historical baseline.
+    """
+    if value_dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if value_dtype == torch.float32:
+        return torch.float32 if _is_iluvatar_runtime() else torch.float64
+    return value_dtype
 
 
 # Performance-first CSR-Vector buckets.  num_warps*32 >= block_size.

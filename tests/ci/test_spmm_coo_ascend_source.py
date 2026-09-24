@@ -42,7 +42,11 @@ def test_prepared_ascend_route_sorts_without_coalescing():
 
 def test_ascend_keeps_float64_and_does_not_promote_float32_compute():
     source = _function_source("_spmm_coo_compute_dtype")
-    dispatch = source.index("if _is_ascend_runtime():")
+    # Match the predicate, not the whole line: Iluvatar extended the same branch
+    # to `_is_ascend_runtime() or _is_iluvatar_runtime()` for the same reason
+    # (CoreX 4.4 silently zeroes a device-side fp32 -> fp64 cast), and the
+    # property under test is the ORDER of the dispatch, not its exact spelling.
+    dispatch = source.index("_is_ascend_runtime()")
     generic_precision = source.index("if value_dtype == torch.float32:")
 
     assert dispatch < generic_precision

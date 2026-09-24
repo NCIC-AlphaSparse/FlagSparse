@@ -19,7 +19,12 @@ or a real CoreX wheel, would otherwise make every case look like Iluvatar.
 
 import pytest
 
-pytest.importorskip("torch", reason="tests/ci runs on a CPU-only runner without torch")
+# The guard has to come BEFORE the import it guards: tests/ci runs on a CPU-only
+# runner, and a bare `import torch` there fails COLLECTION rather than skipping,
+# which takes the whole tests/ci run down with it.
+torch = pytest.importorskip(
+    "torch", reason="tests/ci runs on a CPU-only runner without torch"
+)
 
 from flagsparse.sparse_operations import _common  # noqa: E402
 
@@ -100,3 +105,25 @@ def test_override_wins_in_both_directions(monkeypatch):
     monkeypatch.setattr(_common.torch, "__version__", "2.1.1+corex.4.1.2")
     monkeypatch.setenv("COREX_HOME", "/usr/local/corex")
     assert not _common._detect_iluvatar_runtime()
+
+
+def test_iluvatar_spmv_rowpar_keeps_float32_native(monkeypatch):
+    """CoreX fp32-to-fp64 conversion silently produces zero-filled tensors."""
+    from flagsparse.sparse_operations import spmv_csr
+
+    monkeypatch.setattr(spmv_csr, "_is_iluvatar_runtime", lambda: True)
+    assert spmv_csr._spmv_baseline_compute_dtype(torch.float32) == torch.float32
+
+    monkeypatch.setattr(spmv_csr, "_is_iluvatar_runtime", lambda: False)
+    assert spmv_csr._spmv_baseline_compute_dtype(torch.float32) == torch.float64
+
+
+def test_iluvatar_spmm_coo_keeps_float32_native(monkeypatch):
+    """CoreX must not create a zero-filled fp64 intermediate for fp32 COO SpMM."""
+    from flagsparse.sparse_operations import spmm_coo
+
+    monkeypatch.setattr(spmm_coo, "_is_iluvatar_runtime", lambda: True)
+    assert spmm_coo._spmm_coo_compute_dtype(torch.float32) == torch.float32
+
+    monkeypatch.setattr(spmm_coo, "_is_iluvatar_runtime", lambda: False)
+    assert spmm_coo._spmm_coo_compute_dtype(torch.float32) == torch.float64
