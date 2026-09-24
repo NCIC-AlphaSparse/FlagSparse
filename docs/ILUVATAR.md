@@ -162,14 +162,15 @@ env -u FLAGSPARSE_BACKEND python3 -c "from flagsparse.sparse_operations import _
 python3 - <<'EOF'
 import torch
 a = torch.sparse_csr_tensor(torch.tensor([0, 2, 4]), torch.tensor([0, 1, 0, 1]),
-                            torch.randn(4), (2, 2), device="cuda")
-b = torch.randn(2, 8, device="cuda")
-print("csr mm ok:", (a @ b).shape)
+                            torch.tensor([1., 2., 3., 4.], device="cuda"), (2, 2), device="cuda")
+x = torch.tensor([1., 2.], device="cuda")
+print("csr spmv:", torch.sparse.mm(a, x[:, None]).squeeze(1).cpu())  # expected [5., 11.]
 EOF
 ```
 
-这是摩尔线程翻过车的地方：那里能建稀疏张量、只缺 matmul，光看"能不能建出稀疏张量"发现不了。
-报错就按第 3 节把默认基线改成 `None`。
+不能只检查 shape，必须检查数值。BI-V150/CoreX 4.4 上这个最小 CSR SpMV 例子返回全零，
+即使输入非零也不会报错。因此 CSR SpMV 的 PyTorch baseline 必须保持未接入（性能列为 `N/A`）；
+不能把 Iluvatar 放宽为与 MACA 一样的 `torch` 路由。CSR SpMM/COO 的可用性需逐项实测。
 
 ### 第 4 步：单算子冒烟
 
@@ -204,30 +205,57 @@ setsid timeout -s KILL 14400 python3 -u run_flagsparse_pytest.py \
 
 ---
 
-## 2. 交付复现：20 个变体 × 10 个矩阵（精度 + 性能）
+## 2. 交付复现：BI-V150 可运行 dtype（精度 + 性能）
 
 第 1 节的环境和检查通过后：
 
 ```bash
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
-  --phase both --mode normal --delivery-only --gpus 0 --timeout 3600 \
-  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
-  --results-dir pytest_results_iluvatar_delivery \
-  > pytest_results_iluvatar_delivery.log 2>&1 < /dev/null &
+setsid timeout -s KILL 43200 \
+  env FLAGSPARSE_BACKEND=iluvatar \
+      FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python3 -u run_flagsparse_pytest.py \
+    --phase both \
+    --mode normal \
+    --delivery-only \
+    --gpus 0 \
+    --timeout 3600 \
+    --benchmark-input tests/data \
+    --benchmark-warmup 5 \
+    --benchmark-iters 20 \
+    --pytest-args='-k "(float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)"' \
+    --op-benchmark-args='gather=--value-dtypes float16,float32' \
+    --op-benchmark-args='scatter=--value-dtypes float16,float32' \
+    --op-benchmark-args='spmv_csr=--dtypes float32' \
+    --op-benchmark-args='spmv_coo=--dtypes float32' \
+    --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
+    --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
+    --op-benchmark-args='sddmm_csr=--dtype float32' \
+    --results-dir pytest_results_iluvatar_delivery_f16_f32 \
+  > pytest_results_iluvatar_delivery_f16_f32.log 2>&1 < /dev/null &
 ```
 
+这里的 pytest 表达式必须保留内层双引号；写成没有引号的 `-k ... or ...` 会让
+pytest 把 `or` 当成测试路径，报 `file or directory not found: or`。不能只匹配
+`float32`：gather 的 fp32 参数 ID 是 `float`，而其他套件多为 `float32`。表达式同时
+匹配这两种 ID，并排除 double、bf16 和 complex，确保精度阶段只覆盖 fp16/fp32。
+性能参数按各脚本的 CLI 能力分别设置：`spmv_csr`/`spmv_coo` 的性能脚本不接受
+fp16，`sddmm_csr` 当前也只跑 fp32；gather、scatter、spmm 则跑 fp16 和 fp32。
+其中 `spmm_csr` 的 dtype 网格参数是复数形式的 `--dtypes`；单值参数 `--dtype` 不接受
+逗号分隔列表，传入 `float16,float32` 会在 argparse 阶段直接退出。
+该命令用于验证 BI-V150 当前可运行范围，不会覆盖交付清单中已知不可用的 double/c128 变体。
+
 - `--benchmark-input tests/data`：10 个交付矩阵已经在仓库的 `tests/data` 里。跑完先确认筛选生效了：
-  `grep "delivery-only" pytest_results_iluvatar_delivery.log` 应当是 `matrices from .../delivery_matrices`，
+  `grep "delivery-only" pytest_results_iluvatar_delivery_f16_f32.log` 应当是 `matrices from .../delivery_matrices`，
   出现 `NOT applied` 就说明矩阵不全，跑的不是交付集合；
 - 外层 `timeout -s KILL 43200`（12 小时）是整条命令的总限时，内核卡死时 Ctrl-C 送不进去，只能靠 KILL；
-  `--timeout 3600` 是每个算子每个阶段的限时。20 个变体在天数上的完整耗时**没有实测过**，按实际情况调整；
+  `--timeout 3600` 是每个算子每个阶段的限时。该 dtype 子集在天数上的完整耗时**没有实测过**，按实际情况调整；
 - `--gpus 0`：runner 通过 `CUDA_VISIBLE_DEVICES` 选卡。CoreX 是否照常遵守这个变量**未验证**，
   多卡机器上先用 `ixsmi`（天数的设备管理工具）确认任务确实落在指定的卡上。
 
-跑完看 20 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
+跑完查看结果（被排除的 double/c128 变体不会有有效数据行）：
 
 ```bash
-python3 tools/delivery_table.py pytest_results_iluvatar_delivery    # 加 --markdown 输出 Markdown 表
+python3 tools/delivery_table.py pytest_results_iluvatar_delivery_f16_f32 --markdown
 ```
 
 也可以通过按后端组织的入口跑，它会自动设置 `FLAGSPARSE_BACKEND=iluvatar`：
@@ -240,16 +268,21 @@ python tools/run_backend_tests.py --backend iluvatar --phase accuracy --mode qui
 
 ## 3. 性能基线
 
-**交付跑固定用 PyTorch**：第 1 节设了 `FLAGSPARSE_ILUVATAR_VENDOR=torch`，这样加速比的分母和
-沐曦、昇腾、昆仑芯几个后端一致，可以横向比。
+**交付跑固定用 CoreX cuSPARSE**：第 1 节设了 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`。
+BI-V150/CoreX 4.4 已验证 legacy `cusparseScsrmv` 和 `cusparseScsrmm`，通过
+`cupy.cusparse.csrmv/csrmm` 提供 fp32、int32、`op=non` 的性能分母；CSR SpMM 会将 RHS 转为
+Fortran 连续布局。精度始终由 CPU SciPy 判定，厂商输出只用于计时和交叉核对。
+
+不要使用 `cupyx` 的 `@` 或 generic `cupy.cusparse.spmv/spmm`：CoreX 的 generic SpMV
+工作区查询错误地返回约 140 TB。PyTorch CSR SpMV/SpMM 在该栈上也会静默返回全零；fp16、int64
+或转置变体没有已验证厂商基线，性能列应为 `N/A`。
 
 不设这个变量时走的是探测（照 MetaX 定的策略）：CuPy 真装了就用 CuPy，否则 PyTorch。所以**同一台机器
 装没装 CuPy 会给出两种口径的加速比**，这也是交付跑要显式指定的原因。设成 `none` 则没有基线列，全是 `N/A`。
 
-这套默认值的理由是 CoreX 与 CUDA 兼容、`torch.sparse` 应当能跑，**但没有实测过**。摩尔线程的教训是
-"应当能跑"不等于能跑（那里 `torch.sparse` 能建张量却没有 matmul）。第一次上机时如果基线列是 `N/A`，
-看 `reason` 字段：若是 `torch.sparse` 本身报错，就把 `_iluvatar_vendor_sparse_library()` 的默认值改成
-`None`，并把实测记到这里。
+不要将 CUDA 兼容视为 `torch.sparse` 正确性的保证。BI-V100/CoreX 3.2.3 曾验证 CSR matmul 可用，
+但 BI-V150/CoreX 4.4 已验证 CSR SpMV 静默全零，二者不能互相外推。若其他稀疏路径的基线列为
+`N/A`，先核对最小数值结果和 `reason` 字段，再决定是否接入或禁用。
 
 ---
 

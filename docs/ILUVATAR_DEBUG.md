@@ -9,9 +9,15 @@
 
 ## 0. 一句话现状
 
-软件栈**已经跑通**：`tests/ci` 197 passed，五个交付父算子的精度已验证可用。
-**这张卡的 fp64 不能用**，根因在厂商的 H2D 拷贝，我们这边绕不过去。
+软件栈**已经跑通**：`tests/ci` 197 passed，**七个交付父算子的非 fp64 精度都已验证可用**
+（`sddmm_csr` 待跑）。**这张卡的 fp64 不能用**，根因在厂商的 H2D 拷贝，我们这边绕不过去。
 20 个交付变体里 **9 个（所有 f64 和 c64）拿不到数**，其余 11 个可跑。
+
+性能分母**不是 PyTorch** —— `torch.sparse` 在这张卡上对非零 fp32 输入静默返回零，
+用的是 CoreX 的 **legacy `cusparseScsrmv` / `Scsrmm`**，仅覆盖 fp32 + int32 + `op=non`
+（4.0.1 节）。其余组合没有基线，显示 `N/A`。
+
+2026-09-24 的一轮改动已合入主线，合入时的核对记录见第 9 节。
 
 ---
 
@@ -155,16 +161,110 @@ PY
 | `tests/ci` | 197 passed / 6 skipped / 1 deselected | deselect 见 5.3 |
 | `gather` | 16 passed | |
 | `scatter` | 34 passed | |
-| `spmv_csr` | 278 passed / 9 failed | 9 个全是 `float32 + legacy_rowpar`，见下 |
+| `spmv_csr` | 287 passed / 1092 skipped | 2026-09-24 强制 `legacy_rowpar` 的无 fp64 精度回归；原先 9 个 `float32 + legacy_rowpar` 失败已修复 |
 | `spmv_coo` | 41 passed | |
 | `spmm_csr` | 31 passed | 耗时 27 秒，偏慢但正常 |
-| `spmm_coo` | **未完成** | 疑似编译卡住，见 6.1 |
+| `spmm_coo` | 12 passed | 2026-09-24 fp32 精度：non/trans/conj、int32/int64、2 个形状；首轮约 2 分钟 |
 | `sddmm_csr` | **未跑** | |
 
-**那 9 个失败的根因已知，不是内核问题。** `float32` 时
+**那 9 个失败的根因已知，且已修复，不是内核问题。** 修复前 `float32` 时
 `_baseline_compute_dtype` 是 `float64`（`spmv_csr.py:181`），
 `_get_spmv_baseline_data`（`:1050`）做 `prepared.data.to(compute_dtype)` —— 正是缺陷 A。
-**默认路由是 segbin，不走 `_get_spmv_baseline_data`**，所以交付不受影响。
+Iluvatar 现在保持 `float32`，不再触发该转换；其他后端仍保留原先的 fp64 基线。
+默认路由是 segbin，本来就不走 `_get_spmv_baseline_data`，所以交付不受影响。
+
+最小回归（强制 `FLAGSPARSE_SPMV_CSR_KERNEL=rowpar`）已实测为 6 passed：`non`、
+int32/int64、3 个形状。按第 5.1 节的筛选和两个 `--deselect` 跑完整无 fp64 集合，
+已实测为 287 passed / 1092 skipped。
+
+### CSR SpMV 的 PyTorch 性能基线（BI-V150/CoreX 4.4）
+
+`torch.sparse_csr_tensor` 可创建，但对非零 2x2 CSR 矩阵和非零向量执行
+`torch.sparse.mm(csr, x[:, None]).squeeze(1)` 返回 `[0.0, 0.0]`，预期为 `[5.0, 11.0]`。
+这是静默错误，不能作为 PyTorch 性能基线。2026-09-24 已验证并接入 CoreX legacy
+`cusparseScsrmv`（fp32、int32、`non`），由 `cupy.cusparse.csrmv` 计时；其输出只和 CPU
+SciPy 参考交叉核对，不参与精度 oracle。generic `cusparseSpMV` 仍因错误的多 TB 工作区查询禁用。
+
+CSR SpMM 的情况相同：fp32 2x2 非零矩阵乘非零 dense RHS 返回全零，fp16 则报
+`addmm_sparse_cuda not implemented for 'Half'`。`tests/test_spmm.py` 在 Iluvatar 上改为将
+CPU SciPy 参考直接按输出 dtype 传回设备（避免 fp64 H2D 置零），并显式禁用该 PyTorch baseline。
+同日接入 `cupy.cusparse.csrmm` 作为 fp32/int32/`non` 的性能 baseline；Fortran RHS 和 int32
+row pointer 在计时前准备，generic `cusparseSpMM` 仍不使用。
+
+### 4.0.1 CoreX legacy cuSPARSE baseline 接线记录（2026-09-24）
+
+**目标和边界。** 这里只补性能分母，不改变任何精度 oracle。CSR SpMV 原有正确性是 CPU
+FP64/complex128 scatter；CSR SpMM 在 Iluvatar 上是 CPU SciPy。厂商输出仅用于计时和再做一次
+交叉 `allclose`，其错误不会改写 FlagSparse 的精度结论。
+
+**库的发现。** BI-V150/CoreX 4.4 镜像中有厂商版 `cupy 11.4.0+corex.4.4.0`，并带有
+`/usr/local/corex-4.4.0/include/cusparse.h` 和
+`/usr/local/corex-4.4.0/lib64/libcusparse.so`。`readelf -Ws` 可见
+`cusparseScsrmv`、`cusparseScsrmm`、generic `cusparseSpMV` 和 `cusparseSpMM` 均导出；它是
+CUDA/cuSPARSE ABI 兼容层，不是单独名为 `ixsparse` 的 Python 包。
+
+**先排除的路径。** 以下最小 fp32 CSR SpMV 用例在 `cupyx` 的 `A @ x` 和
+`cupy.cusparse.spmv()` 上都因 `SpMV_bufferSize` 返回约 140 TB 工作区而 OOM；generic SpMM
+也不能作为候选。另一方面，`torch.sparse.mm` 的 CSR SpMV/SpMM 对非零 fp32 输入静默返回零，
+fp16 CSR SpMM 直接报未实现。这些路径都不能作为 baseline。
+
+```python
+# A = [[1, 2], [3, 4]], x = [1, 2]
+# cupyx CSR @ x / cupy.cusparse.spmv -> OOM: ~140 TB workspace
+# torch.sparse.mm(CSR, x[:, None]).squeeze(1) -> [0., 0.]
+```
+
+**验证通过的 API。** 同一矩阵经 `cupy.cusparse.csrmv()` 得到 `[5., 11.]`；
+`cupy.cusparse.csrmm()` 对 RHS `[[1, 2], [3, 4]]` 得到 `[[7, 10], [15, 22]]`。在
+`GL7d14.mtx`（1,831,183 nnz）上，两者相对 CPU SciPy 的最大绝对误差均为 `1.907e-06`。
+这就是选择 legacy `cusparseScsrmv`/`cusparseScsrmm` 的原因。
+
+**实现。**
+
+- `_common._spmv_csr_sparse_ref_backend()` 只在 Iluvatar 返回专用
+  `iluvatar_legacy_cusparse` backend，且只接受 fp32、int32、`op=non`；其他 backend 的路由不变。
+- `_spmv_csr_benchmark.measure_vendor()` 对该标识局部导入 `cupy.cusparse`，以 DLPack 共享
+  torch tensor，并复用输出 buffer 调 `csrmv`。若原始 `indptr` 为 int64，只在计时前转换副本；
+  FlagSparse 输入不变。
+- `tests/test_spmm.py` 只在 Iluvatar 性能分支以相同限制调用 `csrmm`。RHS 在计时前经
+  `cp.asfortranarray()` 变为 column-major，row pointer 转 int32；两种转换都不计入 baseline 时间。
+- 没有改变 `spmm_csr.py` 的通用 vendor 路由，避免其他 benchmark/test 入口把未接线的 legacy API
+  误判成可用。`cupy.cusparse` 也只在 Iluvatar 分支按需导入，因此不影响其他后端的可选依赖导入。
+
+**交付复测。** 使用下列命令，各 10 个 delivery matrix、warmup 5、iters 20：
+
+```bash
+env FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python3 -u tests/test_spmv_csr.py pytest_results_iluvatar_delivery_f16_f32_rerun_20260924/delivery_matrices \
+  --dtypes float32 --index-dtypes int32 --indptr-dtypes int32 --ops non --warmup 5 --iters 20 \
+  --csv-csr pytest_results_iluvatar_delivery_f16_f32_rerun_20260924/spmv_csr/performance_legacy_cusparse.csv
+
+env FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python3 -u tests/test_spmm.py pytest_results_iluvatar_delivery_f16_f32_rerun_20260924/delivery_matrices \
+  --dtypes float32 --index-dtypes int32 --ops non --warmup 5 --iters 20 \
+  --csv pytest_results_iluvatar_delivery_f16_f32_rerun_20260924/spmm_csr/performance_legacy_cusparse.csv
+```
+
+SpMV 为 10/10 vendor PASS，几何平均 `1.15x`（FlagSparse 相对 legacy cuSPARSE）；SpMM 为
+10/10 CPU-reference PASS + vendor PASS，几何平均 `7.99x`。结果只代表 fp32/int32/non；fp16、
+int64 和 trans/conj 仍应显示 baseline `N/A`，不能套用这些数字。
+
+### 4.0.2 runner 的 fp16/fp32 精度筛选修正（2026-09-24）
+
+首次交付 runner 使用 `-k "float16 or half or float32"`。性能脚本按各自的 `--dtypes` 参数
+确实跑到了 fp16/fp32，但共享 pytest 的 gather fp32 参数 ID 是 `float`，不是 `float32`：结果表中
+`gather_f32_int` 的性能为 Passed，精度却为 NotFound。这不是算子失败，而是筛选漏选。
+
+交付命令已改用：
+
+```text
+-k "(float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)"
+```
+
+其中 `float` 覆盖 gather 的 fp32，`f16`/`f32` 覆盖采用简写 ID 的套件；显式排除项防止 substring
+匹配把 fp64、bf16 或 complex 带入。以 delivery 选择的 7 个算子执行 `pytest --collect-only`，得到
+648 个用例，结果中没有 double、float64、bfloat16、complex64 或 complex128 节点。性能参数不变，
+仍由各 `--op-benchmark-args` 限制为 fp16/fp32。
 
 ---
 
@@ -205,7 +305,7 @@ python3 tests/test_spmv_csr.py tests/data/cage12.mtx \
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 3600 \
   --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
-  --pytest-args="-k \"$NOFP64\" --deselect tests/pytest/test_spmv_csr_accuracy.py::test_spmv_csr_default_segment_multilevel --deselect tests/pytest/test_spmv_csr_accuracy.py::test_spmv_csr_complex_cancellation" \
+  --pytest-args="-k \"(float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)\" --deselect tests/pytest/test_spmv_csr_accuracy.py::test_spmv_csr_default_segment_multilevel --deselect tests/pytest/test_spmv_csr_accuracy.py::test_spmv_csr_complex_cancellation" \
   --op-benchmark-args='spmv_csr=--dtypes float32' \
   --op-benchmark-args='spmv_coo=--dtypes float32' \
   --op-benchmark-args='spmm_csr=--dtypes float32' \
@@ -222,10 +322,17 @@ python3 tools/delivery_table.py pytest_results_iluvatar_delivery_v1 --markdown
 `--op-benchmark-args` 管性能（起 `tests/test_*.py` 这些独立脚本）。
 `--delivery-only` 会先注入 `float32,float64`，显式写的会覆盖它。
 
+上面那个 `-k` 是 4.0.2 节修正后的版本：gather 的 fp32 参数 ID 是 `float` 不是 `float32`，
+旧写法会让 `gather_f32_int` 的精度显示 `NotFound` 而性能却是 Passed —— 是筛选漏选，不是算子失败。
+5.1 节那个 `$NOFP64` 用于手工按算子跑，两者不要互相套用。
+
 三条硬规矩：
 
 - **`--results-dir` 每次用新目录。** `summary.json` 是整体覆盖写的，把子集跑进旧目录会毁掉报告。
-- **加速比的分母是 PyTorch**，和海光（hipSPARSE）、摩尔（muSPARSE）的数**不能并排比**。
+- **加速比的分母分两种，别混。** fp32 + int32 + `op=non` 走 CoreX legacy cuSPARSE
+  （`cupy.cusparse.csrmv` / `csrmm`，见 4.0.1 节）；其余组合没有厂商基线，显示 `N/A`。
+  **不要把 4.0.1 那两个几何平均（SpMV 1.15x、SpMM 7.99x）套到 fp16、int64 或 trans/conj 上。**
+  和海光（hipSPARSE）、摩尔（muSPARSE）的数同样不能并排比。
 - 9 个 f64/c64 变体会是 `NotFound` 或 `CRASH`，**这是卡的限制不是我们的缺陷**，回传时要写明。
 
 `tests/ci` 里 `test_installed_wheel_import_resolves_outside_repo_tree` 在 editable 安装下必然失败，
@@ -235,9 +342,13 @@ python3 tools/delivery_table.py pytest_results_iluvatar_delivery_v1 --markdown
 
 ## 6. 还开着的问题
 
-### 6.1 `spmm_coo` 疑似编译卡住（优先）
+### 6.1 `spmm_coo` fp32 全零（已修复）
 
-按算子跑到 `spmm_coo` 时长时间无输出。**怀疑是 `BLOCK_NNZ=256` 的展开**：
+首轮跑到 `spmm_coo` 时长时间无输出，随后所有 fp32 用例返回全零。根因是
+`_spmm_coo_compute_dtype(float32)` 默认升到 fp64，触发 CoreX 的 fp32→fp64 静默置零缺陷；
+2026-09-24 已在 Iluvatar 分支保留原生 fp32，12 个 fp32 精度用例全部通过。
+
+`BLOCK_NNZ=256` 的展开仍是性能风险：
 `_spmm_coo_rowrun_*_kernel` 里是 `tl.static_range(0, BLOCK_NNZ)`，BLOCK_NNZ 是 constexpr，
 内核体会展开 256 次。沐曦 C550 上同一个默认值让 spmm_coo 套件从 23 分 48 秒变成 11.8 秒
 （把 complex 的 BLOCK_NNZ 钳到 4 之后），而且在那张卡上还撞了 4 KB 私有内存上限。
@@ -301,6 +412,28 @@ grep "test_" /home/ix.log | tail -3                # 最后一行没有结果的
 判断某版本在不在，先看 `ls -ld` 和链接数；删用 `rmdir`（非空会失败，这本身是保护）。
 那个挂载本来也不需要 —— 镜像自带 `ixsmi`。
 
+**新增 `tests/ci` 文件时，先查重型 import 在不在守卫后面。** `tests/ci` 跑在**既没有
+numpy 也没有 scipy**（并且可能没有 torch）的环境上 —— 这条约束写在
+`test_ascend_reporting.py::_ascend_row_status` 的 docstring 里。裸 `import` 会在收集阶段
+报错并拖垮整个 `tests/ci`，而 `pytest.importorskip` 只是跳过一个文件。两天内有两个 drop
+栽在这里。本地复现那个瘦环境（开发机什么都装了，门禁抓不到）：
+
+```bash
+mkdir -p /tmp/blk && cat > /tmp/blk/sitecustomize.py <<'EOF'
+import sys
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("numpy", "torch"):   # 按要验的包改
+            raise ImportError("blocked")
+        return None
+sys.meta_path.insert(0, _Block())
+EOF
+PYTHONPATH=/tmp/blk python3 -m pytest tests/ci/<文件> -q -p no:warnings
+# 期望 "1 skipped"，出现 error 就是 import 顺序错了
+```
+
+（py3.12 只认 `find_spec`，老的 `find_module` 写法不生效。）
+
 **诊断工具本身也是嫌疑人。** 这次栽了两回：一次是测试参考链把**算对的内核**报成错
 （见第 8 节），一次是 `--forked` 让**全部用例**失败。两次的输出看起来都像"这张卡不行"的硬件结论。
 在新硬件上，先怀疑工具，再怀疑硬件。
@@ -322,3 +455,69 @@ grep "test_" /home/ix.log | tail -3                # 最后一行没有结果的
 
 **教训**：声称是 CPU oracle 的参考，要逐步确认**每一步**都在 CPU 上，
 包括辅助函数内部的 dtype 转换。
+
+---
+
+## 9. 合入核对记录（2026-09-24）
+
+本节是 `/workspace/fork/biv` 那一轮改动合进主线时的回执：**收了什么、改了什么、验了什么**。
+接手的人不必重读这一节就能干活;它存在的意义是让下一次 drop 少踩同样的坑。
+
+### 9.1 收下的改动（8 个文件，原样采纳）
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/.../_common.py` | 新增 `iluvatar_legacy_cusparse` 厂商后端，门控在 fp32 + int32 + `op=non`，并检查 `cupy.cusparse.csrmv` 真的存在 |
+| `src/.../spmv_csr.py` | `_baseline_compute_dtype` 抽成 `_spmv_baseline_compute_dtype()`，天数上 fp32 保持原生 |
+| `src/.../spmm_coo.py` | `_spmm_coo_compute_dtype` 的昇腾分支扩到 `or _is_iluvatar_runtime()` |
+| `src/.../_spmv_csr_benchmark.py` | legacy `csrmv` 计时路径，dlpack 转换和输出缓冲区复用 |
+| `tests/test_spmm.py` | legacy `csrmm` baseline，参考改为按输出 dtype 直接回传（避开 fp64 H2D 置零） |
+| `tests/ci/test_iluvatar_detection.py` | 两个 dtype 门控测试（monkeypatch `_is_iluvatar_runtime`，CUDA 上可跑） |
+| `docs/ILUVATAR.md`、`docs/ILUVATAR_DEBUG.md` | 4.0.1 / 4.0.2 和第 4、6.1 节的实测更新 |
+
+三处 src 改动的门控都验过：CUDA 上 `_spmv_baseline_compute_dtype(float32)` 和
+`_spmm_coo_compute_dtype(float32)` 仍返回 `torch.float64`，其他后端不受影响。
+
+### 9.2 合入时修掉的三处
+
+**一、`test_iluvatar_detection.py` 的 import 顺序。**
+`import torch` 排在它自己的 `pytest.importorskip("torch", reason="tests/ci runs on a
+CPU-only runner without torch")` **之前**。精简 CI 上这会在**收集阶段**报
+`ModuleNotFoundError`，把整个 `tests/ci` 拖垮（`Interrupted: 1 error during collection`），
+而不是跳过一个文件。改成 `torch = pytest.importorskip(...)`。
+
+**这是两天内第二个 drop 犯同一个错**（前一个是昇腾的 `test_ascend_complex_gather.py`
+里的 `import numpy`）。**新增 `tests/ci` 文件时，先查重型 import 在不在守卫后面。**
+本地门禁抓不到 —— 开发机什么都装了。复现方法见 7 节最后。
+
+**二、两个厂商 drop 撞车。** 昇腾有一个源码 grep 测试
+（`tests/ci/test_spmm_coo_ascend_source.py`）断言 `_spmm_coo_compute_dtype` 里有字面量
+`"if _is_ascend_runtime():"`；天数把同一行扩成了 `"... or _is_iluvatar_runtime():"`，
+于是 `ValueError: substring not found`。
+
+该测试真正保护的是**分派顺序**（昇腾分支在通用 fp32→fp64 提升之前），不是那一行的拼写，
+所以改成只匹配 `_is_ascend_runtime()` 这个谓词。**源码 grep 类断言要匹配承载性质的最小
+token** —— 锁死整行等于给下一个后端埋雷。
+
+**三、本文自身两处命令不一致。** 4.0.2 节说交付命令已改用新的 `-k`，但 5.3 节仍是旧的
+`$NOFP64`；5.3 还写着"分母是 PyTorch"，而 4.0.1 刚接上 legacy cuSPARSE。两处都已对齐，
+并注明 5.1 的手工筛选和 5.3 的交付筛选**不要互相套用**。
+
+### 9.3 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `make format-check` / `lint` / `lint-src` | 全过 |
+| `make pre-commit-check` | 全过 |
+| `tests/ci`（CUDA 开发机） | 247 passed / 4 skipped |
+| `tests/pytest -m "spmv_csr or spmm_coo"`（CUDA） | 1213 passed / 3816 skipped |
+| 无 torch 环境模拟 | `test_iluvatar_detection.py` 为 1 skipped，非 collection error |
+| 门控 | CUDA 上两个 `compute_dtype` 仍是 `float64` |
+
+### 9.4 给下一轮的三条
+
+1. **`sddmm_csr` 还没跑过**，它是七个交付父算子里唯一没有实测记录的（6.2 节）。
+2. **交付跑还没做**（6.3 节）。做之前把 5.3 的命令原样用，特别是 `-k` 和两个 `--deselect`。
+3. **两个厂商缺陷还没提交**（6.4 节）。复现都只有三五行、不涉及 FlagSparse，
+   而且 4.0.1 又添了一条证据：generic `cusparseSpMV` 的 `SpMV_bufferSize` 要约 140 TB，
+   同一个库的 legacy 入口却完全正常 —— 这比"fp64 不支持"具体得多。
