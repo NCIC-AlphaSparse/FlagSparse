@@ -121,9 +121,8 @@ def test_the_runner_filters_under_delivery_only_without_any_extra_option(tmp_pat
     # directory still exists.  Here the point is the runner reaching that code path
     # and then clearing up after itself: the entries are symlinks into the source
     # corpus, so a results directory that outlives them carries dangling links.
-    assert not (
-        tmp_path / "res" / "delivery_matrices"
-    ).exists(), "the delivery matrix symlink directory outlived the run"
+    delivery_matrices = tmp_path / "res" / "delivery_matrices"
+    assert not delivery_matrices.exists(), "delivery matrix symlink directory survived"
     assert sorted(p.stem for p in source.glob("*.mtx")) == sorted(
         [*DELIVERY_MATRICES, "net150"]
     ), "cleanup must never touch the source corpus"
