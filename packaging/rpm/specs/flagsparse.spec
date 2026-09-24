@@ -48,7 +48,7 @@ Sparse matrix operators (SpMM, SpMV, sampled dense-dense) for FlagOS-supported a
 %pyproject_save_files flagsparse
 %else
 %{__python3} -m pip install --no-deps --no-index --no-warn-script-location \
-    --root %{buildroot} dist/*.whl
+    --root %{buildroot} --prefix /usr dist/*.whl
 %endif
 
 %check
