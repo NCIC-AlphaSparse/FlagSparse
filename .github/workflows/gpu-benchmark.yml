@@ -124,7 +124,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gpu-benchmark-${{ github.run_id }}
           path: benchmark_results/
