@@ -90,7 +90,7 @@ jobs:
         run: python3.12 -m pip install --force-reinstall --no-deps dist/*.whl
 
       - name: Validate installed wheel import
-        run: python3.12 tools/ci/check_installed_wheel.py --expected-version 1.0.0
+        run: python3.12 tools/ci/check_installed_wheel.py --expected-version 0.4.0
 
       - name: Run GPU accuracy tests
         shell: bash
