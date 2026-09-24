@@ -17,6 +17,6 @@ black==24.10.0
 flake8==7.1.1
 isort==5.13.2
 pre-commit==4.5.0
-pytest==8.1.1
+pytest==9.1.1
 ruff==0.15.13
 twine==6.2.0
