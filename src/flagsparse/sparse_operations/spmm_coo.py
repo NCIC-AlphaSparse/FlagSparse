@@ -149,6 +149,10 @@ def _materialize_dense_layout(tensor, layout):
 
 
 def _spmm_coo_compute_dtype(value_dtype):
+    if _is_ascend_runtime():
+        if value_dtype in (torch.float16, torch.bfloat16):
+            return torch.float32
+        return value_dtype
     if _is_complex_dtype(value_dtype):
         return torch.complex128 if value_dtype == torch.complex64 else value_dtype
     if value_dtype in (torch.float16, torch.bfloat16):
@@ -1298,6 +1302,18 @@ def _triton_spmm_coo_rowrun_impl(
     seg_starts=None,
     num_warps=None,
 ):
+    if _use_spmm_coo_ascend_dispatch():
+        return _spmm_coo_ascend_scatter(
+            data,
+            row,
+            col,
+            B,
+            n_rows,
+            n_dense_cols,
+            output_dtype=output_dtype,
+            out=out,
+            dense_layout=dense_layout,
+        )
     # Derived by _resolve_spmm_coo_launch_config; falls back to matching BLOCK_N to
     # whole warps if a caller does not supply it.
     if num_warps is None:
@@ -1452,6 +1468,18 @@ def _triton_spmm_coo_atomic_impl(
     out=None,
     dense_layout="row",
 ):
+    if _use_spmm_coo_ascend_dispatch():
+        return _spmm_coo_ascend_scatter(
+            data,
+            row,
+            col,
+            B,
+            n_rows,
+            n_dense_cols,
+            output_dtype=output_dtype,
+            out=out,
+            dense_layout=dense_layout,
+        )
     device = data.device
     dtype = data.dtype
     dense_layout = _normalize_dense_layout(dense_layout)
@@ -1954,6 +1982,30 @@ def _run_spmm_coo_alg1_route(
     B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
     n_dense_cols = int(B.shape[1])
     device = prepared.data.device
+    if _use_spmm_coo_ascend_dispatch():
+        C = _spmm_coo_ascend_scatter(
+            prepared.data,
+            prepared.row,
+            prepared.col,
+            B,
+            prepared.n_rows,
+            n_dense_cols,
+            output_dtype=prepared.output_dtype,
+            dense_layout=dense_layout,
+        )
+        meta = {
+            "alg": "coo_ascend_scatter",
+            "display_name": "COOAscendScatter",
+            "op": prepared.op,
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": None,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
+        }
+        return C, meta
     bucket_count = 5
     counts = torch.zeros((bucket_count,), dtype=torch.int64, device=device)
     offsets = torch.empty_like(counts)
@@ -2154,15 +2206,20 @@ def prepare_spmm_coo_route(data, row, col, shape, *, op="non", alg="auto"):
     compute_dtype = _spmm_coo_compute_dtype(output_dtype)
     data, row, col, shape = _prepare_spmm_coo_matrix(data, row, col, shape)
     data_compute = data if compute_dtype == output_dtype else data.to(compute_dtype)
-    canonical_data, canonical_row, canonical_col = _coalesce_coo_entries(
-        data_compute, row, col, shape
-    )
-    canonical_data, canonical_row, canonical_col = _sort_coo_lex_inplace(
-        canonical_data,
-        canonical_row,
-        canonical_col,
-        shape[1],
-    )
+    if _use_spmm_coo_ascend_dispatch():
+        canonical_data, canonical_row, canonical_col = _sort_coo_lex_inplace(
+            data_compute, row, col, shape[1]
+        )
+    else:
+        canonical_data, canonical_row, canonical_col = _coalesce_coo_entries(
+            data_compute, row, col, shape
+        )
+        canonical_data, canonical_row, canonical_col = _sort_coo_lex_inplace(
+            canonical_data,
+            canonical_row,
+            canonical_col,
+            shape[1],
+        )
     canonical_row = canonical_row.to(torch.int32)
     canonical_col = canonical_col.to(torch.int32)
     seg_starts = _seg_starts_from_sorted_rows(
@@ -2406,22 +2463,34 @@ def _run_spmm_coo_route(
             else 0.0
         )
 
-    # XPU's sparse COO coalesce implementation is unavailable and the Triton
-    # COO routes cannot be launched reliably.  Validate/materialize the dense
-    # RHS with ordinary tensor ops, then use the device index_add scatter path
-    # without constructing a torch sparse tensor.
-    if _is_xpu_runtime():
+    # XPU and Ascend cannot use the sparse COO coalesce/Triton route here.
+    # Scatter-add preserves duplicates and avoids CANN's unsupported float64
+    # plus int32-index coalesce combination.
+    if _is_xpu_runtime() or (
+        _is_ascend_runtime() and _use_spmm_coo_ascend_dispatch()
+    ):
         native_data, native_row, native_col, native_B, n_rows, _n_cols, n_dense_cols = (
             _prepare_spmm_coo_inputs(data, row, col, B, shape, dense_layout=dense_layout)
         )
+        compute_dtype = (
+            _spmm_coo_compute_dtype(native_data.dtype)
+            if _is_ascend_runtime()
+            else native_data.dtype
+        )
+        data_compute = (
+            native_data
+            if compute_dtype == native_data.dtype
+            else native_data.to(compute_dtype)
+        )
+        B_compute = native_B if compute_dtype == native_B.dtype else native_B.to(compute_dtype)
         if do_timing:
             _ACCEL.synchronize()
             compute_start = time.perf_counter()
         C = _spmm_coo_ascend_scatter(
-            native_data,
+            data_compute,
             native_row,
             native_col,
-            native_B,
+            B_compute,
             n_rows,
             n_dense_cols,
             output_dtype=native_data.dtype,
@@ -2437,8 +2506,8 @@ def _run_spmm_coo_route(
                 "symbolic_ms": symbolic_ms,
                 "compute_ms": compute_ms,
                 "op_total_ms": op_total_ms,
-                "alg": "coo_xpu_scatter",
-                "display_name": "COOXPUScatter",
+                "alg": "coo_ascend_scatter" if _is_ascend_runtime() else "coo_xpu_scatter",
+                "display_name": "COOAscendScatter" if _is_ascend_runtime() else "COOXPUScatter",
                 "op": op_name,
                 "dense_layout": dense_layout,
                 "output_layout": _dense_layout_name(C),

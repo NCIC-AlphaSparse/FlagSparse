@@ -17,7 +17,7 @@
 | `ascend` | 昇腾 / CANN | [`ASCEND.md`](ASCEND.md) | [`capi/docs/ASCEND.md`](../capi/docs/ASCEND.md) |
 | `xpu` | 昆仑芯 | [`XPU.md`](XPU.md) | [`capi/docs/XPU.md`](../capi/docs/XPU.md) |
 | `gcu` | 燧原 | — 尚无 | — 尚无 |
-| `iluvatar` | 天数智芯 Iluvatar CoreX（BI-V150） | [`ILUVATAR.md`](ILUVATAR.md)（**未实测**） | — 尚无（`BACKEND=IX` 编不起来，见 ILUVATAR.md 第 5 节） |
+| `iluvatar` | 天数智芯 Iluvatar CoreX（BI-V150） | [`ILUVATAR.md`](ILUVATAR.md) + [`ILUVATAR_DEBUG.md`](ILUVATAR_DEBUG.md)（**已上机，fp64 不可用**） | — 尚无（`BACKEND=IX` 编不起来，见 ILUVATAR.md 第 5 节） |
 
 `gcu` 是**已注册但没有任何文档**的槽位：`_BACKEND_NAMES` 和 `_dispatch.py` 的
 `_IMPLEMENTATION_BACKENDS` 都是 8 条，`backends/gcu` 目录已建好但代码留空，
@@ -47,7 +47,7 @@
 | MUSA | [`MUSA.md`](MUSA.md) 0.5 节 | 改用 `run_flagsparse_split_delivery.py`，性能取自 C API（muSPARSE） |
 | Ascend | [`ASCEND.md`](ASCEND.md) "交付复现" | 只用 `--gpus 6,7`；5 个算子对 PyTorch-NPU，`spmv_coo` / `spmm_coo` 只做能力探测 |
 | XPU | [`XPU.md`](XPU.md) 1.5 节 | `FLAGTREE_BACKEND=xpu` 等环境变量；7 个算子全部对 PyTorch-XPU 计时 |
-| Iluvatar | [`ILUVATAR.md`](ILUVATAR.md) 第 2 节 | **未实测**；与 MACA 相同的通用 runner，基线默认 PyTorch |
+| Iluvatar | [`ILUVATAR_DEBUG.md`](ILUVATAR_DEBUG.md) 5.3 节 | 与 MACA 相同的通用 runner，基线 PyTorch；**20 个变体里 9 个（f64/c64）跑不了**，精度和性能要分别挡 fp64 |
 
 跑完统一用 `python3 tools/delivery_table.py <结果目录>` 看结果。
 
@@ -61,3 +61,4 @@
 | [`ASCEND.md`](ASCEND.md) | 910B 环境检查、Ascend fallback 分发表、算子能力探测、已知限制 |
 | [`XPU.md`](XPU.md) | 昆仑芯：插件探测为什么不能只看 `torch.xpu`、`torch_xmlir` 的 CUDA-shim 路径、7 个算子对 PyTorch-XPU 计时其余能力探测、为什么没有厂商基线、首次上机顺序 |
 | [`ILUVATAR.md`](ILUVATAR.md) | 天数 BI-V150：CUDA 兼容栈的接入方式（同 MetaX）、显式指定与探测、交付命令、第一次上机要实测的项目；C API 的 `IX` 槽位为什么编不起来 |
+| [`ILUVATAR_DEBUG.md`](ILUVATAR_DEBUG.md) | 天数 BI-V150 调试交接：容器和 `.pth` 环境、实测指纹、fp64 为什么不可用（H2D 拷贝静默返回零）、三个厂商缺陷的最小复现、怎么跑精度和性能、还开着的问题，以及不要重复趟的坑 |

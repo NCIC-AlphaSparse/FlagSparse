@@ -95,6 +95,39 @@ def _make_csr(torch, case: Case, device):
     return matrix, data, indices, indptr, actual_case
 
 
+def _make_coo(torch, case: Case, device):
+    if case.matrix_path is not None:
+        loaded = mmread(case.matrix_path)
+        matrix = loaded.tocoo(copy=False) if sp.issparse(loaded) else sp.coo_matrix(loaded)
+        if np.iscomplexobj(matrix.data):
+            matrix = matrix.real.tocoo(copy=False)
+        dtype = getattr(torch, case.dtype_name)
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        matrix = matrix.astype(np_dtype, copy=False)
+        actual_case = Case(
+            matrix.shape[0],
+            matrix.shape[1],
+            matrix.nnz,
+            case.dense_cols,
+            case.dtype_name,
+            case.matrix_path,
+        )
+    else:
+        actual_case = case
+        rng = np.random.default_rng(20260909 + case.m + case.n + case.nnz)
+        rows = rng.integers(0, case.m, size=case.nnz, dtype=np.int64)
+        cols = rng.integers(0, case.n, size=case.nnz, dtype=np.int64)
+        dtype = getattr(torch, case.dtype_name)
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        vals = rng.standard_normal(case.nnz).astype(np_dtype)
+        matrix = sp.coo_matrix((vals, (rows, cols)), shape=(case.m, case.n))
+
+    data = torch.tensor(matrix.data, device=device, dtype=dtype)
+    row = torch.tensor(matrix.row, device=device, dtype=torch.int32)
+    col = torch.tensor(matrix.col, device=device, dtype=torch.int32)
+    return matrix, data, row, col, actual_case
+
+
 def _scipy_spmv(matrix, x):
     return matrix @ x
 
@@ -105,6 +138,99 @@ def _scipy_numpy(tensor):
     if str(value.dtype) == "torch.bfloat16":
         value = value.float()
     return value.numpy()
+
+
+# Which implementation each delivery operator actually executes on Ascend.  Every one
+# of the seven falls back to torch_npu, because 910B's Triton has no shmem extension for
+# the generic gather kernel and does not lower the CSR/COO kernels reliably -- see the
+# _is_ascend_runtime() branches in each operator module.  This matters for reading the
+# speedup column: the baseline is PyTorch-NPU, so on this backend BOTH sides of the
+# ratio are the same library and a value near 1.000x means "we ARE the baseline", not
+# "our kernel matches it".  tests/ci/test_ascend_implementation_labels.py keeps this
+# table honest against the sources.
+ASCEND_OPERATOR_IMPLEMENTATION = {
+    "gather": "torch_npu",
+    "scatter": "torch_npu",
+    "spmv_csr": "torch_npu",
+    "spmv_coo": "torch_npu",
+    "spmm_csr": "torch_npu",
+    "spmm_coo": "torch_npu",
+    "sddmm_csr": "torch_npu",
+}
+
+
+def _ascend_implementation(op_name):
+    """Label for the code path an operator runs here; 'triton' if it has no fallback."""
+    return ASCEND_OPERATOR_IMPLEMENTATION.get(op_name, "triton")
+
+
+def _ascend_complex_index_capability_reason(exc):
+    """Classify only unsupported complex gather/scatter index operations."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    is_complex = "complex" in text or "dt_complex" in text
+    is_index_api = any(token in text for token in ("index", "gather", "scatter"))
+    is_unsupported = any(
+        token in text
+        for token in (
+            "not support",
+            "unsupported",
+            "not implemented",
+            "no kernel",
+            "no implementation",
+        )
+    )
+    if is_complex and is_index_api and is_unsupported:
+        return f"Ascend complex gather/scatter capability unavailable: {exc}"
+    return None
+
+
+def _randn(torch, shape, device, dtype):
+    if dtype == torch.complex64:
+        real = torch.randn(shape, device="cpu", dtype=torch.float32)
+        imag = torch.randn(shape, device="cpu", dtype=torch.float32)
+        return torch.complex(real, imag).to(device)
+    if dtype == torch.complex128:
+        real = torch.randn(shape, device="cpu", dtype=torch.float64)
+        imag = torch.randn(shape, device="cpu", dtype=torch.float64)
+        return torch.complex(real, imag).to(device)
+    return torch.randn(shape, device=device, dtype=dtype)
+
+
+def _torch_gather(torch, dense, indices):
+    if dense.is_complex():
+        components = torch.view_as_real(dense).reshape(-1)
+        real_indices = indices.to(torch.int64) * 2
+        real = torch.gather(components, 0, real_indices)
+        imag = torch.gather(components, 0, real_indices + 1)
+        return torch.view_as_complex(torch.stack((real, imag), dim=-1))
+    return torch.gather(dense, 0, indices)
+
+
+def _torch_scatter(torch, dense, indices, values):
+    dense.zero_()
+    if dense.is_complex():
+        dense_real = torch.view_as_real(dense)
+        values_real = torch.view_as_real(values)
+        dense_real.index_copy_(0, indices, values_real)
+    else:
+        dense.index_copy_(0, indices, values)
+    return dense
+
+
+def _case_for_gather_scatter(case: Case):
+    if case.matrix_path is None:
+        return case
+    loaded = mmread(case.matrix_path)
+    matrix = loaded.tocsr() if sp.issparse(loaded) else sp.csr_matrix(loaded)
+    matrix.sum_duplicates()
+    return Case(
+        matrix.shape[0],
+        matrix.shape[1],
+        matrix.nnz,
+        case.dense_cols,
+        case.dtype_name,
+        case.matrix_path,
+    )
 
 
 def _scipy_spmm(matrix, b):
@@ -151,6 +277,42 @@ def _torch_npu_csr_spmm(data, indices, row_ids, B, n_rows):
     return out
 
 
+def _torch_npu_coo_spmv(data, row, col, x, n_rows):
+    import torch
+
+    out = torch.zeros((n_rows,), device=data.device, dtype=data.dtype)
+    out.index_add_(0, row.to(torch.int64), data * x[col.to(torch.int64)])
+    return out
+
+
+def _torch_npu_coo_spmm(data, row, col, B, n_rows):
+    import torch
+
+    out = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
+    values = data[:, None] * B[col.to(torch.int64)]
+    out.index_add_(0, row.to(torch.int64), values)
+    return out
+
+
+def _accuracy_tolerance(dtype):
+    import torch
+
+    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.complex64):
+        return 2e-2
+    return 1e-8
+
+
+def _outputs_pass_accuracy(candidate, baseline, dtype):
+    tolerance = _accuracy_tolerance(dtype)
+    return np.allclose(
+        candidate,
+        baseline,
+        rtol=tolerance,
+        atol=tolerance,
+        equal_nan=True,
+    )
+
+
 def _torch_npu_sddmm_sampled(x, y, row_ids, indices, chunk_nnz=262144):
     """PyTorch-NPU SDDMM reference with bounded temporary memory."""
     import torch
@@ -188,6 +350,8 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         raise RuntimeError("Ascend benchmark requires torch_npu and an available NPU")
     torch.npu.set_device(int(device_id))
     device = torch.device(f"npu:{int(device_id)}")
+    if case.dtype_name in ("complex64", "complex128") and op not in ("gather", "scatter"):
+        raise ValueError("Ascend complex benchmark dtypes are supported only for gather/scatter")
     # ops-sparse is distributed as a C ``aclsparse`` library.  A Python import
     # alone is not sufficient to claim that it was timed, so report both probes
     # explicitly and keep PyTorch-NPU as the honest fallback when no bridge is
@@ -213,7 +377,17 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         ops_status += f"; C library found: {acl_lib} (C bridge required)"
     else:
         ops_status += "; libaclsparse.so not found"
-    matrix, data, indices, indptr, case = _make_csr(torch, case, device)
+    coo_matrix = coo_data = coo_row = coo_col = None
+    if op in ("gather", "scatter"):
+        case = _case_for_gather_scatter(case)
+        matrix = data = indices = indptr = None
+    elif op in ("spmv_coo", "spmm_coo"):
+        coo_matrix, coo_data, coo_row, coo_col, case = _make_coo(
+            torch, case, device
+        )
+        matrix = data = indices = indptr = None
+    else:
+        matrix, data, indices, indptr, case = _make_csr(torch, case, device)
     dtype = getattr(torch, case.dtype_name)
 
     results = [{
@@ -223,37 +397,73 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         "shape": f"{case.m}x{case.n};nnz={case.nnz}",
         "ops_sparse": ops_status,
         "ops_sparse_910b_supported": ["spmv_csr", "sddmm_csr", "scatter"],
-        "tested_ops": ["spmv_csr", "spmm_csr", "sddmm_csr", "gather", "scatter"],
+        "tested_ops": [
+            "spmv_csr",
+            "spmv_coo",
+            "spmm_csr",
+            "spmm_coo",
+            "sddmm_csr",
+            "gather",
+            "scatter",
+        ],
         "baseline_policy": "ops-sparse/aclsparse when a callable bridge is supplied; otherwise PyTorch-NPU",
     }]
 
     def record(name, fs_fn, pt_fn, scipy_ref, output_to_numpy):
         fs_time = pt_time = None
         fs_err = pt_err = None
+        fs_out_np = pt_out_np = None
         status_parts = []
+        fs_capability_reason = None
+        baseline_capability_reason = None
         try:
             fs_out = fs_fn()
             _sync(torch)
-            fs_time = _bench(torch, fs_fn, warmup, iters)
-            fs_np = output_to_numpy(fs_out)
-            fs_err = float(np.max(np.abs(fs_np - scipy_ref))) if fs_np.size else 0.0
+            fs_out_np = output_to_numpy(fs_out)
+            fs_err = float(np.max(np.abs(fs_out_np - scipy_ref))) if fs_out_np.size else 0.0
         except Exception as exc:
             status_parts.append(f"FlagSparse: {exc}")
+            if device.type == "npu" and case.dtype_name in ("complex64", "complex128"):
+                fs_capability_reason = _ascend_complex_index_capability_reason(exc)
         try:
             pt_out = pt_fn()
             _sync(torch)
-            pt_time = _bench(torch, pt_fn, warmup, iters)
-            pt_np = output_to_numpy(pt_out)
-            pt_err = float(np.max(np.abs(pt_np - scipy_ref))) if pt_np.size else 0.0
-            status_parts.append("PyTorch-NPU: PASS")
+            pt_out_np = output_to_numpy(pt_out)
+            pt_err = float(np.max(np.abs(pt_out_np - scipy_ref))) if pt_out_np.size else 0.0
         except Exception as exc:
             status_parts.append(f"PyTorch-NPU: {exc}")
-        results.append({"op": name, "dtype": case.dtype_name,
+            if device.type == "npu" and case.dtype_name in ("complex64", "complex128"):
+                baseline_capability_reason = _ascend_complex_index_capability_reason(exc)
+                if baseline_capability_reason:
+                    status_parts.append(baseline_capability_reason)
+        outputs_match = (
+            fs_out_np is not None
+            and pt_out_np is not None
+            and _outputs_pass_accuracy(
+                fs_out_np,
+                pt_out_np,
+                dtype,
+            )
+        )
+        if fs_out_np is not None and pt_out_np is not None and not outputs_match:
+            status_parts.append("FlagSparse and PyTorch-NPU outputs differ beyond tolerance")
+        if not status_parts:
+            fs_time = _bench(torch, fs_fn, warmup, iters)
+            pt_time = _bench(torch, pt_fn, warmup, iters)
+        row_state = (
+            "SKIP"
+            if fs_capability_reason or baseline_capability_reason
+            else "PASS" if fs_time is not None and pt_time is not None else "FAIL"
+        )
+        if row_state == "PASS":
+            status_parts.append("PyTorch-NPU: PASS")
+        results.append({"op": name, "implementation": _ascend_implementation(name),
+                        "dtype": case.dtype_name,
                         "matrix": case.matrix_path.name if case.matrix_path is not None else "synthetic",
                         "shape": f"{case.m}x{case.n};nnz={case.nnz}",
                         "flagsparse": fs_time, "pytorch": pt_time,
                         "scipy_max_abs_error": {"flagsparse": fs_err, "pytorch": pt_err},
-                        "status": row_status(fs_time),
+                        "status": row_state,
                         "reason": "; ".join(status_parts) if status_parts else "unknown"})
 
     if op in (None, "spmv_csr"):
@@ -276,15 +486,62 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
                lambda: _torch_npu_sddmm_sampled(sx, sy, row_ids, indices),
                _scipy_sddmm(matrix, _scipy_numpy(sx), _scipy_numpy(sy)), _scipy_numpy)
 
+    if op == "spmv_coo":
+        x = torch.randn(case.n, device=device, dtype=dtype)
+        record(
+            "spmv_coo",
+            lambda: fs.flagsparse_spmv_coo(
+                coo_data, coo_row, coo_col, x, (case.m, case.n), op="non"
+            ),
+            lambda: _torch_npu_coo_spmv(
+                coo_data, coo_row, coo_col, x, case.m
+            ),
+            _scipy_spmv(coo_matrix, _scipy_numpy(x)),
+            _scipy_numpy,
+        )
+    if op == "spmm_coo":
+        b = torch.randn(case.n, case.dense_cols, device=device, dtype=dtype)
+        record(
+            "spmm_coo",
+            lambda: fs.flagsparse_spmm_coo(
+                coo_data, coo_row, coo_col, b, (case.m, case.n), op="non"
+            ),
+            lambda: _torch_npu_coo_spmm(
+                coo_data, coo_row, coo_col, b, case.m
+            ),
+            _scipy_spmm(coo_matrix, _scipy_numpy(b)),
+            _scipy_numpy,
+        )
+
     # Gather/scatter are PyTorch indexing baselines; they are not advertised as
     # equivalent to a dedicated ops-sparse kernel.
     if op in (None, "gather", "scatter"):
         gather_idx = torch.arange(min(case.nnz, case.n), device=device, dtype=torch.int64)
-        dense = torch.randn(case.n, device=device, dtype=dtype)
-        values = torch.randn(gather_idx.numel(), device=device, dtype=dtype)
+        try:
+            dense = _randn(torch, case.n, device, dtype)
+            values = _randn(torch, gather_idx.numel(), device, dtype)
+        except Exception as exc:
+            capability_reason = None
+            if device.type == "npu" and case.dtype_name in ("complex64", "complex128"):
+                capability_reason = _ascend_complex_index_capability_reason(exc)
+            if not capability_reason:
+                raise
+            for name in (("gather", "scatter") if op is None else (op,)):
+                results.append({
+                    "op": name,
+                    "dtype": case.dtype_name,
+                    "matrix": case.matrix_path.name if case.matrix_path is not None else "synthetic",
+                    "shape": f"{case.m}x{case.n};nnz={case.nnz}",
+                    "flagsparse": None,
+                    "pytorch": None,
+                    "scipy_max_abs_error": {"flagsparse": None, "pytorch": None},
+                    "status": "SKIP",
+                    "reason": capability_reason,
+                })
+            return results
     if op in (None, "gather"):
         record("gather", lambda: fs.flagsparse_gather(dense, gather_idx),
-               lambda: torch.gather(dense, 0, gather_idx),
+               lambda: _torch_gather(torch, dense, gather_idx),
                _scipy_numpy(dense)[gather_idx.cpu().numpy()], _scipy_numpy)
     # Keep independent buffers: flagsparse_scatter mutates its input in place,
     # while index_copy returns a new tensor.  Sharing one buffer would make the
@@ -292,11 +549,10 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
     if op in (None, "scatter"):
         scatter_fs = dense.detach().clone()
         scatter_pt = dense.detach().clone()
-        scatter_initial = scatter_fs.detach().clone()
-        scatter_ref = _scipy_numpy(scatter_initial).copy()
+        scatter_ref = np.zeros_like(_scipy_numpy(scatter_fs))
         scatter_ref[gather_idx.cpu().numpy()] = _scipy_numpy(values)
         record("scatter", lambda: (fs.flagsparse_scatter(scatter_fs, gather_idx, values) or scatter_fs),
-               lambda: scatter_pt.index_copy(0, gather_idx, values), scatter_ref,
+               lambda: _torch_scatter(torch, scatter_pt, gather_idx, values), scatter_ref,
                _scipy_numpy)
     return results
 
@@ -310,17 +566,19 @@ def main():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--device", type=int, default=0, help="Ascend NPU device ordinal")
-    p.add_argument("--op", choices=("spmv_csr", "spmm_csr", "sddmm_csr", "gather", "scatter"), default=None)
+    p.add_argument("--op", choices=("spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr", "gather", "scatter"), default=None)
     p.add_argument("--dtypes", default="float32", help="Comma-separated value dtypes")
     p.add_argument("--input", type=Path, default=None,
                    help="MatrixMarket .mtx file or directory; every .mtx is benchmarked")
     p.add_argument("--csv-summary", default=None, help="Write a runner-compatible one-row CSV summary")
     args = p.parse_args()
     dtype_names = [item.strip() for item in args.dtypes.split(",") if item.strip()]
-    allowed_dtypes = {"float16", "bfloat16", "float32", "float64"}
+    allowed_dtypes = {"float16", "bfloat16", "float32", "float64", "complex64", "complex128"}
     unknown = sorted(set(dtype_names) - allowed_dtypes)
     if not dtype_names or unknown:
         p.error("--dtypes must contain names from: " + ", ".join(sorted(allowed_dtypes)))
+    if set(dtype_names) & {"complex64", "complex128"} and args.op not in ("gather", "scatter"):
+        p.error("complex dtypes are supported only for --op gather or --op scatter")
     import json
     if args.input is None:
         matrix_paths: list[Path | None] = [None]
@@ -361,6 +619,10 @@ def main():
                 "dtype": item.get("dtype", "float32"),
                 "matrix": item.get("matrix", ""),
                 "shape": item.get("op", args.op or "ascend"),
+                # Not necessarily Triton on this backend -- see
+                # ASCEND_OPERATOR_IMPLEMENTATION.  The column name is kept because the
+                # runner's schema matches on it; this field says what actually ran.
+                "implementation": item.get("implementation", "triton"),
                 "triton_ms": "" if fs_ms is None else fs_ms,
                 "pytorch_ms": "" if pt_ms is None else pt_ms,
                 "speedup": "" if fs_ms is None or not fs_ms else (pt_ms / fs_ms if pt_ms is not None else ""),
@@ -371,7 +633,8 @@ def main():
         with open(args.csv_summary, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["dtype", "matrix", "shape", "triton_ms", "pytorch_ms",
+                fieldnames=["dtype", "matrix", "shape", "implementation",
+                            "triton_ms", "pytorch_ms",
                             "speedup", "max_abs_err", "status", "reason"],
             )
             writer.writeheader()

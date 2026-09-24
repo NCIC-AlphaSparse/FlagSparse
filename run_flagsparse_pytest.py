@@ -561,9 +561,10 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
 #
 # Two of them, and the split is deliberate:
 #
-#   benchmark_ascend.py        measures against a torch-npu baseline, and only
-#                              these five operators have one.  Where a baseline
-#                              exists, a measured speedup beats a bare timing.
+#   benchmark_ascend.py        measures against a torch-npu baseline for the
+#                              seven supported delivery operators. Where a
+#                              baseline exists, a measured speedup beats a bare
+#                              timing.
 #   benchmark_ascend_probe.py  runs every other operator over the 20-matrix
 #                              spread and classifies the outcome -- PASS,
 #                              REJECTED, TRITON_COMPILE, MISMATCH, ERROR.  On a
@@ -650,6 +651,30 @@ ASCEND_BASELINE_OPS: tuple[str, ...] = (
     "spmm_csr",
     "sddmm_csr",
 )
+
+ASCEND_BASELINE_DTYPES: dict[str, str] = {
+    op: (
+        "float16,float32,float64,complex64,complex128"
+        if op in ("gather", "scatter")
+        else "float16,float32,float64"
+    )
+    for op in ASCEND_BASELINE_OPS
+}
+
+# The COO delivery variants now have executable PyTorch-NPU index_add baselines.
+# Keep them out of ASCEND_ACCURACY_OPS below: their established pytest accuracy
+# path remains unchanged while performance switches from a capability probe to a
+# measured, correctness-gated comparison.
+ASCEND_PYTORCH_PERFORMANCE_OPS: tuple[str, ...] = (
+    *ASCEND_BASELINE_OPS,
+    "spmv_coo",
+    "spmm_coo",
+)
+ASCEND_PERFORMANCE_DTYPES: dict[str, str] = {
+    **ASCEND_BASELINE_DTYPES,
+    "spmv_coo": "float32,float64",
+    "spmm_coo": "float32,float64",
+}
 
 # The operators whose accuracy runs through benchmark_ascend_accuracy.py instead
 # of the pytest suite. Deliberately DERIVED from ASCEND_BASELINE_OPS rather than
@@ -748,15 +773,15 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "{device}",
             "--csv-summary",
             "{csv}",
-            # bf16 is not a delivery dtype; measuring it only costs time.
+            # Complex rows make unsupported Ascend gather/scatter capability explicit.
             "--dtypes",
-            "float16,float32,float64",
+            ASCEND_PERFORMANCE_DTYPES[op],
             "--warmup",
             "{warmup}",
             "--iters",
             "{iters}",
         )
-        for op in ASCEND_BASELINE_OPS
+        for op in ASCEND_PYTORCH_PERFORMANCE_OPS
     },
     **{
         op: (
@@ -774,6 +799,7 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "{iters}",
         )
         for op in ASCEND_PROBE_OPS
+        if op not in ASCEND_PYTORCH_PERFORMANCE_OPS
     },
 }
 
@@ -1475,6 +1501,7 @@ def parse_accuracy_json(path: Path) -> dict[str, object]:
 EXPECTED_ACCURACY_SKIP_REASONS = (
     "external matrix regression directory not configured",
     "legacy bucket requires int32 column indices",
+    "ascend complex gather/scatter capability unavailable",
 )
 
 
@@ -1752,7 +1779,11 @@ def run_accuracy(
             else (
                 "PASS"
                 if returncode == 0 and parsed.get("status") == "Passed"
-                else "FAIL"
+                else (
+                    "SKIP"
+                    if returncode == 0 and parsed.get("status") == "Skipped"
+                    else "FAIL"
+                )
             )
         )
         return {
@@ -2320,6 +2351,24 @@ def _capability_probe_status(rows: list[dict[str, str]]) -> str:
     return "MIXED"
 
 
+def _measured_benchmark_status(rows: list[dict[str, str]]) -> str:
+    """A measured suite passes only when every emitted row passed."""
+    states = {
+        str(row.get("status") or "").strip().upper()
+        for row in rows
+        if str(row.get("status") or "").strip()
+    }
+    if not states:
+        return "NO_TESTS"
+    if states & {"FAIL", "ERROR", "MISMATCH"}:
+        return "FAIL"
+    if states == {"PASS"}:
+        return "PASS"
+    if states == {"SKIP"}:
+        return "SKIP"
+    return "MIXED"
+
+
 def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
     """Require a passing row and both measurements behind its speedup value.
 
@@ -2780,10 +2829,14 @@ def run_performance(
             # rows, so the exit code must not overwrite it with a pass.
             status_from_csv = Path(template[0]).name in {
                 "benchmark_ascend_probe.py",
+                "benchmark_ascend.py",
                 "benchmark_xpu.py",
             }
             if status_from_csv and status == "PASS":
-                status = _capability_probe_status(rows)
+                if Path(template[0]).name == "benchmark_ascend.py":
+                    status = _measured_benchmark_status(rows)
+                else:
+                    status = _capability_probe_status(rows)
             json_status = (
                 status.lower()
                 if status_from_csv and status not in {"PASS", "PASSED"}
@@ -3331,6 +3384,30 @@ def _delivery_performance_phase(
         result["records"] = delivery_rows
         result["delivery_row_count"] = len(delivery_rows)
         result["non_delivery_row_count"] = len(records) - len(delivery_rows)
+        if dtype in ("c32", "c64"):
+            dtype_rows = [
+                row
+                for row in delivery_rows
+                if _row_value(row, "dtype")
+                and str(_row_value(row, "dtype")).lower()
+                in _DELIVERY_PERF_DTYPES[dtype]
+            ]
+            if dtype_rows and not any(
+                _performance_row_has_complete_speedup(row) for row in dtype_rows
+            ):
+                row_states = {
+                    str(row.get("status") or "").strip().upper()
+                    for row in dtype_rows
+                }
+                reasons = [str(row.get("reason") or "").strip() for row in dtype_rows]
+                reasons = [reason for reason in reasons if reason]
+                result["status"] = (
+                    "FAIL" if row_states & {"FAIL", "ERROR"} else "SKIP"
+                )
+                result["reason"] = (
+                    "; ".join(dict.fromkeys(reasons))
+                    or "no comparable PyTorch-NPU baseline for complex dtype"
+                )
     return result
 
 

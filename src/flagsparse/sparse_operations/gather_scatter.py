@@ -436,6 +436,30 @@ def _validate_gather_value_dtype(dense_vector, op_name):
     return None
 
 
+# Ascend has no complex kernel for advanced indexing, and Moore Threads raises
+# `"IndexMusa" not implemented for 'ComplexFloat'` for the same class of op, so complex
+# gathers there have to go through two real-valued reads.  Every other backend keeps the
+# native path: measured on a 5090, the component gather is 3.4-5.3x slower than
+# torch.index_select (and a view_as_real variant is 13-34x slower for complex128), which
+# would land straight on the gather_c32/gather_c64 delivery variants.  Resolved once at
+# import rather than per call -- see the 4.6% a per-call predicate cost spmv_csc.
+_COMPLEX_GATHER_BY_COMPONENTS = _is_ascend_runtime() or _is_mthreads_runtime()
+
+
+def _gather_complex_by_components(dense_vector, indices, out=None):
+    """Gather complex values as two real-valued indexed reads."""
+    dense_components = torch.view_as_real(dense_vector).reshape(-1)
+    real_indices = indices.to(torch.int64) * 2
+    gathered_real = torch.gather(dense_components, 0, real_indices)
+    gathered_imag = torch.gather(dense_components, 0, real_indices + 1)
+    gathered_components = torch.stack((gathered_real, gathered_imag), dim=-1)
+
+    if out is None:
+        return torch.view_as_complex(gathered_components)
+    torch.view_as_real(out).copy_(gathered_components)
+    return out
+
+
 def _validate_scatter_value_dtype(sparse_values):
     if sparse_values.dtype not in SUPPORTED_SCATTER_VALUE_DTYPES:
         raise TypeError(_scatter_dtype_error_message())
@@ -1383,6 +1407,7 @@ def flagsparse_gather(
         and out is None
         and torch.is_tensor(a)
         and torch.is_tensor(indices)
+        and not (_COMPLEX_GATHER_BY_COMPONENTS and _is_complex_dtype(a.dtype))
     ):
         gather_indices = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
         return torch.gather(a, 0, gather_indices)
@@ -1415,7 +1440,11 @@ def flagsparse_gather(
         if return_time:
             _ACCEL.synchronize()
         start_time = time.perf_counter() if return_time else None
-        if out_tensor is not None:
+        if _COMPLEX_GATHER_BY_COMPONENTS and _is_complex_dtype(dense_vector.dtype):
+            gathered = _gather_complex_by_components(
+                dense_vector, gather_indices, out=out_tensor
+            )
+        elif out_tensor is not None:
             torch.index_select(dense_vector, 0, gather_indices, out=out_tensor)
             gathered = out_tensor
         else:

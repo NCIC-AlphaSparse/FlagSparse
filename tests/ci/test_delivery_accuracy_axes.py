@@ -252,10 +252,21 @@ def test_the_exempt_reasons_are_the_ones_the_tests_actually_emit():
     """Rewording a skip in the tests would silently stop exempting it."""
     from pathlib import Path
 
+    # Ascend routes five operators' accuracy through benchmark/benchmark_ascend*.py
+    # instead of tests/pytest (see ASCEND_PERFORMANCE_COMMANDS), so a skip reason can
+    # legitimately originate there. Scanning only tests/pytest reported a live emitter
+    # as missing.
+    root = Path(runner.__file__).parent
     sources = "\n".join(
         p.read_text(encoding="utf-8")
-        for p in (Path(runner.__file__).parent / "tests" / "pytest").glob("*.py")
+        for p in sorted(
+            [*(root / "tests" / "pytest").glob("*.py"),
+             *(root / "benchmark").glob("benchmark_ascend*.py")]
+        )
     )
+    # Case-insensitive, matching _is_expected_accuracy_skip: the exempt list is stored
+    # lowercase while an emitter writes the reason in sentence case.
+    haystack = sources.lower()
     for reason in runner.EXPECTED_ACCURACY_SKIP_REASONS:
-        assert reason in sources, f"no test emits a skip containing {reason!r}"
+        assert reason.lower() in haystack, f"no test emits a skip containing {reason!r}"
         assert runner._is_expected_accuracy_skip(f"Skipped: {reason.upper()}")

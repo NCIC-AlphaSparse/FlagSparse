@@ -7,6 +7,9 @@ Python 侧的天数后端：怎么选中、每次开工的环境、交付复现�
 > "CUDA 兼容栈"（和 MetaX 同类）接入的。第一次上机按 **1.5 节的验证顺序**逐步做，
 > 把实测结果补回第 4 节那张表。
 >
+> **2026-09-23：BI-V150 那台已经跑通**，`tests/ci` 197 passed，指纹和 fp64 限制见 4.0 节。
+> 下面这段是另一台 BI-V100（`u98`）的记录，两台不能混着看。
+>
 > **2026-09-22 的上机尝试卡在环境上**：BI-V100 × 8 的机器（`u98`），宿主机驱动 3.2.3，
 > 但厂商镜像自带 CoreX 4.4.0/4.5.0，torch 初始化报
 > `Error 803: system has unsupported display driver / cuda driver combination`，
@@ -252,9 +255,122 @@ python tools/run_backend_tests.py --backend iluvatar --phase accuracy --mode qui
 
 ## 4. 实测记录与待办
 
-每项对应 1.5 节的一步，验证过就把"未验证"换成实测值和日期。
+**本节按机器分列 —— 目前有两台天数机器，卡型、驱动和 torch 版本都不同，实测值不能互相套用。**
 
-### 4.1 已实测（2026-09-22，机器 `u98`）
+| | 4.0 节 BI-V150 | 4.1 节起 BI-V100 |
+|---|---|---|
+| 机器 | `bm-baai-dx-zone2-d-biv150-64g-15-106` | `u98` |
+| 卡 | `Iluvatar BI-V150 OAM` × 16 | `Iluvatar BI-V100` × 8 |
+| 宿主机驱动 / IX-ML | 4.4.0 / 4.4.0 | 3.2.3 / 3.2.3 |
+| 宿主机 CoreX | 只有 4.4.0 | 3.1.1 / 3.2.3（另有 4.x 未启用） |
+| torch | `2.7.1+corex.4.4.0` | `2.10.0+corex.4.5.0` |
+| 栈状态 | **跑通**，`tests/ci` 197 passed | 卡在 Error 803 |
+
+---
+
+### 4.0 BI-V150 × 16（2026-09-23 实测，栈已跑通）
+
+> **接手调试请先读 [ILUVATAR_DEBUG.md](ILUVATAR_DEBUG.md)** —— 环境搭建、怎么跑精度和性能、
+> 三个厂商缺陷的最小复现、还开着的问题，以及不要重复趟的坑（`-k` 挡不住 fp64、
+> `pytest --forked` 会让全部用例失败、`| tail` 看不到崩溃点）。本节只留结论性的指纹。
+
+**结论:软件栈完整可用,但这张卡的 fp64 不能用。**
+
+#### 指纹
+
+| | |
+|---|---|
+| 设备名 | `'Iluvatar BI-V150 OAM'` —— 同时命中 `iluvatar` 和 `bi-v` 两个探测串 |
+| torch | `2.7.1`,pip 元数据 `2.7.1+corex.4.4.0`（模块属性仍是裸的） |
+| `torch.version.cuda` / `.hip` | `'10.2'` / `None` |
+| **`warp_size`** | **64**,而且**属性存在**（与 BI-V100 不同） |
+| MP count / 显存 | 16 / 32768 MiB;`max_threads_per_block` 属性缺失 |
+| Triton | 3.6.0,backends `['iluvatar']` |
+| **Triton target** | **`GPUTarget(backend='corex', arch=71, warp_size=64)`** |
+| CuPy | 11.4.0+corex.4.4.0,三个 dist-info 指向同一版本（无害） |
+| 探测 | `_backend_name()` → `iluvatar`,无 fallback 原因,不需要 env 覆盖 |
+
+`warp_size=64` **不需要改代码**:`_common.py` 的
+`int(getattr(props, "warp_size", default_warp) or default_warp)` 读到的就是真值,
+`default_warp = 32` 只是属性缺失时的兜底。4.3 节那条警告只适用于 BI-V100 + torch 2.10。
+
+#### 环境搭建（容器重建后要重做）
+
+厂商把包装在 `/usr/local/corex-4.4.0/lib64/python3/dist-packages`,**但没有注册给解释器**
+（没有 `env.sh`,`/etc/profile.d` 里也没有）。只设 `PYTHONPATH` 不够 —— 任何重写
+`PYTHONPATH` 的子进程都会丢掉 torch,`tests/ci` 有 17 个用例因此失败。正解是装 `.pth`:
+
+```bash
+echo "/usr/local/corex-4.4.0/lib64/python3/dist-packages" \
+  > /usr/local/lib/python3.12/site-packages/corex.pth
+pip install pyyaml
+python3 -I -c "import torch; print(torch.__version__)"   # -I 忽略所有环境变量，能过才算数
+```
+
+#### fp64 不可用 —— 根因在 H2D 拷贝
+
+厂商自己的警告,触发点是 `data.to(device)`:
+
+```
+UserWarning: Limited support for torch.double is provided currently.
+(Triggered internally at .../aten/src/ATen/native/cuda/Copy.cu:412.)
+```
+
+**fp64 张量拷到卡上会静默变成全零**,只给一条 UserWarning。这一条解释了全部 fp64 现象,
+它们不是各自独立的问题:
+
+- 设备端 `float32 → float64` 转换返回零（同一条 `Copy.cu` 路径）;
+- `legacy_rowpar` 跑 fp64 能跑完但 18 个用例全错 —— 内核没问题,它在乘零;
+- `torch` 直接拒绝 fp64 gemm:`RuntimeError: gemm of double is not supported on CoreX`;
+- segbin 编译器 abort,这是**另一个独立缺口**:
+  `LLVM ERROR: Cannot select: f64 = AtomicLoadFAdd<... acq_rel (s64) ... addrspace 1>`,
+  位置在 `spmv_csr.py:498`（`_spmv_csr_segbin_kernel`）和 552/553（复数版）。
+
+**路由上的发现（暂不采用）**:`tl.atomic_add` 在 `spmv_csr.py` 里只出现三次,全在两个
+segbin 内核里。`legacy_rowpar` / `legacy_bucket_vector` 用的
+`_spmv_csr_real_kernel`、`_spmv_csr_complex_kernel` 一个原子都没有,所以
+`FLAGSPARSE_SPMV_CSR_KERNEL=rowpar` 能把 fp64 的进程崩溃变成正常运行。形状和
+`_spmv_csr_default_backend()` 里已有的 XPU 分支完全一致。**但现在不要加这条分支** ——
+在 H2D 修好之前,它只是把崩溃换成静默算错,更危险。
+
+#### 已测结果（排除 fp64）
+
+| 范围 | 结果 |
+|---|---|
+| `tests/ci` | 197 passed / 6 skipped / 1 deselected |
+| `spmv_csr` 精度 | 278 passed / 9 failed |
+| `gather` + `scatter` 精度 | 50 passed |
+
+那 9 个失败全是 `float32 + legacy_rowpar`,同样是设备端 fp32→fp64 升精度踩中 `Copy.cu`。
+**默认路由是 segbin,不走这条**,交付不受影响。
+
+#### 交付口径:20 个变体里 9 个跑不了
+
+所有 `f64` 和 `c64`（complex128,分量是 fp64）都拿不到数,和昇腾的 `DT_DOUBLE` 是同一类。
+其余 11 个（f16/f32/c32 的 gather+scatter,f32 的 spmv/spmm/sddmm）正常。
+
+#### 给厂商的三条
+
+1. **fp64 H2D 拷贝返回全零,只给 UserWarning** —— 静默的错误结果,三条里最危险。
+   同一套栈对 fp64 gemm 会干净地抛 `RuntimeError`,说明拒绝机制是有的。
+2. **fp64 `AtomicLoadFAdd` 没有指令选择**,以 `LLVM ERROR` + SIGABRT 杀进程,
+   而不是抛可捕获的异常。
+3. 两条复现都只有三五行,不涉及 FlagSparse。
+
+#### 容器踩过的坑
+
+- **失败的 `docker run` 会污染宿主机**:Docker 把不存在的挂载源自动建成空目录。
+  一次挂 `ixsmi` 的失败尝试在宿主机建出了整条 `/usr/local/corex-4.5.0/bin/ixsmi/`,
+  既让后续 run 报 `not a directory`,又让人误以为宿主机装了 4.5.0（其实从来没装过）。
+  判断某个版本在不在,先看 `ls -ld` 和链接数;删用 `rmdir`（非空会失败,这本身是保护）。
+  那个挂载本来也不需要 —— 镜像自带 `ixsmi`。
+- **镜像 CoreX 版本必须和宿主机驱动一致**。4.5.0 镜像配 4.4.0 驱动时,枚举和
+  `cudaSetDevice` 都成功,但 `cudaMalloc` 返回 **801 `operation not supported`**。
+  快速判据:容器里 `ixsmi` 的 `CUDA Version` 列显示 `N/A` 就是不匹配,显示 `10.2` 才对。
+
+---
+
+### 4.1 已实测（2026-09-22，机器 `u98`，BI-V100）
 
 **GPU 本身可用**：在与驱动匹配的 CoreX 3.2.3 镜像里
 （`harbor.iluvatar.com.cn:10443/saas/bi100-3.2.3-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3`）
@@ -307,7 +423,7 @@ torch.cuda.is_available() -> False        # 但 device_count() -> 8
 
 | 项目                                                                                | 状态                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`warp_size` 的真实值**                                                    | **属性不存在，代码会静默取 32**。`_common.py` 的 `_get_device_backend_info()` 里 `default_warp = 64 if backend == "hip" else 32`，天数走 `cuda` 分支；`spmv_csr.py`、`spmm_csr.py`（三处）、`spmm_csr_opt_alg2.py` 各自也 `getattr(props, "warp_size", 32)`。**若实际是 64，整套启动几何都偏，而且不报错、只掉性能**（MetaX C550 就是 64）。查法：`ixsmi -q` 里找 warp/core 相关字段，或在 Triton 3.x 下 `triton.runtime.driver.active.get_current_target()` |
+| **`warp_size` 的真实值**（仅 BI-V100；BI-V150 已实测为 64，见 4.0 节）                                                    | **属性不存在，代码会静默取 32**。`_common.py` 的 `_get_device_backend_info()` 里 `default_warp = 64 if backend == "hip" else 32`，天数走 `cuda` 分支；`spmv_csr.py`、`spmm_csr.py`（三处）、`spmm_csr_opt_alg2.py` 各自也 `getattr(props, "warp_size", 32)`。**若实际是 64，整套启动几何都偏，而且不报错、只掉性能**（MetaX C550 就是 64）。查法：`ixsmi -q` 里找 warp/core 相关字段，或在 Triton 3.x 下 `triton.runtime.driver.active.get_current_target()` |
 | 自动探测能否命中（元数据里的`+corex` 应当命中，未在真机跑过 `_backend_name()`） | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | FlagTree 的`iluvatar` 后端能否编译执行最小 Triton 内核                            | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `torch.sparse` CSR/COO matmul 能否作为基线                                        | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
