@@ -47,7 +47,17 @@ def reference_dtype(dtype):
 
 
 def _numpy(tensor, dtype):
-    return tensor.to(dtype).detach().cpu().numpy()
+    """Host copy at the reference dtype, cast on the CPU.
+
+    The cast runs AFTER the move, not before: a dtype conversion on the
+    accelerator makes the vendor's cast kernel part of the reference, which is
+    the class golden_device() exists to remove.  Measured on Iluvatar BI-V150
+    (CoreX 4.4.0): an on-device float32 -> float64 cast returns zeros, so every
+    dtype whose reference upcasts (float32 -> float64, complex64 -> complex128)
+    compared a correct kernel result against an all-zero reference.  Identity on
+    CUDA/ROCm, where both orders give the same numbers.
+    """
+    return tensor.detach().cpu().to(dtype).numpy()
 
 
 def scipy_csr(data, indices, indptr, shape, dtype):

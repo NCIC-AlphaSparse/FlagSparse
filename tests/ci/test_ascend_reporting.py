@@ -12,8 +12,10 @@ and spmm_coo because it built its fp64 reference with a cast the NPU cannot do.
 
 import ast
 import importlib.util
+import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -131,32 +133,139 @@ def test_the_probe_casts_to_fp64_only_after_leaving_the_device():
     assert "dense.cpu().to(torch.float64)" in source
 
 
-def test_a_probed_operator_is_measured_in_both_delivery_dtypes():
-    """The f64 delivery variant of a probed operator needs a row of its own.
-
-    The probe defaults to float32 alone and DELIVERY_BENCHMARK_ARGS cannot reach
-    a probe command, so spmv_coo and spmm_coo on Ascend produced no f64 row and
-    the table printed NotFound -- unreadable as "ran and failed" or "never ran".
-    """
+def test_unbenchmarked_probe_operators_keep_both_delivery_dtypes():
+    """Remaining capability probes still cover both COO delivery dtypes."""
     runner = _runner()
     assert runner.PROBE_DTYPE_ARGS == ("--dtypes", "float32,float64")
     for op in ("spmv_coo", "spmm_coo"):
         template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
-        assert "benchmark_ascend_probe.py" in template[0], op
-        index = template.index("--dtypes")
-        assert template[index + 1] == "float32,float64", op
+        assert template[0] == "benchmark/benchmark_ascend.py", op
+        assert template[template.index("--dtypes") + 1] == "float32,float64", op
     generic = runner._probe_command("spmv_coo")
     assert generic[generic.index("--dtypes") + 1] == "float32,float64"
 
 
-def test_the_five_ascend_baseline_operators_keep_their_own_dtypes():
-    """Only the probe commands changed: these run a different script."""
+def test_the_ascend_pytorch_baselines_use_declared_dtypes_and_measured_commands():
+    """All delivery operators with a PyTorch baseline have measured commands."""
     runner = _runner()
-    for op in runner.ASCEND_BASELINE_OPS:
+    assert runner.ASCEND_PYTORCH_PERFORMANCE_OPS == (
+        "gather",
+        "scatter",
+        "spmv_csr",
+        "spmm_csr",
+        "sddmm_csr",
+        "spmv_coo",
+        "spmm_coo",
+    )
+    for op in runner.ASCEND_PYTORCH_PERFORMANCE_OPS:
         template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
-        assert "benchmark_ascend.py" in template[0], op
+        assert template[0] == "benchmark/benchmark_ascend.py", op
         index = template.index("--dtypes")
-        assert template[index + 1] == "float16,float32,float64", op
+        expected = runner.ASCEND_PERFORMANCE_DTYPES[op]
+        assert template[index + 1] == expected, op
+
+
+def test_coo_delivery_performance_uses_pytorch_baselines_not_probe_rows():
+    runner = _runner()
+    for op in ("spmv_coo", "spmm_coo"):
+        command = runner.ASCEND_PERFORMANCE_COMMANDS[op]
+        assert command[0] == "benchmark/benchmark_ascend.py"
+        assert command[command.index("--dtypes") + 1] == "float32,float64"
+    probe_ops = {
+        key
+        for key, value in runner.ASCEND_PERFORMANCE_COMMANDS.items()
+        if value[0] == "benchmark/benchmark_ascend_probe.py"
+    }
+    assert not ({"spmv_coo", "spmm_coo"} & probe_ops)
+
+
+def test_measured_benchmark_row_failures_reach_the_phase_status():
+    runner = _runner()
+    assert runner._measured_benchmark_status([{"status": "PASS"}]) == "PASS"
+    assert runner._measured_benchmark_status([{"status": "FAIL"}]) == "FAIL"
+    assert runner._measured_benchmark_status(
+        [{"status": "PASS"}, {"status": "FAIL"}]
+    ) == "FAIL"
+    assert runner._measured_benchmark_status(
+        [{"status": "PASS"}, {"status": "SKIP"}]
+    ) == "MIXED"
+
+
+def test_complex_index_capability_skip_is_narrowly_classified():
+    source = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(
+        encoding="utf-8"
+    )
+    node = next(
+        item
+        for item in ast.parse(source).body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "_ascend_complex_index_capability_reason"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<capability>", "exec"), namespace)
+    classify = namespace["_ascend_complex_index_capability_reason"]
+    assert classify(RuntimeError("aclnnIndex does not support ComplexDouble"))
+    assert classify(RuntimeError("Index kernel not implemented for complex64"))
+    assert classify(RuntimeError("complex multiplication is unsupported")) is None
+
+
+def test_complex_delivery_rows_are_capability_skips_not_missing():
+    runner = _runner()
+    assert "ascend complex gather/scatter capability unavailable" in (
+        runner.EXPECTED_ACCURACY_SKIP_REASONS
+    )
+    for op in ("gather", "scatter"):
+        command = runner.ASCEND_PERFORMANCE_COMMANDS[op]
+        assert command[command.index("--dtypes") + 1].endswith(
+            "complex64,complex128"
+        )
+    reason = "Ascend complex gather/scatter capability unavailable: Index unsupported"
+    rows = [
+        {
+            **_ascend_row("complex64", "synthetic", 1.0, 1.0, status="SKIP"),
+            "reason": reason,
+        }
+    ]
+    phase = {
+        "operator": "gather",
+        "phase": "performance",
+        "status": "PASS",
+        "records": rows,
+        "data": runner._flaggems_perf_data(rows),
+    }
+    projected = runner._delivery_performance_phase(phase, "c32")
+    assert projected["status"] == "SKIP"
+    assert "Ascend complex gather/scatter capability unavailable" in projected["reason"]
+    accuracy = runner.summarize_accuracy_cases(
+        {
+            "gather[float32]": {"result": "passed"},
+            "gather[complex64]": {
+                "params": {"dtype": "complex64"},
+                "result": "skipped",
+                "reason": reason,
+            },
+        }
+    )
+    assert accuracy["status"] == "Passed"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        result_path = Path(temp_dir) / "accuracy.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "gather[complex64]": {
+                        "params": {"dtype": "complex64"},
+                        "result": "skipped",
+                        "reason": reason,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        complex_only = runner._delivery_accuracy_phase(
+            {"result_path": str(result_path), "status": "SKIP"}, "c32"
+        )
+    assert complex_only["status"] == "Skipped"
+    assert complex_only["skipped"] == 1
 
 
 def test_the_probe_validates_its_dtype_list_before_importing_torch():
@@ -239,6 +348,7 @@ def test_a_measured_ascend_row_reaches_the_dtype_aggregate():
 def test_the_prose_moved_to_a_reason_column_and_is_still_written():
     """Losing the diagnosis would trade one blind spot for another."""
     source = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(encoding="utf-8")
-    assert '"status": row_status(fs_time),' in source
+    assert '"status": row_state,' in source
+    assert '"SKIP"' in source
     assert '"reason": "; ".join(status_parts) if status_parts else "unknown"' in source
     assert '"status", "reason"' in source
