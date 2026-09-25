@@ -14,7 +14,7 @@
 
 PYTHON ?= python
 DIST_DIR ?= dist
-EXPECTED_VERSION ?= 1.0.0
+EXPECTED_VERSION ?= 0.4.0
 
 .PHONY: help ci check ci-deps compile format-check lint lint-src pre-commit-check build install-wheel validate-wheel test-ci smoke triton-smoke triton-deps gpu-env-check gpu-benchmark release-check release clean
 

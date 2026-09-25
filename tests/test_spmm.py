@@ -252,11 +252,16 @@ def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
         product = reference_utils.spmm(
             matrix, B, ref_dtype, op=ast_ops._spmm_op_to_name(op)
         )
-        scipy_ref = reference_utils.as_torch(product, ref_dtype, B.device)
-        value = scipy_ref.to(data.dtype)
+        # Keep the promoted calculation on CPU, then transfer in the output
+        # dtype.  CoreX 4.4 silently zeroes an fp64 H2D transfer.
+        value = reference_utils.as_torch(product, data.dtype, B.device)
         if fs_common._is_mthreads_runtime():
             # Do not construct a MUSA torch.sparse tensor just to discard it.
             return value, None, "SciPy", "torch.sparse registers no matmul on MUSA"
+        if fs_common._is_iluvatar_runtime():
+            # CoreX 4.4 accepts CSR sparse.mm but returns zeros for fp32, while
+            # fp16 is unimplemented.  Do not report that as a baseline.
+            return value, None, "SciPy", "PyTorch CSR SpMM is incorrect on Iluvatar/CoreX"
         # Take the closure the PyTorch path builds -- it carries that path's
         # MACA-specific int32 CSR/COO selection -- and discard only its value.
         # A backend where building it fails keeps the SciPy oracle and reports
@@ -618,9 +623,46 @@ def run_one_mtx(
         torch.complex64,
         torch.complex128,
     )
-    sparse_ref_backend, sparse_ref_reason = ast_ops._spmm_csr_sparse_ref_backend(
-        value_dtype, indices.dtype, indptr.dtype
-    )
+    baseline_indptr = indptr
+    if fs_common._is_iluvatar_runtime() and indptr.dtype != torch.int32:
+        # CoreX legacy csrmm uses 32-bit row offsets. This conversion belongs to
+        # baseline setup and is deliberately outside its timed event window.
+        baseline_indptr = indptr.to(torch.int32)
+    if fs_common._is_iluvatar_runtime():
+        if value_dtype != torch.float32:
+            sparse_ref_backend = None
+            sparse_ref_reason = (
+                "Iluvatar legacy cuSPARSE CSR SpMM baseline supports float32 only"
+            )
+        elif indices.dtype != torch.int32 or baseline_indptr.dtype != torch.int32:
+            sparse_ref_backend = None
+            sparse_ref_reason = (
+                "Iluvatar legacy cuSPARSE CSR SpMM baseline requires int32 CSR indices"
+            )
+        elif ast_ops._spmm_op_to_name(op) != "non":
+            sparse_ref_backend = None
+            sparse_ref_reason = (
+                "Iluvatar legacy cuSPARSE CSR SpMM baseline supports op='non' only"
+            )
+        else:
+            try:
+                import cupy.cusparse as cupy_cusparse
+            except Exception as exc:
+                sparse_ref_backend = None
+                sparse_ref_reason = (
+                    f"Iluvatar legacy cuSPARSE binding is unavailable: {exc}"
+                )
+            else:
+                if hasattr(cupy_cusparse, "csrmm"):
+                    sparse_ref_backend = "iluvatar_legacy_cusparse"
+                    sparse_ref_reason = None
+                else:
+                    sparse_ref_backend = None
+                    sparse_ref_reason = "Iluvatar legacy cuSPARSE binding lacks csrmm"
+    else:
+        sparse_ref_backend, sparse_ref_reason = ast_ops._spmm_csr_sparse_ref_backend(
+            value_dtype, indices.dtype, baseline_indptr.dtype
+        )
     if run_cusparse and sparse_ref_backend == "hipsparse":
         try:
             sparse_ref = ast_ops._benchmark_spmm_csr_sparse_ref(
@@ -669,32 +711,50 @@ def run_one_mtx(
                 import cupyx.scipy.sparse as cpx
 
                 data_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(data))
-                ind_cp = cp.from_dlpack(
-                    torch.utils.dlpack.to_dlpack(indices.to(torch.int64))
-                )
-                ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
+                if fs_common._is_iluvatar_runtime():
+                    ind_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices))
+                    ptr_cp = cp.from_dlpack(
+                        torch.utils.dlpack.to_dlpack(baseline_indptr)
+                    )
+                else:
+                    ind_cp = cp.from_dlpack(
+                        torch.utils.dlpack.to_dlpack(indices.to(torch.int64))
+                    )
+                    ptr_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(indptr))
                 B_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B))
                 A_csr = cpx.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
-                A_eff = A_csr
-                if op == "trans":
-                    A_eff = A_csr.transpose().tocsr()
-                elif op == "conj":
-                    A_eff = A_csr.transpose().conj().tocsr()
+                if fs_common._is_iluvatar_runtime():
+                    # CoreX's generic SpMM is not usable.  The legacy csrmm
+                    # entry point expects column-major dense operands.
+                    import cupy.cusparse as cupy_cusparse
+
+                    B_eff = cp.asfortranarray(B_cp)
+                    C_eff = cp.empty((shape[0], B.shape[1]), dtype=B_cp.dtype, order="F")
+                    baseline_op = lambda: cupy_cusparse.csrmm(  # noqa: E731
+                        A_csr, B_eff, c=C_eff
+                    )
+                else:
+                    A_eff = A_csr
+                    if op == "trans":
+                        A_eff = A_csr.transpose().tocsr()
+                    elif op == "conj":
+                        A_eff = A_csr.transpose().conj().tocsr()
+                    baseline_op = lambda: A_eff @ B_cp  # noqa: E731
 
                 ACCEL.synchronize()
                 for _ in range(warmup):
-                    _ = A_eff @ B_cp
+                    _ = baseline_op()
                 ACCEL.synchronize()
                 start = ACCEL.Event(enable_timing=True)
                 end = ACCEL.Event(enable_timing=True)
                 start.record()
                 for _ in range(iters):
-                    _ = A_eff @ B_cp
+                    _ = baseline_op()
                 end.record()
                 ACCEL.synchronize()
                 result["cusparse_ms"] = start.elapsed_time(end) / iters
 
-                cs_C = A_eff @ B_cp
+                cs_C = baseline_op()
                 cs_C_t = torch.utils.dlpack.from_dlpack(cs_C.toDlpack())
                 cusparse_metrics = ast_ops._spmm_validation_metrics(cs_C_t, ref_C)
                 result["cusparse_abs_err"] = cusparse_metrics["max_abs_error"]

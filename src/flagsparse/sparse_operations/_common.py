@@ -1285,6 +1285,7 @@ def _sparse_backend_label(backend):
     return {
         "hipsparse": "hipSPARSE",
         "cupy_cusparse": "CuPy/cuSPARSE",
+        "iluvatar_legacy_cusparse": "Iluvatar legacy cuSPARSE",
         "native_cusparse": "native cuSPARSE",
         "torch": "PyTorch",
         "musparse": "muSPARSE",
@@ -2200,6 +2201,23 @@ def _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
             None,
             f"{_sparse_backend_label(vendor)} CSR SpMV baseline is not wired for this runner",
         )
+    if _IS_ILUVATAR_RUNTIME:
+        # CoreX 4.4's generic cuSPARSE SpMV reports a bogus multi-terabyte
+        # workspace.  The verified legacy csrmv API is narrower than the
+        # generic CUDA/CuPy route, so do not let unsupported cases reach it.
+        if value_dtype != torch.float32:
+            return None, "Iluvatar legacy cuSPARSE CSR SpMV baseline supports float32 only"
+        if index_dtype != torch.int32:
+            return None, "Iluvatar legacy cuSPARSE CSR SpMV baseline requires int32 indices"
+        if op_name != "non":
+            return None, "Iluvatar legacy cuSPARSE CSR SpMV baseline supports op='non' only"
+        try:
+            import cupy.cusparse as cupy_cusparse
+        except Exception as exc:
+            return None, f"Iluvatar legacy cuSPARSE binding is unavailable: {exc}"
+        if not hasattr(cupy_cusparse, "csrmv"):
+            return None, "Iluvatar legacy cuSPARSE binding lacks csrmv"
+        return "iluvatar_legacy_cusparse", None
     skip_reason = _cupy_cusparse_spmv_skip_reason(value_dtype)
     if skip_reason is None:
         return "cupy_cusparse", None
