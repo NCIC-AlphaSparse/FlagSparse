@@ -1,9 +1,59 @@
 """Shared CSR SpMV measurements; setup and diagnostics never change the denominator."""
 
 import torch
+import triton
+import triton.language as tl
 
 from . import _common as common
 from .spmv_csr import flagsparse_spmv_csr_run, _spmv_device_context
+
+
+def _prepared_row_tile_op(prepared, x, out):
+    """Bind a prepared real row-tile launch outside the event window."""
+    from . import _spmv_csr_kernels as kernels
+
+    config = prepared.config["row_tile"]
+    grid = (triton.cdiv(prepared.n_rows, config["rows_per_program"]),)
+    acc = tl.float32 if prepared.data.dtype == torch.float32 else tl.float64
+    avg_nnz = prepared.data.numel() / prepared.n_rows
+    fixed_steps = 0
+    if (
+        prepared.data.dtype == torch.float32
+        and prepared.max_row_nnz <= 32
+    ) or (
+        prepared.data.dtype == torch.float64
+        and avg_nnz > 7.0
+        and prepared.max_row_nnz <= 32
+    ):
+        fixed_steps = triton.cdiv(
+            prepared.max_row_nnz, config["lanes_per_row"]
+        )
+
+    def launch():
+        kernels.row_tile_real_kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            x,
+            out,
+            prepared.kernel_indptr,
+            prepared.n_rows,
+            INDEXED=False,
+            R=config["rows_per_program"],
+            V=config["lanes_per_row"],
+            STAGES=config["loop_num_stages"],
+            ACC=acc,
+            POSITION_64=not (
+                prepared.data.dtype == torch.float32
+                and prepared.kernel_indptr.dtype == torch.int32
+            ),
+            FIXED_STEPS=fixed_steps,
+            num_warps=config["num_warps"],
+            enable_fp_fusion=(prepared.data.dtype == torch.float32),
+        )
+        return out
+
+    return launch
 
 
 def _filtered_avg_ms(times):
@@ -65,17 +115,17 @@ def measure_route(prepared, x, warmup=10, iters=50, timing=False):
         # to the GPU event while the stream is empty.  Keep the generic route
         # for paths that genuinely perform runtime processing.
         direct_row_tile = (
+            common._is_rocm_runtime()
+            and
             prepared.alg == "row_tile"
             and not prepared.transpose
             and not x.is_conj()
             and not prepared.data.is_conj()
+            and x.is_contiguous()
+            and prepared.data.dtype in (torch.float32, torch.float64)
         )
         if direct_row_tile:
-            from . import _spmv_csr_kernels as kernels
-
-            timed_op = lambda: kernels.compute(
-                prepared, x, out, prepared.alg, prepared.config, plan=None
-            )
+            timed_op = _prepared_row_tile_op(prepared, x, out)
         else:
             timed_op = lambda: flagsparse_spmv_csr_run(prepared, x, out=out)
         value, gpu_ms = event_benchmark(

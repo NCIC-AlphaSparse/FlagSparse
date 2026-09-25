@@ -215,6 +215,7 @@ def _spmv_coo_seg_f32(
     BLOCK_INNER: tl.constexpr,
     SEG_IS_ROW: tl.constexpr,
     HAS_BETA: tl.constexpr,
+    USE_MASKED_SELECT: tl.constexpr,
 ):
     """y[row] = alpha * sum(A[row] * x) + beta * y[row].
 
@@ -244,7 +245,9 @@ def _spmv_coo_seg_f32(
         v = tl.load(data_ptr + offs, mask=m, other=0.0)
         c = tl.load(col_ptr + offs, mask=m, other=0)
         xv = tl.load(x_ptr + c, mask=m, other=0.0)
-        acc += tl.sum(tl.where(m, v * xv, 0.0))
+        # Masked loads already return zero, so the select only adds an extra
+        # instruction to the FP32 reduction.
+        acc += tl.sum(tl.where(m, v * xv, 0.0)) if USE_MASKED_SELECT else tl.sum(v * xv)
         pos += BLOCK_INNER
     out = alpha * acc
     if HAS_BETA:
@@ -266,6 +269,7 @@ def _spmv_coo_seg_f64(
     BLOCK_INNER: tl.constexpr,
     SEG_IS_ROW: tl.constexpr,
     HAS_BETA: tl.constexpr,
+    USE_MASKED_SELECT: tl.constexpr,
 ):
     """y[row] = alpha * sum(A[row] * x) + beta * y[row].
 
@@ -295,7 +299,9 @@ def _spmv_coo_seg_f64(
         v = tl.load(data_ptr + offs, mask=m, other=0.0)
         c = tl.load(col_ptr + offs, mask=m, other=0)
         xv = tl.load(x_ptr + c, mask=m, other=0.0)
-        acc += tl.sum(tl.where(m, v * xv, 0.0))
+        # Masked loads return zero for inactive lanes, so no select is needed
+        # around the FP64 product before reduction.
+        acc += tl.sum(tl.where(m, v * xv, 0.0)) if USE_MASKED_SELECT else tl.sum(v * xv)
         pos += BLOCK_INNER
     out = alpha * acc
     if HAS_BETA:
@@ -648,7 +654,17 @@ def _validate_x_coo(x, prepared):
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     dtype = prepared.data.dtype
-    y = torch.zeros(prepared.n_rows, dtype=dtype, device=prepared.data.device)
+    # A run-compressed launch stores exactly one value for every non-empty row.
+    # When every row has a run, avoid a full output memset before the kernel;
+    # retain zero initialization for genuinely empty rows.
+    if (
+        _is_rocm_runtime()
+        and prepared.use_seg_kernel
+        and prepared.n_segs == prepared.n_rows
+    ):
+        y = torch.empty(prepared.n_rows, dtype=dtype, device=prepared.data.device)
+    else:
+        y = torch.zeros(prepared.n_rows, dtype=dtype, device=prepared.data.device)
     nnz = prepared.nnz
     if nnz == 0:
         return y
@@ -716,6 +732,7 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
             BLOCK_INNER=block_inner,
             SEG_IS_ROW=False,
             HAS_BETA=False,
+            USE_MASKED_SELECT=not _is_rocm_runtime(),
             num_warps=1,
         )
         return y

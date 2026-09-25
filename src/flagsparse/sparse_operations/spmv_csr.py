@@ -1500,40 +1500,76 @@ def _configure_spmv_route(prepared, alg, config=None):
             actual["row_tile"]["loop_num_stages"] = 2
             source += ":stage2"
         avg_nnz_per_row = prepared.data.numel() / prepared.n_rows
-        if avg_nnz_per_row <= 4.0 and prepared.max_row_nnz <= 16:
-            # Uniform low-degree graphs benefit from twice as many rows per
-            # program and a four-lane reduction.  Keep the tight max-row
-            # guard: heavy-tailed graphs with the same average regress here.
-            actual["row_tile"].update(
-                rows_per_program=128,
-                lanes_per_row=4,
-                loop_num_stages=(
-                    2
-                    if prepared.data.dtype in (torch.float32, torch.float64)
-                    else 1
-                ),
-            )
+        maximum = prepared.max_row_nnz
+        if prepared.data.dtype == torch.float32:
+            if avg_nnz_per_row <= 4.0 and maximum <= 16:
+                actual["row_tile"].update(
+                    rows_per_program=128, lanes_per_row=4, num_warps=2
+                )
+                source += ":uniform-short-128x4w2"
+            elif 8.0 <= avg_nnz_per_row <= 11.0 and maximum <= 24:
+                actual["row_tile"].update(rows_per_program=64, lanes_per_row=16)
+                source += ":regular-fp32-64x16"
+            elif avg_nnz_per_row >= 20.0:
+                actual["row_tile"].update(
+                    rows_per_program=32, lanes_per_row=16, loop_num_stages=3
+                )
+                source += ":dense-fp32-32x16s3"
+            elif 15.0 <= avg_nnz_per_row <= 17.0 and maximum <= 36:
+                # Moderately long, tightly bounded rows benefit from fewer
+                # rows per program and a third load stage; this avoids the
+                # idle tail imposed by the 64x16 tile.
+                actual["row_tile"].update(
+                    rows_per_program=32, lanes_per_row=8, loop_num_stages=3
+                )
+                source += ":compact-medium-fp32-32x8s3"
+            elif avg_nnz_per_row >= 11.0 and maximum <= 40:
+                actual["row_tile"].update(rows_per_program=64, lanes_per_row=16)
+                source += ":regular-medium-fp32-64x16"
+            elif avg_nnz_per_row >= 11.0:
+                actual["row_tile"].update(
+                    rows_per_program=32, lanes_per_row=8, loop_num_stages=3
+                )
+                source += ":irregular-medium-fp32-32x8s3"
+        elif prepared.data.dtype == torch.float64:
+            if avg_nnz_per_row <= 4.0 and maximum <= 16:
+                actual["row_tile"].update(rows_per_program=64, lanes_per_row=4)
+                source += ":uniform-short-fp64-64x4"
+            elif avg_nnz_per_row <= 4.0:
+                actual["row_tile"].update(rows_per_program=32, lanes_per_row=4)
+                source += ":irregular-short-fp64-32x4"
+            elif avg_nnz_per_row <= 7.0 and maximum <= 16:
+                actual["row_tile"].update(
+                    rows_per_program=32, lanes_per_row=4, loop_num_stages=3
+                )
+                source += ":compact-fp64-32x4s3"
+            elif avg_nnz_per_row < 9.0 and maximum <= 16:
+                actual["row_tile"]["loop_num_stages"] = 3
+                source += ":regular-short-fp64-64x8s3"
+            elif avg_nnz_per_row >= 20.0:
+                actual["row_tile"].update(
+                    rows_per_program=16,
+                    lanes_per_row=8 if maximum <= 32 else 16,
+                    loop_num_stages=3,
+                )
+                source += ":dense-fp64-small-tile"
+            elif avg_nnz_per_row < 15.0 and maximum <= 40:
+                actual["row_tile"].update(
+                    rows_per_program=16, lanes_per_row=8, loop_num_stages=3
+                )
+                source += ":regular-medium-fp64-16x8s3"
+            elif avg_nnz_per_row >= 12.0:
+                actual["row_tile"].update(
+                    rows_per_program=32, lanes_per_row=8, loop_num_stages=3
+                )
+                source += ":irregular-medium-fp64-32x8s3"
+            elif avg_nnz_per_row >= 9.0:
+                actual["row_tile"].update(rows_per_program=32, lanes_per_row=16)
+                source += ":rowlen-fp64-32x16"
+        elif avg_nnz_per_row <= 4.0 and maximum <= 16:
+            actual["row_tile"].update(rows_per_program=128, lanes_per_row=4)
             source += ":uniform-short-128x4"
-        elif (
-            prepared.data.dtype == torch.float64
-            and 5.0 <= avg_nnz_per_row <= 7.0
-            and prepared.max_row_nnz <= 16
-        ):
-            source += ":compact-fp64-stage2"
-        elif (
-            prepared.data.dtype == torch.float32
-            and 8.0 <= avg_nnz_per_row <= 11.0
-            and prepared.max_row_nnz <= 24
-        ):
-            # Regular FP32 rows in this range fit in one 16-lane vector.
-            # Keeping 64 rows per program retains the graph-like occupancy
-            # that the 32x16 profile loses on the amazon/GL shapes.
-            actual["row_tile"].update(rows_per_program=64, lanes_per_row=16)
-            source += ":regular-fp32-64x16"
         elif avg_nnz_per_row >= 9.0:
-            # A 32x16 tile is faster on regular medium/long-row matrices.
-            # Rows below nine remain in the 64x8 layout: its extra row-level
-            # parallelism matters for the short, nearly uniform NACA shape.
             actual["row_tile"].update(rows_per_program=32, lanes_per_row=16)
             source += ":rowlen-32x16"
     prepared.alg_requested, prepared.alg = requested, resolved

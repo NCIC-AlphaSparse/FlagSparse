@@ -1243,7 +1243,7 @@ def _resolve_spmm_coo_launch_config(
         # exactly the cost the sweep above measured away. The sweep constant holds
         # for gfx936 too; an explicit ``block_nnz=`` argument still overrides it,
         # since this whole branch only runs when the caller passed none.
-        block_nnz = 4
+        block_nnz = 4 if _is_rocm_runtime() else 256
 
     # MetaX/MACA: the rowrun kernels unroll ``tl.static_range(0, BLOCK_NNZ)``, so
     # BLOCK_NNZ multiplies the kernel's per-thread private memory.  C550's driver caps
@@ -2366,7 +2366,7 @@ def _run_spmm_coo_canonical_route(
     n_dense_cols,
     output_dtype,
     block_n=None,
-    block_nnz=256,
+    block_nnz=None,
     out=None,
     return_time=False,
     route="rowrun",
@@ -2421,7 +2421,7 @@ def _run_spmm_coo_route(
     B,
     shape,
     block_n=None,
-    block_nnz=256,
+    block_nnz=None,
     out=None,
     return_time=False,
     return_meta=False,
@@ -2587,7 +2587,7 @@ def flagsparse_spmm_coo(
     B,
     shape,
     block_n=None,
-    block_nnz=256,
+    block_nnz=None,
     out=None,
     return_time=False,
     transpose=None,
@@ -2780,7 +2780,7 @@ def benchmark_spmm_coo_case(
     warmup=20,
     iters=200,
     block_n=None,
-    block_nnz=256,
+    block_nnz=None,
     run_cusparse=True,
     route="rowrun",
     compare_routes=False,
