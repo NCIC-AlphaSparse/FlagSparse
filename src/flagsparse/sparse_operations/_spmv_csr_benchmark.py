@@ -1,9 +1,59 @@
 """Shared CSR SpMV measurements; setup and diagnostics never change the denominator."""
 
 import torch
+import triton
+import triton.language as tl
 
 from . import _common as common
 from .spmv_csr import flagsparse_spmv_csr_run, _spmv_device_context
+
+
+def _prepared_row_tile_op(prepared, x, out):
+    """Bind a prepared real row-tile launch outside the event window."""
+    from . import _spmv_csr_kernels as kernels
+
+    config = prepared.config["row_tile"]
+    grid = (triton.cdiv(prepared.n_rows, config["rows_per_program"]),)
+    acc = tl.float32 if prepared.data.dtype == torch.float32 else tl.float64
+    avg_nnz = prepared.data.numel() / prepared.n_rows
+    fixed_steps = 0
+    if (
+        prepared.data.dtype == torch.float32
+        and prepared.max_row_nnz <= 32
+    ) or (
+        prepared.data.dtype == torch.float64
+        and avg_nnz > 7.0
+        and prepared.max_row_nnz <= 32
+    ):
+        fixed_steps = triton.cdiv(
+            prepared.max_row_nnz, config["lanes_per_row"]
+        )
+
+    def launch():
+        kernels.row_tile_real_kernel[grid](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            x,
+            out,
+            prepared.kernel_indptr,
+            prepared.n_rows,
+            INDEXED=False,
+            R=config["rows_per_program"],
+            V=config["lanes_per_row"],
+            STAGES=config["loop_num_stages"],
+            ACC=acc,
+            POSITION_64=not (
+                prepared.data.dtype == torch.float32
+                and prepared.kernel_indptr.dtype == torch.int32
+            ),
+            FIXED_STEPS=fixed_steps,
+            num_warps=config["num_warps"],
+            enable_fp_fusion=(prepared.data.dtype == torch.float32),
+        )
+        return out
+
+    return launch
 
 
 def _filtered_avg_ms(times):
@@ -65,17 +115,17 @@ def measure_route(prepared, x, warmup=10, iters=50, timing=False):
         # to the GPU event while the stream is empty.  Keep the generic route
         # for paths that genuinely perform runtime processing.
         direct_row_tile = (
+            common._is_rocm_runtime()
+            and
             prepared.alg == "row_tile"
             and not prepared.transpose
             and not x.is_conj()
             and not prepared.data.is_conj()
+            and x.is_contiguous()
+            and prepared.data.dtype in (torch.float32, torch.float64)
         )
         if direct_row_tile:
-            from . import _spmv_csr_kernels as kernels
-
-            timed_op = lambda: kernels.compute(
-                prepared, x, out, prepared.alg, prepared.config, plan=None
-            )
+            timed_op = _prepared_row_tile_op(prepared, x, out)
         else:
             timed_op = lambda: flagsparse_spmv_csr_run(prepared, x, out=out)
         value, gpu_ms = event_benchmark(
@@ -178,13 +228,23 @@ def measure_vendor(data, indices, indptr, x, shape, op, warmup, iters):
                 result["vendor_alg"] = str(state.get("alg", "empty"))
             finally:
                 common._destroy_spmv_csr_ref_hipsparse_prepared(state)
-        elif backend == "cupy_cusparse":
+        elif backend in ("cupy_cusparse", "iluvatar_legacy_cusparse"):
             if op != "non":
                 result["vendor_reason"] = (
                     "CuPy transpose changes CSR storage; no native CSR transpose baseline exposed"
                 )
                 return result
-            cp = common.cp
+            if common._is_iluvatar_runtime():
+                # The CoreX package has no cupyx.cusparse module, which makes
+                # common's generic-CuPy optional import unavailable.  Import
+                # only the verified legacy path here; other backends retain
+                # their existing shared imports and generic implementation.
+                import cupy as cp
+                import cupy.cusparse as cupy_cusparse
+                import cupyx.scipy.sparse as cpx_sparse
+            else:
+                cp = common.cp
+                cpx_sparse = common.cpx_sparse
             # Use the actual Torch stream on the input device for construction and timing.
             with cp.cuda.Device(data.device.index or 0):
                 stream = common._torch_current_stream_ptr()
@@ -192,20 +252,51 @@ def measure_vendor(data, indices, indptr, x, shape, op, warmup, iters):
                     result["vendor_reason"] = "cannot identify the execution stream"
                     return result
                 with cp.cuda.ExternalStream(stream):
-                    matrix = common.cpx_sparse.csr_matrix(
-                        (
+                    if common._is_iluvatar_runtime():
+                        # The verified CoreX legacy API consumes int32 CSR row
+                        # offsets.  This setup conversion is outside events and
+                        # leaves the operator's original index tensors intact.
+                        legacy_indptr = (
+                            indptr
+                            if indptr.dtype == torch.int32
+                            else indptr.to(torch.int32)
+                        )
+                        matrix_args = (
+                            cp.from_dlpack(torch.utils.dlpack.to_dlpack(data)),
+                            cp.from_dlpack(torch.utils.dlpack.to_dlpack(indices)),
+                            cp.from_dlpack(torch.utils.dlpack.to_dlpack(legacy_indptr)),
+                        )
+                        vector = cp.from_dlpack(torch.utils.dlpack.to_dlpack(x))
+                    else:
+                        matrix_args = (
                             common._cupy_from_torch(data),
                             common._cupy_from_torch(indices),
                             common._cupy_from_torch(indptr),
-                        ),
-                        shape=shape,
-                    )
-                    vector = common._cupy_from_torch(x)
-                    value_cp, ms = event_benchmark(
-                        lambda: matrix @ vector, warmup, iters
-                    )
-                    value = common._torch_from_cupy(value_cp)
-            result["vendor_alg"] = "cupy_csr_matvec (library selected)"
+                        )
+                        vector = common._cupy_from_torch(x)
+                    matrix = cpx_sparse.csr_matrix(matrix_args, shape=shape)
+                    if common._is_iluvatar_runtime():
+                        # CoreX generic SpMV has a broken buffer-size query.  Its
+                        # legacy csrmv entry point is independently validated for
+                        # fp32/int32/non and takes a reusable output buffer.
+                        output_cp = cp.empty(shape[0], dtype=vector.dtype)
+                        value_cp, ms = event_benchmark(
+                            lambda: cupy_cusparse.csrmv(
+                                matrix, vector, y=output_cp
+                            ),
+                            warmup,
+                            iters,
+                        )
+                        result["vendor_alg"] = "cupy_legacy_csrmv"
+                    else:
+                        value_cp, ms = event_benchmark(
+                            lambda: matrix @ vector, warmup, iters
+                        )
+                        result["vendor_alg"] = "cupy_csr_matvec (library selected)"
+                    if common._is_iluvatar_runtime():
+                        value = torch.utils.dlpack.from_dlpack(value_cp.toDlpack())
+                    else:
+                        value = common._torch_from_cupy(value_cp)
         elif backend == "torch":
             value, ms, sparse_format = _measure_pytorch_spmv(
                 data, indices, indptr, x, shape, op, warmup, iters

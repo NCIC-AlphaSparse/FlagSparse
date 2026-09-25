@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import _common
+
 
 @triton.jit
 def _product(A, X, pos, col, mask, COMPLEX: tl.constexpr, ACC: tl.constexpr):
@@ -65,6 +67,53 @@ def row_tile_kernel(
         if COMPLEX:
             imag = imag + pi
     _store_result(Y, row, tl.sum(acc, 1), tl.sum(imag, 1), valid, COMPLEX)
+
+
+@triton.jit
+def row_tile_real_kernel(
+    A,
+    CI,
+    RP,
+    X,
+    Y,
+    ROWS,
+    N,
+    INDEXED: tl.constexpr,
+    R: tl.constexpr,
+    V: tl.constexpr,
+    STAGES: tl.constexpr,
+    ACC: tl.constexpr,
+    POSITION_64: tl.constexpr,
+    FIXED_STEPS: tl.constexpr,
+):
+    """Real-only row tile without complex component bookkeeping."""
+    ridx = tl.program_id(0) * R + tl.arange(0, R)
+    if POSITION_64:
+        ridx = ridx.to(tl.int64)
+    valid = ridx < N
+    if INDEXED:
+        row = tl.load(ROWS + ridx, valid, 0)
+    else:
+        row = ridx
+    start = tl.load(RP + row, valid, 0)
+    end = tl.load(RP + row + 1, valid, 0)
+    if POSITION_64:
+        start = start.to(tl.int64)
+        end = end.to(tl.int64)
+    lane = tl.arange(0, V)
+    acc = tl.zeros((R, V), ACC)
+    if FIXED_STEPS > 0:
+        steps = FIXED_STEPS
+    else:
+        steps = tl.max(tl.cdiv(end - start, V), 0)
+    for step in tl.range(0, steps, num_stages=STAGES):
+        pos = start[:, None] + step * V + lane[None, :]
+        mask = valid[:, None] & (pos < end[:, None])
+        col = tl.load(CI + pos, mask, 0).to(tl.int64)
+        value = tl.load(A + pos, mask, 0).to(ACC)
+        vector = tl.load(X + col, mask, 0).to(ACC)
+        acc += value * vector
+    tl.store(Y + row, tl.sum(acc, 1), valid)
 
 
 @triton.jit
@@ -401,19 +450,68 @@ def compute(prepared, x, y, alg, config, plan=None):
         n = m if rows is None else rows.numel()
         c = config["row_tile"]
         if n:
-            row_tile_kernel[(triton.cdiv(n, c["rows_per_program"]),)](
+            grid = (triton.cdiv(n, c["rows_per_program"]),)
+            launch_args = (
                 *args,
                 prepared.kernel_indptr if rows is None else rows,
                 n,
-                INDEXED=rows is not None,
-                R=c["rows_per_program"],
-                V=c["lanes_per_row"],
-                STAGES=c["loop_num_stages"],
-                COMPLEX=complex_input,
-                ACC=acc,
-                num_warps=c["num_warps"],
-                enable_fp_fusion=False,
             )
+            if not _common._is_rocm_runtime():
+                # Keep the pre-existing kernel for non-ROCm backends.  The
+                # real-only specialization below is tuned for DCU wavefronts.
+                row_tile_kernel[grid](
+                    *launch_args,
+                    INDEXED=rows is not None,
+                    R=c["rows_per_program"],
+                    V=c["lanes_per_row"],
+                    STAGES=c["loop_num_stages"],
+                    COMPLEX=complex_input,
+                    ACC=acc,
+                    num_warps=c["num_warps"],
+                    enable_fp_fusion=False,
+                )
+            elif complex_input:
+                row_tile_kernel[grid](
+                    *launch_args,
+                    INDEXED=rows is not None,
+                    R=c["rows_per_program"],
+                    V=c["lanes_per_row"],
+                    STAGES=c["loop_num_stages"],
+                    COMPLEX=True,
+                    ACC=acc,
+                    num_warps=c["num_warps"],
+                    enable_fp_fusion=False,
+                )
+            else:
+                avg_nnz = prepared.data.numel() / m
+                fixed_steps = 0
+                if alg == "row_tile" and rows is None:
+                    if (
+                        prepared.data.dtype == torch.float32
+                        and prepared.max_row_nnz <= 32
+                    ) or (
+                        prepared.data.dtype == torch.float64
+                        and avg_nnz > 7.0
+                        and prepared.max_row_nnz <= 32
+                    ):
+                        fixed_steps = triton.cdiv(
+                            prepared.max_row_nnz, c["lanes_per_row"]
+                        )
+                row_tile_real_kernel[grid](
+                    *launch_args,
+                    INDEXED=rows is not None,
+                    R=c["rows_per_program"],
+                    V=c["lanes_per_row"],
+                    STAGES=c["loop_num_stages"],
+                    ACC=acc,
+                    POSITION_64=not (
+                        prepared.data.dtype == torch.float32
+                        and prepared.kernel_indptr.dtype == torch.int32
+                    ),
+                    FIXED_STEPS=fixed_steps,
+                    num_warps=c["num_warps"],
+                    enable_fp_fusion=(prepared.data.dtype == torch.float32),
+                )
     if alg in ("row_vector", "row_adaptive_split"):
         rows = None if plan is None else plan["mid_rows"]
         n = m if rows is None else rows.numel()
