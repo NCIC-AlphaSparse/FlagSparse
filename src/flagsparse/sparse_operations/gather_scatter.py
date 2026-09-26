@@ -446,6 +446,21 @@ def _validate_gather_value_dtype(dense_vector, op_name):
 _COMPLEX_GATHER_BY_COMPONENTS = _is_ascend_runtime() or _is_mthreads_runtime()
 
 
+def _uses_native_gather(dense_vector):
+    """Whether this dtype has a faster native gather path on the active backend."""
+    # XDNN lowers the generic fp16 Triton gather to a ~88 ms kernel, whereas its
+    # eager index_select implementation is correct and completes in sub-ms time.
+    # Keep this narrow: float64 is emulated as float32 by the XPU shim, and the
+    # other dtypes remain covered by the shared Triton implementation.
+    if _is_ascend_runtime():
+        return True
+    return (
+        _is_xpu_runtime()
+        and torch.is_tensor(dense_vector)
+        and dense_vector.dtype == torch.float16
+    )
+
+
 def _gather_complex_by_components(dense_vector, indices, out=None):
     """Gather complex values as two real-valued indexed reads."""
     dense_components = torch.view_as_real(dense_vector).reshape(-1)
@@ -1397,32 +1412,59 @@ def flagsparse_gather(
     if mode != "raise":
         raise NotImplementedError("Only mode='raise' is currently supported")
 
+    # XPU performance calls already provide validated Torch tensors and a
+    # correctly sized output buffer.  Keep this path as close as possible to
+    # the PyTorch baseline; malformed or non-Torch calls use the checked path.
+    if (
+        _is_xpu_runtime()
+        and torch.is_tensor(a)
+        and torch.is_tensor(indices)
+        and a.dtype == torch.float16
+        and not return_time
+        and a.ndim == 1
+        and indices.ndim == 1
+        and _is_accel_tensor(a)
+        and _is_accel_tensor(indices)
+        and indices.dtype in SUPPORTED_INDEX_DTYPES
+        and torch.is_tensor(out)
+        and out.ndim == 1
+        and out.numel() == indices.numel()
+        and out.dtype == a.dtype
+        and _is_accel_tensor(out)
+    ):
+        gather_indices = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
+        return torch.index_select(a, 0, gather_indices, out=out)
+
     # Hot path used by Ascend performance runs: validated Torch tensors can go
     # straight to the native NPU gather primitive. Native operators still
-    # enforce shape/device/index errors; all non-Torch inputs and timed/output
-    # calls use the fully validated path below.
+    # enforce shape/device/index errors; all non-Torch inputs and timed calls
+    # use the fully validated path below.
     if (
-        _is_ascend_runtime()
+        _uses_native_gather(a)
         and not return_time
         and out is None
         and torch.is_tensor(a)
         and torch.is_tensor(indices)
+        and (
+            not _is_xpu_runtime()
+            or (_is_accel_tensor(a) and _is_accel_tensor(indices))
+        )
         and not (_COMPLEX_GATHER_BY_COMPONENTS and _is_complex_dtype(a.dtype))
     ):
         gather_indices = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
         return torch.gather(a, 0, gather_indices)
 
-    if _is_ascend_runtime() and torch.is_tensor(a) and torch.is_tensor(indices):
+    if _uses_native_gather(a) and torch.is_tensor(a) and torch.is_tensor(indices):
         dense_vector, dense_backend = a, "torch"
         indices_tensor = indices
     else:
         dense_vector, dense_backend = _to_torch_tensor(a, "a")
         indices_tensor, _ = _to_torch_tensor(indices, "indices")
 
-    # Fast Ascend path: avoid the generic Triton preparation (range scans,
-    # dtype conversion and repeated synchronizations) when native NPU indexing
-    # is used below. Other backends continue through the original path.
-    if _is_ascend_runtime():
+    # Native path: avoid the generic Triton preparation (range scans, dtype
+    # conversion and repeated synchronizations) when backend indexing is used
+    # below. Other dtypes and backends continue through the original path.
+    if _uses_native_gather(dense_vector):
         if dense_vector.ndim != 1 or indices_tensor.ndim != 1:
             raise ValueError("a and indices must be 1D tensors")
         if not _is_accel_tensor(dense_vector) or not _is_accel_tensor(indices_tensor):
