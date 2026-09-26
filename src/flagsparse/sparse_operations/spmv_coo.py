@@ -25,6 +25,7 @@ Storage: sorted ``data, row, col`` plus optional ``seg_starts`` vector — never
 from ._common import *
 
 import time
+from functools import lru_cache
 
 import triton
 import triton.language as tl
@@ -881,6 +882,21 @@ def _ascend_spmv_coo_index_add(launch, x):
     return y
 
 
+@lru_cache(maxsize=128)
+def _cached_rocm_fp32_coo_launch(device, nnz, block_size, num_warps):
+    # Device properties and launch clipping do not change between executions.
+    # Cache only immutable launch values, never tensors or output buffers.
+    launch = _spmv_rocm_launch_overrides(
+        fmt="coo",
+        dtype=torch.float32,
+        nnz=nnz,
+        block_size=block_size,
+        num_warps=num_warps,
+        device=device,
+    )
+    return int(launch["block_size"]), int(launch["num_warps"])
+
+
 def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
     # gfx936's atomic COO kernel is memory/atomic bound. A 256-element tile
     # with two waves outperformed the former 512-element tile on the delivery
@@ -890,6 +906,10 @@ def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
         block_size = 256 if _is_rocm_runtime() else 256
     if num_warps is None:
         num_warps = 2 if _is_rocm_runtime() else 4
+    if _is_rocm_runtime() and prepared.data.dtype == torch.float32:
+        return _cached_rocm_fp32_coo_launch(
+            prepared.data.device, prepared.nnz, int(block_size), int(num_warps)
+        )
     launch = _spmv_rocm_launch_overrides(
         fmt="coo",
         dtype=prepared.data.dtype,
