@@ -381,7 +381,8 @@ flagsparseStatus_t run_coo(flagsparseHandle_t handle, SpMatDescr* A,
     sig += std::to_string(kCooBlockInner) + ",";
     if (ops.complex_op) sig += ops.acc_is_fp64 ? "True," : "False,";   // ACC_IS_FP64
     sig += "True,";                             // SEG_IS_ROW
-    sig += ops.has_beta ? "True" : "False";
+    sig += ops.has_beta ? "True" : "False";    // HAS_BETA
+    if (!ops.complex_op) sig += ",False";       // USE_MASKED_SELECT
 
     std::vector<jit::Arg> args;
     args.reserve(12);

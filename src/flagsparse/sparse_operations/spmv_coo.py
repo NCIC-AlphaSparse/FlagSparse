@@ -432,6 +432,38 @@ def _spmv_coo_atomic_f64(
     tl.atomic_add(y_ptr + r, contrib, mask=m, sem="relaxed")
 
 
+@triton.jit
+def _spmv_coo_run_add(row_a, val_a, row_b, val_b):
+    same = row_a == row_b
+    return row_b, val_b + tl.where(same, val_a, 0.0)
+
+
+@triton.jit
+def _spmv_coo_atomic_runs_real(
+    data_ptr, row_ptr, col_ptr, x_ptr, y_ptr, nnz,
+    BLOCK: tl.constexpr, ACC: tl.constexpr,
+):
+    """Reduce adjacent COO entries before the global atomic update.
+
+    This also handles unsorted COO: only adjacent equal rows are combined;
+    disjoint runs still contribute through separate atomics.
+    """
+    pid = tl.program_id(0)
+    lane = tl.arange(0, BLOCK)
+    offs = pid * BLOCK + lane
+    valid = offs < nnz
+    row = tl.load(row_ptr + offs, valid, 0)
+    col = tl.load(col_ptr + offs, valid, 0)
+    value = tl.load(data_ptr + offs, valid, 0.0).to(ACC)
+    vector = tl.load(x_ptr + col, valid, 0.0).to(ACC)
+    _, run_sum = tl.associative_scan(
+        (row, value * vector), axis=0, combine_fn=_spmv_coo_run_add
+    )
+    next_row = tl.load(row_ptr + offs + 1, valid & (offs + 1 < nnz), -1)
+    boundary = valid & ((row != next_row) | (lane == BLOCK - 1))
+    tl.atomic_add(y_ptr + row, run_sum, mask=boundary, sem="relaxed")
+
+
 def _sort_coo_lex_inplace(data, row, col, n_cols):
     row64 = row.to(torch.int64)
     col64 = col.to(torch.int64)
@@ -738,6 +770,14 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
         return y
     ker = _spmv_coo_atomic_f64 if dtype == torch.float64 else _spmv_coo_atomic_f32
     grid = (triton.cdiv(nnz, block_size),)
+    if _is_rocm_runtime():
+        _spmv_coo_atomic_runs_real[grid](
+            prepared.data, prepared.row, prepared.col, x, y, nnz,
+            BLOCK=block_size,
+            ACC=tl.float64 if dtype == torch.float64 else tl.float32,
+            num_warps=num_warps,
+        )
+        return y
     ker[grid](
         prepared.data,
         prepared.row,
@@ -842,12 +882,12 @@ def _ascend_spmv_coo_index_add(launch, x):
 
 
 def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
-    # gfx936's atomic COO kernel is memory/atomic bound. A 512-element tile
-    # with two waves outperformed the former 256-element/four-wave default on
-    # every delivery matrix for both fp32 and fp64. Preserve explicit callers'
+    # gfx936's atomic COO kernel is memory/atomic bound. A 256-element tile
+    # with two waves outperformed the former 512-element tile on the delivery
+    # matrices. Preserve explicit callers'
     # launch choices; this policy is only the public default.
     if block_size is None:
-        block_size = 512 if _is_rocm_runtime() else 256
+        block_size = 256 if _is_rocm_runtime() else 256
     if num_warps is None:
         num_warps = 2 if _is_rocm_runtime() else 4
     launch = _spmv_rocm_launch_overrides(

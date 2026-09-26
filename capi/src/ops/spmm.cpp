@@ -142,6 +142,12 @@ LaunchConfig resolve_coo_launch(int64_t n_dense_cols, int device_index) {
     LaunchConfig cfg;
     cfg.block_n = warp_size * factor;
     cfg.block_nnz = 4;
+    if (musa_backend()) {
+        // MUSA needs two 32-thread warps to hide the row-run load latency.
+        // Keep this profile local to the C API's MUSA backend: the other
+        // backends retain the dense-column heuristic above.
+        cfg.block_n = 64;
+    }
     const int device_warp = std::max(1, adaptor::warp_size(device_index));
     cfg.num_warps = std::max(1, cfg.block_n / device_warp);
     // The Python path passes no num_stages, so Triton's own default applies;
