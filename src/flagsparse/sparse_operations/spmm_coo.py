@@ -874,6 +874,121 @@ def _spmm_coo_rowrun_real_kernel(
 
 
 @triton.jit
+def _spmm_coo_rowrun_real_vec_kernel(
+    data_ptr,
+    row_ptr,
+    col_ptr,
+    b_ptr,
+    c_ptr,
+    seg_starts_ptr,
+    alpha,
+    beta,
+    n_segs,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
+):
+    """ROCm COO row-run kernel with vectorized NNZ x dense-column loads."""
+    seg = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if seg >= n_segs:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(seg_starts_ptr + seg)
+    end = tl.load(seg_starts_ptr + seg + 1)
+    if SEG_IS_ROW:
+        row_id = seg
+    else:
+        row_id = tl.load(row_ptr + start)
+    acc = tl.zeros((BLOCK_N,), dtype=ACC_DTYPE)
+    for chunk_start in tl.range(0, end - start, BLOCK_NNZ):
+        kk = tl.arange(0, BLOCK_NNZ)
+        idx = start + chunk_start + kk
+        valid_k = idx < end
+        a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+        a_cols = tl.load(col_ptr + idx, mask=valid_k, other=0)
+        b_vals = tl.load(
+            b_ptr + a_cols[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+            mask=valid_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(ACC_DTYPE)
+        acc += tl.sum(a_vals[:, None] * b_vals, axis=0)
+    c_ptrs = c_ptr + row_id * stride_cm + offs_n * stride_cn
+    out = alpha * acc
+    if HAS_BETA:
+        out += beta * tl.load(c_ptrs, mask=mask_n, other=0.0).to(ACC_DTYPE)
+    tl.store(c_ptrs, out, mask=mask_n)
+
+
+@triton.jit
+def _spmm_coo_rowrun_real_vec_rows2_kernel(
+    data_ptr,
+    row_ptr,
+    col_ptr,
+    b_ptr,
+    c_ptr,
+    seg_starts_ptr,
+    alpha,
+    beta,
+    n_segs,
+    n_dense_cols,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    SEG_IS_ROW: tl.constexpr,
+    HAS_BETA: tl.constexpr,
+):
+    """ROCm row-run kernel which amortizes dispatch over two adjacent rows."""
+    seg_base = tl.program_id(0) * 2
+    pid_n = tl.program_id(1)
+    segs = seg_base + tl.arange(0, 2)
+    valid_row = segs < n_segs
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_dense_cols
+    start = tl.load(seg_starts_ptr + segs, mask=valid_row, other=0)
+    end = tl.load(seg_starts_ptr + segs + 1, mask=valid_row, other=0)
+    if SEG_IS_ROW:
+        row_ids = segs
+    else:
+        row_ids = tl.load(row_ptr + start, mask=valid_row, other=0)
+    acc = tl.zeros((2, BLOCK_N), dtype=ACC_DTYPE)
+    max_row_nnz = tl.max(end - start, axis=0)
+    for chunk_start in tl.range(0, max_row_nnz, BLOCK_NNZ):
+        kk = tl.arange(0, BLOCK_NNZ)
+        idx = start[:, None] + chunk_start + kk[None, :]
+        valid_k = valid_row[:, None] & (idx < end[:, None])
+        a_vals = tl.load(data_ptr + idx, mask=valid_k, other=0.0).to(ACC_DTYPE)
+        a_cols = tl.load(col_ptr + idx, mask=valid_k, other=0)
+        b_vals = tl.load(
+            b_ptr + a_cols[:, :, None] * stride_bk + offs_n[None, None, :] * stride_bn,
+            mask=valid_k[:, :, None] & mask_n[None, None, :],
+            other=0.0,
+        ).to(ACC_DTYPE)
+        acc += tl.sum(a_vals[:, :, None] * b_vals, axis=1)
+    c_ptrs = c_ptr + row_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out = alpha * acc
+    if HAS_BETA:
+        out += beta * tl.load(
+            c_ptrs,
+            mask=valid_row[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(ACC_DTYPE)
+    tl.store(c_ptrs, out, mask=valid_row[:, None] & mask_n[None, :])
+
+
+@triton.jit
 def _spmm_coo_rowrun_complex_kernel(
     data_ri_ptr,
     row_ptr,
@@ -1348,19 +1463,35 @@ def _triton_spmm_coo_rowrun_impl(
             (n_rows, n_dense_cols), output_dtype, device, dense_layout
         )
 
-    grid = (n_segs, triton.cdiv(n_dense_cols, block_n))
+    all_rows_covered = _is_rocm_runtime() and n_segs == n_rows
+    # Low-NNZ COO matrices are dispatch-bound on gfx936. Grouping two adjacent
+    # row runs keeps independent output rows while halving the grid height.
+    use_rocm_rows2 = _is_rocm_runtime() and not _is_complex_dtype(dtype)
+    grid = (
+        triton.cdiv(n_segs, 2) if use_rocm_rows2 else n_segs,
+        triton.cdiv(n_dense_cols, block_n),
+    )
     if not _is_complex_dtype(dtype):
         C_compute = (
             out
             if out is not None and dtype == output_dtype
-            else _zeros_dense_layout(
+            else (
+                _empty_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+                if all_rows_covered
+                else _zeros_dense_layout(
                 (n_rows, n_dense_cols), dtype, device, dense_layout
+                )
             )
         )
-        if C_compute is out:
+        if C_compute is out and not all_rows_covered:
             C_compute.zero_()
         acc_dtype = tl.float64 if dtype == torch.float64 else tl.float32
-        _spmm_coo_rowrun_real_kernel[grid](
+        rowrun_kernel = (
+            _spmm_coo_rowrun_real_vec_rows2_kernel
+            if use_rocm_rows2
+            else _spmm_coo_rowrun_real_kernel
+        )
+        rowrun_kernel[grid](
             data,
             row,
             col,
@@ -1405,14 +1536,15 @@ def _triton_spmm_coo_rowrun_impl(
     C_compute = (
         out
         if out is not None and dtype == output_dtype
-        else _zeros_dense_layout(
-            (n_rows, n_dense_cols),
-            dtype,
-            device,
-            dense_layout,
+        else (
+            _empty_dense_layout((n_rows, n_dense_cols), dtype, device, dense_layout)
+            if all_rows_covered
+            else _zeros_dense_layout(
+                (n_rows, n_dense_cols), dtype, device, dense_layout
+            )
         )
     )
-    if C_compute is out:
+    if C_compute is out and not all_rows_covered:
         C_compute.zero_()
     C_ri = torch.view_as_real(C_compute)
     acc_dtype = tl.float64 if B_ri.dtype == torch.float64 else tl.float32
@@ -1871,14 +2003,20 @@ def _run_spmm_coo_rowrun_route(
             "bucket_count": 0,
             "long_row_count": 0,
             "long_part_count": 0,
-            "launch_version": "coo_rowrun_v1",
+            "launch_version": "coo_rowrun_v2",
             "block_n": launch["block_n"],
             "block_nnz": launch["block_nnz"],
             "warp_size": launch["heuristic_warp_size"],
             "factor": launch["heuristic_factor"],
             "launch_backend": launch["launch_backend"],
             "device_warp_size": launch["device_warp_size"],
-            "grid_m": prepared.n_segs,
+            "grid_m": triton.cdiv(
+                prepared.n_segs,
+                2
+                if _is_rocm_runtime()
+                and not _is_complex_dtype(prepared.data.dtype)
+                else 1,
+            ),
             "grid_n": triton.cdiv(int(B.shape[1]), launch["block_n"]),
             "dense_layout": dense_layout,
             "b_stride": tuple(int(v) for v in B.stride()),

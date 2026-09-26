@@ -949,6 +949,25 @@ def _prepare_spmv_csr_matrix(
             raise IndexError("indices out of range for n_cols")
     kernel_indices = indices
     kernel_indptr = indptr
+    # gfx936 has substantially cheaper address arithmetic for 32-bit index
+    # tensors.  Delivery inputs commonly arrive as int64 even though their
+    # complete index domain is safely representable in int32; keep the public
+    # input dtype unchanged but use compact kernel metadata when provably safe.
+    if _is_rocm_runtime():
+        indices_fit_i32 = (
+            indices.dtype == torch.int64
+            and n_cols <= _INDEX_LIMIT_INT32
+            and (nnz == 0 or int(indices.max().item()) <= _INDEX_LIMIT_INT32)
+        )
+        indptr_fit_i32 = (
+            indptr.dtype == torch.int64
+            and n_rows <= _INDEX_LIMIT_INT32
+            and nnz <= _INDEX_LIMIT_INT32
+        )
+        if indices_fit_i32:
+            kernel_indices = indices.to(torch.int32).contiguous()
+        if indptr_fit_i32:
+            kernel_indptr = indptr.to(torch.int32).contiguous()
     row_lengths = kernel_indptr[1:] - kernel_indptr[:-1]
     max_row_nnz = int(row_lengths.max().item()) if n_rows > 0 else 0
     return (
