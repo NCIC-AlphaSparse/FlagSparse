@@ -10,6 +10,10 @@ from .spmv_csr import flagsparse_spmv_csr_run, _spmv_device_context
 
 def _prepared_row_tile_op(prepared, x, out):
     """Bind a prepared real row-tile launch outside the event window."""
+    if common._is_rocm_runtime() and prepared.rocm_nnz_plan is not None:
+        from . import _spmv_csr_nnz
+
+        return _spmv_csr_nnz.bind(prepared, x, out)
     from . import _spmv_csr_kernels as kernels
 
     config = prepared.config["row_tile"]
@@ -17,9 +21,15 @@ def _prepared_row_tile_op(prepared, x, out):
     acc = tl.float32 if prepared.data.dtype == torch.float32 else tl.float64
     avg_nnz = prepared.data.numel() / prepared.n_rows
     fixed_steps = 0
+    # Match the production row-tile loop policy in kernels.compute: short
+    # multi-load FP32 rows use the tile-local maximum, not the matrix maximum.
     if (
         prepared.data.dtype == torch.float32
         and prepared.max_row_nnz <= 32
+        and (
+            prepared.max_row_nnz <= config["lanes_per_row"]
+            or prepared.max_row_nnz > 24
+        )
     ) or (
         prepared.data.dtype == torch.float64
         and avg_nnz > 7.0
