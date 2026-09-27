@@ -570,7 +570,11 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase performance --gpus 0 \
 及 `K=32,64,128,256`。MACA PyTorch 的 `torch.sparse.sampled_addmm` 虽能调用，但其
 sampled-dot 输出不正确，不能作为 SDDMM 的精度参考或性能 baseline。因此 C550 上必须传入
 `--no-cusparse`，SDDMM 脚本会使用独立的、同 dtype PyTorch 参考
-`sum(X[row] * Y[col])`：它同时是精度 oracle 和性能 baseline。CSV 的有效字段为
+`sum(X[row] * Y[col])` 作为性能 baseline（包含 gather、乘法及归约的开销）；精度仍用独立的
+CPU 高精度参考，并在计时后校验 baseline 输出，若与 CPU 参考不符则该行的 `pytorch_ms` 留空
+（不会把 baseline 的问题记成算子精度失败）。注意该 baseline 并非融合 kernel，会实体化
+nnz x K 的中间张量，因此这个加速比高于与真正厂商 SDDMM 对比的结果，不能当作厂商加速比引用。
+CSV 的有效字段为
 `pytorch_ms` 与 `triton_speedup_vs_pytorch`；仅精度 `PASS` 且两侧时延有效的行参与加速比汇总。
 
 ```bash
