@@ -233,14 +233,46 @@ def _benchmark_reference_sddmm(
     # same precision as the thing under test cannot separate a real accumulation bug from
     # rounding both sides share.  That evaluation runs once, outside the timed window.
     if fs_common._use_scipy_accuracy_reference():
-        # MUSA has no torch.sparse.sampled_addmm implementation.  Evaluate the
-        # oracle on CPU and leave the device baseline explicitly unavailable.
+        # Accuracy and performance come from different places here.  The oracle is the
+        # CPU SciPy evaluation (MUSA has no torch.sparse.sampled_addmm at all, MACA's
+        # returns wrong sampled-dot values), so it stays independent of any device
+        # timing.
         ref_dtype = reference_utils.reference_dtype(value_dtype)
         sampled = reference_utils.sddmm_csr_values(indices, indptr64, x, y, ref_dtype)
         vals = reference_utils.as_torch(sampled, ref_dtype, x.device) * alpha
         if data is not None:
             vals = vals + beta * data.to(ref_dtype)
-        return vals.to(value_dtype), None
+        reference = vals.to(value_dtype)
+        baseline_ms = None
+        # On MACA, time the gather/multiply/sum formulation so the operator has a
+        # PyTorch baseline at all -- there is no vendor SDDMM and the sampled_addmm API
+        # is wrong.  It is NOT a fused kernel: it materialises an nnz x K temporary, so
+        # the ratio against it overstates what a real vendor SDDMM would give.  The
+        # banner and docs/MACA.md say so; do not quote it as a vendor speedup.
+        if fs_common._is_maca_runtime() and value_dtype in (
+            torch.float32,
+            torch.float64,
+        ):
+            baseline, baseline_ms = ast_ops._benchmark_cuda_op(
+                lambda: ast_ops._sddmm_reference(
+                    indices, indptr64, x, y, data, alpha, beta
+                ),
+                warmup=warmup,
+                iters=iters,
+            )
+            atol, rtol = _resolve_tolerance(value_dtype, "f32")
+            if not torch.allclose(baseline, reference, atol=atol, rtol=rtol):
+                # A baseline that disagrees with the CPU oracle is not evidence about
+                # the kernel, so drop the timing rather than raise: raising here is
+                # caught by the caller as REF_FAIL and would report a correct kernel as
+                # a failed case.  No metric beats a wrong metric.
+                print(
+                    "WARNING: PyTorch gather/multiply/sum baseline disagrees with the "
+                    "CPU reference; pytorch_ms left empty for this case",
+                    file=sys.stderr,
+                )
+                baseline_ms = None
+        return reference, baseline_ms
 
     timing_op = lambda: ast_ops._sddmm_reference(
         indices, indptr64, x, y, data, alpha, beta
@@ -385,8 +417,9 @@ def run_one_mtx(
         "prepare_ms": None,
         "pytorch_ms": None,
         # pytorch_api_ms is a *separate* column from pytorch_ms on purpose:
-        # pytorch_ms is the accuracy reference (it materialises nnz x K temporaries and
-        # is not a performance baseline), while pytorch_api_ms times the real
+        # pytorch_ms times the gather/multiply/sum formulation -- the accuracy reference
+        # on CUDA/ROCm, and additionally the only available baseline on MACA, where it
+        # still materialises nnz x K temporaries -- while pytorch_api_ms times the real
         # torch.sparse.sampled_addmm API.  Folding them into one column would change
         # both the historical CSV meaning and the test semantics.
         "pytorch_api_ms": None,
@@ -601,8 +634,12 @@ def _print_sddmm_mtx_header(value_dtype, index_dtype, k_dim, alpha, beta, acc_mo
     )
     print(
         f"Formats: FlagSparse=CSR SDDMM vs {vendor_label} CSR SDDMM when supported. "
-        "PyTorch = correctness reference only, not a "
-        "performance baseline."
+        + (
+            "PyTorch baseline = same-dtype gather/multiply/sum (unfused, materialises "
+            "an nnz x K temporary); accuracy = CPU reference."
+            if fs_common._is_maca_runtime()
+            else "PyTorch = correctness reference only, not a performance baseline."
+        )
     )
     print(
         "Metric: scenario B -- single-shot, validation on both sides. Both timings "
@@ -713,27 +750,31 @@ def run_all_dtypes_export_csv(
                             "pytorch_api_status": entry.get("pytorch_api_status"),
                             "pytorch_api_reason": entry.get("pytorch_api_reason"),
                             "err_pytorch_api": entry.get("err_pytorch_api"),
-                            "triton_speedup_vs_pytorch_api": _speedup_ratio(
-                                pytorch_api_ms, triton_ms
+                            # On MACA sampled_addmm returns wrong sampled-dot values,
+                            # so a ratio against it would be a number with no meaning.
+                            # Emit it only where the API itself passed accuracy.
+                            "triton_speedup_vs_pytorch_api": (
+                                _speedup_ratio(pytorch_api_ms, triton_ms)
+                                if (
+                                    not fs_common._is_maca_runtime()
+                                    or entry.get("pytorch_api_status") == "PASS"
+                                )
+                                else None
                             ),
                             # Only meaningful where pytorch_ms is a dtype-matched
-                            # baseline rather than an fp64 oracle.  Left empty elsewhere
-                            # so the runner -- which reports the first non-empty schema
-                            # match, and puts vs_pytorch before vs_cusparse -- keeps
-                            # reporting the vendor metric on CUDA/ROCm.
+                            # baseline rather than an fp64 oracle, which is MACA alone.
+                            # Left empty elsewhere on purpose: run_flagsparse_pytest.py
+                            # reports the first non-empty match in
+                            # PERFORMANCE_SPEEDUP_SCHEMAS, so filling this column on a
+                            # backend that has a vendor timing would not add a column,
+                            # it would silently replace the reported metric.
                             "triton_speedup_vs_pytorch": (
                                 _speedup_ratio(pytorch_ms, triton_ms)
                                 if fs_common._is_maca_runtime()
                                 else None
                             ),
-                            # Scenario B is the single performance metric. There is
-                            # deliberately no speedup-vs-pytorch column: the PyTorch
-                            # path is a correctness reference that materialises
-                            # nnz x k temporaries, so its latency is not a baseline.
-                            # run_flagsparse_pytest.py resolves the reported metric by
-                            # first non-empty match in PERFORMANCE_SPEEDUP_SCHEMAS,
-                            # where vs_pytorch precedes vs_cusparse -- emitting it
-                            # would silently override this metric.
+                            # Vendor timings take precedence where available: this key
+                            # sits ahead of vs_pytorch in PERFORMANCE_SPEEDUP_SCHEMAS.
                             "triton_speedup_vs_cusparse": _speedup_ratio(
                                 cusparse_ms, triton_ms
                             ),

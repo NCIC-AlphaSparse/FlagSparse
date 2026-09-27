@@ -1358,7 +1358,13 @@ def _resolve_spmm_coo_launch_config(
         # exactly the cost the sweep above measured away. The sweep constant holds
         # for gfx936 too; an explicit ``block_nnz=`` argument still overrides it,
         # since this whole branch only runs when the caller passed none.
-        block_nnz = 4 if _is_rocm_runtime() else 256
+        #
+        # The constant is flat across backends, NOT ROCm-only: the sweep above ran on
+        # CUDA against cuSPARSE, so 256 is the value it measured away, not a CUDA
+        # baseline to preserve.  Narrowing this to ``4 if _is_rocm_runtime() else 256``
+        # (441edce) restored the 6.96x average cost on CUDA while leaving all of the
+        # reasoning above it in place, and turned tests/ci/test_spmm_coo_block_nnz.py red.
+        block_nnz = 4
 
     # MetaX/MACA: the rowrun kernels unroll ``tl.static_range(0, BLOCK_NNZ)``, so
     # BLOCK_NNZ multiplies the kernel's per-thread private memory.  C550's driver caps
