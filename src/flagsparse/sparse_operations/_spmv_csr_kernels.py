@@ -417,6 +417,10 @@ def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
         return y
+    if _common._is_rocm_runtime() and alg == "row_tile" and prepared.rocm_nnz_plan is not None:
+        from . import _spmv_csr_nnz
+
+        return _spmv_csr_nnz.bind(prepared, x, y)()
     complex_input = prepared.data.is_complex()
     # gfx936's FP64 accumulation doubles value traffic and register pressure for
     # FP32 SpMV. The native FP32 reduction remains within the operator's FP32
@@ -486,9 +490,17 @@ def compute(prepared, x, y, alg, config, plan=None):
                 avg_nnz = prepared.data.numel() / m
                 fixed_steps = 0
                 if alg == "row_tile" and rows is None:
+                    # On gfx936, short FP32 rows spanning several vector
+                    # loads benefit from a tile-local bound: a matrix-wide
+                    # maximum makes every tile execute the same masked tail.
+                    # Retain fixed bounds for one-load rows and 25-32 NNZ rows.
                     if (
                         prepared.data.dtype == torch.float32
                         and prepared.max_row_nnz <= 32
+                        and (
+                            prepared.max_row_nnz <= c["lanes_per_row"]
+                            or prepared.max_row_nnz > 24
+                        )
                     ) or (
                         prepared.data.dtype == torch.float64
                         and avg_nnz > 7.0

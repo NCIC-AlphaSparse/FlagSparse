@@ -268,6 +268,8 @@ def main(argv=None):
     else:
         explicit_algorithms = choices(args.alg, ("auto",) + registered)
     fields = FIELDS + (["process_gpu_ms", "compute_ms"] if args.timing else [])
+    if common._is_rocm_runtime():
+        fields += ["execution_kernel", "nnz_prepare_ms", "nnz_metadata_bytes"]
     csv_file = None
     writer = None
     failures = 0

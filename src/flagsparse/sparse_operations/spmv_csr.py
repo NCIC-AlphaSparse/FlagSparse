@@ -134,7 +134,7 @@ class PreparedCsrSpmv:
         "config_source",
         "backend_caps",
         "config_rejections",
-    )
+    ) + (("rocm_nnz_plan",) if _is_rocm_runtime() else ())
 
     def __init__(
         self,
@@ -184,6 +184,8 @@ class PreparedCsrSpmv:
         self.config_source = "legacy"
         self.backend_caps = None
         self.config_rejections = []
+        if _is_rocm_runtime():
+            self.rocm_nnz_plan = None
 
 
 def _spmv_baseline_compute_dtype(value_dtype):
@@ -1415,6 +1417,8 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
     result.config_source = prepared.config_source
     result.backend_caps = prepared.backend_caps
     result.config_rejections = deepcopy(prepared.config_rejections)
+    if _is_rocm_runtime():
+        result.rocm_nnz_plan = prepared.rocm_nnz_plan
     return result
 
 
@@ -1598,6 +1602,28 @@ def _configure_spmv_route(prepared, alg, config=None):
         caps,
     )
     prepared.config_rejections = rejections
+    if _is_rocm_runtime():
+        prepared.rocm_nnz_plan = None
+    if (
+        resolved == "row_tile"
+        and config is None
+        and caps.backend == "rocm"
+        and caps.arch == "gfx936"
+        and not prepared.transpose
+        and prepared.data.dtype in (torch.float32, torch.float64)
+        and prepared.n_rows > 0
+        and prepared.n_rows <= _INDEX_LIMIT_INT32
+        and 1_000_000 <= prepared.data.numel() <= _INDEX_LIMIT_INT32 - 512
+        and prepared.data.numel() / prepared.n_rows <= 4.0
+        and 64 < prepared.max_row_nnz <= 256
+    ):
+        from . import _spmv_csr_nnz
+
+        # Bound prefix recomputation to one block. The prepared row map is
+        # worthwhile for large, irregular short-row matrices measured on
+        # gfx936; explicit configurations and other devices retain row_tile.
+        prepared.rocm_nnz_plan = _spmv_csr_nnz.prepare(prepared)
+        prepared.config_source += ":prepared-nnz-balanced"
     return prepared
 
 
@@ -1810,6 +1836,8 @@ def flagsparse_spmv_csr_run(
             )
         spec = get_spmv_csr_algorithm_spec(actual.alg)
         compute_dtype = _csr_config.compute_dtype(actual.alg, actual.data.dtype)
+        if _is_rocm_runtime() and actual.rocm_nnz_plan is not None:
+            compute_dtype = str(actual.data.dtype).removeprefix("torch.")
         ms = phases["process_cpu_ms"] + gpu_ms
         meta = {
             "alg_requested": prepared.alg_requested,
@@ -1848,6 +1876,12 @@ def flagsparse_spmv_csr_run(
         if timing:
             meta.update(
                 process_gpu_ms=phases["process_gpu_ms"], compute_ms=phases["compute_ms"]
+            )
+        if _is_rocm_runtime() and actual.rocm_nnz_plan is not None:
+            meta.update(
+                execution_kernel="rocm_nnz_balanced",
+                nnz_prepare_ms=actual.rocm_nnz_plan["prepare_ms"],
+                nnz_metadata_bytes=actual.rocm_nnz_plan["metadata_bytes"],
             )
         if return_meta:
             return (y, ms, meta) if return_time else (y, meta)
