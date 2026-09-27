@@ -247,6 +247,7 @@ def runtime_namespace():
         "_spmv_csr_default_backend": lambda: "rowpar",
         "_spmv_uses_int64_indices": lambda p: True,
         "_is_ascend_runtime": lambda: False,
+        "_is_rocm_runtime": lambda: False,
     }
     exec(
         compile(
