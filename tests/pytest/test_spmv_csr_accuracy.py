@@ -318,7 +318,7 @@ def _native_case(lengths, dtype, col_dtype, ptr_dtype, n=4099):
     counts = torch.tensor(lengths, dtype=torch.int64)
     ptr = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
     nnz = int(ptr[-1])
-    torch.manual_seed(71)
+    common._ACCEL.manual_seed(71)
     data = torch.randn(nnz, dtype=dtype, device=device)
     col = (torch.arange(nnz, dtype=torch.int64) % n).to(device=device, dtype=col_dtype)
     ptr = ptr.to(device=device, dtype=ptr_dtype)
@@ -544,7 +544,7 @@ def test_spmv_csr_external_matrix_regressions(alg, dtype, op, matrix_name):
     ), f"expected exactly one regression input {matrix_name} under {directory}"
     path = paths[0]
     data, col, ptr, shape = load_csr(path, dtype=dtype, device=accelerator_device())
-    torch.manual_seed(2026)
+    common._ACCEL.manual_seed(2026)
     assert not col.numel() or int(col.max()) <= 2147483647
     col, ptr = col.to(torch.int32), ptr.to(torch.int64)
     x = torch.randn(
