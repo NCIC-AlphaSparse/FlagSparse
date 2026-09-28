@@ -14,11 +14,19 @@
 
 """CPU-only smoke tests for CI packaging and public exports."""
 
+import re
+
 import flagsparse
 
 
 def test_package_version_is_exposed():
-    assert flagsparse.__version__ == "0.4.0"
+    # __version__ comes from the installed metadata. The exact value is checked
+    # against pyproject.toml by tools/ci/check_installed_wheel.py on the wheel; here
+    # it only has to be a real, parseable version -- "0.0.0" means metadata was not found.
+    assert flagsparse.__version__ != "0.0.0"
+    assert re.fullmatch(
+        r"\d+(\.\d+)+((a|b|rc|\.dev|\.post)\d+)*", flagsparse.__version__
+    )
 
 
 def test_public_exports_are_listed():

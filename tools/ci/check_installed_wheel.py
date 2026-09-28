@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -32,6 +33,33 @@ class WheelImportCheck:
 
     version: str
     module_path: pathlib.Path
+
+
+def normalize_version(raw: str) -> str:
+    """The PEP 440 form a built wheel reports for a version written in pyproject.toml.
+
+    ``0.4.0-dev1`` is written that way but installs as ``0.4.0.dev1``; comparing the
+    raw text is what broke the wheel check when the dev version landed.
+    """
+    try:
+        from packaging.version import Version
+
+        return str(Version(raw))
+    except ImportError:  # packaging is not a declared dependency
+        return re.sub(r"[-_.]?(dev|a|b|rc)(\d+)", r".\1\2", raw)
+
+
+def project_version(project_root: Optional[pathlib.Path] = None) -> str:
+    """The version pyproject.toml declares, normalized as a wheel reports it.
+
+    pyproject.toml stays the only place the version lives.
+    """
+    root = project_root or pathlib.Path(__file__).resolve().parents[2]
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^\[project\]\s.*?^version\s*=\s*"([^"]+)"', text, re.S | re.M)
+    if match is None:
+        raise AssertionError("no [project] version in pyproject.toml")
+    return normalize_version(match.group(1))
 
 
 def validate_installed_wheel(
@@ -62,6 +90,8 @@ def validate_installed_wheel(
         raise AssertionError(proc.stdout)
 
     version = lines[0]
+    if expected_version == "auto":
+        expected_version = project_version(project_root)
     if expected_version is not None and version != expected_version:
         raise AssertionError(f"expected version {expected_version!r}, got {version!r}")
 
@@ -76,7 +106,11 @@ def validate_installed_wheel(
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--expected-version", default=None)
+    parser.add_argument(
+        "--expected-version",
+        default=None,
+        help="version the installed wheel must report, or 'auto' for pyproject.toml's",
+    )
     args = parser.parse_args(argv)
 
     result = validate_installed_wheel(expected_version=args.expected_version)

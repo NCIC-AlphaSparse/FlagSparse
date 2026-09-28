@@ -15,11 +15,17 @@
 """CPU-only packaging metadata checks."""
 
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 import flagsparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.ci.check_installed_wheel import normalize_version  # noqa: E402
 
 
 def _read_text(path):
@@ -57,9 +63,11 @@ def _extract_python_requires_from_setup_py():
 
 
 def test_package_version_matches_metadata():
-    version = flagsparse.__version__
-    assert version == _extract_version_from_pyproject()
-    assert version == _extract_version_from_setup_py()
+    declared = _extract_version_from_pyproject()
+    # The two declarations are compared as written; the installed package reports
+    # the PEP 440 form of them (0.4.0-dev1 is installed as 0.4.0.dev1).
+    assert declared == _extract_version_from_setup_py()
+    assert flagsparse.__version__ == normalize_version(declared)
 
 
 def test_python_requires_matches_metadata():
@@ -75,3 +83,24 @@ def test_license_metadata_is_apache_2():
     assert 'license = "Apache-2.0"' in pyproject
     assert 'license-files = ["LICENSE"]' in pyproject
     assert "Apache (Version 2.0)" in _read_text("README.md")
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("0.4.0", "0.4.0"),
+        ("0.4.0-dev1", "0.4.0.dev1"),
+        ("0.4.0.dev1", "0.4.0.dev1"),
+        ("1.2.3rc1", "1.2.3rc1"),
+    ],
+)
+def test_declared_versions_normalize_like_a_built_wheel(raw, expected):
+    assert normalize_version(raw) == expected
+
+
+def test_normalization_survives_a_missing_packaging_module(monkeypatch):
+    # packaging is not a declared dependency; the fallback must agree for the common case.
+    monkeypatch.setitem(sys.modules, "packaging", None)
+    monkeypatch.setitem(sys.modules, "packaging.version", None)
+    assert normalize_version("0.4.0-dev1") == "0.4.0.dev1"
+    assert normalize_version("0.4.0") == "0.4.0"
