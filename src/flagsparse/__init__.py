@@ -14,7 +14,11 @@
 
 """FlagSparse package."""
 
-__version__ = "0.4.0"
+from importlib.metadata import version, PackageNotFoundError
+try:
+    __version__ = version("flagsparse")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 __all__ = [
     "flagsparse_gather",
