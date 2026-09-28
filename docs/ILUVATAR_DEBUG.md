@@ -310,7 +310,7 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --op-benchmark-args='spmv_coo=--dtypes float32' \
   --op-benchmark-args='spmm_csr=--dtypes float32' \
   --op-benchmark-args='spmm_coo=--dtypes float32' \
-  --op-benchmark-args='sddmm_csr=--dtypes float32' \
+  --op-benchmark-args='sddmm_csr=--dtype float32' \
   --results-dir pytest_results_iluvatar_delivery_v1 \
   > pytest_results_iluvatar_delivery_v1.log 2>&1 &
 

@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools" / "baseline_bound.py"
 sys.path.insert(0, str(ROOT))
@@ -324,11 +326,11 @@ def test_results_directories_pair_up_by_operator(tmp_path):
 
 
 def test_duplicate_keys_are_an_error_until_disambiguated(tmp_path):
-    rows_in = [_ref(alg="1"), _ref(alg="2", t=2.0)]
+    rows_in = [_ref(batch="1"), _ref(batch="2", t=2.0)]
     proc, rows = _run(tmp_path, rows_in)
     assert proc.returncode == 1
     assert rows[0]["verdict"] == "ERROR" and "--extra-key" in rows[0]["note"]
-    proc, rows = _run(tmp_path, rows_in, None, "--extra-key", "alg")
+    proc, rows = _run(tmp_path, rows_in, None, "--extra-key", "batch")
     assert proc.returncode == 0, proc.stderr
     assert sorted(float(r["bound_ms"]) for r in rows) == [2.5, 5.0]
 
@@ -353,3 +355,240 @@ def test_markdown_table_is_well_formed(tmp_path):
     # grows extra columns.
     assert len({len(re.split(r"(?<!\\)\|", line)) for line in lines}) == 1
     assert "a.mtx\\|float32" in lines[2]
+
+
+def _results_dir(tmp_path, name, rows, *, vendor=None, device=""):
+    """A runner-shaped results directory: <dir>/<op>/performance.csv + summary.json."""
+    root = tmp_path / name
+    _write_csv(root / "sddmm_csr" / "performance.csv", rows)
+    if vendor is not None:
+        env = {
+            "torch": {"device_name": device},
+            "flag_gems": {"version": "0.4.0", "vendor": vendor, "device": "cuda"},
+        }
+        (root / "summary.json").write_text(
+            json.dumps({"env": env, "result": {}}), encoding="utf-8"
+        )
+    return root
+
+
+def test_vendor_card_is_detected_from_the_vendor_runs_summary(tmp_path):
+    ref = _results_dir(tmp_path, "ref", [_ref(t=1.0)], vendor="nvidia", device="H800")
+    ven = _results_dir(
+        tmp_path, "ven", [_ven(t=2.0)], vendor="iluvatar", device="Iluvatar BI-V150 OAM"
+    )
+    proc, rows = _call(tmp_path, ref, "--vendor", ven)
+    assert proc.returncode == 0, proc.stderr
+    assert "iluvatar-biv150 detected" in proc.stderr
+    # 1.0 * 3050 / 1150 / 0.8
+    assert abs(float(rows[0]["bound_ms"]) - 3050 / 1150 / 0.8) < 1e-3
+    assert rows[0]["verdict"] == "PASS"
+
+
+def test_an_explicit_card_that_contradicts_the_run_is_flagged(tmp_path):
+    ref = _results_dir(tmp_path, "ref", [_ref(t=1.0)], vendor="nvidia", device="H800")
+    ven = _results_dir(
+        tmp_path, "ven", [_ven(t=2.0)], vendor="iluvatar", device="Iluvatar BI-V150 OAM"
+    )
+    proc, rows = _call(tmp_path, ref, "--vendor", ven, "--vendor-card", "maca-c550")
+    assert "overrides iluvatar-biv150" in proc.stderr
+    # The explicit card still wins; the warning is what makes it visible.
+    assert abs(float(rows[0]["bound_ms"]) - 3050 / 1440 / 0.8) < 1e-3
+
+
+def test_a_reference_run_from_another_card_is_flagged(tmp_path):
+    ref = _results_dir(
+        tmp_path,
+        "ref",
+        [_ref(t=1.0)],
+        vendor="nvidia",
+        device="NVIDIA GeForce RTX 5090",
+    )
+    ven = _results_dir(
+        tmp_path, "ven", [_ven(t=2.0)], vendor="iluvatar", device="Iluvatar BI-V150 OAM"
+    )
+    proc, _ = _call(tmp_path, ref, "--vendor", ven)
+    assert "RTX 5090" in proc.stderr and "wrong ratio" in proc.stderr
+    # An H800 reference run raises nothing.
+    ref_h800 = _results_dir(
+        tmp_path, "ref2", [_ref(t=1.0)], vendor="nvidia", device="NVIDIA H800 SXM5"
+    )
+    proc, _ = _call(tmp_path, ref_h800, "--vendor", ven)
+    assert "wrong ratio" not in proc.stderr
+
+
+def test_detection_is_skipped_without_a_summary(tmp_path):
+    ref = _results_dir(tmp_path, "ref", [_ref(t=1.0)])
+    ven = _results_dir(tmp_path, "ven", [_ven(t=2.0)])
+    proc, rows = _call(
+        tmp_path, ref, "--vendor", ven, "--vendor-card", "iluvatar-biv150"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "detected" not in proc.stderr and "wrong ratio" not in proc.stderr
+    assert rows[0]["verdict"] == "PASS"
+
+
+def test_bound_only_mode_keeps_a_case_sweep_apart(tmp_path):
+    """A reference with a k sweep (SDDMM: k = 32..256 per matrix) is not a duplicate."""
+    ref = [_ref("a.mtx", t=1.0, k=32), _ref("a.mtx", t=2.0, k=64)]
+    proc, rows = _run(tmp_path, ref, None, "--vendor-bw-gbs", HALF_BW)
+    assert proc.returncode == 0, proc.stderr
+    assert sorted(float(r["bound_ms"]) for r in rows) == [2.5, 5.0]
+    assert sorted(r["key"] for r in rows) == ["a.mtx|float32|32", "a.mtx|float32|64"]
+
+
+# --- the rescaled H800 time as a speedup baseline (what the delivery report carries) ---
+from tools.baseline_bound import SCALED_COLUMNS, scaled_baseline_rows  # noqa: E402
+
+CARD_RATIO = 3050 / 1150  # H800 bandwidth / BI-V150 bandwidth
+
+
+def _scaled(tmp_path, ref_rows, rows, needs=lambda row: True):
+    root = tmp_path / "h800"
+    _write_csv(root / "sddmm_csr" / "performance.csv", ref_rows)
+    fields = list(rows[0]) if rows else []
+    return scaled_baseline_rows(
+        "sddmm_csr", rows, fields, str(root), "iluvatar-biv150", needs_baseline=needs
+    )
+
+
+def test_verdict_table_reports_the_rescaled_time_and_the_speedup(tmp_path):
+    ref, ven = [_ref(t=10.0)], [_ven(t=20.0)]
+    proc, rows = _run(tmp_path, ref, ven, "--vendor-bw-gbs", HALF_BW)
+    assert proc.returncode == 0, proc.stderr
+    # 10 ms on H800, half the bandwidth -> 20 ms rescaled; 20 ms measured -> speedup 1.0
+    assert float(rows[0]["expected_ms"]) == 20.0
+    assert float(rows[0]["speedup"]) == 1.0
+    # the pass line is the ratio: speedup >= 0.8  <=>  T' <= bound
+    assert float(rows[0]["speedup"]) == pytest.approx(0.8 * float(rows[0]["margin"]))
+
+
+def test_scaled_baseline_makes_the_rescaled_time_the_one(tmp_path):
+    ref = [_ref("a.mtx", t=1.0, k=32), _ref("a.mtx", t=2.0, k=64)]
+    rows = [_ven("a.mtx", t=0.5, k=32), _ven("a.mtx", t=4.0, k=64)]
+    out, info = _scaled(tmp_path, ref, rows)
+    assert info["filled"] == 2 and info["eligible"] == 2
+    first, second = out
+    assert float(first["h800_scaled_ms"]) == pytest.approx(1.0 * CARD_RATIO)
+    assert float(first["speedup_vs_h800_scaled"]) == pytest.approx(CARD_RATIO / 0.5)
+    assert float(second["speedup_vs_h800_scaled"]) == pytest.approx(
+        2.0 * CARD_RATIO / 4.0
+    )
+    assert first["h800_scaled_card"] == "iluvatar-biv150"
+    assert set(SCALED_COLUMNS) <= set(first)
+
+
+def test_scaled_baseline_leaves_rows_that_have_a_baseline_alone(tmp_path):
+    rows = [_ven("a.mtx", t=1.0), _ven("b.mtx", t=1.0, cusparse_ms=0.5)]
+    out, info = _scaled(
+        tmp_path,
+        [_ref("a.mtx"), _ref("b.mtx")],
+        rows,
+        needs=lambda row: not row.get("cusparse_ms"),
+    )
+    assert info["filled"] == 1 and info["eligible"] == 1
+    assert (
+        out[0]["speedup_vs_h800_scaled"] != ""
+        and out[1]["speedup_vs_h800_scaled"] == ""
+    )
+
+
+def test_scaled_baseline_says_why_a_row_got_nothing(tmp_path):
+    ref = [_ref("a.mtx"), _ref("failed.mtx", status="FAIL")]
+    rows = [
+        _ven("a.mtx"),
+        _ven("failed.mtx"),
+        _ven("absent.mtx"),
+        _ven("slow.mtx", t=0),
+    ]
+    out, info = _scaled(tmp_path, ref, rows)
+    assert info["filled"] == 1
+    assert info["skipped"] == {
+        "the reference row did not pass": 1,
+        "no such case in the reference run": 1,
+        "this row has no usable FlagSparse time": 1,
+    }
+    assert all(row["speedup_vs_h800_scaled"] == "" for row in out[1:])
+
+
+def test_scaled_baseline_without_the_operator_in_the_reference_is_an_error_note(
+    tmp_path,
+):
+    _write_csv(tmp_path / "h800" / "other_op" / "performance.csv", [_ref()])
+    out, info = scaled_baseline_rows(
+        "sddmm_csr",
+        [_ven()],
+        ["matrix", "triton_ms"],
+        str(tmp_path / "h800"),
+        "maca-c550",
+    )
+    assert "no sddmm_csr/performance.csv" in info["error"] and info["filled"] == 0
+    assert out[0]["speedup_vs_h800_scaled"] == ""
+
+
+# --- the baseline is the reference's VENDOR-LIBRARY time, not FlagSparse's own ---
+# `_ref` gives triton_ms and cusparse_ms the same value, which hid the difference: every
+# test below sets them apart.
+
+
+def test_the_reference_time_is_the_vendor_librarys_not_flagsparses(tmp_path):
+    # H800: FlagSparse 2.0 ms, cuSPARSE 10.0 ms; half the bandwidth -> cuSPARSE ~20 ms there.
+    ref = [_ref(t=2.0, cusparse_ms=10.0)]
+    proc, rows = _run(tmp_path, ref, [_ven(t=20.0)], "--vendor-bw-gbs", HALF_BW)
+    assert proc.returncode == 0, proc.stderr
+    assert float(rows[0]["t_ref_ms"]) == 10.0
+    assert float(rows[0]["expected_ms"]) == 20.0
+    assert (
+        float(rows[0]["speedup"]) == 1.0
+    )  # FlagSparse (20) == the scaled library (20)
+    # --ref-column still reaches the old reading: FlagSparse's own H800 time.
+    proc, rows = _run(
+        tmp_path,
+        ref,
+        [_ven(t=20.0)],
+        "--vendor-bw-gbs",
+        HALF_BW,
+        "--ref-column",
+        "triton_ms",
+    )
+    assert float(rows[0]["t_ref_ms"]) == 2.0
+    assert float(rows[0]["expected_ms"]) == 4.0  # 2.0 ms x (H800 bw / half of it)
+    assert float(rows[0]["speedup"]) == pytest.approx(4.0 / 20.0)
+
+
+def test_scaled_speedup_divides_the_scaled_library_by_flagsparses_time(tmp_path):
+    out, info = _scaled(
+        tmp_path,
+        [_ref("a.mtx", t=2.0, cusparse_ms=10.0)],
+        [_ven("a.mtx", t=5.0)],
+    )
+    assert info["filled"] == 1
+    row = out[0]
+    assert (
+        float(row["h800_vendor_ms"]) == 10.0
+    )  # not the 2.0 FlagSparse took on the H800
+    assert float(row["h800_scaled_ms"]) == pytest.approx(10.0 * CARD_RATIO)
+    assert float(row["h800_scaled_fs_ms"]) == 5.0
+    assert float(row["speedup_vs_h800_scaled"]) == pytest.approx(
+        10.0 * CARD_RATIO / 5.0
+    )
+
+
+def test_a_reference_row_without_a_usable_library_time_gets_nothing(tmp_path):
+    ref = [
+        _ref("nolib.mtx", t=2.0, cusparse_ms=""),
+        _ref("mismatch.mtx", t=2.0, cusparse_ms=10.0, cu_status="FAIL"),
+        _ref("ok.mtx", t=2.0, cusparse_ms=10.0, cu_status="PASS"),
+    ]
+    rows = [_ven("nolib.mtx"), _ven("mismatch.mtx"), _ven("ok.mtx")]
+    out, info = _scaled(tmp_path, ref, rows)
+    assert info["filled"] == 1 and out[2]["speedup_vs_h800_scaled"] != ""
+    assert info["skipped"] == {
+        "the reference row has no vendor-library (cuSPARSE) time": 1,
+        "the reference's vendor-library result did not match FlagSparse": 1,
+    }
+    # FlagSparse's own H800 time is NOT a fallback: there is no baseline to stand in for.
+    assert (
+        out[0]["speedup_vs_h800_scaled"] == ""
+        and out[1]["speedup_vs_h800_scaled"] == ""
+    )

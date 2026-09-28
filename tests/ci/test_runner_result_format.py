@@ -811,3 +811,195 @@ def test_ascend_benchmark_commands_pass_the_matrix_input_the_script_accepts():
         template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
         assert template[template.index("--input") + 1] == "{input}"
         assert "bfloat16" not in template[template.index("--dtypes") + 1]
+
+
+def test_summary_env_records_the_active_backend_not_the_torch_build(monkeypatch):
+    """Iluvatar and MetaX present as CUDA; the summary must still name them.
+
+    The field used to be `"nvidia" if cuda_available`, so every CUDA-compatible
+    backend's results directory claimed nvidia/cuda and could not say which card
+    produced it -- which tools/baseline_bound.py reads to pick the right peaks.
+    """
+    env_info = {
+        "python": {"version": "3.test"},
+        "platform": {"machine": "x86_64", "system": "Linux", "release": "6"},
+        "packages": {"torch": {"version": "2.9"}, "flagsparse": {"version": "0.4.0"}},
+        "cuda": {"available": True, "device_count": 1, "devices": [{"name": "card"}]},
+    }
+
+    monkeypatch.setattr(runner, "_runner_backend_name", lambda: "iluvatar")
+    monkeypatch.setattr(runner, "_runner_device_type", lambda: "cuda")
+    flag_gems = runner._flag_gems_env_info(env_info)["flag_gems"]
+    assert flag_gems["vendor"] == "iluvatar" and flag_gems["device"] == "cuda"
+
+    # Unchanged on a plain CUDA box, and unchanged when the package cannot be read.
+    monkeypatch.setattr(runner, "_runner_backend_name", lambda: "cuda")
+    assert runner._flag_gems_env_info(env_info)["flag_gems"]["vendor"] == "cuda"
+    monkeypatch.setattr(runner, "_runner_backend_name", lambda: "")
+    monkeypatch.setattr(runner, "_runner_device_type", lambda: "")
+    assert runner._flag_gems_env_info(env_info)["flag_gems"] == {
+        "version": "0.4.0",
+        "vendor": "nvidia",
+        "device": "cuda",
+    }
+
+
+# --- --h800-reference: the rescaled H800 time as the last-resort speedup baseline ---
+
+
+def _scaled_row(**extra):
+    row = {
+        "matrix": "a.mtx",
+        "value_dtype": "float32",
+        "index_dtype": "int32",
+        "k": "32",
+        "triton_ms": "0.2",
+        "status": "PASS",
+    }
+    row.update(extra)
+    return row
+
+
+def test_the_scaled_baseline_is_the_last_speedup_schema():
+    schemas = runner.PERFORMANCE_SPEEDUP_SCHEMAS
+    assert schemas[-1] == (
+        "speedup_vs_h800_scaled",
+        "h800_scaled_ms",
+        "h800_scaled_fs_ms",
+    )
+    assert schemas.index(schemas[-1]) == len(schemas) - 1
+
+
+def test_a_vendor_or_pytorch_speedup_beats_the_scaled_one():
+    both = _scaled_row(
+        cusparse_ms="0.4",
+        triton_speedup_vs_cusparse="2.0",
+        h800_scaled_ms="0.8",
+        h800_scaled_fs_ms="0.2",
+        speedup_vs_h800_scaled="4.0",
+    )
+    assert runner._performance_schema(both)[0] == "triton_speedup_vs_cusparse"
+    only_scaled = _scaled_row(
+        cusparse_ms="",
+        triton_speedup_vs_cusparse="",
+        h800_scaled_ms="0.8",
+        h800_scaled_fs_ms="0.2",
+        speedup_vs_h800_scaled="4.0",
+    )
+    assert runner._performance_schema(only_scaled)[0] == "speedup_vs_h800_scaled"
+    assert runner._performance_row_has_complete_speedup(only_scaled)
+    # The projection reports the scaled baseline as the row's `base`, i.e. the 1.0.
+    data = runner._flaggems_perf_data([only_scaled])
+    detail = next(iter(next(iter(data.values()))["details"].values()))
+    assert (detail["base"], detail["gems"], detail["speedup"]) == (0.8, 0.2, 4.0)
+
+
+def _reference_dir(tmp_path, rows):
+    import csv as _csv
+
+    path = tmp_path / "h800" / "sddmm_csr"
+    path.mkdir(parents=True, exist_ok=True)
+    fields = list(rows[0])
+    with (path / "performance.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = _csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return tmp_path / "h800"
+
+
+def test_apply_scaled_baseline_fills_only_rows_without_a_baseline(
+    tmp_path, monkeypatch
+):
+    import csv as _csv
+
+    # H800: FlagSparse took 1.0 ms and cuSPARSE 4.0 ms; the baseline is the latter.
+    reference = _reference_dir(
+        tmp_path, [_scaled_row(triton_ms="1.0", cusparse_ms="4.0", cu_status="PASS")]
+    )
+    monkeypatch.setattr(
+        runner,
+        "_SCALED_BASELINE",
+        {
+            "reference": str(reference),
+            "card": "iluvatar-biv150",
+            "reference_peaks": "h800-sxm",
+        },
+    )
+    csv_path = tmp_path / "performance.csv"
+    with_baseline = _scaled_row(
+        matrix="b.mtx",
+        cusparse_ms="0.5",
+        triton_speedup_vs_cusparse="2.5",
+    )
+    without = _scaled_row(cusparse_ms="", triton_speedup_vs_cusparse="")
+    with_baseline.setdefault("cusparse_ms", "0.5")
+    rows = [dict(without), dict(with_baseline)]
+    for row in rows:  # one header for both, as the benchmark scripts write it
+        row.setdefault("cusparse_ms", "")
+        row.setdefault("triton_speedup_vs_cusparse", "")
+    out, info = runner._apply_scaled_baseline("sddmm_csr", csv_path, rows)
+    assert info["filled"] == 1 and info["eligible"] == 1
+    assert float(out[0]["h800_vendor_ms"]) == 4.0
+    assert float(out[0]["speedup_vs_h800_scaled"]) == pytest.approx(
+        4.0 * 3050 / 1150 / 0.2
+    )
+    assert out[1]["speedup_vs_h800_scaled"] == ""  # b.mtx keeps its cuSPARSE speedup
+    with csv_path.open(encoding="utf-8", newline="") as handle:
+        written = list(_csv.DictReader(handle))
+    assert "speedup_vs_h800_scaled" in written[0] and len(written) == 2
+    # Idempotent: a re-read row already carries a complete speedup and is left alone.
+    again, info2 = runner._apply_scaled_baseline("sddmm_csr", csv_path, written)
+    assert info2["eligible"] == 0 and info2["filled"] == 0
+    assert again[0]["speedup_vs_h800_scaled"] == written[0]["speedup_vs_h800_scaled"]
+
+
+def test_apply_scaled_baseline_is_a_no_op_unless_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "_SCALED_BASELINE", None)
+    rows = [_scaled_row()]
+    out, info = runner._apply_scaled_baseline("sddmm_csr", tmp_path / "p.csv", rows)
+    assert out is rows and info is None and not (tmp_path / "p.csv").exists()
+
+
+def _configure(monkeypatch, tmp_path, *, backend, device, **flags):
+    import argparse
+
+    monkeypatch.setattr(runner, "_runner_backend_name", lambda: backend)
+    args = argparse.Namespace(
+        h800_reference=str(_reference_dir(tmp_path, [_scaled_row()])),
+        vendor_card=None,
+        reference_peaks="h800-sxm",
+    )
+    for key, value in flags.items():
+        setattr(args, key, value)
+    env = {"cuda": {"devices": [{"name": device}]}}
+    runner._configure_scaled_baseline(argparse.ArgumentParser(), args, env)
+    return runner._SCALED_BASELINE
+
+
+def test_the_card_is_detected_from_the_backend_and_device(tmp_path, monkeypatch):
+    got = _configure(
+        monkeypatch, tmp_path, backend="iluvatar", device="Iluvatar BI-V150 OAM"
+    )
+    assert got["card"] == "iluvatar-biv150"
+    got = _configure(monkeypatch, tmp_path, backend="cuda", device="MetaX C550")
+    assert got["card"] == "maca-c550"  # the device name wins over the backend
+    got = _configure(
+        monkeypatch, tmp_path, backend="iluvatar", device="x", vendor_card="dcu-bw1000"
+    )
+    assert got["card"] == "dcu-bw1000"  # an explicit card wins, with a warning
+
+
+def test_an_undetectable_card_needs_an_explicit_one(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit):
+        _configure(monkeypatch, tmp_path, backend="cuda", device="NVIDIA H800")
+    assert (
+        _configure(
+            monkeypatch,
+            tmp_path,
+            backend="cuda",
+            device="NVIDIA H800",
+            vendor_card="maca-c550",
+        )["card"]
+        == "maca-c550"
+    )
+    runner._SCALED_BASELINE = None

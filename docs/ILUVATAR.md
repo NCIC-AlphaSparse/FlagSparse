@@ -284,6 +284,53 @@ Fortran 连续布局。精度始终由 CPU SciPy 判定，厂商输出只用于�
 但 BI-V150/CoreX 4.4 已验证 CSR SpMV 静默全零，二者不能互相外推。若其他稀疏路径的基线列为
 `N/A`，先核对最小数值结果和 `reason` 字段，再决定是否接入或禁用。
 
+### 3.1 没有厂商基线的算子：以折算后的 H800 时间作为加速比的分母
+
+CoreX 的 legacy 接口只覆盖 fp32 + int32 + `op=non` 的 SpMV/SpMM。**其余算子在 BI-V150 上没有厂商基线**，
+PyTorch 那条路也不能用（这张卡上 PyTorch 稀疏路径会静默返回全零），性能列本来是 `N/A` —— 例如
+SDDMM CSR：`_sddmm_csr_sparse_ref_backend` 在 `FLAGSPARSE_ILUVATAR_VENDOR=torch` 下返回
+`(None, "PyTorch CSR SDDMM baseline is not wired for this runner")`。
+
+**这类行按 `modified/基线缺失方案.md` 给出加速比。** 缺的是厂商库的时间，就用同一个算例在 H800 上
+**cuSPARSE 的用时**（`cusparse_ms`）顶替：按瓶颈单元的峰值比折算到 BI-V150，**折算后的 cuSPARSE 时间就是基线，
+记为 1**；天数上 FlagSparse 的实测用时和它相比：
+
+```
+h800_scaled_ms          = T_cuSPARSE@H800 × (P_H800 / P_BI-V150)     # 带宽口径：3050 / 1150 = 2.652
+speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和折算后的 cuSPARSE 一样快；≥ 0.8 达标
+```
+
+分子是“厂商库”、分母是“FlagSparse”，和其他后端的加速比同一个方向。**但它是估算值**：BI-V150 上并没有真的跑过厂商库，
+分子是 H800 上 cuSPARSE 的时间按带宽换算出来的。汇报时要写明。
+
+只有**没有厂商加速比、也没有 PyTorch 加速比的行**才用这个替代方案；有真实基线的行（fp32 SpMV/SpMM
+的 CoreX legacy 接口）保持原来的加速比，不受影响。
+
+用法：跑天数时加一个参数，指向 H800 上同样算子的结果目录。
+
+```bash
+# BI-V150 上，在第 2 节的命令里加 --h800-reference（卡型自动识别为 iluvatar-biv150，不用手填）
+... run_flagsparse_pytest.py --delivery-only ... \
+    --h800-reference /path/to/h800_results_dir \
+    --results-dir biv150_delivery
+```
+
+- H800 那边的目录用同一版本的代码、同样的矩阵和 k 跑出来；仓库里现成的一份是
+  `pytest_results_sparse_202609221038`（H800 ×8，提交 `47a441e`，20 个算子，sddmm 含 30 个矩阵 × f32/f64 × k=32/64/128/256）。
+- 每行的 `performance.csv` 会多 5 列：`h800_vendor_ms`（H800 上 cuSPARSE 的用时）、`h800_scaled_ms`（折算后的时间，
+  即基线 1）、`h800_scaled_fs_ms`（天数上 FlagSparse 的实测）、`speedup_vs_h800_scaled`（加速比）、`h800_scaled_card`（用的卡）。
+  `summary.json` / `summary.csv` 里交付变体的 speedup 就是这个数，`delivery_table.py` 也照常显示。
+- 没能填上的行保持 `N/A`，原因记在 `performance_result` 的 `scaled_baseline.skipped` 里：H800 里没有这个算例、
+  H800 那行没通过、H800 那行没有 cuSPARSE 时间，或者 H800 上 cuSPARSE 的结果和 FlagSparse 对不上（`cu_status` 是 FAIL）。
+  **H800 上 FlagSparse 自己的用时不会顶替**：没有厂商库时间就是没有基线。
+- 两道防呆：H800 目录不是 H800 上跑的 → 警告；手填的 `--vendor-card` 和检测结果不符 → 警告，但以手填为准。
+
+只想要 PASS/FAIL 判定和余量，用 `tools/baseline_bound.py`（现在也多了 `T' scaled ms` 和 `speedup` 两列）：
+
+```bash
+python3 tools/baseline_bound.py h800_results_dir --vendor biv150_delivery --ops sddmm_csr --markdown
+```
+
 ---
 
 ## 4. 实测记录与待办
