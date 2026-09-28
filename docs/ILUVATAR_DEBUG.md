@@ -38,7 +38,7 @@ export COREX_HOME=/usr/local/corex
 export LD_LIBRARY_PATH=/usr/local/corex-4.4.0/lib64:/usr/local/corex-4.4.0/lib:$LD_LIBRARY_PATH
 export PATH=/usr/local/corex-4.4.0/bin:$PATH
 export FLAGSPARSE_BACKEND=iluvatar
-export FLAGSPARSE_ILUVATAR_VENDOR=torch
+export FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse   # 不要用 torch：静默返回全零
 
 # 自检，两行都要对
 python3 -I -c "import torch; print(torch.__version__)"      # -I 忽略所有环境变量
@@ -310,7 +310,7 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --op-benchmark-args='spmv_coo=--dtypes float32' \
   --op-benchmark-args='spmm_csr=--dtypes float32' \
   --op-benchmark-args='spmm_coo=--dtypes float32' \
-  --op-benchmark-args='sddmm_csr=--dtypes float32' \
+  --op-benchmark-args='sddmm_csr=--dtype float32' \
   --results-dir pytest_results_iluvatar_delivery_v1 \
   > pytest_results_iluvatar_delivery_v1.log 2>&1 &
 
@@ -365,7 +365,61 @@ ps aux | grep -c "[c]lang\|[l]lc\|[t]riton"
 如果确认是展开开销，参照 `_MACA_SPMM_COO_COMPLEX_BLOCK_NNZ` 的做法，在
 `_resolve_spmm_coo_launch_config` 里加一条 iluvatar 的钳位。
 
-### 6.2 `sddmm_csr` 未跑
+### 6.2 `sddmm_csr` / `spmm_coo` 的 f32 性能行全部 FAIL（脚本已修，待上机重跑）
+
+2026-09-28 的交付跑里，`sddmm_csr` 40/40 行、`spmm_coo` f32 10/10 行的 `status` 都是 FAIL，误差
+1e5～1e8，`delivery_table` 里两个变体的加速比是 `-`；而同一轮里精度阶段是 Passed。
+`--h800-reference` 也生效了，但折算记录写着 `this row has no usable FlagSparse time`：FAIL 的行没有可用时间，
+不会被折算。
+
+**根因不在 FlagSparse，在性能脚本的参考。** 这两个脚本的 SciPy 参考在 CPU 上以 fp64 算好，再用
+`reference_utils.as_torch(..., fp64, device)` 搬到设备、在设备上转回 fp32——而 CoreX 4.4 会把 fp64 的 H2D 和
+设备上的 fp64 转换静默置零（见 3.1）。参考成了全零，误差就等于 `|输出| / atol`。精度阶段没受影响：
+它把输出搬回 CPU 再比。`test_spmm.py`（spmm_csr）早就改过，所以同一轮里它是 PASS。
+
+修法：在 CPU 上转成输出 dtype，再搬一次（`reference_utils.as_torch_at`）；`spmm_coo` 在天数上同时不再计时
+`torch.sparse.mm`（COO 路径没验证过，CSR 路径已知返回全零）。`tests/ci/test_iluvatar_reference_transfer.py`
+在 CI 里模拟 CoreX 的置零，旧代码 4 个失败、新代码全过。
+
+上机重跑后应看到：这两个算子的 `status` 变 PASS，`speedup_vs_h800_scaled` 有值。若仍 FAIL，
+说明这次不是参考的问题，误差要从 FlagSparse 的输出查起（用 CPU 上的 SciPy 结果逐元素对比，
+不要用 `torch.sparse`）。
+
+#### 6.2.1 SDDMM 在天数上的性能：先扫启动配置，再谈内核
+
+修好参考之后，按 `speedup_vs_h800_scaled` 预览（用 2026-09-28 那轮 BI-V150 的真实时间，假设状态 PASS），
+SDDMM f32 几何均值约 0.40，任何 k 下都没到 0.8，**而且差距集中在两个地方**：
+
+- **cfd2、filter3D（每行约 25 个非零）**：速率只有 115～200 GB/s，比 H800 上的 FlagSparse 慢 17～44 倍，
+  其余矩阵只慢 5.5～7.8 倍。这两个恰好是唯一走 `_resolve_sddmm_launch_config` 宽分支
+  （`BLOCK_P=512, BLOCK_K=32, num_warps=4`，平均行长 ≥ 16）的矩阵，而这套配置是在 sm_120 上调的。
+  BI-V150 的 warp 是 64，同样的 tile 每线程寄存器压力和 sm_120 不同。这是对着“启动配置优先”清单
+  （grid、tile、num_warps）的第一嫌疑，**是假设，没有在天数上验证**。
+- **其余矩阵**：稳定在 0.3～0.6。H800 上的“等效速率”是 2000～8700 GB/s（超过物理峰值 3050，靠 L2 复用），
+  BI-V150 在 k=256 时约 1150～1280 GB/s（约等于物理峰值，没有复用）。这部分配置调不出来，要减少访存：
+  内核现在对每个非零都重新读一遍 `x[row, :]`，同一行 15 个非零就读 15 遍。
+
+上机先用 `tools/sddmm_sweep.py` 拿数据，不要先改内核。它遍历 `(BLOCK_P, BLOCK_K, num_warps)`，
+**每个配置都和 CPU 上的 SciPy 结果对比**（所以也顺带回答“天数上 FlagSparse SDDMM 到底对不对”）：
+
+```bash
+# 先小范围（几分钟）：确认能跑、结果对
+FLAGSPARSE_BACKEND=iluvatar python3 tools/sddmm_sweep.py \
+  --matrices cfd2,roadNet-TX --k 32,256 \
+  --block-p 32,64,128,512 --block-k 32 --warps 4,8 --csv sweep_small.csv
+
+# 再完整网格（交付的 10 个矩阵 × k=32/64/128/256，较久）
+FLAGSPARSE_BACKEND=iluvatar python3 tools/sddmm_sweep.py --csv sweep_full.csv
+```
+
+怎么读结果：
+1. 末尾出现 `FAIL`：有配置和 CPU 不一致，**先查正确性**，不要拿它当性能数据。
+2. cfd2 / filter3D 换成窄配置（如 `64/32/8`）后明显变快 → 上面的第一嫌疑成立，把“按平均行长分档的最优配置”
+   写成 BI-V150 专用分支（参照 `_MACA_SPMM_COO_COMPLEX_BLOCK_NNZ` 的做法，按 `_is_iluvatar_runtime()` 判断）。
+3. 最优配置对其余矩阵提升不大 → 需要改内核（同一行只读一次 `x`）。此时把 `sweep_full.csv` 给我。
+
+在 5090 上这个脚本的结果是默认配置离最优只差 1.07x（配置就是在这张卡上调的），
+所以 BI-V150 上的差距是这张卡特有的，不是脚本的问题。
 
 ### 6.3 交付跑未做
 
