@@ -60,7 +60,7 @@ python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 20-row 
 | Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
 | Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; `spmv_coo` and `spmm_coo` probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (7 ops) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
-| Iluvatar BI-V150 (**unmeasured**) | `FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=torch` | -- | PyTorch (CuPy when installed) | SciPy (CPU) | [docs/ILUVATAR.md](docs/ILUVATAR.md) §2 |
+| Iluvatar BI-V150 (**unmeasured**) | `FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse` | -- | CoreX cuSPARSE via CuPy (fp32/int32/non-transpose only) | SciPy (CPU) | [docs/ILUVATAR.md](docs/ILUVATAR.md) §2 |
 
 **Results produced before `86a09cd` (2026-09-18) are not comparable**: the old projection averaged
 int64 and trans/conj rows into each `..._int_non` variant and counted rows without a speedup as 0.

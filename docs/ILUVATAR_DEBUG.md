@@ -38,7 +38,7 @@ export COREX_HOME=/usr/local/corex
 export LD_LIBRARY_PATH=/usr/local/corex-4.4.0/lib64:/usr/local/corex-4.4.0/lib:$LD_LIBRARY_PATH
 export PATH=/usr/local/corex-4.4.0/bin:$PATH
 export FLAGSPARSE_BACKEND=iluvatar
-export FLAGSPARSE_ILUVATAR_VENDOR=torch
+export FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse   # 不要用 torch：静默返回全零
 
 # 自检，两行都要对
 python3 -I -c "import torch; print(torch.__version__)"      # -I 忽略所有环境变量

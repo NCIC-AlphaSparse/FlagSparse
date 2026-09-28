@@ -74,7 +74,7 @@ python3 tools/delivery_table.py pytest_results_<后端>_delivery      # 打印 2
 | 摩尔线程 | `FLAGSPARSE_BACKEND=mthreads` | 改用 `run_flagsparse_split_delivery.py`（性能取自 C API） | muSPARSE（C API） | SciPy（CPU） | [docs/MUSA.md](docs/MUSA.md) 0.5 节 |
 | 昇腾 910B | CANN 的 `set_env.sh`；`FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | 只能用 `--gpus 6,7` | PyTorch-NPU（5 个算子；`spmv_coo`、`spmm_coo` 只做能力探测） | SciPy（CPU） | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
 | 昆仑芯 XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | 无 | PyTorch-XPU（7 个算子） | SciPy（CPU） | [docs/XPU.md](docs/XPU.md) 1.5 节 |
-| 天数 BI-V150（**未实测**） | `FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=torch` | 无 | PyTorch（CuPy 装了则用 CuPy） | SciPy（CPU） | [docs/ILUVATAR.md](docs/ILUVATAR.md) 第 2 节 |
+| 天数 BI-V150（**未实测**） | `FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse` | 无 | CoreX cuSPARSE（经 CuPy，仅 fp32/int32/不转置） | SciPy（CPU） | [docs/ILUVATAR.md](docs/ILUVATAR.md) 第 2 节 |
 
 **`86a09cd`（2026-09-18）之前跑出的结果不能拿来比较**：旧版把 int64、trans/conj 的行也平均进了
 `..._int_non` 变体，还把没有加速比的行当作 0。请用当前 runner 重跑，见 `prompt.md` 第 2 节。
