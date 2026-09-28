@@ -117,6 +117,20 @@ def as_torch(array, dtype, device):
     return torch.as_tensor(np.asarray(array), dtype=dtype, device=device)
 
 
+def as_torch_at(array, dtype, device):
+    """Back to torch at the OUTPUT dtype: cast on the CPU, then one transfer.
+
+    ``as_torch`` hands the promoted (float64/complex128) result to the device, and
+    the caller then casts it there. CoreX 4.4 on BI-V150 silently zeroes an fp64
+    H2D transfer and an on-device cast from fp64, so that reference arrives as all
+    zeros and a correct kernel is compared with zero: every fp32 row FAILs with an
+    error of about |value| / atol. Finishing the arithmetic on the CPU and moving
+    the result at the dtype the kernel produces avoids both. Identical numbers on
+    every other backend.
+    """
+    return torch.as_tensor(np.asarray(array), dtype=dtype).to(device)
+
+
 def spmv(matrix, x, dtype, *, op="non"):
     """y = op(A) @ x, with x a 1-D torch vector."""
     return apply_op(matrix, op) @ _numpy(x, dtype)

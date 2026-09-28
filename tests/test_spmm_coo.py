@@ -576,20 +576,34 @@ def _build_pytorch_reference(
             ref_dtype,
         )
         product = reference_utils.spmm(matrix, prepared["canonical_B"], ref_dtype)
-        scipy_ref = reference_utils.as_torch(
-            product, ref_dtype, prepared["canonical_B"].device
+        # Cast to the output dtype on the CPU and transfer once: CoreX 4.4 silently
+        # zeroes an fp64 H2D transfer and an on-device cast from fp64, so moving the
+        # promoted reference up first left an all-zero oracle on BI-V150 and every
+        # fp32 row FAILed. See reference_utils.as_torch_at.
+        scipy_ref = reference_utils.as_torch_at(
+            product, out_dtype, prepared["canonical_B"].device
         )
         if fs_common._is_mthreads_runtime():
             return (
-                scipy_ref.to(out_dtype),
+                scipy_ref,
                 None,
                 "SciPy",
                 "torch.sparse registers no matmul on MUSA",
             )
+        if fs_common._is_iluvatar_runtime():
+            # CoreX 4.4 returns zeros from torch.sparse CSR mm, and nothing here
+            # has verified the COO route or that it computes what it is timed for.
+            # A latency measured on an unverified op is not a baseline.
+            return (
+                scipy_ref,
+                None,
+                "SciPy",
+                "PyTorch COO SpMM is not verified on Iluvatar/CoreX",
+            )
         pytorch_op = lambda: torch.sparse.mm(  # noqa: E731
             prepared["native_coo"], prepared["native_B"]
         )
-        return scipy_ref.to(out_dtype), pytorch_op, "SciPy", None
+        return scipy_ref, pytorch_op, "SciPy", None
 
     expected, pytorch_op, fmt, reason = _build_torch_reference_and_timing(
         data, row, col, shape, B, prepared=prepared, op=op, layout=layout

@@ -45,6 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools import baseline_bound as _baseline_bound
 from tools.delivery_variants import (
     cleanup_delivery_matrices,
     load_delivery_variants,
@@ -298,6 +299,10 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("FlagSparse_vs_vendor_speedup", "vendor_ms", "flagsparse_ms"),
     ("FlagSparse_vs_PyTorch_all_speedup", "pytorch_ms", "flagsparse_ms"),
     ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
+    # LAST, so any vendor or PyTorch speedup a row has wins. Rows with neither get
+    # theirs from _apply_scaled_baseline: the same case's H800 FlagSparse time,
+    # rescaled to this card by the bottleneck-unit peak ratio, is the baseline (1.0).
+    ("speedup_vs_h800_scaled", "h800_scaled_ms", "h800_scaled_fs_ms"),
 )
 
 
@@ -955,6 +960,27 @@ def collect_env_info(project_root: Path) -> dict[str, object]:
     return env
 
 
+def _runner_backend_name() -> str:
+    """FlagSparse's own backend name (cuda/rocm/metax/mthreads/ascend/iluvatar/...)."""
+    try:
+        from flagsparse.sparse_operations._common import _backend_name
+
+        return str(_backend_name() or "")
+    except Exception:
+        # The summary must still be written when the package cannot be imported.
+        return os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+
+
+def _runner_device_type() -> str:
+    """The torch device type the backend dispatches on (cuda/musa/npu)."""
+    try:
+        from flagsparse.sparse_operations._common import _ACCEL_DEVICE_TYPE
+
+        return str(_ACCEL_DEVICE_TYPE or "")
+    except Exception:
+        return ""
+
+
 def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
     """Project rich runner metadata onto the strict FlagGems env schema."""
     python_info = env_info.get("python")
@@ -1023,8 +1049,13 @@ def _flag_gems_env_info(env_info: dict[str, object]) -> dict[str, object]:
             # FlagSparse is the package under test; retain the FlagGems field name
             # required by the external summary contract.
             "version": str(flagsparse_package.get("version") or ""),
-            "vendor": "nvidia" if cuda_available else "cpu",
-            "device": "cuda" if cuda_available else "cpu",
+            # The ACTIVE backend, not the torch build. Iluvatar and MetaX present as
+            # CUDA, so `cuda_available` reported every one of their runs as nvidia/cuda
+            # and a results directory could not say which card produced it -- which
+            # tools/baseline_bound.py needs to pick the right peaks. capi's
+            # write_summary.py already recorded the backend; this matches it.
+            "vendor": _runner_backend_name() or ("nvidia" if cuda_available else "cpu"),
+            "device": _runner_device_type() or ("cuda" if cuda_available else "cpu"),
         },
     }
 
@@ -2677,6 +2708,42 @@ def summarize_performance_csv(
     return summary
 
 
+# Set by main() from --h800-reference; None leaves every report exactly as before.
+_SCALED_BASELINE: dict[str, str] | None = None
+
+
+def _apply_scaled_baseline(
+    op: str, csv_path: Path, rows: list[dict[str, str]]
+) -> tuple[list[dict[str, str]], dict[str, object] | None]:
+    """Give rows with no vendor and no PyTorch speedup one against the scaled H800 time.
+
+    Only rows that ``_performance_row_has_complete_speedup`` rejects are touched, so a
+    row that has a real baseline keeps it. The CSV is rewritten with the added columns
+    (tools.baseline_bound.SCALED_COLUMNS), which is what carries the number into
+    summary.json / summary.csv through PERFORMANCE_SPEEDUP_SCHEMAS.
+    """
+    config = _SCALED_BASELINE
+    if not config or not rows:
+        return rows, None
+    fields = list(rows[0].keys())
+    new_rows, info = _baseline_bound.scaled_baseline_rows(
+        op,
+        rows,
+        fields,
+        config["reference"],
+        config["card"],
+        reference=config["reference_peaks"],
+        needs_baseline=lambda row: not _performance_row_has_complete_speedup(row),
+    )
+    if info.get("filled"):
+        header = fields + [c for c in _baseline_bound.SCALED_COLUMNS if c not in fields]
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(new_rows)
+    return new_rows, info
+
+
 def run_performance(
     *,
     project_root: Path,
@@ -2822,6 +2889,9 @@ def run_performance(
         try:
             with csv_path.open("r", encoding="utf-8", newline="") as handle:
                 raw_rows = list(csv.DictReader(handle))
+            raw_rows, scaled_info = _apply_scaled_baseline(op, csv_path, raw_rows)
+            if scaled_info is not None:
+                result["scaled_baseline"] = scaled_info
             rows, filter_metadata = filter_interrupted_performance_rows(
                 raw_rows,
                 output=output,
@@ -2997,6 +3067,9 @@ def _run_bell_per_matrix(
         # Each timed-out matrix ran in its own process, so rows from completed
         # matrices are already independent and must not be filtered by the
         # aggregate stdout's last matrix name.
+        all_rows, scaled_info = _apply_scaled_baseline(op, csv_path, all_rows)
+        if scaled_info is not None:
+            result["scaled_baseline"] = scaled_info
         rows = all_rows
         filter_metadata = {
             "excluded_row_count": 0,
@@ -4214,6 +4287,66 @@ def warn_if_backend_fell_back() -> str | None:
     return reason
 
 
+def _configure_scaled_baseline(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    env_info: dict[str, object],
+) -> None:
+    """Resolve --h800-reference / --vendor-card into the module-level setting."""
+    global _SCALED_BASELINE
+    _SCALED_BASELINE = None
+    reference = getattr(args, "h800_reference", None)
+    if not reference:
+        return
+    reference_dir = Path(reference)
+    if not (reference_dir.is_dir() or reference_dir.is_file()):
+        parser.error(
+            f"--h800-reference {reference} is neither a results directory nor a "
+            "reference JSON file"
+        )
+    cuda = env_info.get("cuda")
+    devices = cuda.get("devices") if isinstance(cuda, dict) else None
+    device = ""
+    if isinstance(devices, list) and devices and isinstance(devices[0], dict):
+        device = str(devices[0].get("name") or "")
+    detected = _baseline_bound._detect_card((_runner_backend_name(), device))
+    card = getattr(args, "vendor_card", None) or detected
+    if card is None:
+        parser.error(
+            "--h800-reference needs the card to rescale to, and none was detected "
+            f"(backend {_runner_backend_name() or '?'!r}, device {device or '?'!r}); "
+            "pass --vendor-card"
+        )
+    if detected and card != detected:
+        print(
+            f"WARNING: --vendor-card {card} overrides {detected}, which this run "
+            "detected. A wrong peak moves every rescaled time.",
+            flush=True,
+        )
+    reference_peaks = getattr(args, "reference_peaks", "h800-sxm")
+    reference_env = _baseline_bound._run_env(str(reference_dir))
+    if reference_env is not None and not any(
+        token in reference_env[1].lower()
+        for token in _baseline_bound._REFERENCE_TOKENS.get(reference_peaks, ())
+    ):
+        print(
+            f"WARNING: --h800-reference {reference} was recorded on "
+            f"{reference_env[1] or reference_env[0]!r}, not on the reference card "
+            f"({reference_peaks}); every rescaled time is off by that ratio.",
+            flush=True,
+        )
+    _SCALED_BASELINE = {
+        "reference": str(reference_dir),
+        "card": card,
+        "reference_peaks": reference_peaks,
+    }
+    print(
+        f"scaled baseline: rows with no vendor/PyTorch speedup are compared with "
+        f"{reference_dir} rescaled {reference_peaks} -> {card}",
+        flush=True,
+    )
+
+
 def main(
     default_phase: str = "both",
     expose_phase_arg: bool = True,
@@ -4291,6 +4424,32 @@ def main(
         )
         parser.add_argument("--benchmark-warmup", type=int, default=5)
         parser.add_argument("--benchmark-iters", type=int, default=20)
+        parser.add_argument(
+            "--h800-reference",
+            nargs="?",
+            const=str(_baseline_bound._h800_reference.DEFAULT_PATH),
+            default=None,
+            metavar="FILE_OR_DIR",
+            help=(
+                "H800 times of the same operators: a results directory or a bundled "
+                "reference JSON. With no value, the repo's own conf/h800_reference.json "
+                "is used. Rows that have no vendor and no PyTorch baseline get a "
+                "speedup against the same case's H800 time rescaled to this card by "
+                "memory bandwidth (tools/baseline_bound.py; the rescaled time is 1.0)."
+            ),
+        )
+        parser.add_argument(
+            "--vendor-card",
+            default=None,
+            choices=sorted(_baseline_bound.VENDOR_BANDWIDTH_GBS),
+            help="Card for --h800-reference; default: detected from the backend/device.",
+        )
+        parser.add_argument(
+            "--reference-peaks",
+            default="h800-sxm",
+            choices=sorted(_baseline_bound.REFERENCE_PEAKS),
+            help="Peak table of the reference card for --h800-reference.",
+        )
     parser.add_argument(
         "--timeout",
         type=int,
@@ -4412,6 +4571,7 @@ def main(
                 )
         extra_benchmark_args = []
     env_info = collect_env_info(project_root)
+    _configure_scaled_baseline(parser, args, env_info)
 
     tasks = {gpu: [] for gpu in gpus}
     for index, op in enumerate(ops):

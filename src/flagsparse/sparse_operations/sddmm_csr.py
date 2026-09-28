@@ -83,6 +83,12 @@ def _sddmm_csr_sparse_ref_backend(value_dtype, index_dtype):
             return "hipsparse", None
         return None, reason
     if vendor == "cupy_cusparse":
+        if _is_iluvatar_runtime():
+            # CoreX has no verified SDDMM entry point, and the benchmark's "cusparse"
+            # column for this operator is torch.sparse.sampled_addmm, which cannot be
+            # trusted on BI-V150 (torch's CSR SpMV/SpMM silently return zeros there).
+            # No baseline; the runner's scaled H800 baseline supplies the speedup.
+            return None, "CoreX has no verified CSR SDDMM baseline"
         return "cupy_cusparse", None
     if vendor in ("ops_sparse", "torch") and _is_ascend_runtime():
         if value_dtype not in (torch.float16, torch.bfloat16, torch.float32):

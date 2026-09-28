@@ -29,7 +29,7 @@ Python 侧的天数后端：怎么选中、每次开工的环境、交付复现�
 | 自动探测    | 三个信号，任一命中即可（`_detect_iluvatar_runtime()`）：torch 版本带 `+corex` 标记（`torch.__version__` **和** pip 元数据都查）、`COREX_HOME` / `COREX_PATH` 环境变量、设备名含 `iluvatar` / `bi-v` / `corex` |
 | 显式指定    | `FLAGSPARSE_BACKEND=iluvatar`，**优先于探测**                                                                                                                                                                               |
 | 算子内核    | 共享实现，`backends/iluvatar/` 下只有 `__init__.py`，没有覆盖                                                                                                                                                                   |
-| 性能基线    | 交付跑用**`torch`**（第 1 节显式设 `FLAGSPARSE_ILUVATAR_VENDOR=torch`），与其余国产后端同口径。不设这个变量时是探测：CuPy 真装了就用 `cupy_cusparse`，否则 `torch`（同 MetaX 的策略，**未实测**）               |
+| 性能基线    | 交付跑用**`cupy_cusparse`**（第 1 节显式设 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`）：CoreX 的 legacy `cusparseScsrmv/Scsrmm`，经 CuPy 调用，只覆盖 fp32 + int32 + 不转置。**不要用 `torch`**：BI-V150 上 PyTorch 的 CSR SpMV/SpMM 会静默返回全零（第 3 节）。不设这个变量时是探测（CuPy 真装了用 `cupy_cusparse`，否则 `torch`），同一台机器装没装 CuPy 口径就变，所以必须显式设置 |
 | 精度参考    | CPU 上的 SciPy（CUDA、ROCm 以外的后端都是这样）                                                                                                                                                                                     |
 | runner 路由 | 与 CUDA / MetaX 相同的通用性能脚本（`GENERIC_BENCHMARK_BACKENDS`）                                                                                                                                                                |
 
@@ -63,7 +63,7 @@ export LD_LIBRARY_PATH=$COREX_HOME/lib64:$COREX_HOME/lib:$LD_LIBRARY_PATH
 # FlagSparse：后端和基线全部显式指定
 export PYTHONPATH=$PWD/src                  # 独立脚本需要；pytest 由 pytest.ini 自带
 export FLAGSPARSE_BACKEND=iluvatar
-export FLAGSPARSE_ILUVATAR_VENDOR=torch     # 固定用 PyTorch 作基线；不设则装了 CuPy 就会改用 CuPy，两者口径不同。不要设 none，否则基线列全是 N/A
+export FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse   # 固定用 CoreX cuSPARSE（经 CuPy）作基线；不要用 torch（BI-V150 上 PyTorch 稀疏静默返回全零），不要设 none（基线列全是 N/A）；需要 CuPy 真装好：python3 -c "import cupy"
 unset FLAGSPARSE_ACCURACY_REFERENCE         # 用默认的 auto（CPU 上的 SciPy），防止上次调试残留的设置
 ```
 
@@ -78,7 +78,7 @@ python3 -c "import flagsparse; print(flagsparse.__file__)"
 # 期望：<仓库>/src/flagsparse/__init__.py；指到 site-packages 就是跑错了副本
 python3 -c "import torch; print(torch.cuda.get_device_properties(0).name); from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_device_type(), c._accel_fallback_reason(), c._vendor_sparse_library())"
 # 期望：Iluvatar BI-V150（或类似的天数设备名）
-#       iluvatar cuda None torch
+#       iluvatar cuda None cupy_cusparse   （最后一项是基线库；出现 torch 说明 FLAGSPARSE_ILUVATAR_VENDOR 没设或 CuPy 没装好）
 ```
 
 显式指定会跳过探测，所以要看**真实设备名**：只有它确实是天数的卡，`FLAGSPARSE_BACKEND=iluvatar` 才对。
@@ -222,40 +222,49 @@ setsid timeout -s KILL 43200 \
     --benchmark-input tests/data \
     --benchmark-warmup 5 \
     --benchmark-iters 20 \
-    --pytest-args='-k "(float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)"' \
-    --op-benchmark-args='gather=--value-dtypes float16,float32' \
-    --op-benchmark-args='scatter=--value-dtypes float16,float32' \
-    --op-benchmark-args='spmv_csr=--dtypes float32' \
+    --h800-reference \
+    --pytest-args='-k "((float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)) or (complex64 and (gather or scatter))"' \
+    --op-benchmark-args='gather=--value-dtypes float16,float32,complex64' \
+    --op-benchmark-args='scatter=--value-dtypes float16,float32,complex64' \
+    --op-benchmark-args='spmv_csr=--dtypes float32 --alg auto' \
     --op-benchmark-args='spmv_coo=--dtypes float32' \
     --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
     --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
     --op-benchmark-args='sddmm_csr=--dtype float32' \
-    --results-dir pytest_results_iluvatar_delivery_f16_f32 \
-  > pytest_results_iluvatar_delivery_f16_f32.log 2>&1 < /dev/null &
+    --results-dir pytest_results_iluvatar_delivery \
+  > pytest_results_iluvatar_delivery.log 2>&1 < /dev/null &
 ```
 
 这里的 pytest 表达式必须保留内层双引号；写成没有引号的 `-k ... or ...` 会让
 pytest 把 `or` 当成测试路径，报 `file or directory not found: or`。不能只匹配
 `float32`：gather 的 fp32 参数 ID 是 `float`，而其他套件多为 `float32`。表达式同时
-匹配这两种 ID，并排除 double、bf16 和 complex，确保精度阶段只覆盖 fp16/fp32。
+匹配这两种 ID，并排除 double、bf16 和 complex。表达式最后的 `(complex64 and (gather or scatter))`
+把 gather/scatter 的 complex64 用例加回来：交付清单里的 **c32 就是 complex64**，gather/scatter 的 c32 在天数上能跑
+（实测见 4.0 节）；c64（complex128）跑不了，仍然排除。实测这一段只给 gather 多选 4 个、scatter 多选 8 个用例，
+其余算子的用例数不变。
 性能参数按各脚本的 CLI 能力分别设置：`spmv_csr`/`spmv_coo` 的性能脚本不接受
-fp16，`sddmm_csr` 当前也只跑 fp32；gather、scatter、spmm 则跑 fp16 和 fp32。
+fp16，`sddmm_csr` 当前也只跑 fp32；gather、scatter 跑 fp16、fp32 和 complex64，spmm 跑 fp16 和 fp32。
+`spmv_csr` 的 `--alg auto` 就是脚本默认值，写出来只是让口径一目了然。
 其中 `spmm_csr` 的 dtype 网格参数是复数形式的 `--dtypes`；单值参数 `--dtype` 不接受
 逗号分隔列表，传入 `float16,float32` 会在 argparse 阶段直接退出。
-该命令用于验证 BI-V150 当前可运行范围，不会覆盖交付清单中已知不可用的 double/c128 变体。
+该命令覆盖 20 个交付变体里 BI-V150 能跑的 11 个（f16×2、f32×7、c32×2），不会跑已知不可用的 double/c128 变体。
 
 - `--benchmark-input tests/data`：10 个交付矩阵已经在仓库的 `tests/data` 里。跑完先确认筛选生效了：
-  `grep "delivery-only" pytest_results_iluvatar_delivery_f16_f32.log` 应当是 `matrices from .../delivery_matrices`，
+  `grep "delivery-only" pytest_results_iluvatar_delivery.log` 应当是 `matrices from .../delivery_matrices`，
   出现 `NOT applied` 就说明矩阵不全，跑的不是交付集合；
+- `--h800-reference`（不带值）：没有厂商加速比、也没有 PyTorch 加速比的行，用仓库自带的 H800 结果折算出加速比，
+  见 3.1 节。天数上 SDDMM 没有厂商基线，不加这一项 `sddmm_csr_f32_int_non_non_row` 的加速比就是 `N/A`。
+  日志里应出现 `scaled baseline: ... rescaled h800-sxm -> iluvatar-biv150`，没有就是没生效或卡型没识别出来；
+- `--results-dir` 要用没用过的新目录：`summary.json` 每次运行都会被整个覆盖；
 - 外层 `timeout -s KILL 43200`（12 小时）是整条命令的总限时，内核卡死时 Ctrl-C 送不进去，只能靠 KILL；
   `--timeout 3600` 是每个算子每个阶段的限时。该 dtype 子集在天数上的完整耗时**没有实测过**，按实际情况调整；
 - `--gpus 0`：runner 通过 `CUDA_VISIBLE_DEVICES` 选卡。CoreX 是否照常遵守这个变量**未验证**，
   多卡机器上先用 `ixsmi`（天数的设备管理工具）确认任务确实落在指定的卡上。
 
-跑完查看结果（被排除的 double/c128 变体不会有有效数据行）：
+跑完查看结果（被排除的 double/c128 变体不会有有效数据行，共 9 个）：
 
 ```bash
-python3 tools/delivery_table.py pytest_results_iluvatar_delivery_f16_f32 --markdown
+python3 tools/delivery_table.py pytest_results_iluvatar_delivery --markdown
 ```
 
 也可以通过按后端组织的入口跑，它会自动设置 `FLAGSPARSE_BACKEND=iluvatar`：
@@ -283,6 +292,62 @@ Fortran 连续布局。精度始终由 CPU SciPy 判定，厂商输出只用于�
 不要将 CUDA 兼容视为 `torch.sparse` 正确性的保证。BI-V100/CoreX 3.2.3 曾验证 CSR matmul 可用，
 但 BI-V150/CoreX 4.4 已验证 CSR SpMV 静默全零，二者不能互相外推。若其他稀疏路径的基线列为
 `N/A`，先核对最小数值结果和 `reason` 字段，再决定是否接入或禁用。
+
+### 3.1 没有厂商基线的算子：以折算后的 H800 时间作为加速比的分母
+
+CoreX 的 legacy 接口只覆盖 fp32 + int32 + `op=non` 的 SpMV/SpMM。**其余算子在 BI-V150 上没有厂商基线**，
+PyTorch 那条路也不能用（这张卡上 PyTorch 稀疏路径会静默返回全零），性能列本来是 `N/A`。
+
+SDDMM CSR 要特别说明：CoreX 没有已验证的 SDDMM 接口，而 `cupy_cusparse` 下测试脚本的 `cusparse` 列
+（`tests/test_sddmm.py::_benchmark_cusparse_sddmm`）**实际是 `torch.sparse.sampled_addmm`**，不是 CuPy，
+在 BI-V150 上不可信。所以天数运行时 `_sddmm_csr_sparse_ref_backend` 直接返回“没有基线”
+（`sddmm_csr.py`）：`cusparse_ms` 为空、`cu_status=PERF_UNAVAILABLE`、`cu_reason` 写着
+`CoreX has no verified CSR SDDMM baseline`，`status` 仍按精度判定为 PASS，加速比由下面的 H800 折算给出。
+其他后端（CUDA、带 CuPy 的 MetaX 等）不受影响。
+
+**这类行按 `modified/基线缺失方案.md` 给出加速比。** 缺的是厂商库的时间，就用同一个算例在 H800 上
+**cuSPARSE 的用时**（`cusparse_ms`）顶替：按瓶颈单元的峰值比折算到 BI-V150，**折算后的 cuSPARSE 时间就是基线，
+记为 1**；天数上 FlagSparse 的实测用时和它相比：
+
+```
+h800_scaled_ms          = T_cuSPARSE@H800 × (P_H800 / P_BI-V150)     # 带宽口径：3050 / 1150 = 2.652
+speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和折算后的 cuSPARSE 一样快；≥ 0.8 达标
+```
+
+分子是“厂商库”、分母是“FlagSparse”，和其他后端的加速比同一个方向。**但它是估算值**：BI-V150 上并没有真的跑过厂商库，
+分子是 H800 上 cuSPARSE 的时间按带宽换算出来的。汇报时要写明。
+
+只有**没有厂商加速比、也没有 PyTorch 加速比的行**才用这个替代方案；有真实基线的行（fp32 SpMV/SpMM
+的 CoreX legacy 接口）保持原来的加速比，不受影响。
+
+用法：跑天数时加 `--h800-reference`，**不带值就用仓库自带的 H800 结果**，不用再找目录。
+
+```bash
+# 第 2 节的命令已经带了 --h800-reference（卡型自动识别为 iluvatar-biv150，不用手填）；单跑某个算子时这样加
+... run_flagsparse_pytest.py --delivery-only ... \
+    --h800-reference \
+    --results-dir biv150_delivery
+```
+
+- 自带的数据在 [`conf/h800_reference.json`](../conf/h800_reference.json)（约 1 MB，一个文件），说明见
+  [H800_REFERENCE.md](H800_REFERENCE.md)：H800 ×8，提交 `47a441e`（那轮是脏工作树），17 个算子的 7801 行，
+  每行保留算例键、各 `*_ms` 时间、加速比和状态列。想换成自己的一轮 H800 结果，`--h800-reference 目录或json文件`
+  都行；重新生成用 `python3 tools/h800_reference.py <H800 结果目录>`。
+- **有一处覆盖不到**：这轮 H800 数据里 `spmm_bsr`、`spmm_bell` 没有 cuSPARSE 时间（当时基线只有 CuPy，没有
+  BSR / Blocked-ELL 的库），所以这两个算子没有折算基线，行保持 `N/A`；`spmm_csc` 只有 240/720 行有。
+- 每行的 `performance.csv` 会多 5 列：`h800_vendor_ms`（H800 上 cuSPARSE 的用时）、`h800_scaled_ms`（折算后的时间，
+  即基线 1）、`h800_scaled_fs_ms`（天数上 FlagSparse 的实测）、`speedup_vs_h800_scaled`（加速比）、`h800_scaled_card`（用的卡）。
+  `summary.json` / `summary.csv` 里交付变体的 speedup 就是这个数，`delivery_table.py` 也照常显示。
+- 没能填上的行保持 `N/A`，原因记在 `performance_result` 的 `scaled_baseline.skipped` 里：H800 里没有这个算例、
+  H800 那行没通过、H800 那行没有 cuSPARSE 时间，或者 H800 上 cuSPARSE 的结果和 FlagSparse 对不上（`cu_status` 是 FAIL）。
+  **H800 上 FlagSparse 自己的用时不会顶替**：没有厂商库时间就是没有基线。
+- 两道防呆：H800 目录不是 H800 上跑的 → 警告；手填的 `--vendor-card` 和检测结果不符 → 警告，但以手填为准。
+
+只想要 PASS/FAIL 判定和余量，用 `tools/baseline_bound.py`（现在也多了 `T' scaled ms` 和 `speedup` 两列）：
+
+```bash
+python3 tools/baseline_bound.py --vendor biv150_delivery --ops sddmm_csr --markdown   # 不写参考 = 用自带的 H800 文件
+```
 
 ---
 
@@ -416,7 +481,7 @@ segbin 内核里。`legacy_rowpar` / `legacy_bucket_vector` 用的
 | 设备名（torch 侧）                            | **`'Iluvatar BI-V100'`** —— 命中探测的 `iluvatar` 和 `bi-v` 两个匹配串                                                                                                                                                    |
 | **`warp_size`**                       | **属性不存在**（`getattr` 返回默认值）—— 见 4.3 节，这是目前最需要查实的一项                                                                                                                                                  |
 | MP count                                      | 16                                                                                                                                                                                                                                      |
-| `torch.sparse` CSR matmul                   | **可用**（有 beta 警告，但能算出结果），所以 `FLAGSPARSE_ILUVATAR_VENDOR=torch` 这个基线是站得住的                                                                                                                              |
+| `torch.sparse` CSR matmul                   | **可用**（有 beta 警告，但能算出结果），这是 BI-V100 / CoreX 3.2.3 的结果，**不能外推到 BI-V150**：那边 CSR SpMV/SpMM 会静默返回全零（第 3 节），BI-V150 的基线用 `cupy_cusparse`                                                                                                                              |
 | 3.2.3 镜像里的 torch / triton                 | `torch 2.1.0+corex.3.2.3`（模块属性又是裸的 `2.1.0`）、**`triton 2.3.1`** —— 比 FlagTree 镜像的 Triton 3.6 老得多，这个镜像只适合做指纹，不适合跑算子                                                                     |
 | 宿主机驱动 / IX-ML                            | **3.2.3 / 3.2.3**；呈现的 CUDA 兼容级别是 **10.2**                                                                                                                                                                          |
 | 宿主机 CoreX 安装                             | `/usr/local/corex` → `corex-3.2.3`，另有 3.1.1 / 4.4.0 / 4.5.0 未启用                                                                                                                                                              |
@@ -459,7 +524,7 @@ torch.cuda.is_available() -> False        # 但 device_count() -> 8
 | **`warp_size` 的真实值**（仅 BI-V100；BI-V150 已实测为 64，见 4.0 节）                                                    | **属性不存在，代码会静默取 32**。`_common.py` 的 `_get_device_backend_info()` 里 `default_warp = 64 if backend == "hip" else 32`，天数走 `cuda` 分支；`spmv_csr.py`、`spmm_csr.py`（三处）、`spmm_csr_opt_alg2.py` 各自也 `getattr(props, "warp_size", 32)`。**若实际是 64，整套启动几何都偏，而且不报错、只掉性能**（MetaX C550 就是 64）。查法：`ixsmi -q` 里找 warp/core 相关字段，或在 Triton 3.x 下 `triton.runtime.driver.active.get_current_target()` |
 | 自动探测能否命中（元数据里的`+corex` 应当命中，未在真机跑过 `_backend_name()`） | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | FlagTree 的`iluvatar` 后端能否编译执行最小 Triton 内核                            | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `torch.sparse` CSR/COO matmul 能否作为基线                                        | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `torch.sparse` CSR/COO matmul 能否作为基线                                        |  **不能**：BI-V150 上 CSR SpMV/SpMM 静默返回全零（`ILUVATAR_DEBUG.md`）；基线改用 `cupy_cusparse` |
 | `CUDA_VISIBLE_DEVICES` 选卡（八卡机，务必确认落在哪张）                           | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | 20 变体交付结果                                                                     | 无                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
