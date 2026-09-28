@@ -12,19 +12,27 @@ bound on the vendor's FlagSparse time::
 
     T' <= T * (P_ref / P_vendor) / ratio
 
-``T`` is the same operator's FlagSparse time on the reference card (H800 by
-default), ``P`` the peak of the bottleneck unit: memory bandwidth, CUDA-core
-FLOP/s for the dtype, or Tensor-core FLOP/s for the dtype. Example: 10 ms on an
-H800 at 3050 GB/s (measured), vendor card at 1525 GB/s -> expected 20 ms, bound
-20 / 0.8 = 25 ms.
+``T`` is the VENDOR LIBRARY's time (cuSPARSE: the ``cusparse_ms`` / ``vendor_ms`` /
+``*sparse_ms`` column) for the same case on the reference card (H800 by default) --
+the baseline the missing one is standing in for. ``P`` is the peak of the bottleneck
+unit: memory bandwidth, CUDA-core FLOP/s for the dtype, or Tensor-core FLOP/s for the
+dtype. Example: cuSPARSE takes 10 ms on an H800 at 3050 GB/s (measured), the vendor
+card has 1525 GB/s -> its library would take 20 ms (``T' scaled``), bound 20 / 0.8 =
+25 ms. The speedup is that scaled library time divided by FlagSparse's own time on
+the vendor card; 1.0 means FlagSparse is exactly as fast as the scaled library.
+``--ref-column`` names a different reference column (e.g. ``triton_ms`` to scale
+FlagSparse's own H800 time instead).
 
 Inputs
     * the reference run: a results directory (``<dir>/<op>/performance.csv``) or
       one ``performance.csv``. Only rows whose ``status`` is PASS are used -- the
-      reference must itself be a verified result;
+      reference must itself be a verified result -- and whose vendor-library result
+      matched FlagSparse (no FAIL in ``cu_status`` / ``vendor_status``);
     * the reference peaks: built in for ``--reference h800-sxm`` (default) and
       ``h800-pcie``, or the ``reference`` side of a ``--peaks`` JSON;
-    * the vendor peaks: ``--vendor-card`` (built-in measured bandwidth for C550,
+    * the vendor peaks: detected from the vendor run's ``summary.json`` when it has
+      one (the runner records the backend and device name), or ``--vendor-card``
+      (built-in measured bandwidth for C550,
       S5000, BW1000, BI-V150, Ascend 910B/910C), ``--vendor-bw-gbs`` (either is enough for
       the default memory-bound unit), or the ``vendor`` side of ``--peaks``;
     * optionally the vendor run (``--vendor``, same layout as the reference). Each
@@ -46,7 +54,12 @@ nothing measured it -- and is labelled ``assumed`` in the output.
 Exit status is 0 when every row has a bound (and, with ``--vendor``, passes or
 has its own baseline), 1 otherwise.
 
+The reference may be a results directory, one performance.csv, or the bundled
+``conf/h800_reference.json`` (see ``tools/h800_reference.py``); when it is left out the
+bundled file is used.
+
 Usage:
+    python3 tools/baseline_bound.py --vendor vendor_results/ --vendor-card dcu-bw1000
     python3 tools/baseline_bound.py h800_results/ --vendor-bw-gbs 1600
     python3 tools/baseline_bound.py h800_results/ --vendor-card dcu-bw1000 \
         --vendor vendor_results/ [--markdown] [--csv out.csv]
@@ -61,6 +74,11 @@ import csv
 import json
 import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:  # `python3 tools/baseline_bound.py` puts tools/ first
+    sys.path.insert(0, str(_ROOT))
+from tools import h800_reference as _h800_reference  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "run_flagsparse_pytest.py"
@@ -105,6 +123,30 @@ VENDOR_BANDWIDTH_GBS = {
     # Measured on an Atlas 800T A3 (910C, two dies per package). Not the tested chip.
     "ascend-910c": 3070.0,
 }
+
+# Device tokens -> the VENDOR_BANDWIDTH_GBS entry, for auto-detection from a results
+# directory's summary.json (its env records the backend and the device name). Checked
+# against the device name first, then the backend, so a box with two cards of the same
+# vendor is still told apart.
+_DEVICE_TOKEN_CARDS = (
+    ("bi-v150", "iluvatar-biv150"),
+    ("biv150", "iluvatar-biv150"),
+    ("c550", "maca-c550"),
+    ("s5000", "musa-s5000"),
+    ("bw1000", "dcu-bw1000"),
+    ("910b", "ascend-910b"),
+    ("910c", "ascend-910c"),
+)
+_BACKEND_CARDS = {
+    "iluvatar": "iluvatar-biv150",
+    "metax": "maca-c550",
+    "mthreads": "musa-s5000",
+    "ascend": "ascend-910b",
+}
+# Reference peaks are a card's; a reference run from a different card silently
+# rescales every bound, so the detected name is checked against these tokens.
+_REFERENCE_TOKENS = {"h800-sxm": ("h800",), "h800-pcie": ("h800",)}
+
 
 # A column holding a vendor sparse library's time: cusparse_ms, vendor_ms, and the
 # SpSV/SpSM spellings cuSPARSE_ms, hipSPARSE_ms, CuPy/cuSPARSE_ms. PyTorch is not
@@ -195,16 +237,21 @@ def _time_column(fields: list[str]) -> str | None:
     return None
 
 
-def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+def _read_csv(path) -> tuple[list[str], list[dict[str, str]]]:
+    if isinstance(path, _h800_reference.ReferenceTable):
+        return path.read()
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         return list(reader.fieldnames or []), list(reader)
 
 
-def _collect(target: str) -> dict[str, Path]:
-    """Map operator -> performance.csv for a results directory or a single CSV."""
+def _collect(target: str) -> dict:
+    """Map operator -> performance.csv (or bundled table) for a results directory, a
+    single CSV, or the bundled ``conf/h800_reference.json``."""
 
     path = Path(target)
+    if _h800_reference.is_reference_file(path):
+        return _h800_reference.tables(path)
     if path.is_file():
         return {path.parent.name or path.stem: path}
     if path.is_dir():
@@ -215,6 +262,48 @@ def _collect(target: str) -> dict[str, Path]:
             return found
         raise SystemExit(f"no */performance.csv under {path}")
     raise SystemExit(f"no such file or directory: {path}")
+
+
+def _run_env(target: str) -> tuple[str, str] | None:
+    """(backend, device name) from a results directory's summary.json, else None.
+
+    A single CSV or a directory the runner did not write has no env; detection is
+    skipped rather than guessed.
+    """
+    path = Path(target)
+    if _h800_reference.is_reference_file(path):
+        ref = _h800_reference.reference_info(path)
+        device = str(ref.get("device") or "").strip()
+        return ("nvidia", device) if device else None
+    if not path.is_dir():
+        return None
+    for name in ("summary.json", "summary_split.json"):
+        candidate = path / name
+        if not candidate.is_file():
+            continue
+        try:
+            env = json.loads(candidate.read_text(encoding="utf-8")).get("env") or {}
+        except (OSError, ValueError):
+            return None
+        gems = env.get("flag_gems") if isinstance(env.get("flag_gems"), dict) else {}
+        torch_env = env.get("torch") if isinstance(env.get("torch"), dict) else {}
+        backend = str(gems.get("vendor") or gems.get("device") or "").strip().lower()
+        device = str(torch_env.get("device_name") or "").strip()
+        if backend or device:
+            return backend, device
+    return None
+
+
+def _detect_card(env: tuple[str, str] | None) -> str | None:
+    """The VENDOR_BANDWIDTH_GBS key this run's hardware matches, if any."""
+    if env is None:
+        return None
+    backend, device = env
+    lowered = device.lower()
+    for token, card in _DEVICE_TOKEN_CARDS:
+        if token in lowered:
+            return card
+    return _BACKEND_CARDS.get(backend)
 
 
 def _num(value: object) -> float | None:
@@ -289,6 +378,29 @@ def _passed(row: dict[str, str]) -> bool:
     return status in _PASS
 
 
+def _baseline_ok(row: dict[str, str]) -> bool:
+    """False when the row's own vendor-library check failed (its time is not a baseline)."""
+    for key, value in row.items():
+        if str(key).lower() in ("cu_status", "vendor_status", "cusparse_status"):
+            if any(bad in str(value).upper() for bad in ("FAIL", "ERROR")):
+                return False
+    return True
+
+
+def _reference_time(
+    row: dict[str, str], ref_col: str | None
+) -> tuple[float | None, str]:
+    """The reference row's baseline time and, if it has none, why.
+
+    Default: the vendor library's time on that row. ``--ref-column`` names another.
+    """
+    if ref_col:
+        return _num(row.get(ref_col)), f"no usable reference {ref_col}"
+    if not _baseline_ok(row):
+        return None, "the reference's vendor-library result did not match FlagSparse"
+    return _baseline_ms(row), "the reference row has no vendor-library (cuSPARSE) time"
+
+
 def _baseline_ms(row: dict[str, str]) -> float | None:
     for key, value in row.items():
         if _is_baseline_column(key):
@@ -296,6 +408,26 @@ def _baseline_ms(row: dict[str, str]) -> float | None:
             if number is not None and number > 0:
                 return number
     return None
+
+
+def _check_reference_run(args) -> None:
+    """Warn when the reference run is not the card whose peaks are being used."""
+    if args.peaks:
+        return  # explicit peaks: the caller stated both sides
+    env = _run_env(args.reference_run)
+    if env is None:
+        return
+    backend, device = env
+    tokens = _REFERENCE_TOKENS.get(args.reference, ())
+    if any(token in device.lower() for token in tokens):
+        return
+    print(
+        f"WARNING: --reference {args.reference} peaks are being applied to a reference "
+        f"run recorded on {device or backend!r}. T is that card's time, so every bound "
+        "is scaled by the wrong ratio. Re-run the reference on the card, or pass "
+        "--peaks with its measured peaks.",
+        file=sys.stderr,
+    )
 
 
 def _load_peaks(args) -> dict:
@@ -310,9 +442,22 @@ def _load_peaks(args) -> dict:
         reference = json.loads(json.dumps(REFERENCE_PEAKS[args.reference]))
     vendor = peaks.get("vendor")
     vendor = dict(vendor) if isinstance(vendor, dict) else {}
-    if args.vendor_card:
-        vendor["name"] = args.vendor_card
-        vendor["mem_bw_gbs"] = VENDOR_BANDWIDTH_GBS[args.vendor_card]
+    detected = _detect_card(_run_env(args.vendor)) if args.vendor else None
+    card = args.vendor_card or detected
+    if detected and args.vendor_card and args.vendor_card != detected:
+        print(
+            f"WARNING: --vendor-card {args.vendor_card} overrides {detected}, which the "
+            "vendor run's summary.json reports. A wrong peak moves every bound.",
+            file=sys.stderr,
+        )
+    elif detected and not args.vendor_card:
+        print(
+            f"note: vendor card {detected} detected from the vendor run's summary.json",
+            file=sys.stderr,
+        )
+    if card:
+        vendor["name"] = card
+        vendor["mem_bw_gbs"] = VENDOR_BANDWIDTH_GBS[card]
     if args.vendor_bw_gbs is not None:
         vendor["mem_bw_gbs"] = args.vendor_bw_gbs
     if _num(vendor.get("mem_bw_gbs")) is None and not any(
@@ -362,8 +507,10 @@ def _result(op: str, key: str, **fields) -> dict:
         "resource": "",
         "source": "",
         "t_ref_ms": None,
+        "expected_ms": None,
         "bound_ms": None,
         "t_vendor_ms": None,
+        "speedup": None,
         "margin": None,
         "verdict": "",
         "note": "",
@@ -387,17 +534,17 @@ def _pick(fields: list[str], wanted: str | None, side: str, path: Path) -> str:
     return column
 
 
-def _bound(out: dict, row: dict[str, str], ref_col: str, args, peaks) -> bool:
+def _bound(out: dict, row: dict[str, str], ref_col: str | None, args, peaks) -> bool:
     """Fill ``out`` with the reference time and its bound; False when there is none."""
 
-    t_ref = _num(row.get(ref_col))
+    t_ref, why = _reference_time(row, ref_col)
     out["t_ref_ms"] = t_ref
     if not _passed(row):
         out["verdict"] = "N/A"
         out["note"] = f"reference row is not PASS ({row.get('status') or 'no status'})"
         return False
     if t_ref is None or t_ref <= 0:
-        out["verdict"], out["note"] = "N/A", f"no usable reference {ref_col}"
+        out["verdict"], out["note"] = "N/A", why
         return False
     try:
         p_ref = _peak(peaks["reference"], out["resource"], out["dtype"])
@@ -405,13 +552,145 @@ def _bound(out: dict, row: dict[str, str], ref_col: str, args, peaks) -> bool:
     except KeyError as exc:
         out["verdict"], out["note"] = "N/A", f"peak missing: {exc.args[0]}"
         return False
-    out["bound_ms"] = t_ref * (p_ref / p_v) / args.ratio
+    # The H800 time rescaled to the vendor card: what the vendor should take if it
+    # used its bottleneck unit as well as the H800 did. `--ratio` only sets the
+    # pass line around it.
+    out["expected_ms"] = t_ref * (p_ref / p_v)
+    out["bound_ms"] = out["expected_ms"] / args.ratio
     return True
+
+
+# Columns scaled_baseline_rows() adds to a performance CSV. The runner's
+# PERFORMANCE_SPEEDUP_SCHEMAS reads the last three as (speedup, baseline, latency), so
+# they have to exist under exactly these names.
+SCALED_COLUMNS = (
+    "h800_vendor_ms",
+    "h800_scaled_ms",
+    "h800_scaled_fs_ms",
+    "speedup_vs_h800_scaled",
+    "h800_scaled_card",
+)
+
+
+def _usable(row: dict[str, str]) -> bool:
+    """The runner's rule: no status column, or a passing one."""
+    status = str(row.get("status") or row.get("matrix_status") or "").strip().upper()
+    return not status or status in _PASS
+
+
+def scaled_baseline_rows(
+    op: str,
+    rows: list[dict[str, str]],
+    fields: list[str],
+    reference_run: str,
+    card: str,
+    *,
+    reference: str = "h800-sxm",
+    needs_baseline=lambda row: True,
+) -> tuple[list[dict[str, str]], dict]:
+    """Fill a speedup for rows that have no vendor or PyTorch baseline.
+
+    For a row ``needs_baseline`` accepts, the same case's VENDOR-LIBRARY time (cuSPARSE)
+    on the reference card (H800) is rescaled by the bottleneck-unit peak ratio to the
+    vendor card; THAT time stands in for the missing baseline (speedup 1.0), and the
+    row's own FlagSparse time is compared with it::
+
+        h800_scaled_ms          = T_cusparse_h800 * (P_h800 / P_vendor)
+        speedup_vs_h800_scaled  = h800_scaled_ms / T_flagsparse_vendor
+
+    Returns ``(rows, info)``: ``rows`` are copies with ``SCALED_COLUMNS`` added (blank
+    where nothing could be filled), ``info`` counts what happened and why not.
+    """
+    info = {
+        "op": op,
+        "reference": str(reference_run),
+        "reference_card": reference,
+        "card": card,
+        "rows": len(rows),
+        "filled": 0,
+        "eligible": 0,
+        "skipped": {},
+    }
+
+    def skip(reason: str, count: int = 1) -> None:
+        info["skipped"][reason] = info["skipped"].get(reason, 0) + count
+
+    out = [dict(row) for row in rows]
+    for row in out:
+        for column in SCALED_COLUMNS:
+            row.setdefault(column, "")
+    try:
+        ref_path = _collect(reference_run).get(op)
+    except SystemExit as exc:
+        info["error"] = str(exc)
+        return out, info
+    if ref_path is None:
+        info["error"] = f"no {op}/performance.csv in the reference run"
+        return out, info
+    ref_fields, ref_rows = _read_csv(ref_path)
+    own_col = _time_column(fields)
+    if own_col is None:
+        info["error"] = "no FlagSparse time column recognised"
+        return out, info
+    extra = [c for c in _OPTIONAL_KEYS if c in ref_fields and c in fields]
+    ref_index: dict[tuple[str, ...], dict[str, str]] = {}
+    ambiguous: set[tuple[str, ...]] = set()
+    for row in ref_rows:
+        key = _row_key(row, extra)
+        if key in ref_index:
+            ambiguous.add(key)
+        ref_index[key] = row
+    peaks = {
+        "reference": REFERENCE_PEAKS[reference],
+        "vendor": {"mem_bw_gbs": VENDOR_BANDWIDTH_GBS[card]},
+    }
+    for row in out:
+        if not needs_baseline(row):
+            continue
+        info["eligible"] += 1
+        t_own = _num(row.get(own_col))
+        if not _usable(row) or t_own is None or t_own <= 0:
+            skip("this row has no usable FlagSparse time")
+            continue
+        key = _row_key(row, extra)
+        if key in ambiguous:
+            skip("the reference has several rows for this case")
+            continue
+        ref = ref_index.get(key)
+        if ref is None:
+            skip("no such case in the reference run")
+            continue
+        if not _usable(ref):
+            skip("the reference row did not pass")
+            continue
+        t_ref, why = _reference_time(ref, None)
+        if t_ref is None or t_ref <= 0:
+            skip(why)
+            continue
+        resource, _ = _resource_for(ref, "auto", "mem")
+        try:
+            p_ref = _peak(peaks["reference"], resource, _dtype(ref))
+            p_v = _peak(peaks["vendor"], resource, _dtype(row))
+        except KeyError as exc:
+            skip(f"peak missing: {exc.args[0]}")
+            continue
+        scaled = t_ref * (p_ref / p_v)
+        row["h800_vendor_ms"] = repr(t_ref)
+        row["h800_scaled_ms"] = repr(scaled)
+        row["h800_scaled_fs_ms"] = repr(t_own)
+        row["speedup_vs_h800_scaled"] = repr(scaled / t_own)
+        row["h800_scaled_card"] = card
+        info["filled"] += 1
+    return out, info
 
 
 def _evaluate_op(op: str, ref_path: Path, vendor_path: Path | None, args, peaks):
     ref_fields, ref_rows = _read_csv(ref_path)
-    ref_col = _pick(ref_fields, args.ref_column, "reference", ref_path)
+    ref_col = (
+        _pick(ref_fields, args.ref_column, "reference", ref_path)
+        if args.ref_column
+        else None
+    )
     vendor_fields, vendor_rows = _read_csv(vendor_path) if vendor_path else ([], [])
     # A header-only CSV (a benchmark that recorded nothing) would otherwise add no
     # rows and vanish from the table.
@@ -420,7 +699,12 @@ def _evaluate_op(op: str, ref_path: Path, vendor_path: Path | None, args, peaks)
         return [_result(op, "*", verdict="EMPTY", note=f"{empty} has no rows")]
     if vendor_path is None:
         results = []
-        for key, row in _index_rows(ref_rows, args.extra_key, str(ref_path)).items():
+        # No vendor run to intersect columns with: use the reference's own case axes
+        # (a k / layout / alg sweep would otherwise collapse into duplicate keys).
+        extra = list(args.extra_key) + [
+            c for c in _OPTIONAL_KEYS if c in ref_fields and c not in args.extra_key
+        ]
+        for key, row in _index_rows(ref_rows, extra, str(ref_path)).items():
             resource, source = _resource_for(row, args.resource, args.default_resource)
             out = _result(
                 op, _label(key), dtype=_dtype(row), resource=resource, source=source
@@ -472,6 +756,8 @@ def _evaluate_op(op: str, ref_path: Path, vendor_path: Path | None, args, peaks)
             continue
         out["t_vendor_ms"] = t_v
         out["margin"] = out["bound_ms"] / t_v
+        # 1.0 = exactly the rescaled H800 time; >= --ratio passes.
+        out["speedup"] = out["expected_ms"] / t_v
         out["verdict"] = "PASS" if t_v <= out["bound_ms"] else "FAIL"
     return results
 
@@ -510,8 +796,10 @@ _HEADERS = (
     ("resource", "unit"),
     ("source", "unit from"),
     ("t_ref_ms", "T_ref ms"),
+    ("expected_ms", "T' scaled ms"),
     ("bound_ms", "T' max ms"),
     ("t_vendor_ms", "T' ms"),
+    ("speedup", "speedup"),
     ("margin", "margin"),
     ("verdict", "verdict"),
     ("note", "note"),
@@ -525,7 +813,9 @@ def _cell(row: dict, name: str) -> str:
 
 def _render(results: list[dict], markdown: bool, with_vendor: bool) -> str:
     columns = [
-        (n, h) for n, h in _HEADERS if with_vendor or n not in ("t_vendor_ms", "margin")
+        (n, h)
+        for n, h in _HEADERS
+        if with_vendor or n not in ("t_vendor_ms", "margin", "speedup")
     ]
     table = [[h for _, h in columns]]
     table += [[_cell(r, n) for n, _ in columns] for r in results]
@@ -550,7 +840,12 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "reference_run", nargs="?", help="H800 results dir or performance.csv"
+        "reference_run",
+        nargs="?",
+        help=(
+            "H800 results dir, performance.csv or reference JSON "
+            f"(default: the bundled {_h800_reference.DEFAULT_PATH.relative_to(_ROOT)})"
+        ),
     )
     parser.add_argument(
         "--reference",
@@ -575,7 +870,13 @@ def main(argv: list[str] | None = None) -> int:
         help="also judge vendor rows that have their own library baseline",
     )
     parser.add_argument("--ops", help="comma-separated operators to evaluate")
-    parser.add_argument("--ref-column", help="reference time column (default: auto)")
+    parser.add_argument(
+        "--ref-column",
+        help=(
+            "reference time column. Default: the reference row's vendor-library "
+            "(cuSPARSE) time; name e.g. triton_ms to scale FlagSparse's own H800 time"
+        ),
+    )
     parser.add_argument("--vendor-column", help="vendor time column (default: auto)")
     parser.add_argument("--ratio", type=float, default=0.8)
     parser.add_argument(
@@ -605,10 +906,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(_template(), indent=2, ensure_ascii=False))
         return 0
     if not args.reference_run:
-        parser.error("the reference run is required (or use --print-template)")
+        if not _h800_reference.DEFAULT_PATH.is_file():
+            parser.error("the reference run is required (or use --print-template)")
+        args.reference_run = str(_h800_reference.DEFAULT_PATH)
     if not 0 < args.ratio <= 1:
         parser.error("--ratio must be in (0, 1]")
 
+    _check_reference_run(args)
     peaks = _load_peaks(args)
     results = _evaluate(args, peaks)
     print(_render(results, args.markdown, bool(args.vendor)))
