@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
     [1, 819, 0, 17, 512, 0, 3],
 ])
 def test_nnz_partition_ownership_and_live_inputs(dtype, index_dtype, lengths):
-    torch.manual_seed(23)
+    _common._ACCEL.manual_seed(23)
     counts = torch.tensor(lengths, dtype=torch.int64)
     rp_cpu = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
     nnz = int(rp_cpu[-1])

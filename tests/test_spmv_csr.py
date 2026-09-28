@@ -302,7 +302,7 @@ def main(argv=None):
     try:
         for dtype_name in dtypes:
             dtype = getattr(torch, dtype_name)
-            torch.manual_seed(2026)
+            common._ACCEL.manual_seed(2026)
 
             def inputs():
                 if args.synthetic:
