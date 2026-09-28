@@ -438,7 +438,10 @@ def test_bound_only_mode_keeps_a_case_sweep_apart(tmp_path):
 
 
 # --- the rescaled H800 time as a speedup baseline (what the delivery report carries) ---
-from tools.baseline_bound import SCALED_COLUMNS, scaled_baseline_rows  # noqa: E402
+from tools import baseline_bound as _bb  # noqa: E402
+
+SCALED_COLUMNS = _bb.SCALED_COLUMNS
+scaled_baseline_rows = _bb.scaled_baseline_rows
 
 CARD_RATIO = 3050 / 1150  # H800 bandwidth / BI-V150 bandwidth
 
