@@ -385,6 +385,74 @@ ps aux | grep -c "[c]lang\|[l]lc\|[t]riton"
 说明这次不是参考的问题，误差要从 FlagSparse 的输出查起（用 CPU 上的 SciPy 结果逐元素对比，
 不要用 `torch.sparse`）。
 
+#### 6.2.1 SDDMM 在天数上的性能：先扫启动配置，再谈内核
+
+修好参考之后，按 `speedup_vs_h800_scaled` 预览（用 2026-09-28 那轮 BI-V150 的真实时间，假设状态 PASS），
+SDDMM f32 几何均值约 0.40，任何 k 下都没到 0.8，**而且差距集中在两个地方**：
+
+- **cfd2、filter3D（每行约 25 个非零）**：速率只有 115～200 GB/s，比 H800 上的 FlagSparse 慢 17～44 倍，
+  其余矩阵只慢 5.5～7.8 倍。这两个恰好是唯一走 `_resolve_sddmm_launch_config` 宽分支
+  （`BLOCK_P=512, BLOCK_K=32, num_warps=4`，平均行长 ≥ 16）的矩阵，而这套配置是在 sm_120 上调的。
+  BI-V150 的 warp 是 64，同样的 tile 每线程寄存器压力和 sm_120 不同。这是对着“启动配置优先”清单
+  （grid、tile、num_warps）的第一嫌疑，**是假设，没有在天数上验证**。
+- **其余矩阵**：稳定在 0.3～0.6。H800 上的“等效速率”是 2000～8700 GB/s（超过物理峰值 3050，靠 L2 复用），
+  BI-V150 在 k=256 时约 1150～1280 GB/s（约等于物理峰值，没有复用）。这部分配置调不出来，要减少访存：
+  内核现在对每个非零都重新读一遍 `x[row, :]`，同一行 15 个非零就读 15 遍。
+
+上机先用 `tools/sddmm_sweep.py` 拿数据，不要先改内核。它遍历 `(BLOCK_P, BLOCK_K, num_warps)`，
+**每个配置都和 CPU 上的 SciPy 结果对比**（所以也顺带回答“天数上 FlagSparse SDDMM 到底对不对”）：
+
+```bash
+# 先小范围（几分钟）：确认能跑、结果对
+FLAGSPARSE_BACKEND=iluvatar python3 tools/sddmm_sweep.py \
+  --matrices cfd2,roadNet-TX --k 32,256 \
+  --block-p 32,64,128,512 --block-k 32 --warps 4,8 --csv sweep_small.csv
+
+# 再完整网格（交付的 10 个矩阵 × k=32/64/128/256，较久）
+FLAGSPARSE_BACKEND=iluvatar python3 tools/sddmm_sweep.py --csv sweep_full.csv
+```
+
+怎么读结果：
+1. 末尾出现 `FAIL`：有配置和 CPU 不一致，**先查正确性**，不要拿它当性能数据。
+2. cfd2 / filter3D 换成窄配置（如 `64/32/8`）后明显变快 → 上面的第一嫌疑成立，把“按平均行长分档的最优配置”
+   写成 BI-V150 专用分支（参照 `_MACA_SPMM_COO_COMPLEX_BLOCK_NNZ` 的做法，按 `_is_iluvatar_runtime()` 判断）。
+3. 最优配置对其余矩阵提升不大 → 需要改内核（同一行只读一次 `x`）。此时把 `sweep_full.csv` 给我。
+
+在 5090 上这个脚本的结果是默认配置离最优只差 1.07x（配置就是在这张卡上调的），
+所以 BI-V150 上的差距是这张卡特有的，不是脚本的问题。
+
+**结果（2026-09-28，天数实机扫描）：第一嫌疑成立，是启动配置。** 10 个交付矩阵 × K={32,64,128,256} 的完整扫描里，
+`64/16/4`（`BLOCK_P=64, BLOCK_K=16, num_warps=4`）离逐例最优在 1% 以内，几何均值比 NVIDIA 默认配置快 2.36 倍；
+CoreX 上 512 宽的长行 tile 明显更慢。已写进 `_resolve_sddmm_launch_config`：`_is_iluvatar_runtime()` 且
+fp32 时返回 `(64, 16, 4)`，fp64 和其他后端不变（`tests/ci/test_sddmm_sweep.py` 覆盖）。
+
+粗算：原来折算后的几何均值约 0.40，乘 2.36 约 0.94；**这只是估算**，两轮的折算基线是同一份，但 2.36 倍是
+扫描里的直测倍数，不等于 runner 里每一行都涨 2.36 倍。
+
+**runner 实测：只换配置还不到 0.8。** 原因是 runner 计时的那一次 `flagsparse_sddmm_csr` 调用每次迭代都带着
+`prepare + 结构校验 + row_ids`（`tests/test_sddmm.py` 的 Scenario B：传原始 CSR、`validate=True`），
+不只是内核。通用校验是 8 个左右的小 torch 内核加 `.item()` 主机同步，与 nnz、k 无关，启动延迟高的卡上占比很大。
+于是又加了一个**天数专用的融合校验内核**（`_sddmm_csr_validation_kernel`）：一次启动、一次 `.item()` 检查
+indptr[0]、indptr[-1]、单调性和列号范围，**只对合法输入加速**——只要有任何一项不合法，就落回原来的逐项检查，
+抛出原来的具体异常。`tests/ci/test_sddmm_iluvatar_validation.py` 覆盖合法输入、8 类违规、异常类型不变
+（需要加速器，CPU 上的 CI 跳过，天数和 CUDA 机器上会真跑）。
+
+**最终实测：SDDMM 加速比 1.023（折算 H800 基线口径，≥ 0.8 达标）。** 注意这是**估算值**：分母是 H800 上
+cuSPARSE 的时间按带宽折算，不是 BI-V150 上的厂商实测，汇报时要写明。
+
+### 6.2.2 `--breakdown`：拆开 runner 的计时窗口
+
+以后再遇到“配置调过了还不达标”，先看时间花在哪：
+
+```bash
+FLAGSPARSE_BACKEND=iluvatar python3 tools/sddmm_sweep.py --breakdown --k 32,256
+```
+
+每个（矩阵，k）一行：`total`（runner 实际计时的那次调用）、`prepare`、`validate`、`rowids`、`kernel`，
+以及“固定开销占比”（total 里不是内核的部分）、现在的折算加速比 `now`、开销降到 0 的上限 `ceiling`。
+`ceiling` 远高于 `now` 说明该去减开销，两者接近说明该去优化内核。（在 5090 上，k=32 的矩阵固定开销能占
+total 的 80%，k=256 只占 9%～32%，所以小 k 最吃 prepare。）
+
 ### 6.3 交付跑未做
 
 ### 6.4 厂商缺陷未提交

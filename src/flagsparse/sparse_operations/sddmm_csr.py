@@ -454,7 +454,15 @@ def _resolve_sddmm_launch_config(k, mean_row_len=None, value_dtype=None):
     just pay for its masked tail -- and on the value dtype: fp64 doubles the
     register footprint of the [BLOCK_P, BLOCK_K] tiles, and a wide block then
     *regresses* by up to 28%, so fp64 always takes the narrow config.
+
+    BI-V150/CoreX is an exception to the NVIDIA profile. A complete 10-matrix,
+    K={32,64,128,256} sweep found 64/16/4 within 1% of the per-case optimum and
+    2.36x faster geometrically than the NVIDIA defaults. In particular, CoreX
+    makes the 512-wide long-row tile markedly slower.
     """
+    if _is_iluvatar_runtime() and value_dtype == torch.float32:
+        return 64, 16, 4
+
     block_k = 32 if k >= 32 else max(1, triton.next_power_of_2(int(k)))
     if (
         value_dtype != torch.float64
@@ -463,6 +471,51 @@ def _resolve_sddmm_launch_config(k, mean_row_len=None, value_dtype=None):
     ):
         return 512, block_k, 4
     return 64, block_k, 8
+
+
+@triton.jit
+def _sddmm_csr_validation_kernel(
+    indices_ptr,
+    indptr_ptr,
+    block_flags_ptr,
+    nnz,
+    n_rows,
+    n_cols,
+    limit,
+    BLOCK: tl.constexpr,
+):
+    """Mark blocks containing a CSR structural violation."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < limit
+    ptr_mask = mask & (offs <= n_rows)
+    ptr = tl.load(indptr_ptr + offs, mask=ptr_mask, other=0)
+    next_ptr = tl.load(indptr_ptr + offs + 1, mask=mask & (offs < n_rows), other=0)
+    cols = tl.load(indices_ptr + offs, mask=mask & (offs < nnz), other=0)
+
+    bad = ((offs == 0) & (ptr != 0)) | ((offs == n_rows) & (ptr != nnz))
+    bad |= (offs < n_rows) & (ptr > next_ptr)
+    bad |= (offs < nnz) & ((cols < 0) | (cols >= n_cols))
+    tl.store(block_flags_ptr + pid, tl.sum(bad.to(tl.int32), axis=0))
+
+
+def _iluvatar_sddmm_csr_pattern_is_valid(indices, indptr, n_rows, n_cols, nnz):
+    """Fast valid-input check; detailed generic checks handle error reporting."""
+    limit = max(nnz, n_rows + 1)
+    blocks = triton.cdiv(limit, 256)
+    flags = torch.empty(blocks, dtype=torch.int32, device=indices.device)
+    _sddmm_csr_validation_kernel[(blocks,)](
+        indices,
+        indptr,
+        flags,
+        nnz,
+        n_rows,
+        n_cols,
+        limit,
+        BLOCK=256,
+        num_warps=4,
+    )
+    return not bool(torch.any(flags != 0).item())
 
 
 def _prepare_sddmm_csr_pattern(indices, indptr, shape, validate=True):
@@ -497,6 +550,10 @@ def _prepare_sddmm_csr_pattern(indices, indptr, shape, validate=True):
     # the only thing that removes the cost -- hence ``validate`` on the public entry
     # points. cuSPARSE performs no equivalent input validation.
     if not validate:
+        return indices, indptr64, (n_rows, n_cols)
+    if _is_iluvatar_runtime() and _iluvatar_sddmm_csr_pattern_is_valid(
+        indices, indptr64, n_rows, n_cols, nnz
+    ):
         return indices, indptr64, (n_rows, n_cols)
     if indptr64.numel() > 0 and int(indptr64[0].item()) != 0:
         raise ValueError("indptr[0] must be 0")
