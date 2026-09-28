@@ -18,23 +18,36 @@ REQUIRED_KEYS = frozenset({"id", "operator", "format", "dtype"})
 
 def load_delivery_variants(path: Path | None = None) -> list[dict[str, str]]:
     """Return ordered, validated delivery variants from the canonical manifest."""
+    return _load_variant_list(path, "delivery_variants", required=True)
+
+
+def load_q4_variants(path: Path | None = None) -> list[dict[str, str]]:
+    """The q4 variants (``q4_variants:``), validated like the delivery list.
+
+    Separate from ``delivery_variants`` so the delivery scope, ``--delivery-only`` and
+    the C API manifest stay at the delivered 20. Empty when the section is absent.
+    """
+    return _load_variant_list(path, "q4_variants", required=False)
+
+
+def _load_variant_list(
+    path: Path | None, key: str, *, required: bool
+) -> list[dict[str, str]]:
     manifest = path or DEFAULT_MANIFEST
     raw = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-    variants = raw.get("delivery_variants")
+    variants = raw.get(key)
+    if variants is None and not required:
+        return []
     if not isinstance(variants, list) or not variants:
-        raise ValueError(f"{manifest}: delivery_variants must be a non-empty list")
+        raise ValueError(f"{manifest}: {key} must be a non-empty list")
     result: list[dict[str, str]] = []
     seen: set[str] = set()
     for index, item in enumerate(variants):
         if not isinstance(item, dict):
-            raise ValueError(
-                f"{manifest}: delivery_variants[{index}] must be a mapping"
-            )
+            raise ValueError(f"{manifest}: {key}[{index}] must be a mapping")
         missing = REQUIRED_KEYS.difference(item)
         if missing:
-            raise ValueError(
-                f"{manifest}: delivery_variants[{index}] lacks {sorted(missing)}"
-            )
+            raise ValueError(f"{manifest}: {key}[{index}] lacks {sorted(missing)}")
         variant = {key: str(item[key]) for key in REQUIRED_KEYS}
         if variant["id"] in seen:
             raise ValueError(f"{manifest}: duplicate variant id {variant['id']!r}")

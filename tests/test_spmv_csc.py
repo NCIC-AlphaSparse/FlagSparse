@@ -666,6 +666,12 @@ def main():
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants (mixed precision, int8, ops, "
+        "layouts; tests/q4_variant_bench.py) and append them to the CSV",
+    )
     args = parser.parse_args()
     try:
         value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
@@ -711,6 +717,12 @@ def main():
             run_cusparse=not args.no_cusparse,
             fail_fast=args.fail_fast,
         )
+        if args.q4_variants:
+            import q4_variant_bench
+
+            q4_variant_bench.run_and_append(
+                "spmv_csc", paths, args.csv_csc, args.warmup, args.iters
+            )
         return
     if not paths:
         print("No .mtx files. Use --synthetic or --csv-csc with inputs.")

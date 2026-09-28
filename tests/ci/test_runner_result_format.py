@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 import run_flagsparse_pytest as runner
-from tools.delivery_variants import load_delivery_variants
+from tools.delivery_variants import load_delivery_variants, load_q4_variants
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -170,12 +170,16 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     }
     assert set(summary["env"]["triton"]) == {"version", "has_config"}
     assert set(summary["env"]["flag_gems"]) == {"version", "vendor", "device"}
-    # `result` is keyed by DELIVERY VARIANT, not by operator: the names come from
+    # `result` is keyed by VARIANT, not by operator: the names come from
     # conf/operators.yaml's delivery_variants, which 算子列表注册修改.xlsx spells the
     # same way (gather_f32_int, spmv_csr_f32_int_non, ...). The C API's
     # capi/tools/write_summary.py keys its summary identically, from the same
     # loader, so the two front ends produce comparable files.
-    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    # q4_variants (the 42 of docs/NEW_OPERATORS_CUSPARSE_12_5.md) are projected into
+    # the same file; the C API manifest keeps only the delivered 20.
+    manifest = ROOT / "conf" / "operators.yaml"
+    delivery = load_delivery_variants(manifest)
+    variants = delivery + load_q4_variants(manifest)
     assert set(summary["result"]) == {v["id"] for v in variants}
 
     gather = summary["result"]["gather_f32_int"]
@@ -227,7 +231,7 @@ def test_runner_writes_flaggems_style_summary(tmp_path):
     assert summary["result"]["gather_f64_int"]["accuracy"]["status"] == "Skipped"
     assert summary["result"]["gather_c32_int"]["accuracy"]["status"] == "NotFound"
     assert summary["result"]["gather_c32_int"]["performance"]["status"] == "NotFound"
-    unselected = next(v for v in variants if v["operator"] != "gather")
+    unselected = next(v for v in delivery if v["operator"] != "gather")
     assert summary["result"][unselected["id"]]["accuracy"]["status"] == "NotFound"
 
     compat_summary = json.loads(

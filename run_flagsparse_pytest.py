@@ -48,6 +48,7 @@ from pathlib import Path
 from tools.delivery_variants import (
     cleanup_delivery_matrices,
     load_delivery_variants,
+    load_q4_variants,
     select_delivery_matrices,
 )
 
@@ -307,7 +308,35 @@ class OperatorTestConfig:
     performance_cmd: tuple[str, ...] | None = None
 
 
+# ``--q4-variants`` on six scripts: each also measures its operator's q4 variants
+# (mixed precision, int8, transposes, layouts; tests/q4_variant_bench.py) and appends
+# them to its CSV, tagged by a ``variant`` column.
 PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
+    # Sparse-vector operators take synthetic (dense, nnz) cases, like gather/scatter.
+    **{
+        op: (
+            "tests/test_vector_ops.py",
+            "--op",
+            op,
+            "--csv-summary",
+            "{csv}",
+            "--warmup",
+            "{warmup}",
+            "--iters",
+            "{iters}",
+        )
+        for op in ("axpby", "spvv")
+    },
+    "spmv_sell": (
+        "tests/test_spmv_sell.py",
+        "{input}",
+        "--csv",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "gather": (
         "tests/test_gather.py",
         "--csv-summary",
@@ -331,6 +360,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-csr",
         "{csv}",
+        "--q4-variants",
         "--alg",
         "compare",
         "--warmup",
@@ -343,6 +373,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-coo",
         "{csv}",
+        "--q4-variants",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -353,6 +384,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-csc",
         "{csv}",
+        "--q4-variants",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -391,6 +423,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv",
         "{csv}",
+        "--q4-variants",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -401,6 +434,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv",
         "{csv}",
+        "--q4-variants",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -425,6 +459,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-bell",
         "{csv}",
+        "--q4-variants",
         "--ops",
         "non",
         "--block-dims",
@@ -501,6 +536,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv",
         "{csv}",
+        "--q4-variants",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -805,6 +841,9 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         for op in ASCEND_PROBE_OPS
         if op not in ASCEND_PYTORCH_PERFORMANCE_OPS
     },
+    # The q4 operators' scripts are backend-neutral (their PyTorch baseline runs on
+    # torch_npu; the cuSPARSE column is empty with a reason), so Ascend reuses them.
+    **{op: PERFORMANCE_COMMANDS[op] for op in ("axpby", "spvv", "spmv_sell")},
 }
 
 
@@ -814,6 +853,9 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "spmv_csr": OperatorTestConfig("spmv_csr", PERFORMANCE_COMMANDS["spmv_csr"]),
     "spmv_coo": OperatorTestConfig("spmv_coo", PERFORMANCE_COMMANDS["spmv_coo"]),
     "spmv_csc": OperatorTestConfig("spmv_csc", PERFORMANCE_COMMANDS["spmv_csc"]),
+    "spmv_sell": OperatorTestConfig("spmv_sell", PERFORMANCE_COMMANDS["spmv_sell"]),
+    "axpby": OperatorTestConfig("axpby", PERFORMANCE_COMMANDS["axpby"]),
+    "spvv": OperatorTestConfig("spvv", PERFORMANCE_COMMANDS["spvv"]),
     "spmv_bsr": OperatorTestConfig("spmv_bsr", PERFORMANCE_COMMANDS["spmv_bsr"]),
     "spmv_coo_tocsr": OperatorTestConfig(
         "spmv_coo_tocsr", PERFORMANCE_COMMANDS["spmv_coo_tocsr"]
@@ -3213,6 +3255,7 @@ _DELIVERY_PERF_DTYPES = {
     "f64": ("fp64", "float64", "double"),
     "c32": ("complex64", "c32"),
     "c64": ("complex128", "c64"),
+    "i8": ("int8", "torch.int8", "i8"),
 }
 
 
@@ -3260,10 +3303,27 @@ def _delivery_not_configured_phase(phase: str, reason: str) -> dict[str, object]
     }
 
 
+# The q4 variants' accuracy cases, one pytest case per (variant, shape), with the
+# variant id as the first parametrize id: ``...[spmv_csr_f16f32_int_non-64x48x16]``.
+_Q4_ACCURACY_TEST = "test_q4_variants_accuracy.py"
+
+
+def _is_q4_variant_case(nodeid: object, variant_id: str) -> bool:
+    text = str(nodeid)
+    return _Q4_ACCURACY_TEST in text and (
+        f"[{variant_id}-" in text or text.endswith(f"[{variant_id}]")
+    )
+
+
 def _delivery_accuracy_phase(
-    phase_result: dict[str, object], dtype: str
+    phase_result: dict[str, object], dtype: str, variant_id: str | None = None
 ) -> dict[str, object]:
-    """Restrict recorded pytest cases to one delivery dtype when available."""
+    """Restrict recorded pytest cases to one delivery dtype when available.
+
+    With ``variant_id`` (a q4 variant) the slice is exactly the cases carrying that
+    id. Without it (the delivered 20) the q4 cases are left out of the dtype slice:
+    ``spmv_csr_f32_int_trans`` must not count toward ``spmv_csr_f32_int_non``.
+    """
     path_value = phase_result.get("result_path")
     if not path_value:
         return _delivery_not_configured_phase("accuracy", "no accuracy artifact")
@@ -3274,10 +3334,33 @@ def _delivery_accuracy_phase(
             "accuracy", f"cannot read accuracy artifact: {exc}"
         )
 
+    if variant_id is not None:
+        exact = {
+            nodeid: item
+            for nodeid, item in raw.items()
+            if isinstance(item, dict) and _is_q4_variant_case(nodeid, variant_id)
+        }
+        if not exact:
+            return _delivery_not_configured_phase(
+                "accuracy", f"no recorded pytest case carries {variant_id}"
+            )
+        projected = dict(phase_result)
+        for stale in ("errors", "xfailed", "xpassed", "failures", "tests"):
+            projected.pop(stale, None)
+        projected.update(summarize_accuracy_cases(exact))
+        projected["off_axis_excluded"] = 0
+        projected["phase"] = "accuracy"
+        projected["duration"] = phase_result.get("duration", 0.0)
+        projected["exit_code"] = phase_result.get("exit_code", 0)
+        projected["data_file"] = phase_result.get("data_file", "")
+        return projected
+
     tokens = _DELIVERY_DTYPE_TOKENS[dtype]
     selected: dict[str, object] = {}
     for nodeid, item in raw.items():
         if not isinstance(item, dict):
+            continue
+        if _Q4_ACCURACY_TEST in str(nodeid):
             continue
         values = [str(nodeid).lower()]
         values.extend(
@@ -3352,17 +3435,70 @@ def _is_delivery_performance_row(row: dict[str, str]) -> bool:
     return transpose not in {"true", "1"}
 
 
+# A q4 variant shaped like a delivery row -- one plain dtype, int32 indices, `non`
+# op, row-major -- is measured by its script's ordinary rows (spmm_bsr/bell/csc f32,
+# gather/scatter int8), which carry no ``variant`` tag.
+_Q4_DELIVERY_SHAPED_SUFFIXES = ("_int", "_int_non", "_int_non_non_row")
+
+
+def _q4_performance_phase(
+    phase_result: dict[str, object], variant_id: str, dtype: str | None = None
+) -> dict[str, object]:
+    """Benchmark rows whose ``variant`` column is ``variant_id``, all dtypes kept.
+
+    Without such rows, a delivery-shaped variant (``_Q4_DELIVERY_SHAPED_SUFFIXES``,
+    plain ``dtype``) takes the same untagged-row slice a delivery variant would.
+    """
+    records = phase_result.get("records")
+    rows = [
+        row
+        for row in (records if isinstance(records, list) else [])
+        if isinstance(row, dict) and str(row.get("variant") or "") == variant_id
+    ]
+    if (
+        not rows
+        and dtype in _DELIVERY_PERF_DTYPES
+        and variant_id.endswith(_Q4_DELIVERY_SHAPED_SUFFIXES)
+    ):
+        result = _delivery_performance_phase(phase_result, dtype)
+        if result.get("status") != "NOT_CONFIGURED":
+            result["matched_by"] = "dtype on the delivery axes (untagged rows)"
+        return result
+    if not rows:
+        if str(phase_result.get("status") or "").upper() == "TIMEOUT":
+            result = dict(phase_result)
+            result["data"] = {}
+            return result
+        return _delivery_not_configured_phase(
+            "performance", f"the benchmark recorded no {variant_id} rows"
+        )
+    result = dict(phase_result)
+    result["data"] = _strict_flag_gems_perf_data(_flaggems_perf_data(rows))
+    result["records"] = rows
+    result["delivery_row_count"] = len(rows)
+    result["non_delivery_row_count"] = len(records) - len(rows)
+    states = {str(row.get("status") or "").strip().upper() for row in rows}
+    if states & {"FAIL", "ERROR"}:
+        result["status"] = "FAIL"
+    return result
+
+
 def _delivery_performance_phase(
     phase_result: dict[str, object], dtype: str
 ) -> dict[str, object]:
-    """Restrict CSV-derived performance data to one delivery variant."""
+    """Restrict CSV-derived performance data to one delivery variant.
+
+    Rows tagged with a q4 ``variant`` belong to that variant only and are skipped.
+    """
     records = phase_result.get("records")
     delivery_rows = None
     if isinstance(records, list) and records:
         delivery_rows = [
             row
             for row in records
-            if isinstance(row, dict) and _is_delivery_performance_row(row)
+            if isinstance(row, dict)
+            and not row.get("variant")
+            and _is_delivery_performance_row(row)
         ]
         data = _strict_flag_gems_perf_data(_flaggems_perf_data(delivery_rows))
     else:
@@ -3416,16 +3552,19 @@ def _delivery_performance_phase(
 
 
 def _delivery_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Project group-level runner results onto the fixed delivery registry."""
+    """Project group-level runner results onto the delivery + q4 variant registries."""
     by_operator = {str(result.get("operator")): result for result in results}
     projected: list[dict[str, object]] = []
-    for variant in load_delivery_variants():
+    registry = [(v, False) for v in load_delivery_variants()]
+    registry += [(v, True) for v in load_q4_variants()]
+    for variant, is_q4 in registry:
         parent = by_operator.get(variant["operator"])
+        group = "q4" if is_q4 else "delivery"
         result: dict[str, object] = {
             "operator": variant["id"],
             "variant": variant,
             "customized": True,
-            "labels": ["flagsparse", "delivery", variant["format"], variant["dtype"]],
+            "labels": ["flagsparse", group, variant["format"], variant["dtype"]],
         }
         if parent is None:
             reason = f"delivery parent {variant['operator']!r} was not selected"
@@ -3437,14 +3576,20 @@ def _delivery_results(results: list[dict[str, object]]) -> list[dict[str, object
             accuracy = parent.get("accuracy")
             performance = parent.get("performance")
             result["accuracy"] = (
-                _delivery_accuracy_phase(accuracy, variant["dtype"])
+                _delivery_accuracy_phase(
+                    accuracy, variant["dtype"], variant["id"] if is_q4 else None
+                )
                 if isinstance(accuracy, dict)
                 else _delivery_not_configured_phase(
                     "accuracy", "accuracy phase was not run"
                 )
             )
             result["performance"] = (
-                _delivery_performance_phase(performance, variant["dtype"])
+                (
+                    _q4_performance_phase(performance, variant["id"], variant["dtype"])
+                    if is_q4
+                    else _delivery_performance_phase(performance, variant["dtype"])
+                )
                 if isinstance(performance, dict)
                 else _delivery_not_configured_phase(
                     "performance", "performance phase was not run"

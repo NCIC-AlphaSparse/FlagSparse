@@ -152,6 +152,8 @@ from .spmm_csr_opt_alg2 import (
 from .spmv_coo import PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo
 from .spmv_bsr import PreparedBsrSpmv, flagsparse_spmv_bsr, prepare_spmv_bsr
 from .spmv_csc import PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc
+from .spmv_sell import csr_to_sell, dense_to_sell, flagsparse_spmv_sell
+from .vector_ops import flagsparse_axpby, flagsparse_spvv
 from .spmv_csr import (
     PreparedCsrSpmv,
     flagsparse_spmv_coo_tocsr,
@@ -287,6 +289,11 @@ __all__ = [
     "flagsparse_spmv_bsr",
     "flagsparse_spmv_coo_tocsr",
     "flagsparse_spmv_csc",
+    "flagsparse_spmv_sell",
+    "dense_to_sell",
+    "csr_to_sell",
+    "flagsparse_axpby",
+    "flagsparse_spvv",
     "flagsparse_spmv_csr",
     "flagsparse_spmv_csr_run",
     "get_spmv_csr_algorithm_spec",

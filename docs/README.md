@@ -62,3 +62,5 @@
 | [`XPU.md`](XPU.md) | 昆仑芯：插件探测为什么不能只看 `torch.xpu`、`torch_xmlir` 的 CUDA-shim 路径、7 个算子对 PyTorch-XPU 计时其余能力探测、为什么没有厂商基线、首次上机顺序 |
 | [`ILUVATAR.md`](ILUVATAR.md) | 天数 BI-V150：CUDA 兼容栈的接入方式（同 MetaX）、显式指定与探测、交付命令、第一次上机要实测的项目；C API 的 `IX` 槽位为什么编不起来 |
 | [`ILUVATAR_DEBUG.md`](ILUVATAR_DEBUG.md) | 天数 BI-V150 调试交接：容器和 `.pth` 环境、实测指纹、fp64 为什么不可用（H2D 拷贝静默返回零）、三个厂商缺陷的最小复现、怎么跑精度和性能、还开着的问题，以及不要重复趟的坑 |
+| [`debug/`](debug/README.md) | q4 各后端 debug 手册：42 个新变体在每个后端上的风险点、通用排查顺序、上机后要带回的信息（上面那些文件讲环境和交付复现，这里只讲怎么定位问题） |
+| [`NEW_OPERATORS_CUSPARSE_12_5.md`](NEW_OPERATORS_CUSPARSE_12_5.md) | 对标 cuSPARSE 12.5 的 97 个新算子清单，按实现难度排序；前 42 个是 q4 已实现的范围 |

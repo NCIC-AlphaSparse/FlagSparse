@@ -1222,6 +1222,12 @@ def main():
         action="store_true",
         help="Show/export native COO timing breakdown columns",
     )
+    parser.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants (mixed precision, int8, ops, "
+        "layouts; tests/q4_variant_bench.py) and append them to the CSV",
+    )
     args = parser.parse_args()
     value_dtypes = _parse_csv_tokens(args.dtypes, DTYPE_MAP, "--dtypes")
     index_dtypes = _parse_csv_tokens(
@@ -1264,6 +1270,12 @@ def main():
             run_cusparse=not args.no_cusparse,
             timing=args.timing,
         )
+        if args.q4_variants:
+            import q4_variant_bench
+
+            q4_variant_bench.run_and_append(
+                "spmv_coo", paths, args.csv_coo, args.warmup, args.iters
+            )
         return
 
     if args.csv_tocsr:

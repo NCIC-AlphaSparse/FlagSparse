@@ -641,6 +641,12 @@ def main():
     parser.add_argument("--no-cusparse", action="store_true", help="Skip the vendor BELL performance baseline")
     parser.add_argument("--no-hipsparse", action="store_true", dest="no_cusparse", help=argparse.SUPPRESS)
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants (mixed precision, int8, ops, "
+        "layouts; tests/q4_variant_bench.py) and append them to the CSV",
+    )
     args = parser.parse_args()
 
     if not ACCEL.is_available():
@@ -728,6 +734,12 @@ def main():
     finally:
         if fh is not None:
             fh.close()
+    if args.q4_variants:
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmm_bell", args.inputs, args.csv_bell, args.warmup, args.iters
+        )
     return rows
 
 

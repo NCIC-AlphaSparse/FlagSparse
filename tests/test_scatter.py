@@ -41,7 +41,7 @@ DEFAULT_CASES = [
 # leaving them out here passed accuracy 8/8 while the performance row came back
 # NOT_CONFIGURED with "the benchmark recorded no c32 rows" -- a coverage gap in
 # this list, not a kernel limit. The sibling gather script has carried them all along.
-DEFAULT_VALUE_DTYPES = "float16,float32,float64,complex64,complex128"
+DEFAULT_VALUE_DTYPES = "float16,float32,float64,complex64,complex128,int8"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -84,6 +84,7 @@ def _parse_value_dtypes(raw):
         "float64",
         "complex64",
         "complex128",
+        "int8",
     }
     tokens = [tok.strip().lower() for tok in str(raw).split(",") if tok.strip()]
     if not tokens:

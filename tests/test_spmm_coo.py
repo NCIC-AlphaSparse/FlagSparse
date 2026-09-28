@@ -3085,6 +3085,12 @@ def main():
         metavar="FILE",
         help="Run selected dtype/index grids on all .mtx and write results to one CSV",
     )
+    parser.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants (mixed precision, int8, ops, "
+        "layouts; tests/q4_variant_bench.py) and append them to the CSV",
+    )
     args = parser.parse_args()
 
     if not ACCEL.is_available():
@@ -3188,6 +3194,12 @@ def main():
             alg_names=alg_names,
             diagnose=args.diagnose,
         )
+        if args.q4_variants:
+            import q4_variant_bench
+
+            q4_variant_bench.run_and_append(
+                "spmm_coo", paths, csv_path, args.warmup, args.iters
+            )
         return
 
     print("=" * 140)

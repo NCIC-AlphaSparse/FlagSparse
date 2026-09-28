@@ -23,6 +23,7 @@ Storage: sorted ``data, row, col`` plus optional ``seg_starts`` vector — never
 """
 
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 
 import time
 from functools import lru_cache
@@ -939,12 +940,27 @@ def flagsparse_spmv_coo(
     transpose=None,
     op=None,
     index_fallback_policy="auto",
+    *,
+    out_dtype=None,
 ):
     """COO SpMV with no CSR indptr. See module docstring.
 
     ``block_inner``: tile for the row-run kernel (``sort_by_row=True``).
     ``block_size`` / ``num_warps``: grid over NNZ when ``sort_by_row=False`` (atomics).
+    float16 / bfloat16 / int8 matrices and widened outputs (``out_dtype`` or
+    ``out.dtype``: half -> float32, int8 -> int32 / float32) run in ``mixed_spmx``.
     """
+    if (
+        prepared is None
+        and torch.is_tensor(data)
+        and _mixed_spmx.spmv_needs_mixed(
+            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype, coo=True
+        )
+    ):
+        return _mixed_spmx.spmv_coo_mixed(
+            data, row, col, x, shape, op=op, transpose=transpose,
+            out=out, out_dtype=out_dtype, return_time=return_time,
+        )
     transpose_flag = False if transpose is None else bool(transpose)
     op_explicit = op is not None
     op_code = _normalize_spmv_coo_op(op, transpose=transpose_flag)

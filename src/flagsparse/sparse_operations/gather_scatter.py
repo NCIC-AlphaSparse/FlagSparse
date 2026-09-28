@@ -25,7 +25,7 @@ HipPointer = _common_mod.HipPointer
 import triton
 import triton.language as tl
 
-SUPPORTED_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES
+SUPPORTED_SCATTER_VALUE_DTYPES = GATHER_SCATTER_VALUE_DTYPES
 DEFAULT_GATHER_BLOCK_SIZE = 256
 DEFAULT_GATHER_NUM_WARPS = 8
 DEFAULT_SCATTER_BLOCK_SIZE = 1024
@@ -487,6 +487,7 @@ _CUSPARSE_INDEX_64I = 3
 _CUDA_R_32F = 0
 _CUDA_R_64F = 1
 _CUDA_R_16F = 2
+_CUDA_R_8I = 3
 _CUDA_C_32F = 4
 _CUDA_C_64F = 5
 _CUSPARSE_LIB = None
@@ -514,6 +515,7 @@ def _cusparse_native_scatter_skip_reason(value_dtype):
 def _cuda_data_type_from_torch(torch_dtype):
     mapping = {
         torch.float16: _CUDA_R_16F,
+        torch.int8: _CUDA_R_8I,
         torch.float32: _CUDA_R_32F,
         torch.float64: _CUDA_R_64F,
         torch.complex64: _CUDA_C_32F,
@@ -1471,7 +1473,7 @@ def flagsparse_gather(
             raise ValueError("a and indices must both be accelerator tensors")
         if indices_tensor.dtype not in SUPPORTED_INDEX_DTYPES:
             raise TypeError("indices dtype must be torch.int32 or torch.int64")
-        if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
+        if dense_vector.dtype not in GATHER_SCATTER_VALUE_DTYPES:
             raise TypeError("a has an unsupported dtype")
         out_tensor = None
         if out is not None:

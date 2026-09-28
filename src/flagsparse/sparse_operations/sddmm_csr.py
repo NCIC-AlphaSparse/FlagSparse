@@ -873,6 +873,37 @@ def _run_sddmm_prepared(
     }
 
 
+def _normalize_sddmm_dense_op(op, default):
+    token = default if op is None else str(op).strip().lower()
+    token = {"0": "non", "n": "non", "non_trans": "non", "1": "trans", "t": "trans",
+             "2": "conj", "c": "conj", "conj_trans": "conj"}.get(token, token)
+    if token not in ("non", "trans", "conj"):
+        raise ValueError("op_a/op_b must be one of: non, trans, conj")
+    # SDDMM values are real (float32/float64), so conj(B^T) is B^T.
+    return "trans" if token == "conj" else token
+
+
+def _apply_sddmm_dense_ops(x, y, op_a, op_b, dense_layout):
+    """Map cuSPARSE (op_a, op_b, layout) onto the kernel's x: M x K, y: N x K views."""
+    if op_a is None and op_b is None and dense_layout is None:
+        return x, y
+    if not (torch.is_tensor(x) and torch.is_tensor(y) and x.ndim == 2 and y.ndim == 2):
+        raise ValueError("x and y must be 2D tensors")
+    if dense_layout is not None:
+        layout = str(dense_layout).strip().lower()
+        if layout not in ("row", "col"):
+            raise ValueError("dense_layout must be 'row' or 'col'")
+        for t, name in ((x, "x"), (y, "y")):
+            unit = t.stride(1) == 1 if layout == "row" else t.stride(0) == 1
+            if not unit and t.numel() > 1:
+                raise ValueError(f"{name} is not stored {layout}-major")
+    if _normalize_sddmm_dense_op(op_a, "non") == "trans":
+        x = x.transpose(0, 1)
+    if _normalize_sddmm_dense_op(op_b, "trans") == "non":
+        y = y.transpose(0, 1)
+    return x, y
+
+
 def flagsparse_sddmm_csr(
     data=None,
     indices=None,
@@ -888,12 +919,24 @@ def flagsparse_sddmm_csr(
     return_meta=False,
     allow_fallback=False,
     validate=True,
+    *,
+    op_a=None,
+    op_b=None,
+    dense_layout=None,
 ):
     """CSR SDDMM: out[p] = alpha * dot(x[row(p)], y[col(p)]) + beta * data[p].
 
     ``validate=False`` is forwarded to :func:`prepare_sddmm_csr` and only applies
     when this call builds the prepared pattern itself.
+
+    ``op_a`` / ``op_b`` follow ``cusparseSDDMM``: C = op(A) @ op(B) sampled on the
+    pattern, with ``x`` holding A and ``y`` holding B. ``op_a='non'``: x is M x K;
+    ``'trans'``: x is K x M. ``op_b='non'``: y is K x N; ``'trans'``: y is N x K.
+    ``op_b=None`` keeps this function's historical layout, y is N x K -- which is
+    cuSPARSE opB=TRANS (the hipSPARSE baseline calls it that way). ``dense_layout``
+    ('row' / 'col') checks how x and y are stored; any strides are read in place.
     """
+    x, y = _apply_sddmm_dense_ops(x, y, op_a, op_b, dense_layout)
     # Ascend 910B currently fails lowering the generic Triton SDDMM kernel.  Compute the
     # sampled dense products with torch_npu indexing instead; CUDA/ROCm/MetaX/MUSA fall
     # through to the Triton path unchanged.
@@ -1003,10 +1046,13 @@ def flagsparse_sddmm_csr(
     if timed:
         _ACCEL.synchronize()
     t0 = time.perf_counter()
+    # x / y go in as views: the kernel reads them through their strides, so a
+    # transposed op_a/op_b or a column-major operand needs no copy (``contiguous``
+    # here used to copy both inside the timed window; row-major input is unchanged).
     out_tensor, launch_meta = _run_sddmm_prepared(
         prepared,
-        x.contiguous(),
-        y.contiguous(),
+        x,
+        y,
         data.contiguous() if data is not None else None,
         alpha,
         beta,

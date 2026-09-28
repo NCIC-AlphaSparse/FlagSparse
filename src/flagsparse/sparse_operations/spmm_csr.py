@@ -19,6 +19,7 @@ import math
 
 from . import _common as _common_mod
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
@@ -4396,6 +4397,23 @@ def _spmm_csr_auto_prefers_alg1(data, indptr, shape):
     return mean < 9.0 and (max_row_nnz / mean) < 5.0
 
 
+def _apply_spmm_op_b(B, op_b):
+    """View ``op(B)``: a transpose is a strided view, conj materialises (complex only)."""
+    token = "non" if op_b is None else str(op_b).strip().lower()
+    token = {"0": "non", "n": "non", "non_trans": "non", "1": "trans", "t": "trans",
+             "2": "conj", "c": "conj", "conj_trans": "conj"}.get(token, token)
+    if token == "non":
+        return B
+    if token not in ("trans", "conj"):
+        raise ValueError("op_b must be one of: non, trans, conj")
+    if not torch.is_tensor(B) or B.ndim != 2:
+        raise ValueError("B must be a 2D tensor")
+    B_t = B.transpose(0, 1)
+    if token == "conj" and B.is_complex():
+        B_t = B_t.conj().resolve_conj()
+    return B_t
+
+
 def flagsparse_spmm_csr(
     data,
     indices,
@@ -4410,12 +4428,32 @@ def flagsparse_spmm_csr(
     transpose=None,
     op=None,
     return_meta=False,
+    *,
+    op_b=None,
+    out_dtype=None,
 ):
     """CSR SpMM using Triton.
 
     op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
     2/'conj' for A.conj().T @ B.
+    op_b: 'non' (B is K x N), 'trans' (B is N x K, uses B.T) or 'conj' (B.T.conj()),
+    as cusparseSpMM's opB. B may be row- or column-major.
+    out_dtype (or out.dtype): float16 / bfloat16 -> float32 and int8 -> int32 /
+    float32 run in ``mixed_spmx``.
     """
+    B = _apply_spmm_op_b(B, op_b)
+    if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
+        C = _mixed_spmx.spmm_csr_mixed(
+            data, indices, indptr, B, shape, op=op, transpose=transpose,
+            out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return C
+        C, elapsed = C
+        if return_meta:
+            meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (C, elapsed, meta) if return_time else (C, meta)
+        return C, elapsed
     op_explicit = op is not None
     op_code = _normalize_spmm_op(
         op,

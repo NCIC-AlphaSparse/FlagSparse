@@ -1001,6 +1001,12 @@ def main():
     )
     parser.add_argument("--csv", type=str, default=None, metavar="FILE")
     parser.add_argument("--skip-api-checks", action="store_true")
+    parser.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants (mixed precision, int8, ops, "
+        "layouts; tests/q4_variant_bench.py) and append them to the CSV",
+    )
     args = parser.parse_args()
 
     try:
@@ -1069,6 +1075,12 @@ def main():
             run_cusparse=run_cusparse_ref,
             acc_mode=args.acc_mode,
         )
+        if args.q4_variants:
+            import q4_variant_bench
+
+            q4_variant_bench.run_and_append(
+                "sddmm_csr", paths, csv_path, args.warmup, args.iters
+            )
         return
 
     print("=" * 150)

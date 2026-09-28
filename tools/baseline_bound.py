@@ -138,7 +138,9 @@ _DTYPE_KEYS = (
 _OP_KEYS = ("op", "opa", "transpose")
 # Case axes joined into the key when BOTH sides carry the column; one side alone
 # (ROCm spmv_csr has `alg`, CUDA does not) would make every key miss.
-_OPTIONAL_KEYS = ("alg", "layout", "mode", "dense_cols", "k")
+# ``out_dtype`` separates mixed-precision rows (f16 -> f16 and f16 -> f32 share a
+# value dtype and a matrix).
+_OPTIONAL_KEYS = ("alg", "layout", "mode", "dense_cols", "k", "out_dtype")
 _PASS = {"PASS", "PASSED", "OK", "SUCCESS"}
 _TEMPLATE_SIDE = {
     "name": None,

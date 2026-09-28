@@ -65,6 +65,9 @@ _SUPPORTED_VALUE_DTYPES = [
     torch.complex128,
 ]
 SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
+# Gather/scatter only move values, so they also take int8 (cusparseGather/Scatter
+# accept CUDA_R_8I). Kept separate: the arithmetic operators share the tuple above.
+GATHER_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES + (torch.int8,)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
 # ---------------------------------------------------------------------------
@@ -398,6 +401,7 @@ _CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
 # Star-import exposes only non-underscore names unless listed here.
 __all__ = (
     "SUPPORTED_VALUE_DTYPES",
+    "GATHER_SCATTER_VALUE_DTYPES",
     "SUPPORTED_INDEX_DTYPES",
     "_INDEX_LIMIT_INT32",
     "_is_complex_dtype",
@@ -580,6 +584,7 @@ def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
             "float64": torch.float64,
             "complex64": torch.complex64,
             "complex128": torch.complex128,
+            "int8": torch.int8,
         }
         if token not in mapping:
             raise TypeError(f"Unsupported dtype token: {value_dtype}")
@@ -604,6 +609,8 @@ def _tolerance_for_dtype(value_dtype):
         return 1e-6, 1e-5
     if value_dtype in (torch.float64, torch.complex128):
         return 1e-10, 1e-8
+    if value_dtype == torch.int8:
+        return 0.0, 0.0  # moved bytes must match exactly
     return 1e-6, 1e-5
 
 
@@ -3343,6 +3350,9 @@ def _build_random_dense(dense_size, value_dtype, device):
         real = torch.randn(dense_size, dtype=component_dtype, device=device)
         imag = torch.randn(dense_size, dtype=component_dtype, device=device)
         return torch.complex(real, imag)
+    if value_dtype == torch.int8:
+        # gather/scatter move int8 (GATHER_SCATTER_VALUE_DTYPES); values are bytes.
+        return torch.randint(-128, 128, (dense_size,), dtype=torch.int8, device=device)
     raise TypeError(f"Unsupported value dtype: {value_dtype}")
 
 
@@ -3377,9 +3387,9 @@ def _validate_common_inputs(dense_vector, indices):
         raise ValueError("indices must be a 1D tensor")
     if not _is_accel_tensor(dense_vector) or not _is_accel_tensor(indices):
         raise ValueError("dense_vector and indices must both be CUDA tensors")
-    if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
+    if dense_vector.dtype not in GATHER_SCATTER_VALUE_DTYPES:
         raise TypeError(
-            f"dense_vector dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
+            f"dense_vector dtype must be one of: {', '.join(str(dt) for dt in GATHER_SCATTER_VALUE_DTYPES)}"
         )
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -3430,9 +3440,9 @@ def _prepare_scatter_inputs(
         )
     if not _is_accel_tensor(sparse_values) or not _is_accel_tensor(indices):
         raise ValueError("sparse_values and indices must both be CUDA tensors")
-    if sparse_values.dtype not in SUPPORTED_VALUE_DTYPES:
+    if sparse_values.dtype not in GATHER_SCATTER_VALUE_DTYPES:
         raise TypeError(
-            f"sparse_values dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
+            f"sparse_values dtype must be one of: {', '.join(str(dt) for dt in GATHER_SCATTER_VALUE_DTYPES)}"
         )
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")

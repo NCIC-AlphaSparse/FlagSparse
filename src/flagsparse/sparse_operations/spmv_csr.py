@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from . import _common as _common_mod
 from . import _spmv_csr_config as _csr_config
+from . import mixed_spmx as _mixed_spmx
 
 _csr_config.set_known_backends(spec.name for spec in _common_mod.backend_specs())
 
@@ -1892,8 +1893,34 @@ def flagsparse_spmv_csr(
     alg=None,
     config=None,
     timing=False,
+    out_dtype=None,
 ):
-    """Native CSR SpMV; auto preserves the existing backend default algorithm."""
+    """Native CSR SpMV; auto preserves the existing backend default algorithm.
+
+    ``out_dtype`` (or ``out.dtype``) selects the cuSPARSE mixed outputs: float16 /
+    bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
+    ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
+    """
+    if (
+        prepared is None
+        and torch.is_tensor(data)
+        and _mixed_spmx.spmv_needs_mixed(
+            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype
+        )
+    ):
+        if alg is not None or config is not None or use_opt is not None:
+            raise ValueError("alg/config/use_opt do not apply to mixed-precision SpMV")
+        y = _mixed_spmx.spmv_csr_mixed(
+            data, indices, indptr, x, shape, op=op, transpose=transpose,
+            out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return y
+        y, elapsed = y
+        if return_meta:
+            meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     requested = _csr_config.normalize_alg(alg)
     if use_opt is not None:
         compatibility_alg = (

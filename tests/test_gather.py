@@ -41,7 +41,7 @@ DEFAULT_CASES = [
     (524_288, 16_384),
     (1_048_576, 65_536),
 ]
-DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128"
+DEFAULT_VALUE_DTYPES = "float16,bfloat16,float32,float64,complex64,complex128,int8"
 DEFAULT_INDEX_DTYPES = "int32,int64"
 WARMUP = 20
 ITERS = 200
@@ -76,6 +76,7 @@ def _parse_value_dtypes(raw):
         "float64",
         "complex64",
         "complex128",
+        "int8",
     }
     tokens = [tok.strip().lower() for tok in str(raw).split(",") if tok.strip()]
     if not tokens:
@@ -180,6 +181,7 @@ def _resolve_value_dtype(value_dtype_req):
         "float64": torch.float64,
         "complex64": torch.complex64,
         "complex128": torch.complex128,
+        "int8": torch.int8,
     }
     return mapping[value_dtype_req]
 

@@ -100,6 +100,12 @@ def parser():
         "--no-vendor", "--no-cusparse", dest="no_vendor", action="store_true"
     )
     p.add_argument("--fail-fast", action="store_true")
+    p.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants (mixed precision, int8, ops, "
+        "layouts; tests/q4_variant_bench.py) and append them to the CSV",
+    )
     return p
 
 
@@ -469,6 +475,12 @@ def main(argv=None):
     # phase and the delivery rows inherit that, so one FAIL matrix in one dtype
     # marked every dtype of spmv_csr Failed. --fail-fast is the explicit way to
     # stop (and exit non-zero) on the first failing row.
+    if args.q4_variants:
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmv_csr", [str(path) for path in paths], args.csv_csr, args.warmup, args.iters
+        )
     if failures:
         print(f"{failures} row(s) FAILED; see the status column of the results")
     return 0

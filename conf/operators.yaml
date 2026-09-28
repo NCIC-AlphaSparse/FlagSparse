@@ -43,6 +43,36 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: axpby
+    description: |
+      Computes y = alpha * x + beta * y for a sparse vector x (cusparseAxpby).
+    for:
+      - flagsparse_axpby
+    labels:
+      - flagsparse
+      - sparse
+      - triton
+      - public-api
+    kind:
+      - Sparse
+    stages:
+      - alpha: "1.0"
+
+  - id: spvv
+    description: |
+      Computes the dot product of a sparse and a dense vector (cusparseSpVV).
+    for:
+      - flagsparse_spvv
+    labels:
+      - flagsparse
+      - sparse
+      - triton
+      - public-api
+    kind:
+      - Sparse
+    stages:
+      - alpha: "1.0"
+
   - id: spmv_csr
     description: |
       Computes sparse matrix-vector multiplication for a CSR matrix.
@@ -99,6 +129,24 @@ ops:
       - SparseLinearAlg
     stages:
       - beta: "1.0"
+
+  - id: spmv_sell
+    description: |
+      Computes sparse matrix-vector multiplication for a sliced-ELLPACK matrix (cusparseSpMV SELL_ALG1).
+    for:
+      - flagsparse_spmv_sell
+      - dense_to_sell
+      - csr_to_sell
+    labels:
+      - flagsparse
+      - sparse
+      - sell
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - alpha: "1.0"
 
   - id: spmv_bsr
     description: |
@@ -537,3 +585,52 @@ delivery_matrices:
   - wave
   - ASIC_680ks
   - cfd2
+
+# q4 variants: the first 42 of docs/NEW_OPERATORS_CUSPARSE_12_5.md. Kept apart from
+# delivery_variants (the 20 delivered ones, shared with the C API manifest) so the
+# delivery scope and `--delivery-only` do not change. The runner projects BOTH lists
+# into summary.json; a q4 variant takes exactly the pytest cases / benchmark rows that
+# carry its id (tests/pytest/test_q4_variants_accuracy.py, the `variant` CSV column).
+q4_variants:
+  - {id: gather_i8_int, operator: gather, format: sparse_vector, dtype: i8}
+  - {id: scatter_i8_int, operator: scatter, format: sparse_vector, dtype: i8}
+  - {id: axpby_f16_int, operator: axpby, format: sparse_vector, dtype: f16}
+  - {id: spmv_sell_f32_int_non, operator: spmv_sell, format: sell, dtype: f32}
+  - {id: spmv_csr_f16f32_int_non, operator: spmv_csr, format: csr, dtype: f16f32}
+  - {id: spvv_f16f32_int_non, operator: spvv, format: sparse_vector, dtype: f16f32}
+  - {id: spmv_csr_f16_int_non, operator: spmv_csr, format: csr, dtype: f16}
+  - {id: spmv_csr_f32c32_int_non, operator: spmv_csr, format: csr, dtype: f32c32}
+  - {id: spmv_sell_f16_int_non, operator: spmv_sell, format: sell, dtype: f16}
+  - {id: spmm_csr_f16f32_int_non_non_row, operator: spmm_csr, format: csr, dtype: f16f32}
+  - {id: spmm_csr_f16_int_non_non_row, operator: spmm_csr, format: csr, dtype: f16}
+  - {id: spmm_csr_f32_int_non_non_col, operator: spmm_csr, format: csr, dtype: f32}
+  - {id: spmm_csr_f32_int_non_trans_row, operator: spmm_csr, format: csr, dtype: f32}
+  - {id: spmv_csc_f32_int_non, operator: spmv_csc, format: csc, dtype: f32}
+  - {id: spmv_csr_c32_int_non, operator: spmv_csr, format: csr, dtype: c32}
+  - {id: spmv_sell_c32_int_non, operator: spmv_sell, format: sell, dtype: c32}
+  - {id: spvv_c32_int_conj, operator: spvv, format: sparse_vector, dtype: c32}
+  - {id: spmv_coo_f16f32_int_non, operator: spmv_coo, format: coo, dtype: f16f32}
+  - {id: spmm_csr_c32_int_non_non_row, operator: spmm_csr, format: csr, dtype: c32}
+  - {id: spmv_coo_f32_int_trans, operator: spmv_coo, format: coo, dtype: f32}
+  - {id: spmv_csr_f32_int_trans, operator: spmv_csr, format: csr, dtype: f32}
+  - {id: spmv_csr_i8f32_int_non, operator: spmv_csr, format: csr, dtype: i8f32}
+  - {id: spmv_csr_i8i32_int_non, operator: spmv_csr, format: csr, dtype: i8i32}
+  - {id: spmv_sell_i8i32_int_non, operator: spmv_sell, format: sell, dtype: i8i32}
+  - {id: spvv_i8i32_int_non, operator: spvv, format: sparse_vector, dtype: i8i32}
+  - {id: spmm_csc_f32_int_non_non_row, operator: spmm_csc, format: csc, dtype: f32}
+  - {id: spmm_csr_i8i32_int_non_non_row, operator: spmm_csr, format: csr, dtype: i8i32}
+  - {id: spmv_coo_c32_int_non, operator: spmv_coo, format: coo, dtype: c32}
+  - {id: spmv_coo_f16_int_non, operator: spmv_coo, format: coo, dtype: f16}
+  - {id: spmv_csc_c32_int_non, operator: spmv_csc, format: csc, dtype: c32}
+  - {id: spmv_csc_f16_int_non, operator: spmv_csc, format: csc, dtype: f16}
+  - {id: sddmm_csr_f32_int_non_non_col, operator: sddmm_csr, format: csr, dtype: f32}
+  - {id: sddmm_csr_f32_int_non_trans_row, operator: sddmm_csr, format: csr, dtype: f32}
+  - {id: sddmm_csr_f32_int_trans_non_row, operator: sddmm_csr, format: csr, dtype: f32}
+  - {id: spmm_bell_f32_int_non_non_row, operator: spmm_bell, format: bell, dtype: f32}
+  - {id: spmm_bsr_f32_int_non_non_row, operator: spmm_bsr, format: bsr, dtype: f32}
+  - {id: spmm_coo_c32_int_non_non_row, operator: spmm_coo, format: coo, dtype: c32}
+  - {id: spmm_coo_f16_int_non_non_row, operator: spmm_coo, format: coo, dtype: f16}
+  - {id: spmm_csr_f32_int_trans_non_row, operator: spmm_csr, format: csr, dtype: f32}
+  - {id: spmv_coo_c32_int_conj, operator: spmv_coo, format: coo, dtype: c32}
+  - {id: spmv_coo_i8i32_int_non, operator: spmv_coo, format: coo, dtype: i8i32}
+  - {id: spmv_csr_c32_int_conj, operator: spmv_csr, format: csr, dtype: c32}
