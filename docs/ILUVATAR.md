@@ -222,40 +222,49 @@ setsid timeout -s KILL 43200 \
     --benchmark-input tests/data \
     --benchmark-warmup 5 \
     --benchmark-iters 20 \
-    --pytest-args='-k "(float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)"' \
-    --op-benchmark-args='gather=--value-dtypes float16,float32' \
-    --op-benchmark-args='scatter=--value-dtypes float16,float32' \
-    --op-benchmark-args='spmv_csr=--dtypes float32' \
+    --h800-reference \
+    --pytest-args='-k "((float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)) or (complex64 and (gather or scatter))"' \
+    --op-benchmark-args='gather=--value-dtypes float16,float32,complex64' \
+    --op-benchmark-args='scatter=--value-dtypes float16,float32,complex64' \
+    --op-benchmark-args='spmv_csr=--dtypes float32 --alg auto' \
     --op-benchmark-args='spmv_coo=--dtypes float32' \
     --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
     --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
     --op-benchmark-args='sddmm_csr=--dtype float32' \
-    --results-dir pytest_results_iluvatar_delivery_f16_f32 \
-  > pytest_results_iluvatar_delivery_f16_f32.log 2>&1 < /dev/null &
+    --results-dir pytest_results_iluvatar_delivery \
+  > pytest_results_iluvatar_delivery.log 2>&1 < /dev/null &
 ```
 
 这里的 pytest 表达式必须保留内层双引号；写成没有引号的 `-k ... or ...` 会让
 pytest 把 `or` 当成测试路径，报 `file or directory not found: or`。不能只匹配
 `float32`：gather 的 fp32 参数 ID 是 `float`，而其他套件多为 `float32`。表达式同时
-匹配这两种 ID，并排除 double、bf16 和 complex，确保精度阶段只覆盖 fp16/fp32。
+匹配这两种 ID，并排除 double、bf16 和 complex。表达式最后的 `(complex64 and (gather or scatter))`
+把 gather/scatter 的 complex64 用例加回来：交付清单里的 **c32 就是 complex64**，gather/scatter 的 c32 在天数上能跑
+（实测见 4.0 节）；c64（complex128）跑不了，仍然排除。实测这一段只给 gather 多选 4 个、scatter 多选 8 个用例，
+其余算子的用例数不变。
 性能参数按各脚本的 CLI 能力分别设置：`spmv_csr`/`spmv_coo` 的性能脚本不接受
-fp16，`sddmm_csr` 当前也只跑 fp32；gather、scatter、spmm 则跑 fp16 和 fp32。
+fp16，`sddmm_csr` 当前也只跑 fp32；gather、scatter 跑 fp16、fp32 和 complex64，spmm 跑 fp16 和 fp32。
+`spmv_csr` 的 `--alg auto` 就是脚本默认值，写出来只是让口径一目了然。
 其中 `spmm_csr` 的 dtype 网格参数是复数形式的 `--dtypes`；单值参数 `--dtype` 不接受
 逗号分隔列表，传入 `float16,float32` 会在 argparse 阶段直接退出。
-该命令用于验证 BI-V150 当前可运行范围，不会覆盖交付清单中已知不可用的 double/c128 变体。
+该命令覆盖 20 个交付变体里 BI-V150 能跑的 11 个（f16×2、f32×7、c32×2），不会跑已知不可用的 double/c128 变体。
 
 - `--benchmark-input tests/data`：10 个交付矩阵已经在仓库的 `tests/data` 里。跑完先确认筛选生效了：
-  `grep "delivery-only" pytest_results_iluvatar_delivery_f16_f32.log` 应当是 `matrices from .../delivery_matrices`，
+  `grep "delivery-only" pytest_results_iluvatar_delivery.log` 应当是 `matrices from .../delivery_matrices`，
   出现 `NOT applied` 就说明矩阵不全，跑的不是交付集合；
+- `--h800-reference`（不带值）：没有厂商加速比、也没有 PyTorch 加速比的行，用仓库自带的 H800 结果折算出加速比，
+  见 3.1 节。天数上 SDDMM 没有厂商基线，不加这一项 `sddmm_csr_f32_int_non_non_row` 的加速比就是 `N/A`。
+  日志里应出现 `scaled baseline: ... rescaled h800-sxm -> iluvatar-biv150`，没有就是没生效或卡型没识别出来；
+- `--results-dir` 要用没用过的新目录：`summary.json` 每次运行都会被整个覆盖；
 - 外层 `timeout -s KILL 43200`（12 小时）是整条命令的总限时，内核卡死时 Ctrl-C 送不进去，只能靠 KILL；
   `--timeout 3600` 是每个算子每个阶段的限时。该 dtype 子集在天数上的完整耗时**没有实测过**，按实际情况调整；
 - `--gpus 0`：runner 通过 `CUDA_VISIBLE_DEVICES` 选卡。CoreX 是否照常遵守这个变量**未验证**，
   多卡机器上先用 `ixsmi`（天数的设备管理工具）确认任务确实落在指定的卡上。
 
-跑完查看结果（被排除的 double/c128 变体不会有有效数据行）：
+跑完查看结果（被排除的 double/c128 变体不会有有效数据行，共 9 个）：
 
 ```bash
-python3 tools/delivery_table.py pytest_results_iluvatar_delivery_f16_f32 --markdown
+python3 tools/delivery_table.py pytest_results_iluvatar_delivery --markdown
 ```
 
 也可以通过按后端组织的入口跑，它会自动设置 `FLAGSPARSE_BACKEND=iluvatar`：
@@ -314,7 +323,7 @@ speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和
 用法：跑天数时加 `--h800-reference`，**不带值就用仓库自带的 H800 结果**，不用再找目录。
 
 ```bash
-# BI-V150 上，在第 2 节的命令里加 --h800-reference（卡型自动识别为 iluvatar-biv150，不用手填）
+# 第 2 节的命令已经带了 --h800-reference（卡型自动识别为 iluvatar-biv150，不用手填）；单跑某个算子时这样加
 ... run_flagsparse_pytest.py --delivery-only ... \
     --h800-reference \
     --results-dir biv150_delivery
