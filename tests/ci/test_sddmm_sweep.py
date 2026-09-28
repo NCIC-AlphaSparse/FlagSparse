@@ -74,13 +74,27 @@ def test_force_and_restore_the_launch_config():
     assert sddmm_sweep.sddmm_mod._resolve_sddmm_launch_config is original
 
 
-def test_the_default_config_is_the_one_the_operator_would_pick():
+def test_the_nvidia_default_config_is_the_one_the_operator_would_pick(monkeypatch):
+    monkeypatch.setattr(sddmm_sweep.sddmm_mod, "_is_iluvatar_runtime", lambda: False)
     default = sddmm_sweep._DEFAULT_RESOLVE(
         256, mean_row_len=25.0, value_dtype=torch.float32
     )
     assert default == (512, 32, 4)  # the wide branch the BI-V150 sweep is about
     assert sddmm_sweep._DEFAULT_RESOLVE(
         256, mean_row_len=3.0, value_dtype=torch.float32
+    ) == (64, 32, 8)
+
+
+def test_iluvatar_fp32_uses_the_sweep_validated_config(monkeypatch):
+    monkeypatch.setattr(sddmm_sweep.sddmm_mod, "_is_iluvatar_runtime", lambda: True)
+    for k in (32, 64, 128, 256):
+        assert sddmm_sweep._DEFAULT_RESOLVE(
+            k, mean_row_len=25.0, value_dtype=torch.float32
+        ) == (64, 16, 4)
+
+    # BI-V150 fp64 is unsupported, but it must not accidentally inherit fp32 tuning.
+    assert sddmm_sweep._DEFAULT_RESOLVE(
+        256, mean_row_len=25.0, value_dtype=torch.float64
     ) == (64, 32, 8)
 
 

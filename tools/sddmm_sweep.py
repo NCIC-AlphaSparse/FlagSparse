@@ -16,6 +16,14 @@ in the runner.
     python3 tools/sddmm_sweep.py --matrices cfd2,cage12 --k 32,256 --csv sweep.csv
     python3 tools/sddmm_sweep.py --block-p 32,64,128,256 --warps 2,4,8   # narrower grid
 
+    python3 tools/sddmm_sweep.py --breakdown           # where the runner's timed window goes
+
+``--breakdown`` measures what the runner actually times: one ``flagsparse_sddmm_csr``
+call on raw CSR arguments, i.e. prepare + structural validation + row-id build + the
+kernel, EVERY iteration (tests/test_sddmm.py, "Scenario B"). It reports each part, the
+speedup against the scaled H800 cuSPARSE time now, and the ceiling if the overhead were
+free -- so you can tell a slow kernel from a slow prepare before touching either.
+
 Run it on the target card (FLAGSPARSE_BACKEND=iluvatar ...), not on the H800.
 """
 
@@ -139,6 +147,127 @@ def _fmt(value, width=8, digits=3):
     )
 
 
+H800_RATIO = 3050.0 / 1150.0  # H800 / BI-V150 measured bandwidth (baseline_bound.py)
+
+
+def _h800_scaled_ms(matrix, k):
+    """H800 cuSPARSE SDDMM time for this case, scaled to BI-V150 by bandwidth."""
+    from tools import h800_reference
+
+    _fields, rows = h800_reference.tables(h800_reference.DEFAULT_PATH)[
+        "sddmm_csr"
+    ].read()
+    for row in rows:
+        if (
+            row.get("matrix") == f"{matrix}.mtx"
+            and row.get("k") == str(k)
+            and row.get("value_dtype") == "float32"
+            and row.get("cusparse_ms")
+        ):
+            return float(row["cusparse_ms"]) * H800_RATIO
+    return None
+
+
+def _breakdown(args, paths, device):
+    """Split the runner's timed window into its parts, for the config in force."""
+    print(
+        "每个 k 一行；ms 都是稳态均值。total = runner 实际计时的那一次调用（含 prepare+校验）\n"
+        "  validate = prepare(校验开) - prepare(校验关)； kernel = 已 prepare 好之后的一次调用\n"
+        "  now = 折算 H800 cuSPARSE ÷ total； ceiling = 折算 ÷ kernel（开销降到 0 的上限）",
+        flush=True,
+    )
+    header = (
+        f"{'matrix':12s} {'k':>4s} | {'total':>8s} {'prepare':>8s} {'validate':>8s} "
+        f"{'rowids':>8s} {'kernel':>8s} | {'固定开销占比':>9s} | {'折算ms':>8s} {'now':>6s} {'ceiling':>7s}"
+    )
+    print(header, flush=True)
+    rows_out = []
+    for path in paths:
+        _v, indices, indptr, shape = load_mtx_to_csr_torch(
+            str(path), dtype=torch.float32, device=device
+        )
+        indices = indices.to(torch.int32)
+        n_rows, n_cols = shape
+        for k in _ints(args.k):
+            torch.manual_seed(0)
+            x = torch.randn((n_rows, k), dtype=torch.float32).to(device)
+            y = torch.randn((n_cols, k), dtype=torch.float32).to(device)
+
+            def call(**kw):
+                return ast.flagsparse_sddmm_csr(
+                    data=None, x=x, y=y, alpha=1.0, beta=0.0, **kw
+                )
+
+            prepared = ast.prepare_sddmm_csr(indices, indptr, shape, k_hint=k)
+            total = _time(
+                lambda: call(indices=indices, indptr=indptr, shape=shape),
+                args.warmup,
+                args.iters,
+            )
+            prep_v = _time(
+                lambda: ast.prepare_sddmm_csr(indices, indptr, shape, k_hint=k),
+                args.warmup,
+                args.iters,
+            )
+            prep_n = _time(
+                lambda: ast.prepare_sddmm_csr(
+                    indices, indptr, shape, k_hint=k, validate=False
+                ),
+                args.warmup,
+                args.iters,
+            )
+            rowids = _time(
+                lambda: sddmm_mod._build_row_ids(prepared.indptr, prepared.nnz),
+                args.warmup,
+                args.iters,
+            )
+            kernel = _time(lambda: call(prepared=prepared), args.warmup, args.iters)
+            scaled = _h800_scaled_ms(path.stem, k)
+            share = 1.0 - kernel / total if total > 0 else float("nan")
+            now = scaled / total if scaled else None
+            ceiling = scaled / kernel if scaled else None
+            print(
+                f"{path.stem:12s} {k:>4d} | {total:8.3f} {prep_v:8.3f} {prep_v - prep_n:8.3f} "
+                f"{rowids:8.3f} {kernel:8.3f} | {share:>8.0%} | "
+                f"{_fmt(scaled, 8)} {_fmt(now, 6, 2)} {_fmt(ceiling, 7, 2)}",
+                flush=True,
+            )
+            rows_out.append(
+                {
+                    "matrix": path.stem,
+                    "k": k,
+                    "total_ms": total,
+                    "prepare_ms": prep_v,
+                    "validate_ms": prep_v - prep_n,
+                    "row_ids_ms": rowids,
+                    "kernel_ms": kernel,
+                    "overhead_share": share,
+                    "scaled_h800_ms": scaled,
+                    "speedup_now": now,
+                    "speedup_ceiling": ceiling,
+                }
+            )
+    if args.csv and rows_out:
+        with open(args.csv, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows_out[0]))
+            writer.writeheader()
+            writer.writerows(rows_out)
+        print(f"wrote {args.csv} ({len(rows_out)} rows)")
+    if rows_out:
+        shares = [r["overhead_share"] for r in rows_out]
+        print(
+            f"\n固定开销（total 里不是内核的部分）占比：中位 {statistics.median(shares):.0%}，最大 {max(shares):.0%}"
+        )
+        now = [r["speedup_now"] for r in rows_out if r["speedup_now"]]
+        cei = [r["speedup_ceiling"] for r in rows_out if r["speedup_ceiling"]]
+        if now:
+            geo = lambda v: math.exp(statistics.mean(math.log(x) for x in v))  # noqa: E731
+            print(
+                f"折算加速比几何均值：现在 {geo(now):.2f}，开销归零的上限 {geo(cei):.2f}"
+            )
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("input", nargs="?", default=str(ROOT / "tests" / "data"))
@@ -155,9 +284,20 @@ def main(argv=None):
     parser.add_argument(
         "--no-check", action="store_true", help="skip the CPU comparison"
     )
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        help="split the runner's timed call into prepare/validate/row-ids/kernel",
+    )
     args = parser.parse_args(argv)
 
     device = accelerator_device()
+    if args.breakdown:
+        print(
+            f"backend={fs_common._backend_name()} device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else device}",
+            flush=True,
+        )
+        return _breakdown(args, _matrix_paths(args), device)
     grid = list(
         itertools.product(_ints(args.block_p), _ints(args.block_k), _ints(args.warps))
     )
