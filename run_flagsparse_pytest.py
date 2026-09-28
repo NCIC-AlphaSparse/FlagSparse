@@ -4299,8 +4299,11 @@ def _configure_scaled_baseline(
     if not reference:
         return
     reference_dir = Path(reference)
-    if not reference_dir.is_dir():
-        parser.error(f"--h800-reference {reference} is not a directory")
+    if not (reference_dir.is_dir() or reference_dir.is_file()):
+        parser.error(
+            f"--h800-reference {reference} is neither a results directory nor a "
+            "reference JSON file"
+        )
     cuda = env_info.get("cuda")
     devices = cuda.get("devices") if isinstance(cuda, dict) else None
     device = ""
@@ -4423,13 +4426,16 @@ def main(
         parser.add_argument("--benchmark-iters", type=int, default=20)
         parser.add_argument(
             "--h800-reference",
+            nargs="?",
+            const=str(_baseline_bound._h800_reference.DEFAULT_PATH),
             default=None,
-            metavar="DIR",
+            metavar="FILE_OR_DIR",
             help=(
-                "Results directory of an H800 run of the same operators. Rows that "
-                "have no vendor and no PyTorch baseline get a speedup against the "
-                "same case's H800 time rescaled to this card by memory bandwidth "
-                "(tools/baseline_bound.py; the rescaled time is 1.0)."
+                "H800 times of the same operators: a results directory or a bundled "
+                "reference JSON. With no value, the repo's own conf/h800_reference.json "
+                "is used. Rows that have no vendor and no PyTorch baseline get a "
+                "speedup against the same case's H800 time rescaled to this card by "
+                "memory bandwidth (tools/baseline_bound.py; the rescaled time is 1.0)."
             ),
         )
         parser.add_argument(

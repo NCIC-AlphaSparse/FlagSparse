@@ -1003,3 +1003,51 @@ def test_an_undetectable_card_needs_an_explicit_one(tmp_path, monkeypatch):
         == "maca-c550"
     )
     runner._SCALED_BASELINE = None
+
+
+def test_the_bundled_h800_file_is_accepted_and_not_flagged_as_another_card(
+    tmp_path, monkeypatch, capsys
+):
+    from tools import h800_reference
+
+    if not h800_reference.DEFAULT_PATH.is_file():
+        pytest.skip("conf/h800_reference.json not generated")
+    got = _configure(
+        monkeypatch,
+        tmp_path,
+        backend="iluvatar",
+        device="Iluvatar BI-V150 OAM",
+        h800_reference=str(h800_reference.DEFAULT_PATH),
+    )
+    assert got["card"] == "iluvatar-biv150"
+    assert got["reference"] == str(h800_reference.DEFAULT_PATH)
+    assert "WARNING" not in capsys.readouterr().out
+    runner._SCALED_BASELINE = None
+
+
+def test_a_missing_h800_reference_is_an_error(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit):
+        _configure(
+            monkeypatch,
+            tmp_path,
+            backend="iluvatar",
+            device="Iluvatar BI-V150 OAM",
+            h800_reference=str(tmp_path / "nope"),
+        )
+    runner._SCALED_BASELINE = None
+
+
+def test_the_h800_flag_can_be_given_without_a_value():
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "run_flagsparse_pytest.py"), "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--h800-reference [FILE_OR_DIR]" in proc.stdout
+    assert "conf/h800_reference.json" in proc.stdout.replace("\n", " ").replace(
+        "  ", " "
+    )

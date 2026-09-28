@@ -306,17 +306,21 @@ speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和
 只有**没有厂商加速比、也没有 PyTorch 加速比的行**才用这个替代方案；有真实基线的行（fp32 SpMV/SpMM
 的 CoreX legacy 接口）保持原来的加速比，不受影响。
 
-用法：跑天数时加一个参数，指向 H800 上同样算子的结果目录。
+用法：跑天数时加 `--h800-reference`，**不带值就用仓库自带的 H800 结果**，不用再找目录。
 
 ```bash
 # BI-V150 上，在第 2 节的命令里加 --h800-reference（卡型自动识别为 iluvatar-biv150，不用手填）
 ... run_flagsparse_pytest.py --delivery-only ... \
-    --h800-reference /path/to/h800_results_dir \
+    --h800-reference \
     --results-dir biv150_delivery
 ```
 
-- H800 那边的目录用同一版本的代码、同样的矩阵和 k 跑出来；仓库里现成的一份是
-  `pytest_results_sparse_202609221038`（H800 ×8，提交 `47a441e`，20 个算子，sddmm 含 30 个矩阵 × f32/f64 × k=32/64/128/256）。
+- 自带的数据在 [`conf/h800_reference.json`](../conf/h800_reference.json)（约 1 MB，一个文件），说明见
+  [H800_REFERENCE.md](H800_REFERENCE.md)：H800 ×8，提交 `47a441e`（那轮是脏工作树），17 个算子的 7801 行，
+  每行保留算例键、各 `*_ms` 时间、加速比和状态列。想换成自己的一轮 H800 结果，`--h800-reference 目录或json文件`
+  都行；重新生成用 `python3 tools/h800_reference.py <H800 结果目录>`。
+- **有一处覆盖不到**：这轮 H800 数据里 `spmm_bsr`、`spmm_bell` 没有 cuSPARSE 时间（当时基线只有 CuPy，没有
+  BSR / Blocked-ELL 的库），所以这两个算子没有折算基线，行保持 `N/A`；`spmm_csc` 只有 240/720 行有。
 - 每行的 `performance.csv` 会多 5 列：`h800_vendor_ms`（H800 上 cuSPARSE 的用时）、`h800_scaled_ms`（折算后的时间，
   即基线 1）、`h800_scaled_fs_ms`（天数上 FlagSparse 的实测）、`speedup_vs_h800_scaled`（加速比）、`h800_scaled_card`（用的卡）。
   `summary.json` / `summary.csv` 里交付变体的 speedup 就是这个数，`delivery_table.py` 也照常显示。
@@ -328,7 +332,7 @@ speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和
 只想要 PASS/FAIL 判定和余量，用 `tools/baseline_bound.py`（现在也多了 `T' scaled ms` 和 `speedup` 两列）：
 
 ```bash
-python3 tools/baseline_bound.py h800_results_dir --vendor biv150_delivery --ops sddmm_csr --markdown
+python3 tools/baseline_bound.py --vendor biv150_delivery --ops sddmm_csr --markdown   # 不写参考 = 用自带的 H800 文件
 ```
 
 ---

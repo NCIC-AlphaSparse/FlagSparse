@@ -54,7 +54,12 @@ nothing measured it -- and is labelled ``assumed`` in the output.
 Exit status is 0 when every row has a bound (and, with ``--vendor``, passes or
 has its own baseline), 1 otherwise.
 
+The reference may be a results directory, one performance.csv, or the bundled
+``conf/h800_reference.json`` (see ``tools/h800_reference.py``); when it is left out the
+bundled file is used.
+
 Usage:
+    python3 tools/baseline_bound.py --vendor vendor_results/ --vendor-card dcu-bw1000
     python3 tools/baseline_bound.py h800_results/ --vendor-bw-gbs 1600
     python3 tools/baseline_bound.py h800_results/ --vendor-card dcu-bw1000 \
         --vendor vendor_results/ [--markdown] [--csv out.csv]
@@ -69,6 +74,11 @@ import csv
 import json
 import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:  # `python3 tools/baseline_bound.py` puts tools/ first
+    sys.path.insert(0, str(_ROOT))
+from tools import h800_reference as _h800_reference  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "run_flagsparse_pytest.py"
@@ -227,16 +237,21 @@ def _time_column(fields: list[str]) -> str | None:
     return None
 
 
-def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+def _read_csv(path) -> tuple[list[str], list[dict[str, str]]]:
+    if isinstance(path, _h800_reference.ReferenceTable):
+        return path.read()
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         return list(reader.fieldnames or []), list(reader)
 
 
-def _collect(target: str) -> dict[str, Path]:
-    """Map operator -> performance.csv for a results directory or a single CSV."""
+def _collect(target: str) -> dict:
+    """Map operator -> performance.csv (or bundled table) for a results directory, a
+    single CSV, or the bundled ``conf/h800_reference.json``."""
 
     path = Path(target)
+    if _h800_reference.is_reference_file(path):
+        return _h800_reference.tables(path)
     if path.is_file():
         return {path.parent.name or path.stem: path}
     if path.is_dir():
@@ -256,6 +271,10 @@ def _run_env(target: str) -> tuple[str, str] | None:
     skipped rather than guessed.
     """
     path = Path(target)
+    if _h800_reference.is_reference_file(path):
+        ref = _h800_reference.reference_info(path)
+        device = str(ref.get("device") or "").strip()
+        return ("nvidia", device) if device else None
     if not path.is_dir():
         return None
     for name in ("summary.json", "summary_split.json"):
@@ -821,7 +840,12 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "reference_run", nargs="?", help="H800 results dir or performance.csv"
+        "reference_run",
+        nargs="?",
+        help=(
+            "H800 results dir, performance.csv or reference JSON "
+            f"(default: the bundled {_h800_reference.DEFAULT_PATH.relative_to(_ROOT)})"
+        ),
     )
     parser.add_argument(
         "--reference",
@@ -882,7 +906,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(_template(), indent=2, ensure_ascii=False))
         return 0
     if not args.reference_run:
-        parser.error("the reference run is required (or use --print-template)")
+        if not _h800_reference.DEFAULT_PATH.is_file():
+            parser.error("the reference run is required (or use --print-template)")
+        args.reference_run = str(_h800_reference.DEFAULT_PATH)
     if not 0 < args.ratio <= 1:
         parser.error("--ratio must be in (0, 1]")
 
