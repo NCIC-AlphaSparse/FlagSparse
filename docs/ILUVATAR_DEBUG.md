@@ -365,7 +365,25 @@ ps aux | grep -c "[c]lang\|[l]lc\|[t]riton"
 如果确认是展开开销，参照 `_MACA_SPMM_COO_COMPLEX_BLOCK_NNZ` 的做法，在
 `_resolve_spmm_coo_launch_config` 里加一条 iluvatar 的钳位。
 
-### 6.2 `sddmm_csr` 未跑
+### 6.2 `sddmm_csr` / `spmm_coo` 的 f32 性能行全部 FAIL（脚本已修，待上机重跑）
+
+2026-09-28 的交付跑里，`sddmm_csr` 40/40 行、`spmm_coo` f32 10/10 行的 `status` 都是 FAIL，误差
+1e5～1e8，`delivery_table` 里两个变体的加速比是 `-`；而同一轮里精度阶段是 Passed。
+`--h800-reference` 也生效了，但折算记录写着 `this row has no usable FlagSparse time`：FAIL 的行没有可用时间，
+不会被折算。
+
+**根因不在 FlagSparse，在性能脚本的参考。** 这两个脚本的 SciPy 参考在 CPU 上以 fp64 算好，再用
+`reference_utils.as_torch(..., fp64, device)` 搬到设备、在设备上转回 fp32——而 CoreX 4.4 会把 fp64 的 H2D 和
+设备上的 fp64 转换静默置零（见 3.1）。参考成了全零，误差就等于 `|输出| / atol`。精度阶段没受影响：
+它把输出搬回 CPU 再比。`test_spmm.py`（spmm_csr）早就改过，所以同一轮里它是 PASS。
+
+修法：在 CPU 上转成输出 dtype，再搬一次（`reference_utils.as_torch_at`）；`spmm_coo` 在天数上同时不再计时
+`torch.sparse.mm`（COO 路径没验证过，CSR 路径已知返回全零）。`tests/ci/test_iluvatar_reference_transfer.py`
+在 CI 里模拟 CoreX 的置零，旧代码 4 个失败、新代码全过。
+
+上机重跑后应看到：这两个算子的 `status` 变 PASS，`speedup_vs_h800_scaled` 有值。若仍 FAIL，
+说明这次不是参考的问题，误差要从 FlagSparse 的输出查起（用 CPU 上的 SciPy 结果逐元素对比，
+不要用 `torch.sparse`）。
 
 ### 6.3 交付跑未做
 

@@ -239,10 +239,14 @@ def _benchmark_reference_sddmm(
         # timing.
         ref_dtype = reference_utils.reference_dtype(value_dtype)
         sampled = reference_utils.sddmm_csr_values(indices, indptr64, x, y, ref_dtype)
-        vals = reference_utils.as_torch(sampled, ref_dtype, x.device) * alpha
+        # Finish the promoted arithmetic on the CPU and move the result at the output
+        # dtype. CoreX 4.4 silently zeroes an fp64 H2D transfer and an on-device cast
+        # to fp64, so a reference moved up at fp64 was all zeros there and every fp32
+        # row FAILed (err ~ |value| / atol). See reference_utils.as_torch_at.
+        vals = reference_utils.as_torch(sampled, ref_dtype, "cpu") * alpha
         if data is not None:
-            vals = vals + beta * data.to(ref_dtype)
-        reference = vals.to(value_dtype)
+            vals = vals + beta * data.detach().cpu().to(ref_dtype)
+        reference = reference_utils.as_torch_at(vals.numpy(), value_dtype, x.device)
         baseline_ms = None
         # On MACA, time the gather/multiply/sum formulation so the operator has a
         # PyTorch baseline at all -- there is no vendor SDDMM and the sampled_addmm API
