@@ -159,9 +159,12 @@ CONSTANTS = {
     "spmm_bell": {"alg": "q4", "block_dim": 2, "layout": "row", "index_dtype": "int32"},
 }
 BELL_BLOCK = 2  # the runner's spmm_bell command measures --block-dims 2
-# Blocked-ELL pads every block row to the widest one; past this many stored values
-# (1 GiB of float32) the conversion is skipped rather than risk an OOM.
-_BELL_MAX_STORED = 1 << 28
+# Blocked-ELL pads every block row to the widest one; past this much combined
+# data+index storage the conversion is skipped rather than risk an OOM. Mirrors
+# tests/test_spmm_bell.py's DEFAULT_MAX_BELL_STORAGE_MB (2048 MiB, data+index) --
+# that test already clears ASIC_680ks.mtx at this threshold, whereas the old
+# values-only 1 GiB cap here rejected it on every backend (MUSA/DCU/MACA).
+_BELL_MAX_STORAGE_BYTES = 2048 * 1024 * 1024
 
 _TOL = {torch.float16: 2e-3, torch.bfloat16: 1e-2, torch.float32: 1e-4, torch.complex64: 1e-4}
 
@@ -282,8 +285,15 @@ class _Matrix:
         brow, bcol = uniq // nb, uniq % nb
         counts = torch.bincount(brow, minlength=mb)
         width = max(1, int(counts.max().item())) if uniq.numel() else 1
-        if mb * width * bd * bd > _BELL_MAX_STORED:
-            raise MemoryError(f"Blocked-ELL would store {mb * width * bd * bd} values")
+        stored_values = mb * width * bd * bd
+        index_values = mb * width
+        storage_bytes = stored_values * values.element_size() + index_values * 4  # index is int32
+        if storage_bytes > _BELL_MAX_STORAGE_BYTES:
+            raise MemoryError(
+                f"Blocked-ELL would store {stored_values} values + {index_values} indices "
+                f"({storage_bytes / (1024.0 * 1024.0):.1f} MiB > "
+                f"{_BELL_MAX_STORAGE_BYTES / (1024.0 * 1024.0):.1f} MiB guard)"
+            )
         starts = torch.cumsum(counts, 0) - counts
         slot = torch.arange(uniq.numel(), device=keys.device) - starts[brow]
         data = torch.zeros(mb, width, bd, bd, dtype=values.dtype, device=values.device)

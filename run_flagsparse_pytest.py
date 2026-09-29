@@ -137,7 +137,7 @@ DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
         "--index-dtypes",
         "int32",
         "--value-dtypes",
-        "float16,float32,float64,complex64,complex128",
+        "float16,float32,float64,complex64,complex128,int8",
     ),
     "scatter": ("--index-dtypes", "int32"),
     "spmv_csr": (

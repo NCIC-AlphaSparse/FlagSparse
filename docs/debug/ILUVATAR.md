@@ -30,7 +30,7 @@
 - **复数**：c32 各变体没在这张卡上验证过。
 - **基线**：CoreX 旧接口只覆盖 fp32 + 不转置，所以 q4 的绝大多数变体在这里没有厂商基线，
   用 `tools/baseline_bound.py --vendor-card iluvatar-biv150`（1150 GB/s）判定。
-- 首轮建议先固定 `FLAGSPARSE_ILUVATAR_VENDOR=torch`，一次只变一个变量。
+- 首轮固定 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`（**不要用 `torch`**：BI-V150 上 PyTorch 稀疏静默返回全零），一次只变一个变量。
 
 ## 4. 待确认（上机后回报）
 

@@ -1,0 +1,1436 @@
+{
+  "tests/pytest/test_q4_variants_accuracy.py::test_the_list_has_42_distinct_variants": {
+    "params": {},
+    "result": "passed",
+    "opname": [],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[gather_i8_int-64x48x16]": {
+    "params": {
+      "name": "gather_i8_int",
+      "builder": "<function gather at 0x7f4ea4dbaf80>",
+      "dtype": "torch.int8",
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "gather"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[gather_i8_int-257x129x33]": {
+    "params": {
+      "name": "gather_i8_int",
+      "builder": "<function gather at 0x7f4ea4dbaf80>",
+      "dtype": "torch.int8",
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "gather"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[scatter_i8_int-64x48x16]": {
+    "params": {
+      "name": "scatter_i8_int",
+      "builder": "<function scatter at 0x7f4ea4dbb010>",
+      "dtype": "torch.int8",
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "scatter"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[scatter_i8_int-257x129x33]": {
+    "params": {
+      "name": "scatter_i8_int",
+      "builder": "<function scatter at 0x7f4ea4dbb010>",
+      "dtype": "torch.int8",
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "scatter"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[axpby_f16_int-64x48x16]": {
+    "params": {
+      "name": "axpby_f16_int",
+      "builder": "<function axpby at 0x7f4ea4dbb0a0>",
+      "dtype": "torch.float16",
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "axpby"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[axpby_f16_int-257x129x33]": {
+    "params": {
+      "name": "axpby_f16_int",
+      "builder": "<function axpby at 0x7f4ea4dbb0a0>",
+      "dtype": "torch.float16",
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "axpby"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_f32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_sell_f32_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dbb880>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_f32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_sell_f32_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dbb880>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f16f32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_f16f32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbb910>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f16f32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_f16f32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbb910>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spvv_f16f32_int_non-64x48x16]": {
+    "params": {
+      "name": "spvv_f16f32_int_non",
+      "builder": "<function spvv.<locals>.build at 0x7f4ea4dbb9a0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spvv"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spvv_f16f32_int_non-257x129x33]": {
+    "params": {
+      "name": "spvv_f16f32_int_non",
+      "builder": "<function spvv.<locals>.build at 0x7f4ea4dbb9a0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spvv"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f16_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_f16_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbba30>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f16_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_f16_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbba30>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f32c32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_f32c32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbbac0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f32c32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_f32c32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbbac0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_f16_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_sell_f16_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dbbb50>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_f16_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_sell_f16_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dbbb50>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f16f32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_f16f32_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbbe0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f16f32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_f16f32_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbbe0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f16_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_f16_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbc70>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f16_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_f16_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbc70>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f32_int_non_non_col-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_f32_int_non_non_col",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbd00>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f32_int_non_non_col-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_f32_int_non_non_col",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbd00>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f32_int_non_trans_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_f32_int_non_trans_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbd90>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f32_int_non_trans_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_f32_int_non_trans_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dbbd90>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csc_f32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csc_f32_int_non",
+      "builder": "<function spmv_csc.<locals>.build at 0x7f4ea4dbbe20>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csc_f32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csc_f32_int_non",
+      "builder": "<function spmv_csc.<locals>.build at 0x7f4ea4dbbe20>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_c32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_c32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbbeb0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_c32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_c32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dbbeb0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_c32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_sell_c32_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dbbf40>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_c32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_sell_c32_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dbbf40>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spvv_c32_int_conj-64x48x16]": {
+    "params": {
+      "name": "spvv_c32_int_conj",
+      "builder": "<function spvv.<locals>.build at 0x7f4ea4dcc040>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spvv"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spvv_c32_int_conj-257x129x33]": {
+    "params": {
+      "name": "spvv_c32_int_conj",
+      "builder": "<function spvv.<locals>.build at 0x7f4ea4dcc040>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spvv"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_f16f32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_coo_f16f32_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc0d0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_f16f32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_coo_f16f32_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc0d0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_c32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_c32_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dcc160>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_c32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_c32_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dcc160>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_f32_int_trans-64x48x16]": {
+    "params": {
+      "name": "spmv_coo_f32_int_trans",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc1f0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_f32_int_trans-257x129x33]": {
+    "params": {
+      "name": "spmv_coo_f32_int_trans",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc1f0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f32_int_trans-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_f32_int_trans",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcc280>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_f32_int_trans-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_f32_int_trans",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcc280>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_i8f32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_i8f32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcc310>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_i8f32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_i8f32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcc310>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_i8i32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_i8i32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcc3a0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_i8i32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_i8i32_int_non",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcc3a0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_i8i32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_sell_i8i32_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dcc430>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_sell_i8i32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_sell_i8i32_int_non",
+      "builder": "<function spmv_sell.<locals>.build at 0x7f4ea4dcc430>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_sell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spvv_i8i32_int_non-64x48x16]": {
+    "params": {
+      "name": "spvv_i8i32_int_non",
+      "builder": "<function spvv.<locals>.build at 0x7f4ea4dcc4c0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spvv"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spvv_i8i32_int_non-257x129x33]": {
+    "params": {
+      "name": "spvv_i8i32_int_non",
+      "builder": "<function spvv.<locals>.build at 0x7f4ea4dcc4c0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spvv"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csc_f32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csc_f32_int_non_non_row",
+      "builder": "<function spmm_csc.<locals>.build at 0x7f4ea4dcc550>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csc_f32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csc_f32_int_non_non_row",
+      "builder": "<function spmm_csc.<locals>.build at 0x7f4ea4dcc550>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_i8i32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_i8i32_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dcc5e0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_i8i32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_i8i32_int_non_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dcc5e0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_c32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_coo_c32_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc670>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_c32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_coo_c32_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc670>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_f16_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_coo_f16_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc700>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_f16_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_coo_f16_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dcc700>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csc_c32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csc_c32_int_non",
+      "builder": "<function spmv_csc.<locals>.build at 0x7f4ea4dcc790>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csc_c32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csc_c32_int_non",
+      "builder": "<function spmv_csc.<locals>.build at 0x7f4ea4dcc790>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csc_f16_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_csc_f16_int_non",
+      "builder": "<function spmv_csc.<locals>.build at 0x7f4ea4dcc820>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csc_f16_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_csc_f16_int_non",
+      "builder": "<function spmv_csc.<locals>.build at 0x7f4ea4dcc820>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csc"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[sddmm_csr_f32_int_non_non_col-64x48x16]": {
+    "params": {
+      "name": "sddmm_csr_f32_int_non_non_col",
+      "builder": "<function sddmm.<locals>.build at 0x7f4ea4dcc8b0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "sddmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[sddmm_csr_f32_int_non_non_col-257x129x33]": {
+    "params": {
+      "name": "sddmm_csr_f32_int_non_non_col",
+      "builder": "<function sddmm.<locals>.build at 0x7f4ea4dcc8b0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "sddmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[sddmm_csr_f32_int_non_trans_row-64x48x16]": {
+    "params": {
+      "name": "sddmm_csr_f32_int_non_trans_row",
+      "builder": "<function sddmm.<locals>.build at 0x7f4ea4dcc940>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "sddmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[sddmm_csr_f32_int_non_trans_row-257x129x33]": {
+    "params": {
+      "name": "sddmm_csr_f32_int_non_trans_row",
+      "builder": "<function sddmm.<locals>.build at 0x7f4ea4dcc940>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "sddmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[sddmm_csr_f32_int_trans_non_row-64x48x16]": {
+    "params": {
+      "name": "sddmm_csr_f32_int_trans_non_row",
+      "builder": "<function sddmm.<locals>.build at 0x7f4ea4dcc9d0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "sddmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[sddmm_csr_f32_int_trans_non_row-257x129x33]": {
+    "params": {
+      "name": "sddmm_csr_f32_int_trans_non_row",
+      "builder": "<function sddmm.<locals>.build at 0x7f4ea4dcc9d0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "sddmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_bell_f32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_bell_f32_int_non_non_row",
+      "builder": "<function spmm_bell.<locals>.build at 0x7f4ea4dcca60>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_bell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_bell_f32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_bell_f32_int_non_non_row",
+      "builder": "<function spmm_bell.<locals>.build at 0x7f4ea4dcca60>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_bell"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_bsr_f32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_bsr_f32_int_non_non_row",
+      "builder": "<function spmm_bsr.<locals>.build at 0x7f4ea4dccaf0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_bsr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_bsr_f32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_bsr_f32_int_non_non_row",
+      "builder": "<function spmm_bsr.<locals>.build at 0x7f4ea4dccaf0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_bsr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_coo_c32_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_coo_c32_int_non_non_row",
+      "builder": "<function spmm_coo.<locals>.build at 0x7f4ea4dccb80>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_coo_c32_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_coo_c32_int_non_non_row",
+      "builder": "<function spmm_coo.<locals>.build at 0x7f4ea4dccb80>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_coo_f16_int_non_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_coo_f16_int_non_non_row",
+      "builder": "<function spmm_coo.<locals>.build at 0x7f4ea4dccc10>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_coo_f16_int_non_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_coo_f16_int_non_non_row",
+      "builder": "<function spmm_coo.<locals>.build at 0x7f4ea4dccc10>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f32_int_trans_non_row-64x48x16]": {
+    "params": {
+      "name": "spmm_csr_f32_int_trans_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dccca0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmm_csr_f32_int_trans_non_row-257x129x33]": {
+    "params": {
+      "name": "spmm_csr_f32_int_trans_non_row",
+      "builder": "<function spmm_csr.<locals>.build at 0x7f4ea4dccca0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmm_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_c32_int_conj-64x48x16]": {
+    "params": {
+      "name": "spmv_coo_c32_int_conj",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dccd30>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_c32_int_conj-257x129x33]": {
+    "params": {
+      "name": "spmv_coo_c32_int_conj",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dccd30>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_i8i32_int_non-64x48x16]": {
+    "params": {
+      "name": "spmv_coo_i8i32_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dccdc0>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_coo_i8i32_int_non-257x129x33]": {
+    "params": {
+      "name": "spmv_coo_i8i32_int_non",
+      "builder": "<function spmv_coo.<locals>.build at 0x7f4ea4dccdc0>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_coo"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_c32_int_conj-64x48x16]": {
+    "params": {
+      "name": "spmv_csr_c32_int_conj",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcce50>",
+      "dtype": null,
+      "shape": [
+        64,
+        48,
+        16
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  },
+  "tests/pytest/test_q4_variants_accuracy.py::test_q4_variant_matches_cpu_golden[spmv_csr_c32_int_conj-257x129x33]": {
+    "params": {
+      "name": "spmv_csr_c32_int_conj",
+      "builder": "<function spmv_csr.<locals>.build at 0x7f4ea4dcce50>",
+      "dtype": null,
+      "shape": [
+        257,
+        129,
+        33
+      ]
+    },
+    "result": "passed",
+    "opname": [
+      "spmv_csr"
+    ],
+    "reason": null
+  }
+}

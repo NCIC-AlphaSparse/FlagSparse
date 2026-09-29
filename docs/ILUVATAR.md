@@ -29,7 +29,7 @@ Python 侧的天数后端：怎么选中、每次开工的环境、交付复现�
 | 自动探测    | 三个信号，任一命中即可（`_detect_iluvatar_runtime()`）：torch 版本带 `+corex` 标记（`torch.__version__` **和** pip 元数据都查）、`COREX_HOME` / `COREX_PATH` 环境变量、设备名含 `iluvatar` / `bi-v` / `corex` |
 | 显式指定    | `FLAGSPARSE_BACKEND=iluvatar`，**优先于探测**                                                                                                                                                                               |
 | 算子内核    | 共享实现，`backends/iluvatar/` 下只有 `__init__.py`，没有覆盖                                                                                                                                                                   |
-| 性能基线    | 交付跑用**`torch`**（第 1 节显式设 `FLAGSPARSE_ILUVATAR_VENDOR=torch`），与其余国产后端同口径。不设这个变量时是探测：CuPy 真装了就用 `cupy_cusparse`，否则 `torch`（同 MetaX 的策略，**未实测**）               |
+| 性能基线    | 交付跑用**`cupy_cusparse`**（第 1 节显式设 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`）：CoreX 的 legacy `cusparseScsrmv/Scsrmm`，经 CuPy 调用，只覆盖 fp32 + int32 + 不转置。**不要用 `torch`**：BI-V150 上 PyTorch 的 CSR SpMV/SpMM 会静默返回全零（第 3 节）。不设这个变量时是探测（CuPy 真装了用 `cupy_cusparse`，否则 `torch`），同一台机器装没装 CuPy 口径就变，所以必须显式设置 |
 | 精度参考    | CPU 上的 SciPy（CUDA、ROCm 以外的后端都是这样）                                                                                                                                                                                     |
 | runner 路由 | 与 CUDA / MetaX 相同的通用性能脚本（`GENERIC_BENCHMARK_BACKENDS`）                                                                                                                                                                |
 
@@ -63,7 +63,7 @@ export LD_LIBRARY_PATH=$COREX_HOME/lib64:$COREX_HOME/lib:$LD_LIBRARY_PATH
 # FlagSparse：后端和基线全部显式指定
 export PYTHONPATH=$PWD/src                  # 独立脚本需要；pytest 由 pytest.ini 自带
 export FLAGSPARSE_BACKEND=iluvatar
-export FLAGSPARSE_ILUVATAR_VENDOR=torch     # 固定用 PyTorch 作基线；不设则装了 CuPy 就会改用 CuPy，两者口径不同。不要设 none，否则基线列全是 N/A
+export FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse   # 固定用 CoreX cuSPARSE（经 CuPy）作基线；不要用 torch（BI-V150 上 PyTorch 稀疏静默返回全零），不要设 none（基线列全是 N/A）；需要 CuPy 真装好：python3 -c "import cupy"
 unset FLAGSPARSE_ACCURACY_REFERENCE         # 用默认的 auto（CPU 上的 SciPy），防止上次调试残留的设置
 ```
 
@@ -78,7 +78,7 @@ python3 -c "import flagsparse; print(flagsparse.__file__)"
 # 期望：<仓库>/src/flagsparse/__init__.py；指到 site-packages 就是跑错了副本
 python3 -c "import torch; print(torch.cuda.get_device_properties(0).name); from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_device_type(), c._accel_fallback_reason(), c._vendor_sparse_library())"
 # 期望：Iluvatar BI-V150（或类似的天数设备名）
-#       iluvatar cuda None torch
+#       iluvatar cuda None cupy_cusparse   （最后一项是基线库；出现 torch 说明 FLAGSPARSE_ILUVATAR_VENDOR 没设或 CuPy 没装好）
 ```
 
 显式指定会跳过探测，所以要看**真实设备名**：只有它确实是天数的卡，`FLAGSPARSE_BACKEND=iluvatar` 才对。
@@ -416,7 +416,7 @@ segbin 内核里。`legacy_rowpar` / `legacy_bucket_vector` 用的
 | 设备名（torch 侧）                            | **`'Iluvatar BI-V100'`** —— 命中探测的 `iluvatar` 和 `bi-v` 两个匹配串                                                                                                                                                    |
 | **`warp_size`**                       | **属性不存在**（`getattr` 返回默认值）—— 见 4.3 节，这是目前最需要查实的一项                                                                                                                                                  |
 | MP count                                      | 16                                                                                                                                                                                                                                      |
-| `torch.sparse` CSR matmul                   | **可用**（有 beta 警告，但能算出结果），所以 `FLAGSPARSE_ILUVATAR_VENDOR=torch` 这个基线是站得住的                                                                                                                              |
+| `torch.sparse` CSR matmul                   | **可用**（有 beta 警告，但能算出结果），这是 BI-V100 / CoreX 3.2.3 的结果，**不能外推到 BI-V150**：那边 CSR SpMV/SpMM 会静默返回全零（第 3 节），BI-V150 的基线用 `cupy_cusparse`                                                                                                                              |
 | 3.2.3 镜像里的 torch / triton                 | `torch 2.1.0+corex.3.2.3`（模块属性又是裸的 `2.1.0`）、**`triton 2.3.1`** —— 比 FlagTree 镜像的 Triton 3.6 老得多，这个镜像只适合做指纹，不适合跑算子                                                                     |
 | 宿主机驱动 / IX-ML                            | **3.2.3 / 3.2.3**；呈现的 CUDA 兼容级别是 **10.2**                                                                                                                                                                          |
 | 宿主机 CoreX 安装                             | `/usr/local/corex` → `corex-3.2.3`，另有 3.1.1 / 4.4.0 / 4.5.0 未启用                                                                                                                                                              |
@@ -459,7 +459,7 @@ torch.cuda.is_available() -> False        # 但 device_count() -> 8
 | **`warp_size` 的真实值**（仅 BI-V100；BI-V150 已实测为 64，见 4.0 节）                                                    | **属性不存在，代码会静默取 32**。`_common.py` 的 `_get_device_backend_info()` 里 `default_warp = 64 if backend == "hip" else 32`，天数走 `cuda` 分支；`spmv_csr.py`、`spmm_csr.py`（三处）、`spmm_csr_opt_alg2.py` 各自也 `getattr(props, "warp_size", 32)`。**若实际是 64，整套启动几何都偏，而且不报错、只掉性能**（MetaX C550 就是 64）。查法：`ixsmi -q` 里找 warp/core 相关字段，或在 Triton 3.x 下 `triton.runtime.driver.active.get_current_target()` |
 | 自动探测能否命中（元数据里的`+corex` 应当命中，未在真机跑过 `_backend_name()`） | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | FlagTree 的`iluvatar` 后端能否编译执行最小 Triton 内核                            | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `torch.sparse` CSR/COO matmul 能否作为基线                                        | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `torch.sparse` CSR/COO matmul 能否作为基线                                        |  **不能**：BI-V150 上 CSR SpMV/SpMM 静默返回全零（`ILUVATAR_DEBUG.md`）；基线改用 `cupy_cusparse` |
 | `CUDA_VISIBLE_DEVICES` 选卡（八卡机，务必确认落在哪张）                           | 未验证                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | 20 变体交付结果                                                                     | 无                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
