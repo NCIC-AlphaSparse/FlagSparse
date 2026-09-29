@@ -36,3 +36,6 @@ test_spmv_bsr_scipy.csv
 # Backend delivery notes and staging copies; kept out of the repo by the maintainer.
 /prompt.md
 /modified/
+
+# Claude Code session/scheduled-task state; not part of the source tree.
+.claude/
