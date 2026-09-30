@@ -229,6 +229,25 @@ TEST_F(SDDMMAccuracy, Float64AndAlphaBeta) {
                  handle.h);
 }
 
+// q4's sddmm_csr_f16_int_non_non_row: same dispatch path as fp32/fp64 (the
+// ACC_IS_FP64 constexpr already upcasts non-fp64 to fp32 accumulate), just
+// fp16 storage end to end.
+TEST_F(SDDMMAccuracy, Float16) {
+    const CsrMatrix C = random_csr(96, 80, 0.08, 555);
+    // ref is computed from the UNQUANTIZED fp64 A/B (see run_sddmm above), not
+    // from the fp16-rounded values the device actually multiplies -- so the
+    // measured error is input-quantization noise accumulated over k terms, on
+    // top of (not instead of) the kernel's own (correct, fp32-accumulated)
+    // arithmetic. That noise grows with k; k=16 here matches the largest k the
+    // Python side's equivalent q4 accuracy case exercises for this dtype
+    // (tests/pytest/test_q4_variants_accuracy.py's SHAPES), which is already
+    // known to pass at a tighter (2e-3) tolerance than this ctest's fp16
+    // default -- a much larger k would need a bigger tolerance for the same
+    // reason, not a kernel fix.
+    Case c; c.k = 8;
+    expect_close(run_sddmm<Half>(handle.h, C, FLAGSPARSE_R_16F, c), "fp16", handle.h);
+}
+
 // Mean row length picks BLOCK_P: >= 16 takes the wide 512 config (non-fp64),
 // below it the narrow 64. Both must be right, not just the default one.
 TEST_F(SDDMMAccuracy, BlockPConfigsAgree) {

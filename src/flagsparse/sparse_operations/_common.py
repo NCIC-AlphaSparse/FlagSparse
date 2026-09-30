@@ -406,6 +406,7 @@ __all__ = (
     "_INDEX_LIMIT_INT32",
     "_is_complex_dtype",
     "_gather_values",
+    "_index_add_values",
     "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
@@ -554,11 +555,12 @@ def _gather_values(values, order):
     """Gather ``values`` along dim 0 by ``order``; complex-safe on every backend.
 
     Moore Threads has no complex kernel for advanced indexing -- ``values[order]``
-    raises ``RuntimeError: "IndexMusa" not implemented for 'ComplexFloat'`` -- which
-    breaks every reorder a transposed or COO-sorted operator has to do, while the
-    real dtypes go through fine.  Complex values are therefore gathered through
-    ``view_as_real``: the same bytes in the same order, and the real-dtype index
-    kernel exists everywhere.
+    raises ``RuntimeError: "IndexMusa" not implemented for 'ComplexFloat'`` -- and
+    Ascend's aclnnIndex rejects it the same way (``Tensor self not implemented for
+    DT_COMPLEX64``). Both break every reorder a transposed or COO-sorted operator has
+    to do, while the real dtypes go through fine. Complex values are therefore
+    gathered through ``view_as_real``: the same bytes in the same order, and the
+    real-dtype index kernel exists everywhere.
 
     The branch is on **dtype, not backend**, so CUDA/ROCm/MACA keep the exact path
     they always took for real data and get an equivalent one for complex.  The same
@@ -569,6 +571,30 @@ def _gather_values(values, order):
         return values[order]
     real_view = torch.view_as_real(values if values.is_contiguous() else values.contiguous())
     return torch.view_as_complex(real_view[order].contiguous())
+
+
+def _index_add_values(acc, dim, index, source):
+    """``acc.index_add_(dim, index, source)`` in place; complex-safe on every backend.
+
+    The scatter-add counterpart to ``_gather_values``: ``index_add_`` on a complex
+    tensor hits the exact same "no complex index kernel" gap (MUSA's ``IndexMusa``,
+    Ascend's ``aclnnIndex``) that plain advanced indexing does -- it is the same
+    underlying index primitive, just writing instead of reading. Every torch_npu /
+    Ascend fallback in this package that reduces nonzeros with ``index_add_`` (CSR and
+    COO SpMV/SpMM) needs this, not only the ones that also call ``_gather_values``.
+
+    ``torch.view_as_real`` of a complex tensor is a VIEW over the same interleaved
+    storage (contiguous, since a complex64 element already IS two adjacent float32
+    values), so ``index_add_`` on the real view mutates ``acc`` in place exactly like
+    the direct complex call would -- this returns ``acc`` for convenience, not a copy.
+    """
+    if not _is_complex_dtype(acc.dtype):
+        acc.index_add_(dim, index, source)
+        return acc
+    acc_real = torch.view_as_real(acc)
+    src_real = torch.view_as_real(source if source.is_contiguous() else source.contiguous())
+    acc_real.index_add_(dim, index, src_real)
+    return acc
 
 
 def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):

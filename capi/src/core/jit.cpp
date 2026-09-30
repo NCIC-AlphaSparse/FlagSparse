@@ -86,6 +86,7 @@ flagsparseStatus_t launch(const std::string& module_path,
                 case Arg::Kind::I64: raw.push_back(const_cast<std::int64_t*>(&a.i64)); break;
                 case Arg::Kind::F32: raw.push_back(const_cast<float*>(&a.f32)); break;
                 case Arg::Kind::F64: raw.push_back(const_cast<double*>(&a.f64)); break;
+                case Arg::Kind::F16: raw.push_back(const_cast<std::uint16_t*>(&a.f16)); break;
             }
         }
         // Triton appends a global and a profile scratch pointer to every kernel.

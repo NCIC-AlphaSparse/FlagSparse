@@ -226,6 +226,12 @@ Tolerance default_tolerance(flagsparseDataType_t dtype) {
         case FLAGSPARSE_C_32F:  return {1e-5, 1e-6};
         case FLAGSPARSE_R_64F:
         case FLAGSPARSE_C_64F:  return {1e-12, 1e-13};
+        // The sweep's fp64 dense pattern (0.5 .. 2.0, see dense_pattern()) is
+        // rounded to the nearest int8 by upload_as() rather than rescaled, so
+        // the oracle (computed from the unrounded pattern) and the read-back
+        // int8 value can legitimately differ by up to 0.5 -- that is rounding,
+        // not a defect. atol must cover it; rtol is irrelevant at this scale.
+        case FLAGSPARSE_R_8I:   return {0.0, 0.500001};
         default:                return {1e-5, 1e-6};
     }
 }
@@ -237,6 +243,7 @@ Tolerance relaxed_tolerance(flagsparseDataType_t dtype) {
     switch (dtype) {
         case FLAGSPARSE_R_64F:
         case FLAGSPARSE_C_64F: return {1e-10, 1e-11};
+        case FLAGSPARSE_R_8I:  return {0.0, 0.500001};
         default:               return {1e-3, 1e-4};
     }
 }

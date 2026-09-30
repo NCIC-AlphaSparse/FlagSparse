@@ -80,6 +80,11 @@ bool map_dtype(flagsparseDataType_t t, FS_DT_TYPE* out) {
         case FLAGSPARSE_R_64F: *out = FS_DT(R_64F); return true;
         case FLAGSPARSE_C_32F: *out = FS_DT(C_32F); return true;
         case FLAGSPARSE_C_64F: *out = FS_DT(C_64F); return true;
+        // Mapped for the same reason fp16 is (see above): gather/scatter move
+        // bytes, no arithmetic, so whether the vendor call accepts int8 is the
+        // operator's business, not this table's -- it returns its own status if
+        // it does not, which becomes a blank speedup with that reason.
+        case FLAGSPARSE_R_8I: *out = FS_DT(R_8I); return true;
         default: return false;
     }
 }

@@ -389,3 +389,70 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
         _ACCEL.synchronize()
         return C, (time.perf_counter() - t0) * 1000.0
     return C
+
+
+# ---------------------------------------------------------------------------
+# COO SpMM (C = A @ B, B/C row- or column-major through their strides)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _coo_spmm_mixed_kernel(
+    c_ptr, data_ptr, rows_ptr, cols_ptr, b_ptr, nnz, n_dense,
+    stride_bk, stride_bn, stride_cm, stride_cn,
+    ACC: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """One program per (nonzero, dense-column tile); every nonzero's contribution
+    to its output row is atomic_add'd independently, same shape as
+    _coo_spmv_atomic_kernel above with a dense-N axis added (mirroring
+    _csr_spmm_mixed_kernel's per-row accumulator, but COO has no contiguous
+    per-row range to loop over without a CSR-style indptr)."""
+    idx = tl.program_id(0)
+    if idx >= nnz:
+        return
+    n_offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < n_dense
+    row = tl.load(rows_ptr + idx)
+    col = tl.load(cols_ptr + idx)
+    a = tl.load(data_ptr + idx).to(ACC)
+    b = tl.load(b_ptr + col * stride_bk + n_offs * stride_bn, mask=n_mask, other=0).to(ACC)
+    tl.atomic_add(c_ptr + row * stride_cm + n_offs * stride_cn, a * b, mask=n_mask)
+
+
+def spmm_coo_mixed(data, row, col, B, shape, *, op=None, transpose=None,
+                   out=None, out_dtype=None, return_time=False):
+    """``B`` may be any 2D strided view (column-major, or a transposed ``op_b``)."""
+    _normalize_non_op(op, transpose)
+    _check_1d((data, "data"), (row, "row"), (col, "col"))
+    if not torch.is_tensor(B) or B.ndim != 2 or not _is_accel_tensor(B):
+        raise ValueError("B must be a 2D accelerator tensor")
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if not (data.numel() == row.numel() == col.numel()):
+        raise ValueError("data, row and col must have the same length")
+    if B.shape[0] != n_cols:
+        raise ValueError(f"B has {B.shape[0]} rows, expected {n_cols}")
+    result_dtype, acc_dtype = _resolve_types(data.dtype, B.dtype, out, out_dtype, False)
+    n_dense = int(B.shape[1])
+    if out is not None and (tuple(out.shape) != (n_rows, n_dense) or out.device != B.device):
+        raise ValueError("out shape/device must match the COO SpMM result")
+    data = data.contiguous()
+    rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
+    t0 = _start(return_time)
+    if _is_ascend_runtime():
+        C = torch.zeros(n_rows, n_dense, dtype=acc_dtype, device=B.device)
+        C.index_add_(
+            0, rows.to(torch.int64),
+            data.to(acc_dtype).unsqueeze(1) * B.index_select(0, cols.to(torch.int64)).to(acc_dtype),
+        )
+        return _finish(C.to(result_dtype), out, t0, return_time)
+    acc = torch.zeros(n_rows, n_dense, dtype=acc_dtype, device=B.device)
+    nnz = data.numel()
+    if nnz and n_dense:
+        block_n = min(128, max(16, triton.next_power_of_2(n_dense)))
+        _coo_spmm_mixed_kernel[(nnz, triton.cdiv(n_dense, block_n))](
+            acc, data, rows, cols, B, nnz, n_dense,
+            B.stride(0), B.stride(1), acc.stride(0), acc.stride(1),
+            ACC=_TL_ACC[acc_dtype], BLOCK_N=block_n, num_warps=2,
+        )
+    y = acc if acc_dtype == result_dtype else acc.to(result_dtype)
+    return _finish(y, out, t0, return_time)

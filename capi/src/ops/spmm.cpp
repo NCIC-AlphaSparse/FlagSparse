@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -278,6 +279,220 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
     return FLAGSPARSE_STATUS_SUCCESS;
 }
 
+// ------------------------------------------------------- mixed precision ---
+
+// The mixed kernels take narrow A/B buffers and write a widened C buffer. They
+// intentionally have no alpha/beta parameters, matching mixed_spmx.py's public
+// functions, so this path only accepts the identity scaling combination.
+bool mixed_narrow_wide_pair(flagsparseDataType_t input_type,
+                            flagsparseDataType_t output_type, bool* acc_is_i32) {
+    if (input_type == FLAGSPARSE_R_8I) {
+        if (output_type == FLAGSPARSE_R_32I) { *acc_is_i32 = true; return true; }
+        if (output_type == FLAGSPARSE_R_32F) { *acc_is_i32 = false; return true; }
+        return false;
+    }
+    if (input_type == FLAGSPARSE_R_16F) {
+        *acc_is_i32 = false;
+        return output_type == FLAGSPARSE_R_32F;
+    }
+    return false;
+}
+
+bool is_mixed_request(flagsparseOperation_t opA, flagsparseConstSpMatDescr_t matA,
+                      flagsparseConstDnMatDescr_t matB, flagsparseConstDnMatDescr_t matC,
+                      bool* acc_is_i32) {
+    if (matA == nullptr || matB == nullptr || matC == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    if ((A->format != FLAGSPARSE_FORMAT_CSR && A->format != FLAGSPARSE_FORMAT_COO) ||
+        transposes(opA)) {
+        return false;
+    }
+    const DnMatDescr* B = dnmat(matB);
+    const DnMatDescr* C = dnmat(matC);
+    if (B->value_type != A->value_type) return false;
+    return mixed_narrow_wide_pair(A->value_type, C->value_type, acc_is_i32);
+}
+
+flagsparseStatus_t validate_mixed(flagsparseHandle_t handle, flagsparseOperation_t opA,
+                                  flagsparseOperation_t opB,
+                                  flagsparseConstSpMatDescr_t matA,
+                                  flagsparseConstDnMatDescr_t matB,
+                                  flagsparseConstDnMatDescr_t matC,
+                                  flagsparseDataType_t computeType,
+                                  flagsparseSpMMAlg_t alg) {
+    if (handle == nullptr) return FLAGSPARSE_STATUS_NOT_INITIALIZED;
+    if (matA == nullptr || matB == nullptr || matC == nullptr) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    const SpMatDescr* A = spmat(matA);
+    const DnMatDescr* B = dnmat(matB);
+    const DnMatDescr* C = dnmat(matC);
+    bool unused = false;
+    if (!mixed_narrow_wide_pair(A->value_type, C->value_type, &unused) ||
+        B->value_type != A->value_type || computeType != C->value_type) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if ((A->format != FLAGSPARSE_FORMAT_CSR && A->format != FLAGSPARSE_FORMAT_COO) ||
+        transposes(opA) || A->idx_base != FLAGSPARSE_INDEX_BASE_ZERO ||
+        !alg_supported(A->format, alg)) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (opB == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (opB != FLAGSPARSE_OPERATION_NON_TRANSPOSE &&
+        opB != FLAGSPARSE_OPERATION_TRANSPOSE) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    if (triton_index_dtype(A->indices_type)[0] == '\0' ||
+        (A->format == FLAGSPARSE_FORMAT_CSR &&
+         triton_index_dtype(A->offsets_type)[0] == '\0')) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (A->nnz > static_cast<int64_t>(INT32_MAX)) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+
+    const int64_t b_rows = transposes(opB) ? B->cols : B->rows;
+    const int64_t b_cols = transposes(opB) ? B->rows : B->cols;
+    if (C->rows != A->rows || b_rows != A->cols || b_cols != C->cols) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+bool is_identity_alpha_beta(flagsparseHandle_t handle, flagsparseDataType_t computeType,
+                            const void* alpha, const void* beta) {
+    if (alpha == nullptr || beta == nullptr ||
+        ctx(handle)->pointer_mode != FLAGSPARSE_POINTER_MODE_HOST) {
+        return false;
+    }
+    if (computeType == FLAGSPARSE_R_32I) {
+        const std::int32_t one = 1, zero = 0;
+        return std::memcmp(alpha, &one, sizeof(one)) == 0 &&
+               std::memcmp(beta, &zero, sizeof(zero)) == 0;
+    }
+    if (computeType == FLAGSPARSE_R_32F) {
+        const float one = 1.0f, zero = 0.0f;
+        return std::memcmp(alpha, &one, sizeof(one)) == 0 &&
+               std::memcmp(beta, &zero, sizeof(zero)) == 0;
+    }
+    return false;
+}
+
+int mixed_block_n(int64_t n) {
+    int block = 16;
+    while (block < n && block < 128) block *= 2;
+    return block;
+}
+
+DenseStrides mixed_strides_of(const DnMatDescr* M) {
+    return (M->order == FLAGSPARSE_ORDER_ROW) ? DenseStrides{M->ld, 1}
+                                              : DenseStrides{1, M->ld};
+}
+
+flagsparseStatus_t run_csr_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
+                                 flagsparseOperation_t opB, const DnMatDescr* B,
+                                 DnMatDescr* C, bool acc_is_i32) {
+    if (A->rows == 0 || C->cols == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    const char* xt = triton_dtype(A->value_type);
+    const char* yt = triton_dtype(C->value_type);
+    const DenseStrides bs = mixed_strides_of(B);
+    const DenseStrides cs = mixed_strides_of(C);
+    const int64_t stride_bk = transposes(opB) ? bs.col : bs.row;
+    const int64_t stride_bn = transposes(opB) ? bs.row : bs.col;
+    const int block_n = mixed_block_n(C->cols);
+
+    std::string sig;
+    sig.reserve(160);
+    sig += "*"; sig += yt; sig += ":16,";  // C
+    sig += "*"; sig += xt; sig += ":16,";  // data
+    sig += "*"; sig += it; sig += ":16,";  // cols
+    sig += "*"; sig += ot; sig += ":16,";  // indptr
+    sig += "*"; sig += xt; sig += ":16,";  // B
+    sig += "i32,i64,i64,i64,i64,";
+    sig += std::to_string(block_n);
+
+    std::vector<jit::Arg> args;
+    args.reserve(10);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(C->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(B->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(C->cols)));
+    args.push_back(jit::Arg::i64v(stride_bk));
+    args.push_back(jit::Arg::i64v(stride_bn));
+    args.push_back(jit::Arg::i64v(cs.row));
+    args.push_back(jit::Arg::i64v(cs.col));
+
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("mixed_spmx.py"),
+        acc_is_i32 ? "csr_spmm_mixed_i32acc" : "csr_spmm_mixed_f32acc", sig,
+        ctx(handle)->stream, A->rows, (C->cols + block_n - 1) / block_n, 1,
+        /*num_warps=*/2, /*num_stages=*/3, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+flagsparseStatus_t run_coo_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
+                                 flagsparseOperation_t opB, const DnMatDescr* B,
+                                 DnMatDescr* C, bool acc_is_i32) {
+    const std::size_t storage_elems = static_cast<std::size_t>(
+        C->order == FLAGSPARSE_ORDER_ROW ? C->rows * C->ld : C->cols * C->ld);
+    if (adaptor::memset_device(reinterpret_cast<adaptor::DevicePtr>(C->values), 0,
+                               storage_elems * dtype_size(C->value_type)) !=
+        FLAGSPARSE_STATUS_SUCCESS) {
+        return FLAGSPARSE_STATUS_EXECUTION_FAILED;
+    }
+    if (A->nnz == 0 || C->cols == 0) return FLAGSPARSE_STATUS_SUCCESS;
+
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* xt = triton_dtype(A->value_type);
+    const char* yt = triton_dtype(C->value_type);
+    const DenseStrides bs = mixed_strides_of(B);
+    const DenseStrides cs = mixed_strides_of(C);
+    const int64_t stride_bk = transposes(opB) ? bs.col : bs.row;
+    const int64_t stride_bn = transposes(opB) ? bs.row : bs.col;
+    const int block_n = mixed_block_n(C->cols);
+
+    std::string sig;
+    sig.reserve(176);
+    sig += "*"; sig += yt; sig += ":16,";  // C accumulator
+    sig += "*"; sig += xt; sig += ":16,";  // data
+    sig += "*"; sig += it; sig += ":16,";  // rows
+    sig += "*"; sig += it; sig += ":16,";  // cols
+    sig += "*"; sig += xt; sig += ":16,";  // B
+    sig += "i32,i32,i64,i64,i64,i64,";
+    sig += std::to_string(block_n);
+
+    std::vector<jit::Arg> args;
+    args.reserve(11);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(C->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->row_ind)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(B->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->nnz)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(C->cols)));
+    args.push_back(jit::Arg::i64v(stride_bk));
+    args.push_back(jit::Arg::i64v(stride_bn));
+    args.push_back(jit::Arg::i64v(cs.row));
+    args.push_back(jit::Arg::i64v(cs.col));
+
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("mixed_spmx.py"),
+        acc_is_i32 ? "coo_spmm_mixed_i32acc" : "coo_spmm_mixed_f32acc", sig,
+        ctx(handle)->stream, A->nnz, (C->cols + block_n - 1) / block_n, 1,
+        /*num_warps=*/2, /*num_stages=*/3, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
 // --------------------------------------------------------------- launch ---
 
 // Everything the two formats agree on, resolved once.
@@ -517,6 +732,10 @@ flagsparseStatus_t flagsparseSpMM_bufferSize(
     if (bufferSize == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
     *bufferSize = 0;
     return guard(handle, [&]() -> flagsparseStatus_t {
+        bool acc_is_i32 = false;
+        if (is_mixed_request(opA, matA, matB, matC, &acc_is_i32)) {
+            return validate_mixed(handle, opA, opB, matA, matB, matC, computeType, alg);
+        }
         if (flagsparseStatus_t s =
                 validate(handle, opA, opB, matA, matB, matC, computeType, alg)) {
             return s;
@@ -539,6 +758,10 @@ flagsparseStatus_t flagsparseSpMM_preprocess(
     flagsparseSpMMAlg_t alg, void* externalBuffer) {
     (void)alpha; (void)beta;
     return guard(handle, [&]() -> flagsparseStatus_t {
+        bool acc_is_i32 = false;
+        if (is_mixed_request(opA, matA, matB, matC, &acc_is_i32)) {
+            return validate_mixed(handle, opA, opB, matA, matB, matC, computeType, alg);
+        }
         if (flagsparseStatus_t s =
                 validate(handle, opA, opB, matA, matB, matC, computeType, alg)) {
             return s;
@@ -564,6 +787,22 @@ flagsparseStatus_t flagsparseSpMM(
     const void* beta, flagsparseDnMatDescr_t matC, flagsparseDataType_t computeType,
     flagsparseSpMMAlg_t alg, void* externalBuffer) {
     return guard(handle, [&]() -> flagsparseStatus_t {
+        bool acc_is_i32 = false;
+        if (is_mixed_request(opA, matA, matB, matC, &acc_is_i32)) {
+            if (flagsparseStatus_t s =
+                    validate_mixed(handle, opA, opB, matA, matB, matC, computeType, alg)) {
+                return s;
+            }
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            const SpMatDescr* A = spmat(matA);
+            const DnMatDescr* B = dnmat(matB);
+            DnMatDescr* C = dnmat(matC);
+            return A->format == FLAGSPARSE_FORMAT_COO
+                       ? run_coo_mixed(handle, A, opB, B, C, acc_is_i32)
+                       : run_csr_mixed(handle, A, opB, B, C, acc_is_i32);
+        }
         if (flagsparseStatus_t s =
                 validate(handle, opA, opB, matA, matB, matC, computeType, alg)) {
             return s;

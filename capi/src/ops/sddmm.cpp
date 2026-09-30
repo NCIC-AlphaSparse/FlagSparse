@@ -27,6 +27,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,7 @@ flagsparseStatus_t read_scalar(flagsparseHandle_t handle, const void* p,
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     switch (ctype) {
+        case FLAGSPARSE_R_16F: *out = fp16_to_double(*static_cast<const uint16_t*>(p)); return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_R_32F: *out = *static_cast<const float*>(p);  return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_R_64F: *out = *static_cast<const double*>(p); return FLAGSPARSE_STATUS_SUCCESS;
         default: return FLAGSPARSE_STATUS_NOT_SUPPORTED;
@@ -146,8 +148,11 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
     if (C->format != FLAGSPARSE_FORMAT_CSR) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     if (C->idx_base != FLAGSPARSE_INDEX_BASE_ZERO) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     // The operator package has no complex SDDMM kernel; reporting that beats
-    // inventing one here.
-    if (computeType != FLAGSPARSE_R_32F && computeType != FLAGSPARSE_R_64F) {
+    // inventing one here. f16 is fine: sddmm_csr_real's ACC_IS_FP64 constexpr
+    // already upcasts anything non-fp64 to fp32 accumulate (see
+    // flagsparse_codegen/sddmm_csr.py), the same as the Python dispatch does.
+    if (computeType != FLAGSPARSE_R_32F && computeType != FLAGSPARSE_R_64F &&
+        computeType != FLAGSPARSE_R_16F) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     if (triton_index_dtype(C->indices_type)[0] == '\0' ||
@@ -240,9 +245,17 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
     args.push_back(jit::Arg::i64v(stride_xk));
     args.push_back(jit::Arg::i64v(stride_ym));
     args.push_back(jit::Arg::i64v(stride_yk));
-    if (is_fp64) { args.push_back(jit::Arg::d(alpha_v)); args.push_back(jit::Arg::d(beta_v)); }
-    else { args.push_back(jit::Arg::f(static_cast<float>(alpha_v)));
-           args.push_back(jit::Arg::f(static_cast<float>(beta_v))); }
+    // alpha/beta's Triton-side type is `vt` (declared above), matching x/y/out
+    // -- not a fixed fp32, so each width needs its own Arg constructor.
+    if (is_fp64) {
+        args.push_back(jit::Arg::d(alpha_v)); args.push_back(jit::Arg::d(beta_v));
+    } else if (computeType == FLAGSPARSE_R_16F) {
+        args.push_back(jit::Arg::h(double_to_fp16(alpha_v)));
+        args.push_back(jit::Arg::h(double_to_fp16(beta_v)));
+    } else {
+        args.push_back(jit::Arg::f(static_cast<float>(alpha_v)));
+        args.push_back(jit::Arg::f(static_cast<float>(beta_v)));
+    }
 
     const int64_t grid = (C->nnz + block_p - 1) / block_p;
     std::string err;

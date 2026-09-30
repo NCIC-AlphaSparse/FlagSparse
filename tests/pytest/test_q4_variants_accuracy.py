@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The first 42 variants of docs/NEW_OPERATORS_CUSPARSE_12_5.md, one case each.
+"""The 45 variants of conf/operators.yaml's q4_variants list, one case each.
 
 Every case runs the public operator on the accelerator and compares it with a CPU
 float64 / complex128 golden (integer outputs exactly). Case ids are the variant
@@ -218,12 +218,13 @@ def spmm_csr(dtype, op_a="non", op_b="non", layout="row", out_dtype=None):
     return build
 
 
-def spmm_coo(dtype):
+def spmm_coo(dtype, out_dtype=None):
     def build(_unused, shape, gen):
         m, k, n = shape
         A, B = _sparse(m, k, dtype, gen), _rand((k, n), dtype, gen)
-        C = fs.flagsparse_spmm_coo(*_coo(A), *_dev(B), (m, k))
-        return C, _wide(A) @ _wide(B), dtype
+        kw = {"out_dtype": out_dtype} if out_dtype is not None else {}
+        C = fs.flagsparse_spmm_coo(*_coo(A), *_dev(B), (m, k), **kw)
+        return C, _wide(A) @ _wide(B), out_dtype or dtype
     return build
 
 
@@ -232,6 +233,20 @@ def spmm_csc(dtype):
         m, k, n = shape
         A, B = _sparse(m, k, dtype, gen), _rand((k, n), dtype, gen)
         C = fs.flagsparse_spmm_csc(*_csc(A), *_dev(B), (m, k))
+        return C, _wide(A) @ _wide(B), dtype
+    return build
+
+
+def spgemm(dtype):
+    def build(_unused, shape, gen):
+        m, k, n = shape
+        A, B = _sparse(m, k, dtype, gen), _sparse(k, n, dtype, gen)
+        c_data, c_indices, c_indptr, c_shape = fs.flagsparse_spgemm_csr(
+            *_csr(A), tuple(A.shape), *_csr(B), tuple(B.shape)
+        )
+        C = torch.sparse_csr_tensor(
+            c_indptr.to(torch.int64), c_indices.to(torch.int64), c_data, c_shape
+        ).to_dense()
         return C, _wide(A) @ _wide(B), dtype
     return build
 
@@ -271,12 +286,12 @@ def spmm_bell(dtype, bd=4):
     return build
 
 
-def sddmm(op_a, op_b, layout):
+def sddmm(op_a, op_b, layout, dtype=torch.float32):
     def build(_unused, shape, gen):
         m, n, k = shape
-        S = _sparse(m, n, torch.float32, gen, 0.2)
-        A = _rand((m, k) if op_a == "non" else (k, m), torch.float32, gen)
-        B = _rand((k, n) if op_b == "non" else (n, k), torch.float32, gen)
+        S = _sparse(m, n, dtype, gen, 0.2)
+        A = _rand((m, k) if op_a == "non" else (k, m), dtype, gen)
+        B = _rand((k, n) if op_b == "non" else (n, k), dtype, gen)
         A_d, B_d = _dev(A, B)
         if layout == "col":
             A_d, B_d = A_d.t().contiguous().t(), B_d.t().contiguous().t()
@@ -286,7 +301,7 @@ def sddmm(op_a, op_b, layout):
         full = _op(_wide(A), op_a) @ _op(_wide(B), op_b)
         pattern = S.to_sparse_csr()
         rows = torch.repeat_interleave(torch.arange(m), pattern.crow_indices().diff())
-        return vals, full[rows, pattern.col_indices()], torch.float32
+        return vals, full[rows, pattern.col_indices()], dtype
     return build
 
 
@@ -294,7 +309,6 @@ f16, f32, c32, i8, i32 = torch.float16, torch.float32, torch.complex64, torch.in
 
 # (variant, marker, builder, value dtype passed to generic builders)
 VARIANTS = [
-    ("gather_i8_int", "gather", gather, i8),
     ("scatter_i8_int", "scatter", scatter, i8),
     ("axpby_f16_int", "axpby", axpby, f16),
     ("spmv_sell_f32_int_non", "spmv_sell", spmv_sell(f32, f32), None),
@@ -328,20 +342,24 @@ VARIANTS = [
     ("sddmm_csr_f32_int_non_non_col", "sddmm_csr", sddmm("non", "non", "col"), None),
     ("sddmm_csr_f32_int_non_trans_row", "sddmm_csr", sddmm("non", "trans", "row"), None),
     ("sddmm_csr_f32_int_trans_non_row", "sddmm_csr", sddmm("trans", "non", "row"), None),
-    ("spmm_bell_f32_int_non_non_row", "spmm_bell", spmm_bell(f32), None),
-    ("spmm_bsr_f32_int_non_non_row", "spmm_bsr", spmm_bsr(f32), None),
     ("spmm_coo_c32_int_non_non_row", "spmm_coo", spmm_coo(c32), None),
     ("spmm_coo_f16_int_non_non_row", "spmm_coo", spmm_coo(f16), None),
     ("spmm_csr_f32_int_trans_non_row", "spmm_csr", spmm_csr(f32, op_a="trans"), None),
     ("spmv_coo_c32_int_conj", "spmv_coo", spmv_coo(c32, "conj"), None),
     ("spmv_coo_i8i32_int_non", "spmv_coo", spmv_coo(i8, out_dtype=i32), None),
     ("spmv_csr_c32_int_conj", "spmv_csr", spmv_csr(c32, "conj"), None),
+    ("spmm_coo_i8i32_int_non_non_row", "spmm_coo", spmm_coo(i8, out_dtype=i32), None),
+    ("spmm_csc_c32_int_non_non_row", "spmm_csc", spmm_csc(c32), None),
+    ("sddmm_csr_c32_int_non_non_row", "sddmm_csr", sddmm("non", "non", "row", dtype=c32), None),
+    ("sddmm_csr_f16_int_non_non_row", "sddmm_csr", sddmm("non", "non", "row", dtype=f16), None),
+    ("spmm_csc_f16_int_non_non_row", "spmm_csc", spmm_csc(f16), None),
+    ("spgemm_csr_f32_int_non_non", "spgemm_csr", spgemm(f32), None),
 ]
 
 
-def test_the_list_has_42_distinct_variants():
+def test_the_list_has_45_distinct_variants():
     names = [v[0] for v in VARIANTS]
-    assert len(names) == 42 and len(set(names)) == 42
+    assert len(names) == 45 and len(set(names)) == 45
 
 
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "x".join(map(str, s)))

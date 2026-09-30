@@ -63,7 +63,11 @@ operators:
     formats: [sparse_vector]
     # f16 is in the delivery list; bf16 is supported by the kernel but is not
     # part of it, so it is left out here rather than measured and then filtered.
-    dtypes: [f16, f32, f64, c64, c128]
+    # i8 is q4's gather_i8_int -- implemented (dispatch is dtype-generic, see
+    # src/ops/gather_scatter.cpp) but not in the 20-variant delivery list, hence
+    # delivery_dtypes below excludes it.
+    dtypes: [f16, f32, f64, c64, c128, i8]
+    delivery_dtypes: [f16, f32, f64, c64, c128]
     index_types: [int]
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [gather_real_kernel, gather_complex_kernel]
@@ -84,7 +88,9 @@ operators:
     formats: [sparse_vector]
     # f16 is in the delivery list; bf16 is supported by the kernel but is not
     # part of it, so it is left out here rather than measured and then filtered.
-    dtypes: [f16, f32, f64, c64, c128]
+    # i8 is q4's scatter_i8_int -- see the matching note on `gather` above.
+    dtypes: [f16, f32, f64, c64, c128, i8]
+    delivery_dtypes: [f16, f32, f64, c64, c128]
     index_types: [int]
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [scatter_real_kernel, scatter_complex_kernel]
@@ -99,7 +105,9 @@ operators:
     c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
     python_impl: [flagsparse_spmv_csr, prepare_spmv_csr]
     formats: [csr]
-    dtypes: [f32, f64, c64, c128]   # complex wired 2026-09; measured accurate vs host fp64
+    # f16 (q4's spmv_csr_f16_int_non) is dtype-generic through the same
+    # dispatch as f32/f64/complex -- no separate kernel needed.
+    dtypes: [f32, f64, c64, c128, f16]   # complex wired 2026-09; measured accurate vs host fp64
     index_types: [int]
     ops: [non]                  # trans/conj pending
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_CSR_ALG1, FLAGSPARSE_SPMV_CSR_ALG2]
@@ -110,6 +118,11 @@ operators:
     status: implemented
     reporting: delivery
     delivery_dtypes: [f32, f64]   # complex is implemented, not delivered
+    notes: >
+      In addition to the same-dtype kernels listed above, mixed_spmx.py supplies
+      i8->i32/i8->f32, f16->f32, and real-f32 matrix by complex64 vector
+      dispatch; those mixed routes accept identity alpha/beta because their
+      kernels implement y=A@x directly.
 
   - id: spmv_coo
     zhiyuan_name: SpMV_COO
@@ -117,7 +130,8 @@ operators:
     c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
     python_impl: [flagsparse_spmv_coo, prepare_spmv_coo]
     formats: [coo]
-    dtypes: [f32, f64, c64, c128]
+    # f16 (q4's spmv_coo_f16_int_non) is dtype-generic like spmv_csr's.
+    dtypes: [f32, f64, c64, c128, f16]
     index_types: [int]
     ops: [non]                  # trans needs a column-offsets array; pending
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_COO_ALG1,
@@ -232,6 +246,9 @@ operators:
       signature parser cannot spell the tl.dtype accumulator constexpr, so they
       take a bool and delegate to the operator package's own kernels. The four
       algorithm ids all resolve to that one deterministic row-parallel route.
+      Mixed i8->i32/i8->f32 and f16->f32 A/B->C combinations use the wrappers
+      in mixed_spmx.py; they accept identity alpha/beta because those kernels
+      implement C=A@B rather than the scaled generic SpMM equation.
 
   - id: spmm_coo
     zhiyuan_name: SpMM_COO
@@ -261,7 +278,9 @@ operators:
       beta * C; the Python path instead zeroes C and uses run-compressed segments.
       The atomic and alg1-bucket routes are not wired up: the first needs C
       pre-scaled by beta in a separate pass and is non-deterministic, the second
-      needs two prepare kernels.
+      needs two prepare kernels. Mixed i8->i32/i8->f32 and f16->f32 instead use
+      mixed_spmx.py's atomic kernel, clear C before launch, and need no scratch;
+      as on CSR, only identity alpha/beta is supported on that path.
 
   - id: spmm_csr_opt
     zhiyuan_name: SpMM_CSR_opt
@@ -331,9 +350,15 @@ operators:
     c_api: [flagsparseSDDMM, flagsparseSDDMM_bufferSize, flagsparseSDDMM_preprocess]
     python_impl: [flagsparse_sddmm_csr, prepare_sddmm_csr]
     formats: [csr]
-    # No complex SDDMM: the operator package has no complex kernel, and the
-    # delivery list (conf/operators.yaml) does not include sddmm c32/c64.
-    dtypes: [f32, f64]
+    # f16 (q4's sddmm_csr_f16_int_non_non_row) is dtype-generic through the same
+    # sddmm_csr_real wrapper -- its ACC_IS_FP64 constexpr already upcasts
+    # anything non-fp64 to fp32 accumulate. Complex is not: the operator
+    # package has no complex SDDMM kernel wired into capi's C++ dispatch yet
+    # (Python has one, src/flagsparse/sparse_operations/sddmm_csr.py's
+    # _sddmm_csr_complex_kernel; capi/src/ops/sddmm.cpp does not call it), and
+    # the delivery list (conf/operators.yaml) does not include sddmm c32/c64.
+    dtypes: [f32, f64, f16]
+    delivery_dtypes: [f32, f64]
     index_types: [int]
     ops: [non, trans]           # for BOTH dense operands; conj pending
     orders: [row, col]

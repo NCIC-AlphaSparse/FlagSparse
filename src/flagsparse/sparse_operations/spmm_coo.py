@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from . import _common as _common_mod
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
     _select_spmm_alg1_warp_and_factor,
@@ -1773,10 +1774,11 @@ def _spmm_coo_ascend_scatter(
 
     rows64 = row.to(torch.int64)
     cols64 = col.to(torch.int64)
-    # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]].
-    contrib = data.unsqueeze(1) * B[cols64]
+    # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]]. conj (for
+    # op=conj_trans) is already folded into `data` by _materialize_spmm_coo_op.
+    contrib = data.unsqueeze(1) * _gather_values(B, cols64)
     acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
-    acc.index_add_(0, rows64, contrib)
+    _index_add_values(acc, 0, rows64, contrib)
     acc = acc.to(dtype)
 
     if out is not None:
@@ -2738,12 +2740,31 @@ def flagsparse_spmm_coo(
     op=None,
     return_meta=False,
     dense_layout="auto",
+    *,
+    out_dtype=None,
 ):
     """COO SpMM using a native Triton COO row-run kernel by default.
 
     op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
     2/'conj' for A.conj().T @ B.
+    out_dtype (or out.dtype): int8 -> int32 (default) or float32; float16/
+    bfloat16 -> same type or float32. Both run in ``mixed_spmx`` -- see
+    flagsparse_spmm_csr's identical out_dtype for the CSR counterpart.
     """
+    if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
+        if transpose or (op is not None and str(op).strip().lower() not in ("0", "n", "non", "non_trans")):
+            raise NotImplementedError("mixed-precision/int8 COO SpMM supports op='non' only")
+        C = _mixed_spmx.spmm_coo_mixed(
+            data, row, col, B, shape,
+            out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return C
+        C, elapsed = C
+        if return_meta:
+            meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (C, elapsed, meta) if return_time else (C, meta)
+        return C, elapsed
     return _run_spmm_coo_route(
         data,
         row,

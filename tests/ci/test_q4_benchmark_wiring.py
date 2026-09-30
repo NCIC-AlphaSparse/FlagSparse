@@ -142,13 +142,13 @@ def test_every_listed_existing_op_variant_is_covered(variant_bench):
     assert len(names) == len(set(names)) == 30
 
 
-def test_registry_holds_20_delivery_and_42_q4_variants():
+def test_registry_holds_20_delivery_and_45_q4_variants():
     sys.path.insert(0, str(ROOT))
     from tools.delivery_variants import load_delivery_variants, load_q4_variants
 
     delivery, q4 = load_delivery_variants(), load_q4_variants()
-    assert len(delivery) == 20 and len(q4) == 42
-    assert len({v["id"] for v in delivery + q4}) == 62
+    assert len(delivery) == 20 and len(q4) == 45
+    assert len({v["id"] for v in delivery + q4}) == 65
 
 
 def test_q4_accuracy_slice_is_exactly_the_cases_carrying_the_variant_id(

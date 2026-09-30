@@ -218,15 +218,18 @@ def test_sddmm_csr_rejects_unsupported_index_and_value_dtypes():
             shape=(8, 10),
         )
 
-    data_complex = data.to(torch.complex64)
+    # complex128 stays unsupported (q4 added complex64 only, see
+    # SUPPORTED_SDDMM_VALUE_DTYPES in sddmm_csr.py).
+    data_complex = data.to(torch.complex128)
     with pytest.raises(
-        TypeError, match="x dtype must be torch.float32 or torch.float64"
+        TypeError,
+        match="x dtype must be torch.float16, torch.float32, torch.float64, or torch.complex64",
     ):
         flagsparse_sddmm_csr(
             data=data_complex,
             indices=col_indices.to(torch.int32),
             indptr=indptr,
-            x=x.to(torch.complex64),
-            y=y.to(torch.complex64),
+            x=x.to(torch.complex128),
+            y=y.to(torch.complex128),
             shape=(8, 10),
         )

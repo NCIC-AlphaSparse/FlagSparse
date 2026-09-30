@@ -879,7 +879,9 @@ def _ascend_spmv_coo_index_add(launch, x):
     if launch.nnz:
         row = launch.row.to(torch.int64)
         col = launch.col.to(torch.int64)
-        y.index_add_(0, row, launch.data * x[col])
+        # conj (for op=conj_trans) is already folded into launch.data by
+        # _resolve_spmv_coo_launch / _prepare_spmv_coo_launch.
+        _index_add_values(y, 0, row, launch.data * _gather_values(x, col))
     return y
 
 

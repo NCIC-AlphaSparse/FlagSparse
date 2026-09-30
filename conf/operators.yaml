@@ -592,7 +592,6 @@ delivery_matrices:
 # into summary.json; a q4 variant takes exactly the pytest cases / benchmark rows that
 # carry its id (tests/pytest/test_q4_variants_accuracy.py, the `variant` CSV column).
 q4_variants:
-  - {id: gather_i8_int, operator: gather, format: sparse_vector, dtype: i8}
   - {id: scatter_i8_int, operator: scatter, format: sparse_vector, dtype: i8}
   - {id: axpby_f16_int, operator: axpby, format: sparse_vector, dtype: f16}
   - {id: spmv_sell_f32_int_non, operator: spmv_sell, format: sell, dtype: f32}
@@ -626,11 +625,15 @@ q4_variants:
   - {id: sddmm_csr_f32_int_non_non_col, operator: sddmm_csr, format: csr, dtype: f32}
   - {id: sddmm_csr_f32_int_non_trans_row, operator: sddmm_csr, format: csr, dtype: f32}
   - {id: sddmm_csr_f32_int_trans_non_row, operator: sddmm_csr, format: csr, dtype: f32}
-  - {id: spmm_bell_f32_int_non_non_row, operator: spmm_bell, format: bell, dtype: f32}
-  - {id: spmm_bsr_f32_int_non_non_row, operator: spmm_bsr, format: bsr, dtype: f32}
   - {id: spmm_coo_c32_int_non_non_row, operator: spmm_coo, format: coo, dtype: c32}
   - {id: spmm_coo_f16_int_non_non_row, operator: spmm_coo, format: coo, dtype: f16}
   - {id: spmm_csr_f32_int_trans_non_row, operator: spmm_csr, format: csr, dtype: f32}
   - {id: spmv_coo_c32_int_conj, operator: spmv_coo, format: coo, dtype: c32}
   - {id: spmv_coo_i8i32_int_non, operator: spmv_coo, format: coo, dtype: i8i32}
   - {id: spmv_csr_c32_int_conj, operator: spmv_csr, format: csr, dtype: c32}
+  - {id: spmm_coo_i8i32_int_non_non_row, operator: spmm_coo, format: coo, dtype: i8i32}
+  - {id: spmm_csc_c32_int_non_non_row, operator: spmm_csc, format: csc, dtype: c32}
+  - {id: sddmm_csr_c32_int_non_non_row, operator: sddmm_csr, format: csr, dtype: c32}
+  - {id: sddmm_csr_f16_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f16}
+  - {id: spmm_csc_f16_int_non_non_row, operator: spmm_csc, format: csc, dtype: f16}
+  - {id: spgemm_csr_f32_int_non_non, operator: spgemm_csr, format: csr, dtype: f32}

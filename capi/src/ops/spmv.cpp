@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,7 @@ flagsparseStatus_t read_scalar(flagsparseHandle_t handle, const void* p,
     }
     *im = 0.0;
     switch (ctype) {
+        case FLAGSPARSE_R_16F: *re = fp16_to_double(static_cast<const uint16_t*>(p)[0]); return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_R_32F: *re = static_cast<const float*>(p)[0];  return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_R_64F: *re = static_cast<const double*>(p)[0]; return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_C_32F:
@@ -83,6 +85,7 @@ flagsparseStatus_t read_scalar(flagsparseHandle_t handle, const void* p,
 struct Operands {
     bool complex_op = false;
     bool acc_is_fp64 = false;
+    bool acc_is_fp16 = false;
     bool has_beta = false;
     double alpha_re = 1.0, alpha_im = 0.0, beta_re = 0.0, beta_im = 0.0;
     int64_t y_len = 0;
@@ -91,9 +94,16 @@ struct Operands {
     const char* ot = "";
 };
 
+// alpha/beta's Triton-side type is ops.vt (matching the operand dtype, see the
+// signature strings below), not a fixed fp32 -- so each width needs its own
+// Arg. Missing the fp16 case here silently truncated the scalar (found via
+// sddmm.cpp's identical bug: a 4-byte Arg::f where the kernel expected 2
+// bytes reads only the low 16 bits of a float's bit pattern, e.g. alpha=1.0f
+// decodes as fp16 bits 0x0000 = 0.0).
 void push_scalar(const Operands& ops, double v, std::vector<jit::Arg>* args) {
     if (ops.acc_is_fp64) args->push_back(jit::Arg::d(v));
-    else                 args->push_back(jit::Arg::f(static_cast<float>(v)));
+    else if (ops.acc_is_fp16) args->push_back(jit::Arg::h(double_to_fp16(v)));
+    else args->push_back(jit::Arg::f(static_cast<float>(v)));
 }
 
 // Which algorithm ids belong to which format. An id naming a different format is
@@ -157,9 +167,13 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
     if (X->size != need_x || Y->size != need_y) return FLAGSPARSE_STATUS_INVALID_VALUE;
 
     const flagsparseDataType_t component = component_dtype(computeType);
-    if (component != FLAGSPARSE_R_32F && component != FLAGSPARSE_R_64F) {
-        // fp16/bf16 would need a compute-precision copy of the operands, the way
-        // the Python path casts first. Not wired up.
+    if (component != FLAGSPARSE_R_32F && component != FLAGSPARSE_R_64F &&
+        component != FLAGSPARSE_R_16F) {
+        // bf16 would need a compute-precision copy of the operands. f16 does
+        // not: _spmv_csr_real_kernel (and the COO/CSC/BSR real kernels) are
+        // the exact same kernels flagsparse_spmv_csr's plain (non-mixed)
+        // Python path already runs directly on fp16 storage -- no ACC_DTYPE
+        // constexpr, no upcast copy, same as fp32/fp64.
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     if (triton_index_dtype(A->indices_type)[0] == '\0' ||
@@ -212,6 +226,7 @@ flagsparseStatus_t resolve_operands(flagsparseHandle_t handle, const void* alpha
     out->complex_op = is_complex(computeType);
     const flagsparseDataType_t component = component_dtype(computeType);
     out->acc_is_fp64 = (component == FLAGSPARSE_R_64F);
+    out->acc_is_fp16 = (component == FLAGSPARSE_R_16F);
     out->has_beta = (out->beta_re != 0.0 || out->beta_im != 0.0);
     out->y_len = Y->size;
     out->vt = triton_dtype(component);
@@ -321,6 +336,267 @@ flagsparseStatus_t launch_csr_row_tile_short(flagsparseHandle_t handle, SpMatDes
         jit::codegen_module("spmv_csr.py"), "spmv_csr_row_tile_real", sig,
         ctx(handle)->stream, (A->rows + rows_per_program - 1) / rows_per_program, 1, 1,
         num_warps, /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+// ------------------------------------------------------- mixed-precision CSR
+//
+// int8 matrix/x -> int32 or float32 y; float16/bfloat16 matrix/x -> float32 y
+// (cuSPARSE 12.5's SpMV type table, mirrored from
+// src/flagsparse/sparse_operations/mixed_spmx.py's _resolve_types). A
+// self-contained path, not routed through Operands/launch_csr_rowpar: those
+// assume A/X/Y share one dtype, which is exactly the case this doesn't hold.
+// op(A) = A^T is out of scope here the same way it already is for the
+// non-mixed CSR path (see validate() above); alpha/beta are out of scope too
+// -- _csr_spmv_mixed_kernel has no such terms, matching mixed_spmx.py's own
+// spmv_csr_mixed, which takes no alpha/beta either.
+
+bool mixed_narrow_wide_pair(flagsparseDataType_t data_type, flagsparseDataType_t y_type,
+                    bool* acc_is_i32) {
+    if (data_type == FLAGSPARSE_R_8I) {
+        if (y_type == FLAGSPARSE_R_32I) { *acc_is_i32 = true; return true; }
+        if (y_type == FLAGSPARSE_R_32F) { *acc_is_i32 = false; return true; }
+        return false;
+    }
+    if (data_type == FLAGSPARSE_R_16F) {
+        *acc_is_i32 = false;
+        return y_type == FLAGSPARSE_R_32F;
+    }
+    return false;
+}
+
+// Ported from mixed_spmx.py's _csr_row_tile: the mean row length picks a tile
+// that keeps ROWS * BLOCK around 512 lanes.
+void csr_mixed_row_tile(int64_t nnz, int64_t n_rows, int* rows_per, int* block) {
+    const double mean = n_rows > 0 ? static_cast<double>(nnz) / static_cast<double>(n_rows) : 0.0;
+    if (mean <= 4.0)       { *rows_per = 128; *block = 4; }
+    else if (mean <= 12.0) { *rows_per = 64;  *block = 8; }
+    else if (mean <= 24.0) { *rows_per = 32;  *block = 16; }
+    else                   { *rows_per = 16;  *block = 32; }
+}
+
+flagsparseStatus_t run_csr_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
+                                 const DnVecDescr* X, DnVecDescr* Y, bool acc_is_i32) {
+    if (A->nnz > static_cast<int64_t>(INT32_MAX)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    if (it[0] == '\0' || ot[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    const char* xt = triton_dtype(A->value_type);
+    const char* yt = triton_dtype(Y->value_type);
+    if (xt[0] == '\0' || yt[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
+
+    int rows_per = 128, block = 4;
+    csr_mixed_row_tile(A->nnz, A->rows, &rows_per, &block);
+
+    std::string sig;
+    sig.reserve(128);
+    sig += "*"; sig += yt; sig += ":16,";                 // y
+    sig += "*"; sig += xt; sig += ":16,";                 // data
+    sig += "*"; sig += it; sig += ":16,";                 // cols
+    sig += "*"; sig += ot; sig += ":16,";                 // indptr
+    sig += "*"; sig += xt; sig += ":16,";                 // x
+    sig += "i32,";                                        // n_rows
+    sig += std::to_string(rows_per) + ",";
+    sig += std::to_string(block);
+
+    std::vector<jit::Arg> args;
+    args.reserve(6);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+
+    const int64_t grid = (A->rows + rows_per - 1) / rows_per;
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("mixed_spmx.py"),
+        acc_is_i32 ? "csr_spmv_mixed_i32acc" : "csr_spmv_mixed_f32acc", sig,
+        ctx(handle)->stream, grid, 1, 1, /*num_warps=*/4, /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+flagsparseStatus_t run_csr_real_by_complex(flagsparseHandle_t handle, const SpMatDescr* A,
+                                           const DnVecDescr* X, DnVecDescr* Y) {
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    if (it[0] == '\0' || ot[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
+
+    int rows_per = 128, block = 4;
+    csr_mixed_row_tile(A->nnz, A->rows, &rows_per, &block);
+
+    // X/Y are complex64 descriptors, but the Triton kernel addresses their
+    // interleaved real/imag components as fp32 values.
+    std::string sig;
+    sig.reserve(128);
+    sig += "*fp32:16,*fp32:16,*";
+    sig += it; sig += ":16,*";
+    sig += ot; sig += ":16,*fp32:16,i32,";
+    sig += std::to_string(rows_per) + "," + std::to_string(block);
+
+    std::vector<jit::Arg> args;
+    args.reserve(6);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+
+    const int64_t grid = (A->rows + rows_per - 1) / rows_per;
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("mixed_spmx.py"), "_csr_spmv_real_by_complex_kernel", sig,
+        ctx(handle)->stream, grid, 1, 1, /*num_warps=*/4, /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+// alpha=1, beta=0 exactly (component-wise): the mixed kernel has no scale
+// terms, so anything else is a caller asking for something this path cannot
+// give them, not a silent approximation.
+bool is_identity_alpha_beta(flagsparseHandle_t handle, flagsparseDataType_t computeType,
+                            const void* alpha, const void* beta) {
+    if (ctx(handle)->pointer_mode != FLAGSPARSE_POINTER_MODE_HOST) return false;
+    if (dtype_size(computeType) == 0) return false;
+    std::vector<unsigned char> one(dtype_size(computeType), 0), zero(dtype_size(computeType), 0);
+    if (computeType == FLAGSPARSE_R_32I) {
+        std::int32_t v = 1; std::memcpy(one.data(), &v, sizeof(v));
+    } else if (computeType == FLAGSPARSE_R_32F) {
+        float v = 1.0f; std::memcpy(one.data(), &v, sizeof(v));
+    } else if (computeType == FLAGSPARSE_C_32F) {
+        float v = 1.0f; std::memcpy(one.data(), &v, sizeof(v));
+    } else {
+        return false;
+    }
+    return alpha != nullptr && beta != nullptr &&
+           std::memcmp(alpha, one.data(), one.size()) == 0 &&
+           std::memcmp(beta, zero.data(), zero.size()) == 0;
+}
+
+// Whether (opA, matA, vecX, vecY) names one of the mixed-CSR combinations
+// above -- checked before the general validate(), which requires A/X/Y to
+// share computeType and would reject this on sight.
+bool is_mixed_csr_request(flagsparseOperation_t opA, flagsparseConstSpMatDescr_t matA,
+                          flagsparseConstDnVecDescr_t vecX, flagsparseConstDnVecDescr_t vecY,
+                          bool* acc_is_i32) {
+    if (matA == nullptr || vecX == nullptr || vecY == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    if (A->format != FLAGSPARSE_FORMAT_CSR || transposes(opA)) return false;
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    if (X->value_type != A->value_type) return false;
+    return mixed_narrow_wide_pair(A->value_type, Y->value_type, acc_is_i32);
+}
+
+bool is_real_by_complex_csr_request(flagsparseOperation_t opA,
+                                    flagsparseConstSpMatDescr_t matA,
+                                    flagsparseConstDnVecDescr_t vecX,
+                                    flagsparseConstDnVecDescr_t vecY) {
+    if (matA == nullptr || vecX == nullptr || vecY == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    return A->format == FLAGSPARSE_FORMAT_CSR && !transposes(opA) &&
+           A->value_type == FLAGSPARSE_R_32F && X->value_type == FLAGSPARSE_C_32F &&
+           Y->value_type == FLAGSPARSE_C_32F;
+}
+
+flagsparseStatus_t validate_real_by_complex_csr(flagsparseHandle_t handle,
+                                                flagsparseOperation_t opA,
+                                                flagsparseConstSpMatDescr_t matA,
+                                                flagsparseConstDnVecDescr_t vecX,
+                                                flagsparseConstDnVecDescr_t vecY,
+                                                flagsparseDataType_t computeType,
+                                                flagsparseSpMVAlg_t alg) {
+    if (handle == nullptr) return FLAGSPARSE_STATUS_NOT_INITIALIZED;
+    if (!is_real_by_complex_csr_request(opA, matA, vecX, vecY) ||
+        computeType != FLAGSPARSE_C_32F) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    const SpMatDescr* A = spmat(matA);
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    if (A->idx_base != FLAGSPARSE_INDEX_BASE_ZERO || !alg_supported(A->format, alg) ||
+        triton_index_dtype(A->indices_type)[0] == '\0' ||
+        triton_index_dtype(A->offsets_type)[0] == '\0') {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (X->size != A->cols || Y->size != A->rows) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+// ------------------------------------------------------- mixed-precision COO
+//
+// Same dtype-pair table as CSR, but the kernel is nnz-parallel atomic_add
+// (mixed_spmx.py's _coo_spmv_atomic_kernel/spmv_coo_mixed) rather than
+// row-tiled: COO's row array is already what the kernel needs, no
+// row-offsets/seg_starts preprocessing (run_coo's externalBuffer) required.
+// Also why this is the one q4 asks for float16 COO mixed at all: the plain
+// (non-mixed) COO path has no half-precision kernel, per mixed_spmx.py's own
+// "COO's native path has no half-precision kernel" comment on spmv_needs_mixed.
+
+bool is_mixed_coo_request(flagsparseOperation_t opA, flagsparseConstSpMatDescr_t matA,
+                          flagsparseConstDnVecDescr_t vecX, flagsparseConstDnVecDescr_t vecY,
+                          bool* acc_is_i32) {
+    if (matA == nullptr || vecX == nullptr || vecY == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    if (A->format != FLAGSPARSE_FORMAT_COO || transposes(opA)) return false;
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    if (X->value_type != A->value_type) return false;
+    return mixed_narrow_wide_pair(A->value_type, Y->value_type, acc_is_i32);
+}
+
+flagsparseStatus_t run_coo_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
+                                 const DnVecDescr* X, DnVecDescr* Y, bool acc_is_i32) {
+    if (A->nnz > static_cast<int64_t>(INT32_MAX)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    const char* it = triton_index_dtype(A->indices_type);
+    if (it[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    const char* xt = triton_dtype(A->value_type);
+    const char* yt = triton_dtype(Y->value_type);
+    if (xt[0] == '\0' || yt[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+
+    const std::size_t y_bytes = static_cast<std::size_t>(Y->size) * dtype_size(Y->value_type);
+    if (adaptor::memset_device(reinterpret_cast<adaptor::DevicePtr>(Y->values), 0, y_bytes) !=
+        FLAGSPARSE_STATUS_SUCCESS) {
+        return FLAGSPARSE_STATUS_EXECUTION_FAILED;
+    }
+    if (A->nnz == 0) return FLAGSPARSE_STATUS_SUCCESS;
+
+    constexpr int kBlock = 256;
+    std::string sig;
+    sig.reserve(128);
+    sig += "*"; sig += yt; sig += ":16,";   // acc (Y, zeroed above)
+    sig += "*"; sig += xt; sig += ":16,";   // data
+    sig += "*"; sig += it; sig += ":16,";   // rows
+    sig += "*"; sig += it; sig += ":16,";   // cols
+    sig += "*"; sig += xt; sig += ":16,";   // x
+    sig += "i32,";                          // nnz
+    sig += std::to_string(kBlock);
+
+    std::vector<jit::Arg> args;
+    args.reserve(6);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->row_ind)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->nnz)));
+
+    const int64_t grid = (A->nnz + kBlock - 1) / kBlock;
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("mixed_spmx.py"),
+        acc_is_i32 ? "coo_spmv_atomic_i32acc" : "coo_spmv_atomic_f32acc", sig,
+        ctx(handle)->stream, grid, 1, 1, /*num_warps=*/4, /*num_stages=*/2, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
 }
@@ -598,6 +874,15 @@ flagsparseStatus_t flagsparseSpMV_bufferSize(
     if (bufferSize == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
     *bufferSize = 0;
     return guard(handle, [&]() -> flagsparseStatus_t {
+        bool acc_is_i32 = false;
+        if (is_real_by_complex_csr_request(opA, matA, vecX, vecY)) {
+            return validate_real_by_complex_csr(handle, opA, matA, vecX, vecY,
+                                                computeType, alg);
+        }
+        if (is_mixed_csr_request(opA, matA, vecX, vecY, &acc_is_i32) ||
+            is_mixed_coo_request(opA, matA, vecX, vecY, &acc_is_i32)) {
+            return FLAGSPARSE_STATUS_SUCCESS;  // no scratch: same as gather/scatter.
+        }
         if (flagsparseStatus_t s = validate(handle, opA, matA, vecX, vecY, computeType, alg)) {
             return s;
         }
@@ -619,6 +904,15 @@ flagsparseStatus_t flagsparseSpMV_preprocess(
     flagsparseDataType_t computeType, flagsparseSpMVAlg_t alg, void* externalBuffer) {
     (void)alpha; (void)beta;
     return guard(handle, [&]() -> flagsparseStatus_t {
+        bool acc_is_i32 = false;
+        if (is_real_by_complex_csr_request(opA, matA, vecX, vecY)) {
+            return validate_real_by_complex_csr(handle, opA, matA, vecX, vecY,
+                                                computeType, alg);
+        }
+        if (is_mixed_csr_request(opA, matA, vecX, vecY, &acc_is_i32) ||
+            is_mixed_coo_request(opA, matA, vecX, vecY, &acc_is_i32)) {
+            return FLAGSPARSE_STATUS_SUCCESS;  // row_tile/atomic needs no precomputed state.
+        }
         if (flagsparseStatus_t s = validate(handle, opA, matA, vecX, vecY, computeType, alg)) {
             return s;
         }
@@ -642,6 +936,35 @@ flagsparseStatus_t flagsparseSpMV(
     const void* beta, flagsparseDnVecDescr_t vecY,
     flagsparseDataType_t computeType, flagsparseSpMVAlg_t alg, void* externalBuffer) {
     return guard(handle, [&]() -> flagsparseStatus_t {
+        bool acc_is_i32 = false;
+        if (is_real_by_complex_csr_request(opA, matA, vecX, vecY)) {
+            if (flagsparseStatus_t s = validate_real_by_complex_csr(
+                    handle, opA, matA, vecX, vecY, computeType, alg)) {
+                return s;
+            }
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            return run_csr_real_by_complex(handle, spmat(matA), dnvec(vecX), dnvec(vecY));
+        }
+        if (is_mixed_csr_request(opA, matA, vecX, vecY, &acc_is_i32)) {
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            const SpMatDescr* A = spmat(matA);
+            const DnVecDescr* X = dnvec(vecX);
+            DnVecDescr* Y = dnvec(vecY);
+            return run_csr_mixed(handle, A, X, Y, acc_is_i32);
+        }
+        if (is_mixed_coo_request(opA, matA, vecX, vecY, &acc_is_i32)) {
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            const SpMatDescr* A = spmat(matA);
+            const DnVecDescr* X = dnvec(vecX);
+            DnVecDescr* Y = dnvec(vecY);
+            return run_coo_mixed(handle, A, X, Y, acc_is_i32);
+        }
         if (flagsparseStatus_t s = validate(handle, opA, matA, vecX, vecY, computeType, alg)) {
             return s;
         }

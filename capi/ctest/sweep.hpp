@@ -70,62 +70,14 @@ inline float bf16_to_float(uint16_t h) {
     return f;
 }
 
-inline uint16_t float_to_fp16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, sizeof(x));
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t exp = static_cast<int32_t>((x >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = x & 0x7fffffu;
-    if (exp <= 0) {
-        // Subnormal, not zero. fp16's smallest normal is ~6.1e-5 and its
-        // smallest subnormal ~6e-8, so flushing this whole range to zero loses
-        // four orders of magnitude -- a unit test caught 1e-5 becoming 0.
-        if (exp < -10) return static_cast<uint16_t>(sign);   // truly below range
-        mant |= 0x800000u;                                   // restore implicit 1
-        const int32_t shift = 14 - exp;                      // 24-bit mant -> 10-bit
-        const uint32_t sub = mant >> shift;
-        // Round to nearest even on the discarded bits.
-        const uint32_t rem = mant & ((1u << shift) - 1u);
-        const uint32_t half = 1u << (shift - 1);
-        uint32_t rounded = sub + ((rem > half || (rem == half && (sub & 1u))) ? 1u : 0u);
-        return static_cast<uint16_t>(sign | rounded);
-    }
-    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);  // overflow to inf
-    // Round to nearest even on the 13 bits being discarded.
-    const uint32_t round = (mant & 0x1fffu) > 0x1000u ||
-                           ((mant & 0x1fffu) == 0x1000u && ((mant >> 13) & 1u));
-    uint16_t out = static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
-                                         (mant >> 13));
-    return static_cast<uint16_t>(out + round);
-}
-
-inline float fp16_to_float(uint16_t h) {
-    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x3ffu;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) { bits = sign; }
-        else {
-            // Subnormal: normalise it into an fp32 exponent.
-            int32_t e = -1;
-            uint32_t m = mant;
-            do { m <<= 1; ++e; } while ((m & 0x400u) == 0);
-            bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) |
-                   ((m & 0x3ffu) << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
+// float_to_fp16 / fp16_to_float moved to common.hpp (ctest/accuracy needs them
+// too, for the Half host type; sweep.hpp already includes common.hpp).
 
 inline bool dtype_is_64(flagsparseDataType_t t) {
     return t == FLAGSPARSE_R_64F || t == FLAGSPARSE_C_64F;
+}
+inline bool dtype_is_int8(flagsparseDataType_t t) {
+    return t == FLAGSPARSE_R_8I;
 }
 inline bool dtype_is_complex(flagsparseDataType_t t) {
     return t == FLAGSPARSE_C_32F || t == FLAGSPARSE_C_64F;
@@ -147,14 +99,22 @@ struct Scalars {
     double db[2] = {0.0, 0.0};   // beta  = 0 (+0i)
     float  fa[2] = {1.0f, 0.0f};
     float  fb[2] = {0.0f, 0.0f};
+    // fp16 is 2 bytes: reading it through `fa`/`fb` (4-byte float) decodes the
+    // low half of 1.0f's bit pattern as fp16 bits, i.e. reads alpha=0 -- found
+    // by sddmm's fp16 benchmark rows coming back ~100x off (alpha silently
+    // zeroing the whole product). One caller-owned slot per width, not a cast.
+    uint16_t ha[2] = {float_to_fp16(1.0f), float_to_fp16(0.0f)};
+    uint16_t hb[2] = {float_to_fp16(0.0f), float_to_fp16(0.0f)};
 
     const void* alpha(flagsparseDataType_t t) const {
-        return dtype_is_64(t) ? static_cast<const void*>(da)
-                              : static_cast<const void*>(fa);
+        if (dtype_is_64(t)) return static_cast<const void*>(da);
+        if (t == FLAGSPARSE_R_16F) return static_cast<const void*>(ha);
+        return static_cast<const void*>(fa);
     }
     const void* beta(flagsparseDataType_t t) const {
-        return dtype_is_64(t) ? static_cast<const void*>(db)
-                              : static_cast<const void*>(fb);
+        if (dtype_is_64(t)) return static_cast<const void*>(db);
+        if (t == FLAGSPARSE_R_16F) return static_cast<const void*>(hb);
+        return static_cast<const void*>(fb);
     }
 };
 
@@ -165,6 +125,18 @@ struct Scalars {
 inline DeviceBuffer upload_as(const std::vector<double>& src,
                               flagsparseDataType_t dt) {
     const std::size_t comp = dtype_components(dt);
+    if (dtype_is_int8(dt)) {
+        // Rounded, not rescaled: callers that build their own oracle from the
+        // unrounded fp64 pattern (e.g. benchmark/test_gather.cpp's `ref`) expect
+        // upload_as() to stay in the same numeric range, the way the fp16 branch
+        // below does. The <=0.5 rounding error this introduces is accounted for
+        // by default_tolerance(FLAGSPARSE_R_8I) in common.cpp, not hidden here.
+        std::vector<int8_t> h(src.size(), 0);
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            h[i] = static_cast<int8_t>(std::lround(src[i]));
+        }
+        return DeviceBuffer::from(h);
+    }
     if (dtype_is_half(dt)) {
         std::vector<uint16_t> h(src.size(), 0);
         for (std::size_t i = 0; i < src.size(); ++i) {
@@ -186,6 +158,7 @@ inline DeviceBuffer upload_as(const std::vector<double>& src,
 
 // Bytes one dense element occupies at this dtype.
 inline std::size_t elem_bytes(flagsparseDataType_t dt) {
+    if (dtype_is_int8(dt)) return sizeof(int8_t);
     if (dtype_is_half(dt)) return sizeof(uint16_t);
     return (dtype_is_64(dt) ? sizeof(double) : sizeof(float)) * dtype_components(dt);
 }
@@ -197,6 +170,13 @@ inline std::vector<double> read_back(const void* dev, std::size_t count,
                                      flagsparseDataType_t dt) {
     const std::size_t comp = dtype_components(dt);
     std::vector<double> out(count);
+    if (dtype_is_int8(dt)) {
+        std::vector<int8_t> h(count);
+        if (to_host(h.data(), dev, h.size() * sizeof(int8_t)) !=
+            FLAGSPARSE_STATUS_SUCCESS) return {};
+        for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<double>(h[i]);
+        return out;
+    }
     if (dtype_is_half(dt)) {
         std::vector<uint16_t> h(count);
         if (to_host(h.data(), dev, h.size() * sizeof(uint16_t)) !=

@@ -34,6 +34,7 @@ DTYPES = {
     "c128": ("FLAGSPARSE_C_64F", "c64"),
     "f16": ("FLAGSPARSE_R_16F", "f16"),
     "bf16": ("FLAGSPARSE_R_16BF", "bf16"),
+    "i8": ("FLAGSPARSE_R_8I", "i8"),
 }
 
 FORMATS = {

@@ -4498,10 +4498,12 @@ def flagsparse_spmm_csr(
         t0 = time.perf_counter()
         if transposed:
             out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
-            out_mat.index_add_(0, cols, data[:, None] * B[row_ids])
+            # op(A) = A^H needs the values conjugated too, not just row/col swapped.
+            vals = data.conj() if op_code == SPMM_OP_CONJ_TRANS else data
+            _index_add_values(out_mat, 0, cols, vals[:, None] * _gather_values(B, row_ids))
         else:
             out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
-            out_mat.index_add_(0, row_ids, data[:, None] * B[cols])
+            _index_add_values(out_mat, 0, row_ids, data[:, None] * _gather_values(B, cols))
         if out is not None:
             out.copy_(out_mat)
             out_mat = out

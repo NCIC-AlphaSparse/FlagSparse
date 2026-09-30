@@ -217,6 +217,85 @@ RunResult run_spmm(flagsparseHandle_t handle, const CsrMatrix& A,
     return out;
 }
 
+template <typename In, typename Out>
+struct MixedRunResult {
+    flagsparseStatus_t status = FLAGSPARSE_STATUS_SUCCESS;
+    size_t buffer_size = 0;
+    std::vector<Out> values;
+};
+
+// A small exact matrix is more useful than random floating-point input here:
+// it exercises the input/output dtype split without conflating it with host
+// rounding. The same operands cover CSR and COO.
+template <typename In, typename Out>
+MixedRunResult<In, Out> run_spmm_mixed(flagsparseHandle_t handle,
+                                       flagsparseFormat_t format,
+                                       flagsparseDataType_t input_type,
+                                       flagsparseDataType_t output_type,
+                                       const std::vector<In>& a_values,
+                                       const std::vector<In>& b_values) {
+    constexpr int64_t m = 3, k = 4, n = 3;
+    const std::vector<int32_t> indptr{0, 2, 3, 5};
+    const std::vector<int32_t> rows{0, 0, 1, 2, 2};
+    const std::vector<int32_t> cols{0, 2, 1, 0, 3};
+    std::vector<Out> c_values(static_cast<std::size_t>(m * n), static_cast<Out>(37));
+
+    DeviceBuffer d_val = DeviceBuffer::from(a_values);
+    DeviceBuffer d_ptr = DeviceBuffer::from(indptr);
+    DeviceBuffer d_row = DeviceBuffer::from(rows);
+    DeviceBuffer d_col = DeviceBuffer::from(cols);
+    DeviceBuffer d_b = DeviceBuffer::from(b_values);
+    DeviceBuffer d_c = DeviceBuffer::from(c_values);
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnMatDescr_t matB = nullptr, matC = nullptr;
+    MixedRunResult<In, Out> out;
+    out.status = format == FLAGSPARSE_FORMAT_COO
+                     ? flagsparseCreateCoo(&matA, m, k, 5, d_row.get(), d_col.get(),
+                                           d_val.get(), FLAGSPARSE_INDEX_32I,
+                                           FLAGSPARSE_INDEX_BASE_ZERO, input_type)
+                     : flagsparseCreateCsr(&matA, m, k, 5, d_ptr.get(), d_col.get(),
+                                           d_val.get(), FLAGSPARSE_INDEX_32I,
+                                           FLAGSPARSE_INDEX_32I,
+                                           FLAGSPARSE_INDEX_BASE_ZERO, input_type);
+    if (out.status != FLAGSPARSE_STATUS_SUCCESS) return out;
+    out.status = flagsparseCreateDnMat(&matB, k, n, n, d_b.get(), input_type,
+                                       FLAGSPARSE_ORDER_ROW);
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.status = flagsparseCreateDnMat(&matC, m, n, n, d_c.get(), output_type,
+                                           FLAGSPARSE_ORDER_ROW);
+    }
+
+    const Out one = static_cast<Out>(1), zero = static_cast<Out>(0);
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.status = flagsparseSpMM_bufferSize(
+            handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+            FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, matB, &zero, matC,
+            output_type, FLAGSPARSE_SPMM_ALG_DEFAULT, &out.buffer_size);
+    }
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.status = flagsparseSpMM_preprocess(
+            handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+            FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, matB, &zero, matC,
+            output_type, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr);
+    }
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.status = flagsparseSpMM(
+            handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+            FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, matB, &zero, matC,
+            output_type, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr);
+    }
+    dev_sync();
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.values = d_c.download<Out>(c_values.size());
+    }
+
+    if (matC != nullptr) flagsparseDestroyDnMat(matC);
+    if (matB != nullptr) flagsparseDestroyDnMat(matB);
+    flagsparseDestroySpMat(matA);
+    return out;
+}
+
 // --------------------------------------------------------------- complex ---
 
 // The complex reference lives here rather than in common.cpp: CsrMatrix carries
@@ -396,6 +475,39 @@ TEST_F(SpMMAccuracy, Float32AcrossBlockThresholds) {
         const RunResult r = run_spmm<float>(handle.h, A, FLAGSPARSE_R_32F, c);
         expect_close(r, ("fp32_n" + std::to_string(n)).c_str(), handle.h);
     }
+}
+
+TEST_F(SpMMAccuracy, CsrInt8ToInt32MixedPrecision) {
+    const std::vector<int8_t> a{2, -1, 3, 4, -2};
+    const std::vector<int8_t> b{1, 2, -1, 3, 0, 2, -2, 1, 4, 5, -3, 1};
+    const auto r = run_spmm_mixed<int8_t, int32_t>(
+        handle.h, FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_R_8I, FLAGSPARSE_R_32I, a, b);
+    ASSERT_EQ(r.status, FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(r.buffer_size, 0u);
+    EXPECT_EQ(r.values, (std::vector<int32_t>{4, 3, -6, 9, 0, 6, -6, 14, -6}));
+}
+
+TEST_F(SpMMAccuracy, CsrFloat16ToFloat32MixedPrecision) {
+    const std::vector<Half> a{Half(0.5), Half(-1.0), Half(2.0), Half(1.5), Half(-0.5)};
+    const std::vector<Half> b{
+        Half(1.0), Half(2.0), Half(-1.0), Half(3.0), Half(0.0), Half(2.0),
+        Half(-2.0), Half(1.0), Half(4.0), Half(5.0), Half(-3.0), Half(1.0)};
+    const auto r = run_spmm_mixed<Half, float>(
+        handle.h, FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_R_16F, FLAGSPARSE_R_32F, a, b);
+    ASSERT_EQ(r.status, FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(r.buffer_size, 0u);
+    EXPECT_EQ(r.values, (std::vector<float>{2.5f, 0.0f, -4.5f, 6.0f, 0.0f, 4.0f,
+                                            -1.0f, 4.5f, -2.0f}));
+}
+
+TEST_F(SpMMAccuracy, CooInt8ToInt32MixedPrecision) {
+    const std::vector<int8_t> a{2, -1, 3, 4, -2};
+    const std::vector<int8_t> b{1, 2, -1, 3, 0, 2, -2, 1, 4, 5, -3, 1};
+    const auto r = run_spmm_mixed<int8_t, int32_t>(
+        handle.h, FLAGSPARSE_FORMAT_COO, FLAGSPARSE_R_8I, FLAGSPARSE_R_32I, a, b);
+    ASSERT_EQ(r.status, FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(r.buffer_size, 0u);
+    EXPECT_EQ(r.values, (std::vector<int32_t>{4, 3, -6, 9, 0, 6, -6, 14, -6}));
 }
 
 TEST_F(SpMMAccuracy, Float64MatchesHostReference) {

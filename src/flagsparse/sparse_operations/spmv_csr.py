@@ -1966,10 +1966,13 @@ def flagsparse_spmv_csr(
         t0 = time.perf_counter()
         if _spmv_op_transposes(op_code):
             y = torch.zeros((n_cols,), device=data.device, dtype=data.dtype)
-            y.index_add_(0, cols, data * x[row_ids])
+            # op(A) = A^H (conjugate transpose) needs the values conjugated too, not
+            # just the row/col roles swapped -- op(A) = A^T (plain transpose) does not.
+            vals = data.conj() if op_code == SPMV_OP_CONJ_TRANS else data
+            _index_add_values(y, 0, cols, vals * _gather_values(x, row_ids))
         else:
             y = torch.zeros((n_rows,), device=data.device, dtype=data.dtype)
-            y.index_add_(0, row_ids, data * x[cols])
+            _index_add_values(y, 0, row_ids, data * _gather_values(x, cols))
         if out is not None:
             out.copy_(y)
             y = out

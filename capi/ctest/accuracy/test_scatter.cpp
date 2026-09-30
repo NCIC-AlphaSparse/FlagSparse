@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <complex>
+#include <cstdint>
 #include <numeric>
 #include <random>
 
@@ -57,6 +58,9 @@ template <> std::complex<float> sample<std::complex<float>>(std::mt19937& rng) {
 template <> std::complex<double> sample<std::complex<double>>(std::mt19937& rng) {
     std::normal_distribution<double> d(0.0, 1.0);
     return {d(rng), d(rng)};
+}
+template <> int8_t sample<int8_t>(std::mt19937& rng) {
+    return static_cast<int8_t>(std::uniform_int_distribution<int>(-128, 127)(rng));
 }
 
 template <typename T>
@@ -136,6 +140,11 @@ TEST_F(ScatterAccuracy, Complex64) {
 TEST_F(ScatterAccuracy, Complex128) {
     check_scatter<std::complex<double>, int32_t>(handle.h, FLAGSPARSE_C_64F,
                                                  FLAGSPARSE_INDEX_32I, 2048, 512, "c128/i32");
+}
+// q4's scatter_i8_int.
+TEST_F(ScatterAccuracy, Int8) {
+    check_scatter<int8_t, int32_t>(handle.h, FLAGSPARSE_R_8I, FLAGSPARSE_INDEX_32I,
+                                   4096, 1024, "i8/i32");
 }
 TEST_F(ScatterAccuracy, Int64Indices) {
     check_scatter<float, int64_t>(handle.h, FLAGSPARSE_R_32F, FLAGSPARSE_INDEX_64I,

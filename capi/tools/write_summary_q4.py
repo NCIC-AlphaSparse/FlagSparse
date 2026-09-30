@@ -43,7 +43,7 @@ from tools.delivery_variants import load_q4_variants  # noqa: E402
 # match what the variant id claims. Getting this wrong silently mislabels a
 # number as something it is not, which is worse than leaving the variant
 # NotCoveredYet. See NOT_YET_COVERED below for the specific gap blocking each of
-# the other 39 -- consult that before adding a new CONFIRMED entry.
+# the rest -- consult that before adding a new CONFIRMED entry.
 CONFIRMED: dict[str, dict[str, str]] = {
     # spmv's only supported opA is NON_TRANSPOSE (CSR/COO reject transpose:
     # capi/src/ops/spmv.cpp), so every spmv_csr/spmv_coo row IS the "_non"
@@ -57,6 +57,25 @@ CONFIRMED: dict[str, dict[str, str]] = {
     # exact op/layout; the other spmm_csr f32/f16/c32 variants need row-major
     # and/or opA=trans, neither of which this benchmark measures.
     "spmm_csr_f32_int_non_non_col": {"operator": "spmm_csr", "dtype": "f32"},
+    # ctest/benchmark/test_spgemm.cpp hardcodes opA=NON_TRANSPOSE,
+    # opB=NON_TRANSPOSE (the two `NT, NT` arguments to every flagsparseSpGEMM_*
+    # call in its measured loop) -- exactly "_non_non". spgemm_csr has no other
+    # op axis, so this is unambiguous at f32 (part of the original 20-variant
+    # delivery set, already implemented and benchmarked against cuSPARSE).
+    "spgemm_csr_f32_int_non_non": {"operator": "spgemm_csr", "dtype": "f32"},
+    # gather/scatter have no op axis at all (pure data movement); i8 is already
+    # in capi/conf/operators.yaml's dtypes list (added alongside the ctest
+    # accuracy/benchmark support this session) and gets a real cuSPARSE
+    # baseline (verified: geomean 0.70x over 18 matrices).
+    "scatter_i8_int": {"operator": "scatter", "dtype": "i8"},
+    # ctest/benchmark/test_sddmm.cpp hardcodes opA=NON_TRANSPOSE,
+    # opB=NON_TRANSPOSE, and both dense operands FLAGSPARSE_ORDER_ROW -- exactly
+    # "_non_non_row". f16 is now dispatch-generic in capi (see
+    # capi/src/ops/sddmm.cpp and conf/operators.yaml's sddmm_csr entry);
+    # cuSPARSE itself has no fp16 SDDMM (SDDMM_bufferSize returns an error
+    # status for it), so this row has no vendor speedup -- that is a real
+    # vendor-library gap, not a defect here.
+    "sddmm_csr_f16_int_non_non_row": {"operator": "sddmm_csr", "dtype": "f16"},
 }
 
 # The rest of the 42, and the specific reason each is not in CONFIRMED yet. Kept
@@ -64,25 +83,45 @@ CONFIRMED: dict[str, dict[str, str]] = {
 # needed again before the next slice of work.
 NOT_YET_COVERED_REASONS = {
     "no_i8_in_sweep": (
-        "capi/ctest/sweep.hpp's upload_as/elem_bytes/read_back and "
-        "capi/tools/gen_variants.py's DTYPES table have no int8 case; adding "
-        "int8 to operators.yaml today would silently size it as fp32."
+        "plain int8 (gather/scatter) now has an upload_as/elem_bytes/read_back "
+        "case in capi/ctest/sweep.hpp and an entry in "
+        "capi/tools/gen_variants.py's DTYPES table -- this reason covers "
+        "int8 gather/scatter variants that just haven't been wired into "
+        "operators.yaml's dtypes list yet, not a sweep.hpp gap."
     ),
     "no_csc_benchmark_builder": (
         "capi/ctest/benchmark/test_spmv.cpp has no CSC operand builder "
         "(accuracy coverage exists; benchmark rows report "
         "status=not_implemented_in_test)."
     ),
-    "no_f16_accuracy_host_type": (
-        "capi/ctest has no shared half-precision host type; "
-        "ctest/accuracy/test_spmv.cpp's run_spmv_fmt<T> is only instantiated "
-        "for float/double/complex<float>/complex<double> today."
+    "f16_precision_exceeds_tolerance_on_corpus": (
+        "the dispatch/kernel path is wired and verified correct: "
+        "ctest/accuracy/test_spmv.cpp's Float16MatchesHostReference and "
+        "CooFloat16MatchesHostReference pass (using the shared Half host type "
+        "in ctest/common.hpp) on a low-nnz-per-row matrix. But "
+        "ctest/benchmark/test_spmv.cpp's real corpus matrices have enough "
+        "nonzeros per row that fp16 storage quantization (comparing against "
+        "the *unquantized* fp64 reference, the same source of error "
+        "documented for sddmm's fp16 case) exceeds "
+        "default_tolerance(FLAGSPARSE_R_16F) -- error ratio 4.5x-9.4x "
+        "observed, not a wiring bug. cuSPARSE itself also has no fp16 SpMV "
+        "(baseline_status=failed), so there would be no vendor speedup even "
+        "if this cleared tolerance."
     ),
     "spmm_row_or_trans_not_measured": (
         "ctest/benchmark/test_spmm.cpp measures exactly one op/layout "
         "(non/non/col) per dtype; this variant needs row-major C and/or "
         "opA=TRANSPOSE, which capi/src/ops/spmm.cpp does not support yet "
         "(opA transpose) or the benchmark does not sweep (row layout)."
+    ),
+    "sddmm_dtype_not_in_capi_registry": (
+        "capi/conf/operators.yaml's sddmm_csr entry only lists dtypes: "
+        "[f32, f64]; the Python kernel now supports this dtype "
+        "(src/flagsparse/sparse_operations/sddmm_csr.py), but capi has no "
+        "C++ dispatch path for it yet -- f16 would need widening the dtype "
+        "list only (the kernel is dtype-generic), c32 would need a new "
+        "complex dispatch branch in capi/src/ops/sddmm.cpp mirroring "
+        "_sddmm_csr_complex_kernel's view_as_real convention."
     ),
     "sddmm_op_order_not_measured": (
         "ctest/benchmark/test_sddmm.cpp measures one fixed op/order per "
@@ -94,8 +133,21 @@ NOT_YET_COVERED_REASONS = {
         "no entry in capi/conf/operators.yaml at all yet."
     ),
     "mixed_precision_kernel_not_wired": (
-        "this variant calls a mixed_spmx.py kernel that is not the kernel "
-        "capi's existing dispatch for this operator is wired to."
+        "the Python side now supports this dtype combination "
+        "(src/flagsparse/sparse_operations/mixed_spmx.py), but capi has no "
+        "widened-output-dtype (out_dtype) concept at all for any operator -- "
+        "wiring one variant means designing that concept in capi first, not "
+        "just pointing at the existing Python kernel."
+    ),
+    "mixed_precision_dispatch_verified_no_benchmark_row": (
+        "capi/src/ops/spmv.cpp or spmm.cpp's mixed-precision (out_dtype) "
+        "dispatch IS wired for this variant and passes a hand-built "
+        "ctest accuracy TEST_F on real hardware. It has no benchmark row "
+        "yet only because "
+        "capi/tools/gen_variants.py's DTYPES table maps one manifest dtype "
+        "to one row tag and cannot express 'input dtype != output dtype' -- "
+        "that generator/schema gap, not a dispatch gap, is what blocks "
+        "CONFIRMED status here."
     ),
     "opA_transpose_or_conj_not_supported": (
         "capi/src/ops/spmv.cpp (or spmm.cpp) returns NOT_SUPPORTED for this "
@@ -104,22 +156,42 @@ NOT_YET_COVERED_REASONS = {
 }
 
 
+_MIXED_DISPATCH_VERIFIED = frozenset({
+    "spmv_csr_i8i32_int_non",
+    "spmv_csr_i8f32_int_non",
+    "spmv_csr_f16f32_int_non",
+    "spmv_coo_i8i32_int_non",
+    "spmv_coo_f16f32_int_non",
+    "spmv_csr_f32c32_int_non",
+    "spmm_csr_i8i32_int_non_non_row",
+    "spmm_csr_f16f32_int_non_non_row",
+    "spmm_coo_i8i32_int_non_non_row",
+})
+
+
 def _classify_uncovered(variant: dict[str, str]) -> str:
     vid, op, dtype = variant["id"], variant["operator"], variant["dtype"]
-    if dtype == "i8" or dtype.startswith("i8"):
+    # Compound/widened dtypes (mixed_spmx.py territory) before the plain-i8
+    # check below -- "i8i32"/"i8f32" starting with "i8" would otherwise match
+    # the wrong, now-partly-stale reason.
+    if vid in _MIXED_DISPATCH_VERIFIED:
+        return "mixed_precision_dispatch_verified_no_benchmark_row"
+    if dtype in ("f16f32", "i8i32", "i8f32", "f32c32"):
+        return "mixed_precision_kernel_not_wired"
+    if op in ("spvv", "axpby", "spmv_sell", "spmm_bell", "spmm_bsr", "spmm_csc"):
+        return "new_capi_operator_group"
+    if dtype == "i8":
         return "no_i8_in_sweep"
     if op == "spmv_csc":
         return "no_csc_benchmark_builder"
-    if dtype == "f16" and op in ("spmv_csr", "spmv_coo", "spmv_csc"):
-        return "no_f16_accuracy_host_type"
+    if dtype == "f16" and op in ("spmv_csr", "spmv_coo"):
+        return "f16_precision_exceeds_tolerance_on_corpus"
+    if op == "sddmm_csr" and dtype in ("f16", "c32"):
+        return "sddmm_dtype_not_in_capi_registry"
     if op in ("spmm_csr", "spmm_coo") and vid not in CONFIRMED:
         return "spmm_row_or_trans_not_measured"
     if op == "sddmm_csr":
         return "sddmm_op_order_not_measured"
-    if op in ("spvv", "axpby", "spmv_sell", "spmm_bell", "spmm_bsr", "spmm_csc"):
-        return "new_capi_operator_group"
-    if dtype in ("f16f32", "i8i32", "i8f32", "f32c32"):
-        return "mixed_precision_kernel_not_wired"
     if "trans" in vid or "conj" in vid:
         return "opA_transpose_or_conj_not_supported"
     return "unclassified"

@@ -45,6 +45,15 @@ flagsparseDataType_t component_dtype(flagsparseDataType_t dtype);
 std::size_t index_size(flagsparseIndexType_t idx);
 const char* triton_index_dtype(flagsparseIndexType_t idx);
 
+// IEEE binary16 <-> double, host-side only (alpha/beta scalars are read/built
+// once per call, not a hot path). Shared because every dispatch file that
+// reads a caller-supplied alpha/beta (spmv.cpp, spmm.cpp, sddmm.cpp, ...)
+// needs this once fp16 is one of its dtypes -- triton_dtype() already maps
+// FLAGSPARSE_R_16F, but that says nothing about how to decode a host fp16
+// scalar, which has no native C++ type.
+double fp16_to_double(std::uint16_t bits);
+std::uint16_t double_to_fp16(double value);
+
 // ---------------------------------------------------------------- handle ---
 
 struct Context {
