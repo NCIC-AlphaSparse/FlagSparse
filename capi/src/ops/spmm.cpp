@@ -36,6 +36,7 @@
 #include "adaptor/adaptor.hpp"
 #include "core/internal.hpp"
 #include "core/jit.hpp"
+#include "core/prologue.hpp"
 
 using namespace flagsparse;
 
@@ -183,6 +184,7 @@ flagsparseStatus_t read_scalar(flagsparseHandle_t handle, const void* p,
     }
     *im = 0.0;
     switch (ctype) {
+        case FLAGSPARSE_R_16F: *re = fp16_to_double(static_cast<const uint16_t*>(p)[0]); return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_R_32F: *re = static_cast<const float*>(p)[0];  return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_R_64F: *re = static_cast<const double*>(p)[0]; return FLAGSPARSE_STATUS_SUCCESS;
         case FLAGSPARSE_C_32F:
@@ -211,6 +213,7 @@ bool alg_supported(flagsparseFormat_t format, flagsparseSpMMAlg_t alg) {
     if (format == FLAGSPARSE_FORMAT_COO) {
         return alg == FLAGSPARSE_SPMM_COO_ALG1 || alg == FLAGSPARSE_SPMM_COO_ALG2;
     }
+    if (format == FLAGSPARSE_FORMAT_CSC) return alg == FLAGSPARSE_SPMM_ALG_DEFAULT;
     return false;
 }
 
@@ -235,7 +238,8 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
         // report it rather than computing in the wrong type.
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
-    if (A->format != FLAGSPARSE_FORMAT_CSR && A->format != FLAGSPARSE_FORMAT_COO) {
+    if (A->format != FLAGSPARSE_FORMAT_CSR && A->format != FLAGSPARSE_FORMAT_COO &&
+        A->format != FLAGSPARSE_FORMAT_CSC) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     if (A->idx_base != FLAGSPARSE_INDEX_BASE_ZERO) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
@@ -245,9 +249,14 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
 
-    // op(A) = A^T would need the transposed CSR built first; that is a prepare
-    // step this operator does not have yet, so it is refused, not approximated.
-    if (transposes(opA)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    // CSR f32 transpose is handled by an atomic scatter route.  Other transpose
+    // requests remain unsupported because their value types need a matching
+    // atomic implementation (and conjugation needs separate arithmetic).
+    const bool csr_transpose_f32 =
+        A->format == FLAGSPARSE_FORMAT_CSR &&
+        opA == FLAGSPARSE_OPERATION_TRANSPOSE &&
+        computeType == FLAGSPARSE_R_32F;
+    if (transposes(opA) && !csr_transpose_f32) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     // op(B) = B^T is free (strides swap), but conj(B) would have to negate the
     // imaginary part inside the kernel.
     if (opB == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) {
@@ -262,7 +271,8 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
     if (triton_dtype(component)[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     // fp16/bf16 would need a compute-precision copy of both dense operands, the
     // way the Python path casts to fp32 first. Not wired up.
-    if (component != FLAGSPARSE_R_32F && component != FLAGSPARSE_R_64F) {
+    if (component != FLAGSPARSE_R_32F && component != FLAGSPARSE_R_64F &&
+        component != FLAGSPARSE_R_16F) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     if (triton_index_dtype(A->indices_type)[0] == '\0' ||
@@ -270,8 +280,8 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
 
-    const int64_t m = A->rows;
-    const int64_t k = A->cols;
+    const int64_t m = transposes(opA) ? A->cols : A->rows;
+    const int64_t k = transposes(opA) ? A->rows : A->cols;
     const int64_t n = C->cols;
     const int64_t b_rows = transposes(opB) ? B->cols : B->rows;
     const int64_t b_cols = transposes(opB) ? B->rows : B->cols;
@@ -376,6 +386,16 @@ bool is_identity_alpha_beta(flagsparseHandle_t handle, flagsparseDataType_t comp
         const float one = 1.0f, zero = 0.0f;
         return std::memcmp(alpha, &one, sizeof(one)) == 0 &&
                std::memcmp(beta, &zero, sizeof(zero)) == 0;
+    }
+    if (computeType == FLAGSPARSE_R_16F) {
+        const std::uint16_t one = double_to_fp16(1.0), zero = double_to_fp16(0.0);
+        return std::memcmp(alpha, &one, sizeof(one)) == 0 &&
+               std::memcmp(beta, &zero, sizeof(zero)) == 0;
+    }
+    if (computeType == FLAGSPARSE_C_32F) {
+        const float one[2] = {1.0f, 0.0f}, zero[2] = {0.0f, 0.0f};
+        return std::memcmp(alpha, one, sizeof(one)) == 0 &&
+               std::memcmp(beta, zero, sizeof(zero)) == 0;
     }
     return false;
 }
@@ -499,6 +519,7 @@ flagsparseStatus_t run_coo_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
 struct Operands {
     bool complex_op = false;
     bool acc_is_fp64 = false;
+    bool acc_is_fp16 = false;
     bool has_beta = false;
     double alpha_re = 1.0, alpha_im = 0.0, beta_re = 0.0, beta_im = 0.0;
     int64_t m = 0, n = 0;
@@ -524,6 +545,7 @@ flagsparseStatus_t resolve_operands(flagsparseHandle_t handle, flagsparseOperati
     out->complex_op = is_complex(computeType);
     const flagsparseDataType_t component = component_dtype(computeType);
     out->acc_is_fp64 = (component == FLAGSPARSE_R_64F);
+    out->acc_is_fp16 = (component == FLAGSPARSE_R_16F);
     out->has_beta = (out->beta_re != 0.0 || out->beta_im != 0.0);
     out->vt = triton_dtype(component);
 
@@ -561,6 +583,7 @@ void append_dense_args(const Operands& ops, int64_t leading_extent,
                        std::vector<jit::Arg>* args) {
     const auto push_scalar = [&](double v) {
         if (ops.acc_is_fp64) args->push_back(jit::Arg::d(v));
+        else if (ops.acc_is_fp16) args->push_back(jit::Arg::h(double_to_fp16(v)));
         else                 args->push_back(jit::Arg::f(static_cast<float>(v)));
     };
     push_scalar(ops.alpha_re);
@@ -576,6 +599,57 @@ void append_dense_args(const Operands& ops, int64_t leading_extent,
     args->push_back(jit::Arg::i64v(ops.stride_cm));
     args->push_back(jit::Arg::i64v(ops.stride_cn));
     if (ops.complex_op) args->push_back(jit::Arg::i64v(1));   // stride_cr
+}
+
+flagsparseStatus_t run_csc_q4(flagsparseHandle_t handle, SpMatDescr* A,
+                              const DnMatDescr* B, DnMatDescr* C,
+                              const Operands& ops) {
+    int64_t max_col_nnz = 0;
+    if (flagsparseStatus_t s = ensure_max_row_nnz(A, &max_col_nnz)) return s;
+    const int block_n = mixed_block_n(C->cols);
+    constexpr int block_nnz = 32;
+    const int64_t segments = std::max<int64_t>(1, (max_col_nnz + block_nnz - 1) / block_nnz);
+    const bool complex = ops.complex_op;
+    const std::size_t storage = static_cast<std::size_t>(
+        C->order == FLAGSPARSE_ORDER_ROW ? C->rows * C->ld : C->cols * C->ld);
+    if (adaptor::memset_device(reinterpret_cast<adaptor::DevicePtr>(C->values), 0,
+                               storage * dtype_size(C->value_type)) != FLAGSPARSE_STATUS_SUCCESS) {
+        return FLAGSPARSE_STATUS_EXECUTION_FAILED;
+    }
+    if (A->nnz == 0 || C->cols == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    std::string sig;
+    sig += "*"; sig += ops.vt; sig += ":16,*"; sig += it; sig += ":16,*";
+    sig += ot; sig += ":16,*"; sig += ops.vt; sig += ":16,*"; sig += ops.vt; sig += ":16,";
+    sig += "i32,i32,i64,i64,";
+    if (complex) sig += "i64,";
+    sig += "i64,i64,";
+    if (complex) sig += "i64,";
+    sig += std::to_string(block_n) + "," + std::to_string(block_nnz) + ",";
+    std::vector<jit::Arg> args;
+    args.reserve(12);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(B->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(C->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->cols)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(C->cols)));
+    args.push_back(jit::Arg::i64v(ops.stride_bk)); args.push_back(jit::Arg::i64v(ops.stride_bn));
+    if (complex) args.push_back(jit::Arg::i64v(1));
+    args.push_back(jit::Arg::i64v(ops.stride_cm)); args.push_back(jit::Arg::i64v(ops.stride_cn));
+    if (complex) args.push_back(jit::Arg::i64v(1));
+    for (int64_t seg = 0; seg < segments; ++seg) {
+        std::string err;
+        const flagsparseStatus_t st = jit::launch(
+            jit::codegen_module("spmm_csc.py"),
+            complex ? "_spmm_csc_non_complex_kernel" : "_spmm_csc_non_real_kernel",
+            sig + std::to_string(seg), ctx(handle)->stream, A->cols,
+            (C->cols + block_n - 1) / block_n, 1, 4, 2, args, &err);
+        if (st != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return st; }
+    }
+    return FLAGSPARSE_STATUS_SUCCESS;
 }
 
 flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMatDescr* B,
@@ -641,6 +715,65 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     return st;
 }
 
+// CSR transpose has no output-row owner: every source row can contribute to
+// many output rows.  Apply beta in a dense prologue, then scatter each source
+// row's nonzeros into C with f32 atomics.
+flagsparseStatus_t run_csr_transpose_atomic(flagsparseHandle_t handle,
+                                            SpMatDescr* A, const DnMatDescr* B,
+                                            DnMatDescr* C, const Operands& ops) {
+    int64_t max_row_nnz = 0;
+    if (flagsparseStatus_t s = ensure_max_row_nnz(A, &max_row_nnz)) return s;
+    if (flagsparseStatus_t s = scale_dense(
+            handle, C->values, FLAGSPARSE_R_32F, false, C->rows, C->cols,
+            ops.stride_cm, ops.stride_cn, ops.beta_re, 0.0)) {
+        return s;
+    }
+    if (A->nnz == 0 || C->cols == 0) return FLAGSPARSE_STATUS_SUCCESS;
+
+    constexpr int block_nnz = 32;
+    const int block_n = std::max(1, std::min(128, mixed_block_n(C->cols)));
+    const int64_t segments = std::max<int64_t>(
+        1, (max_row_nnz + block_nnz - 1) / block_nnz);
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    if (it[0] == '\0' || ot[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+
+    std::string sig;
+    sig.reserve(176);
+    sig += "*"; sig += triton_dtype(A->value_type); sig += ":16,"; // values
+    sig += "*"; sig += it; sig += ":16,";                         // cols
+    sig += "*"; sig += ot; sig += ":16,";                         // indptr
+    sig += "*"; sig += triton_dtype(B->value_type); sig += ":16,"; // B
+    sig += "*"; sig += triton_dtype(C->value_type); sig += ":16,"; // C
+    sig += triton_dtype(C->value_type); sig += ",";                // alpha
+    sig += "i32,i32,i64,i64,i64,i64,";
+    sig += std::to_string(block_n) + "," + std::to_string(block_nnz);
+
+    std::vector<jit::Arg> args;
+    args.reserve(12);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(B->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(C->values)));
+    args.push_back(jit::Arg::f(static_cast<float>(ops.alpha_re)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(C->cols)));
+    args.push_back(jit::Arg::i64v(ops.stride_bk));
+    args.push_back(jit::Arg::i64v(ops.stride_bn));
+    args.push_back(jit::Arg::i64v(ops.stride_cm));
+    args.push_back(jit::Arg::i64v(ops.stride_cn));
+
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spmm_transpose.py"),
+        "spmm_csr_transpose_atomic_f32", sig, ctx(handle)->stream,
+        A->rows, (C->cols + block_n - 1) / block_n, segments,
+        /*num_warps=*/4, /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
 flagsparseStatus_t run_coo(flagsparseHandle_t handle, SpMatDescr* A, const DnMatDescr* B,
                            DnMatDescr* C, const Operands& ops, void* externalBuffer) {
     // The row-offsets array is scratch the CALLER owns, sized by
@@ -698,7 +831,8 @@ flagsparseStatus_t run_coo(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     return st;
 }
 
-flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opB,
+flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
+                       flagsparseOperation_t opB,
                        const void* alpha, flagsparseConstSpMatDescr_t matA,
                        flagsparseConstDnMatDescr_t matB, const void* beta,
                        flagsparseDnMatDescr_t matC, flagsparseDataType_t computeType,
@@ -716,7 +850,11 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opB,
 
     return (A->format == FLAGSPARSE_FORMAT_COO)
                ? run_coo(handle, A, B, C, ops, externalBuffer)
-               : run_csr(handle, A, B, C, computeType, ops);
+               : (A->format == FLAGSPARSE_FORMAT_CSC
+                      ? run_csc_q4(handle, A, B, C, ops)
+                      : (transposes(opA)
+                             ? run_csr_transpose_atomic(handle, A, B, C, ops)
+                             : run_csr(handle, A, B, C, computeType, ops)));
 }
 
 }  // namespace
@@ -807,7 +945,11 @@ flagsparseStatus_t flagsparseSpMM(
                 validate(handle, opA, opB, matA, matB, matC, computeType, alg)) {
             return s;
         }
-        return run(handle, opB, alpha, matA, matB, beta, matC, computeType,
+        if (spmat(matA)->format == FLAGSPARSE_FORMAT_CSC &&
+            !is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+            return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+        }
+        return run(handle, opA, opB, alpha, matA, matB, beta, matC, computeType,
                    externalBuffer);
     });
 }

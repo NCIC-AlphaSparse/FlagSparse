@@ -44,6 +44,82 @@ bool musa_backend() {
     return is_musa;
 }
 
+std::vector<double> pack_dense(const std::vector<double>& src, int64_t rows, int64_t cols,
+                               bool transpose, flagsparseOrder_t order) {
+    const int64_t dr = transpose ? cols : rows, dc = transpose ? rows : cols;
+    const int64_t ld = order == FLAGSPARSE_ORDER_ROW ? dc : dr;
+    std::vector<double> dst(static_cast<std::size_t>(dr * dc), 0.0);
+    for (int64_t r = 0; r < rows; ++r) for (int64_t c = 0; c < cols; ++c) {
+        const int64_t pr = transpose ? c : r, pc = transpose ? r : c;
+        dst[static_cast<std::size_t>(order == FLAGSPARSE_ORDER_ROW ? pr * ld + pc
+                                                                     : pr + pc * ld)] =
+            src[static_cast<std::size_t>(r * cols + c)];
+    }
+    return dst;
+}
+
+struct CscMatrix {
+    std::vector<int32_t> colptr, rowind;
+    std::vector<double> values;
+};
+
+CscMatrix csr_to_csc(const CsrMatrix& A) {
+    CscMatrix out;
+    out.colptr.assign(static_cast<std::size_t>(A.cols) + 1, 0);
+    for (int32_t c : A.indices) ++out.colptr[static_cast<std::size_t>(c) + 1];
+    for (int64_t c = 0; c < A.cols; ++c)
+        out.colptr[static_cast<std::size_t>(c) + 1] += out.colptr[static_cast<std::size_t>(c)];
+    out.rowind.assign(static_cast<std::size_t>(A.nnz), 0);
+    out.values.assign(static_cast<std::size_t>(A.nnz), 0.0);
+    std::vector<int32_t> cursor(out.colptr.begin(), out.colptr.end() - 1);
+    for (int64_t r = 0; r < A.rows; ++r) {
+        for (int32_t p = A.indptr[static_cast<std::size_t>(r)];
+             p < A.indptr[static_cast<std::size_t>(r) + 1]; ++p) {
+            const int32_t c = A.indices[static_cast<std::size_t>(p)];
+            const std::size_t slot = static_cast<std::size_t>(cursor[c]++);
+            out.rowind[slot] = static_cast<int32_t>(r);
+            out.values[slot] = A.values[static_cast<std::size_t>(p)];
+        }
+    }
+    return out;
+}
+
+std::vector<double> typed_spmm_reference(const CsrMatrix& A,
+                                         const std::vector<double>& B, int64_t n,
+                                         flagsparseDataType_t input_dt,
+                                         flagsparseDataType_t accum_dt, bool csc) {
+    std::vector<double> C(static_cast<std::size_t>(A.rows * n), 0.0);
+    const CscMatrix S = csr_to_csc(A);
+    auto add = [&](int64_t row, int64_t col, double term) {
+        const std::size_t idx = static_cast<std::size_t>(row * n + col);
+        C[idx] = accumulate_typed(C[idx], term, accum_dt);
+    };
+    if (csc) {
+        for (int64_t k = 0; k < A.cols; ++k) {
+            for (int32_t p = S.colptr[static_cast<std::size_t>(k)];
+                 p < S.colptr[static_cast<std::size_t>(k) + 1]; ++p) {
+                const int64_t row = S.rowind[static_cast<std::size_t>(p)];
+                const double a = quantize_scalar(S.values[static_cast<std::size_t>(p)], input_dt);
+                for (int64_t j = 0; j < n; ++j) {
+                    add(row, j, a * quantize_scalar(B[static_cast<std::size_t>(k * n + j)], input_dt));
+                }
+            }
+        }
+    } else {
+        for (int64_t row = 0; row < A.rows; ++row) {
+            for (int32_t p = A.indptr[static_cast<std::size_t>(row)];
+                 p < A.indptr[static_cast<std::size_t>(row) + 1]; ++p) {
+                const int64_t k = A.indices[static_cast<std::size_t>(p)];
+                const double a = quantize_scalar(A.values[static_cast<std::size_t>(p)], input_dt);
+                for (int64_t j = 0; j < n; ++j) {
+                    add(row, j, a * quantize_scalar(B[static_cast<std::size_t>(k * n + j)], input_dt));
+                }
+            }
+        }
+    }
+    return C;
+}
+
 }  // namespace
 
 TEST(SpmmBenchmark, CsrOverCorpus) {
@@ -96,16 +172,71 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                 }
                 const bool is_coo = std::string(v->format) == "coo";
                 const bool is_csr = std::string(v->format) == "csr";
-                if (!is_csr && !is_coo) {
-                    if (n == kWidths[0]) {   // one row per variant, not per width
-                        const std::string why =
-                            std::string("benchmark/test_spmm.cpp has no ") +
-                            v->format + " operand builder yet";
-                        report_unimplemented(g_report, *v, why.c_str());
-                    }
+                const bool is_csc = std::string(v->format) == "csc";
+                if (!is_csr && !is_coo && !is_csc) {
+                    if (n == kWidths[0]) report_unimplemented(
+                        g_report, *v, "benchmark/test_spmm.cpp has no operand builder");
                     continue;
                 }
                 const auto dt = v->dt;
+                const auto out_dt = q4_output_dtype(*v);
+                const bool mixed = q4_is_mixed(*v);
+                const std::string vid = v->q4_variant ? v->q4_variant : "";
+                const bool row_layout = vid.find("_row") != std::string::npos;
+                const bool trans_a = vid.find("_int_trans_non_") != std::string::npos;
+                const bool trans_b = vid.find("_int_non_trans_") != std::string::npos;
+                if (trans_a && !is_csr) continue;
+                const int64_t b_logical_rows = trans_a ? A.rows : A.cols;
+                const int64_t out_rows = trans_a ? A.cols : A.rows;
+                const std::vector<double> b_row_variant =
+                    trans_a ? dense_pattern(static_cast<std::size_t>(b_logical_rows * n))
+                            : b_row;
+                std::vector<double> ref_row_variant;
+                if (trans_a) {
+                    ref_row_variant.assign(static_cast<std::size_t>(out_rows * n), 0.0);
+                    for (int64_t r = 0; r < A.rows; ++r) {
+                        for (int32_t p = A.indptr[static_cast<std::size_t>(r)];
+                             p < A.indptr[static_cast<std::size_t>(r) + 1]; ++p) {
+                            const int64_t c = A.indices[static_cast<std::size_t>(p)];
+                            for (int64_t j = 0; j < n; ++j) {
+                                ref_row_variant[static_cast<std::size_t>(c * n + j)] +=
+                                    A.values[static_cast<std::size_t>(p)] *
+                                    b_row_variant[static_cast<std::size_t>(r * n + j)];
+                            }
+                        }
+                    }
+                } else {
+                    if (is_csc || (dtype_is_half(dt) && !mixed)) {
+                        const flagsparseDataType_t accum_dt =
+                            out_dt == FLAGSPARSE_R_32I ? FLAGSPARSE_R_32I :
+                            // Native fp16 SpMM widens inputs and accumulates in
+                            // fp32 before storing the fp16 output.
+                            (dtype_is_half(dt) ? FLAGSPARSE_R_32F :
+                             (dtype_is_64(out_dt) ? FLAGSPARSE_R_64F : FLAGSPARSE_R_32F));
+                        ref_row_variant = typed_spmm_reference(
+                            A, b_row_variant, n, dt, accum_dt, is_csc);
+                        quantize_vector_inplace(&ref_row_variant, out_dt);
+                    } else if (mixed) {
+                        CsrMatrix Aq = A;
+                        for (double& value : Aq.values) value = quantize_scalar(value, dt);
+                        std::vector<double> bq = b_row_variant;
+                        for (double& value : bq) value = quantize_scalar(value, dt);
+                        ref_row_variant = spmm_reference(
+                            Aq, bq, n, 1.0, 0.0,
+                            std::vector<double>(static_cast<std::size_t>(A.rows * n), 0.0));
+                    } else if (dtype_is_half(dt) || dtype_is_int8(dt)) {
+                        CsrMatrix Aq = A;
+                        for (double& value : Aq.values) value = quantize_scalar(value, dt);
+                        std::vector<double> bq = b_row_variant;
+                        for (double& value : bq) value = quantize_scalar(value, dt);
+                        ref_row_variant = spmm_reference(
+                            Aq, bq, n, 1.0, 0.0,
+                            std::vector<double>(static_cast<std::size_t>(A.rows * n), 0.0));
+                        quantize_vector_inplace(&ref_row_variant, out_dt);
+                    } else {
+                        ref_row_variant = ref_row;
+                    }
+                }
                 BenchRow row;
                 row.name = std::string("spmm_") + v->format + "_" + v->dtype +
                            "_n" + std::to_string(n) + "_" + entry.name;
@@ -116,16 +247,23 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                    .num("cols", static_cast<double>(A.cols))
                    .num("nnz", static_cast<double>(A.nnz))
                    .num("n", static_cast<double>(n));
+                if (v->q4_variant) row.tag("q4_variant", v->q4_variant);
                 trace("spmm", entry.name, v->dtype, A);
 
-                DeviceBuffer indptr = DeviceBuffer::from(A.indptr);
-                DeviceBuffer indices = DeviceBuffer::from(A.indices);
+                const CscMatrix csc = csr_to_csc(A);
+                DeviceBuffer indptr = DeviceBuffer::from(is_csc ? csc.colptr : A.indptr);
+                DeviceBuffer indices = DeviceBuffer::from(is_csc ? csc.rowind : A.indices);
                 DeviceBuffer rowind = DeviceBuffer::from(coo_rows);
-                DeviceBuffer values = upload_as(A.values, dt);
-                DeviceBuffer B = upload_as(b_col, dt);
-                DeviceBuffer C(static_cast<std::size_t>(A.rows) *
-                               static_cast<std::size_t>(n) * elem_bytes(dt));
-                if (!indptr.get() || !indices.get() || !rowind.get() ||
+                DeviceBuffer values = upload_as(is_csc ? csc.values : A.values, dt);
+                const flagsparseOrder_t order = row_layout ? FLAGSPARSE_ORDER_ROW
+                                                            : FLAGSPARSE_ORDER_COL;
+                const auto q4_b = pack_dense(b_row_variant, b_logical_rows, n, trans_b, order);
+                const auto q4_ref = pack_dense(ref_row_variant, out_rows, n, false, order);
+                DeviceBuffer B = upload_as(v->q4_variant ? q4_b : b_col, dt);
+                DeviceBuffer C(static_cast<std::size_t>(out_rows) *
+                               static_cast<std::size_t>(n) * elem_bytes(out_dt));
+                if (!indptr.get() || !indices.get() ||
+                    (!is_csc && !rowind.get()) ||
                     !values.get() || !B.get() || !C.get()) {
                     g_report.skip(std::move(row), "skipped_memory",
                                   "device allocation failed for this matrix at n=" +
@@ -141,6 +279,11 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                                               rowind.get(), indices.get(), values.get(),
                                               FLAGSPARSE_INDEX_32I,
                                               FLAGSPARSE_INDEX_BASE_ZERO, dt)
+                        : is_csc
+                        ? flagsparseCreateCsc(&matA, A.rows, A.cols, A.nnz, indptr.get(),
+                                              indices.get(), values.get(),
+                                              FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                              FLAGSPARSE_INDEX_BASE_ZERO, dt)
                         : flagsparseCreateCsr(&matA, A.rows, A.cols, A.nnz, indptr.get(),
                                               indices.get(), values.get(),
                                               FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
@@ -151,17 +294,19 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                                       v->format);
                     continue;
                 }
-                flagsparseCreateDnMat(&matB, A.cols, n, A.cols, B.get(), dt,
-                                      FLAGSPARSE_ORDER_COL);
-                flagsparseCreateDnMat(&matC, A.rows, n, A.rows, C.get(), dt,
-                                      FLAGSPARSE_ORDER_COL);
+                const int64_t b_rows = trans_b ? n : b_logical_rows;
+                const int64_t b_cols = trans_b ? b_logical_rows : n;
+                const int64_t b_ld = order == FLAGSPARSE_ORDER_ROW ? b_cols : b_rows;
+                flagsparseCreateDnMat(&matB, b_rows, b_cols, b_ld, B.get(), dt, order);
+                flagsparseCreateDnMat(&matC, out_rows, n, row_layout ? n : out_rows, C.get(), out_dt,
+                                      order);
 
                 std::size_t bufsz = 0;
                 flagsparseSpMM_bufferSize(handle.h,
-                                          FLAGSPARSE_OPERATION_NON_TRANSPOSE,
-                                          FLAGSPARSE_OPERATION_NON_TRANSPOSE,
-                                          sc.alpha(dt), matA, matB, sc.beta(dt), matC,
-                                          dt, FLAGSPARSE_SPMM_ALG_DEFAULT, &bufsz);
+                                          trans_a ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                          trans_b ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                          sc.alpha(out_dt), matA, matB, sc.beta(out_dt), matC,
+                                          out_dt, FLAGSPARSE_SPMM_ALG_DEFAULT, &bufsz);
                 DeviceBuffer scratch(bufsz ? bufsz : 1);
                 if (!scratch.get()) {
                     flagsparseDestroyDnMat(matB); flagsparseDestroyDnMat(matC);
@@ -178,19 +323,39 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                     std::move(row),
                     [&]() {
                         return flagsparseSpMM(handle.h,
-                                              FLAGSPARSE_OPERATION_NON_TRANSPOSE,
-                                              FLAGSPARSE_OPERATION_NON_TRANSPOSE,
-                                              sc.alpha(dt), matA, matB, sc.beta(dt),
-                                              matC, dt, FLAGSPARSE_SPMM_ALG_DEFAULT,
+                                              trans_a ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                              trans_b ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                              sc.alpha(out_dt), matA, matB, sc.beta(out_dt),
+                                              matC, out_dt, FLAGSPARSE_SPMM_ALG_DEFAULT,
                                               scratch.get());
                     },
-                    [&](bool relaxed) { return ratio_against(C.get(), ref, dt, relaxed); },
+                    [&](bool relaxed) {
+                        return out_dt == FLAGSPARSE_R_16F
+                            ? benchmark_ratio_against(C.get(), v->q4_variant ? q4_ref : ref,
+                                                      out_dt, relaxed)
+                            : ratio_against(C.get(), v->q4_variant ? q4_ref : ref,
+                                            out_dt, relaxed);
+                    },
                     [&](baseline::Timing* t) {
+                        if (is_csc || mixed) {
+                            return baseline::Status::no(
+                                is_csc ? "no matching cuSPARSE CSC SpMM baseline in harness"
+                                       : "mixed-precision SpMM has no matching vendor baseline");
+                        }
+                        // cuSPARSE supports opA=TRANSPOSE and row-major dense
+                        // descriptors. Pass the same layout and descriptor
+                        // extents as the C API path so its result overwrites
+                        // the buffer that verify() reads below.
+                        const int64_t b_ld = order == FLAGSPARSE_ORDER_ROW ? b_cols : b_rows;
+                        const int64_t c_ld = order == FLAGSPARSE_ORDER_ROW ? n : out_rows;
                         return baseline::spmm_csr(
-                            bA, B.get(), n, A.cols, C.get(), A.rows, sc.alpha(dt),
-                            sc.beta(dt), FLAGSPARSE_OPERATION_NON_TRANSPOSE,
-                            FLAGSPARSE_OPERATION_NON_TRANSPOSE, BenchReport::kWarmup,
-                            BenchReport::kIters, t);
+                            bA, B.get(), n, b_ld, C.get(), c_ld, sc.alpha(out_dt),
+                            sc.beta(out_dt),
+                            trans_a ? FLAGSPARSE_OPERATION_TRANSPOSE
+                                    : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                            trans_b ? FLAGSPARSE_OPERATION_TRANSPOSE
+                                     : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                            BenchReport::kWarmup, BenchReport::kIters, t, order, order);
                     },
                     2.0 * static_cast<double>(A.nnz) * static_cast<double>(n));
 

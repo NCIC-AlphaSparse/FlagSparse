@@ -94,6 +94,7 @@ TEST(ScatterBenchmark, SpVecOverCorpus) {
                .num("nnz", static_cast<double>(nnz))
                .num("size", static_cast<double>(dense))
                .num("bytes_moved", bytes);
+            if (v->q4_variant) row.tag("q4_variant", v->q4_variant);
             trace("scatter", entry.name, v->dtype, A);
 
             DeviceBuffer d_idx = DeviceBuffer::from(idx);

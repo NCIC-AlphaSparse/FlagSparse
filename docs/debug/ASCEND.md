@@ -2,6 +2,10 @@
 
 `FLAGSPARSE_BACKEND=ascend`。环境、交付复现见 [../ASCEND.md](../ASCEND.md)。
 
+当前 debug 入口使用 Python runner：
+`python3 tools/run_backend_tests.py --backend ascend --phase both --mode normal`。
+Ascend 的 C API adaptor 尚未可构建，不要用 CTest 结果判断该后端算子。
+
 ## 1. 这个后端的特点
 
 - 昇腾的 Triton 缺 shmem 扩展，也降不下 `associative_scan`，FlagSparse 的大多数 Triton kernel 都编译不了。

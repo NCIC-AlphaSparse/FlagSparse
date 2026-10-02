@@ -45,9 +45,9 @@ from tools.delivery_variants import load_q4_variants  # noqa: E402
 # NotCoveredYet. See NOT_YET_COVERED below for the specific gap blocking each of
 # the rest -- consult that before adding a new CONFIRMED entry.
 CONFIRMED: dict[str, dict[str, str]] = {
-    # spmv's only supported opA is NON_TRANSPOSE (CSR/COO reject transpose:
-    # capi/src/ops/spmv.cpp), so every spmv_csr/spmv_coo row IS the "_non"
-    # direction already -- no ambiguity to check beyond dtype.
+    # The current benchmark rows use NON_TRANSPOSE. CSR/COO also have narrow
+    # q4 atomic transpose/conjugate paths, but no benchmark row records that
+    # op axis yet, so these two ordinary-complex rows remain unambiguous.
     "spmv_csr_c32_int_non": {"operator": "spmv_csr", "dtype": "c32"},
     "spmv_coo_c32_int_non": {"operator": "spmv_coo", "dtype": "c32"},
     # ctest/benchmark/test_spmm.cpp hardcodes
@@ -110,9 +110,10 @@ NOT_YET_COVERED_REASONS = {
     ),
     "spmm_row_or_trans_not_measured": (
         "ctest/benchmark/test_spmm.cpp measures exactly one op/layout "
-        "(non/non/col) per dtype; this variant needs row-major C and/or "
-        "opA=TRANSPOSE, which capi/src/ops/spmm.cpp does not support yet "
-        "(opA transpose) or the benchmark does not sweep (row layout)."
+        "(non/non/col) per dtype; this variant needs a row-major or transpose "
+        "benchmark axis that is not present in the current sweep. If dispatch "
+        "is already covered by a focused accuracy test, classify it as "
+        "DispatchVerified rather than treating it as an implementation gap."
     ),
     "sddmm_dtype_not_in_capi_registry": (
         "capi/conf/operators.yaml's sddmm_csr entry only lists dtypes: "
@@ -149,6 +150,19 @@ NOT_YET_COVERED_REASONS = {
         "that generator/schema gap, not a dispatch gap, is what blocks "
         "CONFIRMED status here."
     ),
+    "capi_dispatch_verified_no_benchmark_row": (
+        "The C API dispatch and a targeted device accuracy test implement this "
+        "q4 variant. It has no matching benchmark row yet, so it cannot be "
+        "classified as CONFIRMED/measured without mislabelling another op, "
+        "layout, or dtype combination."
+    ),
+    "implemented_corpus_tolerance_gap": (
+        "The C API path is implemented and has focused accuracy coverage, but "
+        "the corpus benchmark compares fp16 storage against an unquantized fp64 "
+        "oracle. Quantization error exceeds the current global tolerance on "
+        "these matrices; this is an experiment/tolerance policy gap, not a "
+        "missing operator implementation."
+    ),
     "opA_transpose_or_conj_not_supported": (
         "capi/src/ops/spmv.cpp (or spmm.cpp) returns NOT_SUPPORTED for this "
         "operator's opA=TRANSPOSE/CONJUGATE_TRANSPOSE."
@@ -166,6 +180,33 @@ _MIXED_DISPATCH_VERIFIED = frozenset({
     "spmm_csr_i8i32_int_non_non_row",
     "spmm_csr_f16f32_int_non_non_row",
     "spmm_coo_i8i32_int_non_non_row",
+    "spvv_f16f32_int_non",
+    "spvv_i8i32_int_non",
+    "spmv_sell_i8i32_int_non",
+})
+
+# These are ordinary C API paths (not the widened-output family above).  Keep
+# them separate: benchmark attribution lacks the needed op/layout axis, but the
+# variants are implemented and have CUDA ctest accuracy coverage.
+_CAPI_DISPATCH_VERIFIED = frozenset({
+    "axpby_f16_int",
+    "spmm_csc_c32_int_non_non_row",
+    "spmm_csc_f16_int_non_non_row",
+    "spmm_csc_f32_int_non_non_row",
+    "spmv_sell_c32_int_non",
+    "spmv_sell_f16_int_non",
+    "spmv_sell_f32_int_non",
+    "spvv_c32_int_conj",
+    "spmv_csr_f32_int_trans",
+    "spmv_coo_f32_int_trans",
+    "spmv_csr_c32_int_conj",
+    "spmv_coo_c32_int_conj",
+    "sddmm_csr_c32_int_non_non_row",
+})
+
+_DISPATCH_VERIFIED_REASONS = frozenset({
+    "mixed_precision_dispatch_verified_no_benchmark_row",
+    "capi_dispatch_verified_no_benchmark_row",
 })
 
 
@@ -176,6 +217,10 @@ def _classify_uncovered(variant: dict[str, str]) -> str:
     # the wrong, now-partly-stale reason.
     if vid in _MIXED_DISPATCH_VERIFIED:
         return "mixed_precision_dispatch_verified_no_benchmark_row"
+    if vid in _CAPI_DISPATCH_VERIFIED:
+        return "capi_dispatch_verified_no_benchmark_row"
+    if vid in {"spmv_csr_f16_int_non", "spmv_coo_f16_int_non"}:
+        return "implemented_corpus_tolerance_gap"
     if dtype in ("f16f32", "i8i32", "i8f32", "f32c32"):
         return "mixed_precision_kernel_not_wired"
     if op in ("spvv", "axpby", "spmv_sell", "spmm_bell", "spmm_bsr", "spmm_csc"):
@@ -206,19 +251,49 @@ def main() -> None:
     variants = load_q4_variants()
     files = sorted(args.bench_dir.glob("*_benchmark.json"))
     rows_by_op_dtype: dict[tuple[str, str], list[dict]] = {}
+    rows_by_q4_variant: dict[str, list[dict]] = {}
     for path in files:
         doc = json.loads(path.read_text())
         for r in doc.get("result", []):
             rows_by_op_dtype.setdefault((r.get("operator", ""), r.get("dtype", "")), []).append(r)
+            if r.get("q4_variant"):
+                rows_by_q4_variant.setdefault(r["q4_variant"], []).append(r)
 
     result = {}
     for variant in variants:
         vid = variant["id"]
+        exact_rows = rows_by_q4_variant.get(vid)
+        if exact_rows:
+            ok_rows = [r for r in exact_rows if r.get("status") == "ok"]
+            with_baseline = [r for r in ok_rows if r.get("baseline_status") == "ok"]
+            details = {
+                r.get("matrix", r.get("name", "?")): {
+                    "flagsparse_ms": r.get("median_ms"),
+                    "vendor_ms": r.get("baseline_ms"),
+                    "vendor": r.get("baseline"),
+                    "speedup_vs_vendor": r.get("speedup"),
+                    "accuracy": r.get("accuracy"),
+                }
+                for r in ok_rows
+            }
+            speedups = [r["speedup"] for r in with_baseline if r.get("speedup")]
+            result[vid] = {
+                "status": "Passed" if speedups else ("Measured" if ok_rows else "Failed"),
+                "rows_measured": len(exact_rows), "rows_ok": len(ok_rows),
+                "rows_with_vendor_baseline": len(with_baseline),
+                "vendor": with_baseline[0].get("baseline") if with_baseline else None,
+                "avg_speedup_vs_vendor": sum(speedups) / len(speedups) if speedups else None,
+                "details": details,
+            }
+            continue
         confirmed = CONFIRMED.get(vid)
         if confirmed is None:
             reason_key = _classify_uncovered(variant)
             result[vid] = {
-                "status": "NotCoveredYet",
+                "status": (
+                    "DispatchVerified" if reason_key in _DISPATCH_VERIFIED_REASONS
+                    else "NotCoveredYet"
+                ),
                 "reason_key": reason_key,
                 "reason": NOT_YET_COVERED_REASONS.get(reason_key, "unclassified gap"),
             }
@@ -262,12 +337,13 @@ def main() -> None:
     out_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
     n_confirmed = sum(1 for v in result.values() if v["status"] in ("Passed", "Measured"))
+    n_verified = sum(1 for v in result.values() if v["status"] == "DispatchVerified")
     n_uncovered = sum(1 for v in result.values() if v["status"] == "NotCoveredYet")
     n_no_rows = sum(1 for v in result.values() if v["status"] == "NoRows")
     print(
         f"wrote {out_path}  ({len(result)} q4 variants: "
         f"{n_confirmed} measured through capi, {n_no_rows} confirmed-but-not-run, "
-        f"{n_uncovered} not covered yet)"
+        f"{n_verified} dispatch-verified, {n_uncovered} not covered yet)"
     )
 
 

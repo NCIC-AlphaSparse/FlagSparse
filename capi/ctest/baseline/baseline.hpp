@@ -114,7 +114,9 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
-                int iters, Timing* out);
+                int iters, Timing* out,
+                flagsparseOrder_t orderB = FLAGSPARSE_ORDER_COL,
+                flagsparseOrder_t orderC = FLAGSPARSE_ORDER_COL);
 
 Status sddmm_csr(const DeviceCsr& A, const void* Bd, int64_t k, int64_t ldb,
                  const void* Cd, int64_t ldc, const void* alpha, const void* beta,

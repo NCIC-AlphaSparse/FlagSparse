@@ -2,6 +2,28 @@
 
 `FLAGSPARSE_BACKEND=mthreads`。环境、交付复现见 [../MUSA.md](../MUSA.md)。
 
+## 0. 当前入口：MUSA C API
+
+MUSA 的 q4 调试以 C API CTest 为准。重新配置后运行：
+
+```bash
+cmake -S capi -B capi/build-musa -G Ninja \
+  -DBACKEND=MUSA -DMUSA_HOME=/usr/local/musa \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build capi/build-musa -j
+
+# C API 精度
+ctest --test-dir capi/build-musa -L capi -R accuracy --output-on-failure
+
+# C API 性能
+FLAGSPARSE_MATRIX_DIR=/path/to/mtx \
+FLAGSPARSE_BENCH_OUT=./capi/bench-musa \
+  ctest --test-dir capi/build-musa -L capi -R benchmark --output-on-failure
+```
+
+交付报告需要合并 Python 精度与 muSPARSE 性能时，使用
+`run_flagsparse_split_delivery.py`；它不替代上述 C API 全量调试入口。
+
 ## 1. 这个后端的特点（实测于 torch_musa 2.7.1 / muDNN v3105）
 
 | 能力 | fp32 | fp64 | complex64 | complex128 |
@@ -62,8 +84,9 @@ PyTorch 的 CSR beta 提示，不影响结果。
 
 ### 性能
 
-性能阶段使用 Python benchmark，目的只是记录 FlagSparse 的 MUSA 自身耗时；它不是
-MUSA 交付报告的 muSPARSE 对比。命令如下，`tests/data` 中的 10 个 MatrixMarket 矩阵均
+以下性能命令是历史 Python 侧记录，目的只是记录 FlagSparse 的 MUSA 自身耗时；它不是
+当前 MUSA C API 调试入口。MUSA 交付报告的 muSPARSE 对比应使用
+`run_flagsparse_split_delivery.py`。命令如下，`tests/data` 中的 10 个 MatrixMarket 矩阵均
 传入支持 q4 变体的矩阵算子；预热 5 次、计时 20 次：
 
 ```bash

@@ -477,6 +477,93 @@ TEST_F(SpMMAccuracy, Float32AcrossBlockThresholds) {
     }
 }
 
+TEST_F(SpMMAccuracy, CscFloat32RowMajorIdentity) {
+    // A = [[1, 0, 2], [0, 3, 0]], encoded by CSC columns.
+    const std::vector<int32_t> colptr{0, 1, 2, 3};
+    const std::vector<int32_t> rows{0, 1, 0};
+    const std::vector<float> values{1.0f, 3.0f, 2.0f};
+    const std::vector<float> b{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const std::vector<float> expected{11.0f, 14.0f, 9.0f, 12.0f};
+    DeviceBuffer d_ptr = DeviceBuffer::from(colptr);
+    DeviceBuffer d_rows = DeviceBuffer::from(rows);
+    DeviceBuffer d_values = DeviceBuffer::from(values);
+    DeviceBuffer d_b = DeviceBuffer::from(b);
+    DeviceBuffer d_c = DeviceBuffer::from(std::vector<float>(4, -1.0f));
+    flagsparseSpMatDescr_t a = nullptr;
+    flagsparseDnMatDescr_t mat_b = nullptr, mat_c = nullptr;
+    ASSERT_EQ(flagsparseCreateCsc(&a, 2, 3, 3, d_ptr.get(), d_rows.get(), d_values.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_b, 3, 2, 2, d_b.get(), FLAGSPARSE_R_32F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_c, 2, 2, 2, d_c.get(), FLAGSPARSE_R_32F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    const float one = 1.0f, zero = 0.0f;
+    size_t bytes = 1;
+    ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b,
+                                        &zero, mat_c, FLAGSPARSE_R_32F,
+                                        FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(bytes, 0u);
+    ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                             FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
+                             FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    EXPECT_EQ(d_c.download<float>(4), expected);
+    flagsparseDestroyDnMat(mat_c); flagsparseDestroyDnMat(mat_b); flagsparseDestroySpMat(a);
+}
+
+TEST_F(SpMMAccuracy, CscFloat16RowMajorIdentity) {
+    const std::vector<int32_t> colptr{0, 1, 2, 3};
+    const std::vector<int32_t> rows{0, 1, 0};
+    const std::vector<Half> values{Half(1), Half(3), Half(2)};
+    const std::vector<Half> b{Half(1), Half(2), Half(3), Half(4), Half(5), Half(6)};
+    const std::vector<Half> expected{Half(11), Half(14), Half(9), Half(12)};
+    DeviceBuffer d_ptr = DeviceBuffer::from(colptr), d_rows = DeviceBuffer::from(rows);
+    DeviceBuffer d_values = DeviceBuffer::from(values), d_b = DeviceBuffer::from(b);
+    DeviceBuffer d_c = DeviceBuffer::from(std::vector<Half>(4, Half(-1)));
+    flagsparseSpMatDescr_t a = nullptr; flagsparseDnMatDescr_t mat_b = nullptr, mat_c = nullptr;
+    ASSERT_EQ(flagsparseCreateCsc(&a, 2, 3, 3, d_ptr.get(), d_rows.get(), d_values.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_16F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_b, 3, 2, 2, d_b.get(), FLAGSPARSE_R_16F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_c, 2, 2, 2, d_c.get(), FLAGSPARSE_R_16F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    const Half one(1), zero(0);
+    ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                             FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
+                             FLAGSPARSE_R_16F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync(); EXPECT_EQ(d_c.download<Half>(4), expected);
+    flagsparseDestroyDnMat(mat_c); flagsparseDestroyDnMat(mat_b); flagsparseDestroySpMat(a);
+}
+
+TEST_F(SpMMAccuracy, CscComplex64RowMajorIdentity) {
+    using C = std::complex<float>;
+    const std::vector<int32_t> colptr{0, 1, 2, 3};
+    const std::vector<int32_t> rows{0, 1, 0};
+    const std::vector<C> values{C(1, 1), C(3, -1), C(2, 0)};
+    const std::vector<C> b{C(1, 1), C(2, 0), C(3, 0), C(4, -1), C(5, 0), C(6, 0)};
+    const std::vector<C> expected{C(10, 2), C(14, 2), C(9, -3), C(11, -7)};
+    DeviceBuffer d_ptr = DeviceBuffer::from(colptr), d_rows = DeviceBuffer::from(rows);
+    DeviceBuffer d_values = DeviceBuffer::from(values), d_b = DeviceBuffer::from(b);
+    DeviceBuffer d_c = DeviceBuffer::from(std::vector<C>(4, C(-1, 1)));
+    flagsparseSpMatDescr_t a = nullptr; flagsparseDnMatDescr_t mat_b = nullptr, mat_c = nullptr;
+    ASSERT_EQ(flagsparseCreateCsc(&a, 2, 3, 3, d_ptr.get(), d_rows.get(), d_values.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_b, 3, 2, 2, d_b.get(), FLAGSPARSE_C_32F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_c, 2, 2, 2, d_c.get(), FLAGSPARSE_C_32F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    const C one(1, 0), zero(0, 0);
+    ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                             FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
+                             FLAGSPARSE_C_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync(); EXPECT_EQ(d_c.download<C>(4), expected);
+    flagsparseDestroyDnMat(mat_c); flagsparseDestroyDnMat(mat_b); flagsparseDestroySpMat(a);
+}
+
 TEST_F(SpMMAccuracy, CsrInt8ToInt32MixedPrecision) {
     const std::vector<int8_t> a{2, -1, 3, 4, -2};
     const std::vector<int8_t> b{1, 2, -1, 3, 0, 2, -2, 1, 4, 5, -3, 1};
@@ -524,6 +611,63 @@ TEST_F(SpMMAccuracy, AlphaBetaAreApplied) {
     Case c; c.n = 40; c.alpha = -2.5; c.beta = 0.75;
     const RunResult r = run_spmm<double>(handle.h, A, FLAGSPARSE_R_64F, c);
     expect_close(r, "fp64_alpha_beta", handle.h);
+}
+
+TEST_F(SpMMAccuracy, CsrTransposeFloat32MatchesHostReference) {
+    const int64_t m = 2, k = 3, n = 2;
+    const std::vector<int32_t> indptr{0, 2, 3};
+    const std::vector<int32_t> indices{0, 2, 1};
+    const std::vector<float> values{1.0f, 2.0f, 3.0f};
+    const std::vector<float> b_values{1.0f, 2.0f, 4.0f, 5.0f};
+    const std::vector<float> c_initial{7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
+
+    DeviceBuffer d_values = DeviceBuffer::from(values);
+    DeviceBuffer d_indices = DeviceBuffer::from(indices);
+    DeviceBuffer d_indptr = DeviceBuffer::from(indptr);
+    DeviceBuffer d_b = DeviceBuffer::from(b_values);
+    DeviceBuffer d_c = DeviceBuffer::from(c_initial);
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnMatDescr_t matB = nullptr, matC = nullptr;
+    ASSERT_EQ(flagsparseCreateCsr(
+                  &matA, m, k, static_cast<int64_t>(values.size()), d_indptr.get(),
+                  d_indices.get(), d_values.get(), FLAGSPARSE_INDEX_32I,
+                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&matB, m, n, n, d_b.get(), FLAGSPARSE_R_32F,
+                                    FLAGSPARSE_ORDER_ROW),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&matC, k, n, n, d_c.get(), FLAGSPARSE_R_32F,
+                                    FLAGSPARSE_ORDER_ROW),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const float alpha = 2.0f, beta = 0.5f;
+    size_t buffer_size = 0;
+    ASSERT_EQ(flagsparseSpMM_bufferSize(
+                  handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+                  FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC,
+                  FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, &buffer_size),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMM_preprocess(
+                  handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+                  FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC,
+                  FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMM(
+                  handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+                  FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC,
+                  FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+
+    const std::vector<float> got = d_c.download<float>(c_initial.size());
+    const std::vector<float> expected{5.5f, 8.0f, 28.5f, 35.0f, 9.5f, 14.0f};
+    ASSERT_EQ(got.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) EXPECT_NEAR(got[i], expected[i], 1e-4f);
+
+    flagsparseDestroyDnMat(matC);
+    flagsparseDestroyDnMat(matB);
+    flagsparseDestroySpMat(matA);
 }
 
 // Column-major and a padded leading dimension are the same kernel with
@@ -622,12 +766,13 @@ TEST_F(SpMMAccuracy, RejectsMismatchedDimensions) {
                              nullptr),
               FLAGSPARSE_STATUS_INVALID_VALUE);
 
-    // Unported paths must say NOT_SUPPORTED, never crash (spec §4.4).
+    // The transpose route is implemented for f32 CSR, so its mismatched B
+    // extent is an argument error rather than an unsupported operation.
     EXPECT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
                              FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, matB,
                              &zero, matC, FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT,
                              nullptr),
-              FLAGSPARSE_STATUS_NOT_SUPPORTED);
+              FLAGSPARSE_STATUS_INVALID_VALUE);
     // A COO algorithm id names a format this descriptor is not in.
     EXPECT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                              FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, matB,

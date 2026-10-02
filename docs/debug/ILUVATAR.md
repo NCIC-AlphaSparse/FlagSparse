@@ -3,6 +3,10 @@
 `FLAGSPARSE_BACKEND=iluvatar`（通常能自动识别）。环境、交付复现见 [../ILUVATAR.md](../ILUVATAR.md)，
 上机排查记录见 [../ILUVATAR_DEBUG.md](../ILUVATAR_DEBUG.md)。
 
+当前 debug 入口使用 Python runner：
+`python3 tools/run_backend_tests.py --backend iluvatar --phase both --mode normal`。
+Iluvatar 的 C API `IX` profile 尚未可构建，调试时不要运行 C API CTest。
+
 ## 1. 这个后端的特点
 
 - 以 CUDA 兼容栈接入（CoreX 4.4.0，`torch.version.cuda` 显示 10.2）。

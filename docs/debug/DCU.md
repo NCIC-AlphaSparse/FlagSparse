@@ -2,6 +2,10 @@
 
 `FLAGSPARSE_BACKEND=rocm`（通常能自动识别：`torch.version.hip` 不为空）。环境、交付复现见 [../DCU.md](../DCU.md)。
 
+当前 debug 入口使用 Python runner：
+`python3 tools/run_backend_tests.py --backend rocm --phase both --mode normal`。
+该后端没有可运行的 C API adaptor，不要用 `capi/` 的 CTest 作为 DCU 结论。
+
 ## 1. 这个后端的特点
 
 - Triton kernel 与 CUDA 相同；差别主要在**对比基线**：用 hipSPARSE（通过 `hip-python`），每个算子由

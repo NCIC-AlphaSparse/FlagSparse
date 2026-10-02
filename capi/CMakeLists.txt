@@ -82,10 +82,12 @@ add_library(flagsparse SHARED
     src/core/jit.cpp
     src/core/prologue.cpp
     src/ops/gather_scatter.cpp
+    src/ops/axpby.cpp
     src/ops/sddmm.cpp
     src/ops/spgemm.cpp
     src/ops/spmm.cpp
     src/ops/spmv.cpp
+    src/ops/spvv.cpp
     src/ops/spsm.cpp
     src/ops/spsv.cpp
 )

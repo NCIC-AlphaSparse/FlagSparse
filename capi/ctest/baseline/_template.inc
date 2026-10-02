@@ -198,7 +198,8 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
-                int iters, Timing* out) {
+                int iters, Timing* out, flagsparseOrder_t orderB,
+                flagsparseOrder_t orderC) {
     FS_DT_TYPE vt;
     if (!map_dtype(A.dtype, &vt)) return Status::no("baseline: unmapped value type");
     FS_SP_OPERATION va, vb;
@@ -209,10 +210,16 @@ Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void*
     if (Status s = make_csr(A, &mat); !s.ok) return s;
     const int64_t k = (opA == FLAGSPARSE_OPERATION_NON_TRANSPOSE) ? A.cols : A.rows;
     const int64_t m = (opA == FLAGSPARSE_OPERATION_NON_TRANSPOSE) ? A.rows : A.cols;
+    const int64_t b_rows = (opB == FLAGSPARSE_OPERATION_NON_TRANSPOSE) ? k : n;
+    const int64_t b_cols = (opB == FLAGSPARSE_OPERATION_NON_TRANSPOSE) ? n : k;
 
     FS_SP_DNMAT mb = nullptr, mc = nullptr;
-    FS_SP(CreateDnMat)(&mb, k, n, ldb, const_cast<void*>(B), vt, FS_SP_E(ORDER_COL));
-    FS_SP(CreateDnMat)(&mc, m, n, ldc, C, vt, FS_SP_E(ORDER_COL));
+    FS_SP(CreateDnMat)(&mb, b_rows, b_cols, ldb, const_cast<void*>(B), vt,
+                       orderB == FLAGSPARSE_ORDER_ROW ? FS_SP_E(ORDER_ROW)
+                                                       : FS_SP_E(ORDER_COL));
+    FS_SP(CreateDnMat)(&mc, m, n, ldc, C, vt,
+                       orderC == FLAGSPARSE_ORDER_ROW ? FS_SP_E(ORDER_ROW)
+                                                       : FS_SP_E(ORDER_COL));
 
     std::size_t bytes = 0;
     auto st = FS_SP(SpMM_bufferSize)(vendor(), va, vb, alpha, mat, mb, beta, mc, vt,

@@ -87,6 +87,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                 row.tag("operator", v->op).tag("matrix", entry.name)
                    .tag("format", v->format).tag("dtype", v->dtype)
                    .tag("corpus", corpus_tag()).tag("reporting", v->reporting);
+                if (v->q4_variant) row.tag("q4_variant", v->q4_variant);
                 g_report.skip(std::move(row), "skipped_shape",
                               "A*A needs a square A");
             }
@@ -111,6 +112,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                .tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                .num("rows", static_cast<double>(A.rows))
                .num("nnz", static_cast<double>(A.nnz));
+            if (v->q4_variant) row.tag("q4_variant", v->q4_variant);
             trace("spgemm", entry.name, v->dtype, A);
 
             DeviceBuffer indptr = DeviceBuffer::from(A.indptr);

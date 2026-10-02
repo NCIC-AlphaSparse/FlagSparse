@@ -59,6 +59,24 @@ std::vector<double> sddmm_reference(const CsrMatrix& A, const std::vector<double
     return out;
 }
 
+std::vector<double> pack_dense(const std::vector<double>& logical, int64_t rows,
+                               int64_t cols, bool transpose, flagsparseOrder_t order) {
+    const int64_t dr = transpose ? cols : rows;
+    const int64_t dc = transpose ? rows : cols;
+    const int64_t ld = order == FLAGSPARSE_ORDER_ROW ? dc : dr;
+    std::vector<double> packed(static_cast<std::size_t>(dr * dc), 0.0);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t c = 0; c < cols; ++c) {
+            const int64_t pr = transpose ? c : r;
+            const int64_t pc = transpose ? r : c;
+            const std::size_t dst = static_cast<std::size_t>(
+                order == FLAGSPARSE_ORDER_ROW ? pr * ld + pc : pr + pc * ld);
+            packed[dst] = logical[static_cast<std::size_t>(r * cols + c)];
+        }
+    }
+    return packed;
+}
+
 }  // namespace
 
 TEST(SddmmBenchmark, CsrOverCorpus) {
@@ -90,6 +108,14 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                     continue;
                 }
                 const auto dt = v->dt;
+                const std::string vid = v->q4_variant ? v->q4_variant : "";
+                const bool row_order = vid.find("_row") != std::string::npos;
+                const bool trans_a = vid.find("_trans_non_") != std::string::npos;
+                const bool trans_b = vid.find("_non_trans_") != std::string::npos;
+                const flagsparseOperation_t op_a = trans_a
+                    ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+                const flagsparseOperation_t op_b = trans_b
+                    ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE;
                 BenchRow row;
                 row.name = std::string("sddmm_csr_") + v->dtype + "_k" +
                            std::to_string(k) + "_" + entry.name;
@@ -100,13 +126,18 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                    .num("cols", static_cast<double>(A.cols))
                    .num("nnz", static_cast<double>(A.nnz))
                    .num("k", static_cast<double>(k));
+                if (v->q4_variant) row.tag("q4_variant", v->q4_variant);
                 trace("sddmm", entry.name, v->dtype, A);
 
                 DeviceBuffer indptr = DeviceBuffer::from(A.indptr);
                 DeviceBuffer indices = DeviceBuffer::from(A.indices);
                 DeviceBuffer values(static_cast<std::size_t>(A.nnz) * elem_bytes(dt));
-                DeviceBuffer B = upload_as(Bh, dt);
-                DeviceBuffer D = upload_as(Dh, dt);
+                const flagsparseOrder_t order = !v->q4_variant || row_order
+                    ? FLAGSPARSE_ORDER_ROW : FLAGSPARSE_ORDER_COL;
+                const std::vector<double> Bpacked = pack_dense(Bh, A.rows, k, trans_a, order);
+                const std::vector<double> Dpacked = pack_dense(Dh, k, A.cols, trans_b, order);
+                DeviceBuffer B = upload_as(v->q4_variant ? Bpacked : Bh, dt);
+                DeviceBuffer D = upload_as(v->q4_variant ? Dpacked : Dh, dt);
                 if (!indptr.get() || !indices.get() || !values.get() || !B.get() ||
                     !D.get()) {
                     g_report.skip(std::move(row), "skipped_memory",
@@ -124,14 +155,17 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                     g_report.skip(std::move(row), "failed", "flagsparseCreateCsr failed");
                     continue;
                 }
-                flagsparseCreateDnMat(&matB, A.rows, k, k, B.get(), dt,
-                                      FLAGSPARSE_ORDER_ROW);
-                flagsparseCreateDnMat(&matD, k, A.cols, A.cols, D.get(), dt,
-                                      FLAGSPARSE_ORDER_ROW);
+                const int64_t b_rows = trans_a ? k : A.rows;
+                const int64_t b_cols = trans_a ? A.rows : k;
+                const int64_t d_rows = trans_b ? A.cols : k;
+                const int64_t d_cols = trans_b ? k : A.cols;
+                const int64_t b_ld = row_order ? b_cols : b_rows;
+                const int64_t d_ld = row_order ? d_cols : d_rows;
+                flagsparseCreateDnMat(&matB, b_rows, b_cols, b_ld, B.get(), dt, order);
+                flagsparseCreateDnMat(&matD, d_rows, d_cols, d_ld, D.get(), dt, order);
 
-                const auto NT = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
                 std::size_t bufsz = 0;
-                flagsparseSDDMM_bufferSize(handle.h, NT, NT, sc.alpha(dt), matB, matD,
+                flagsparseSDDMM_bufferSize(handle.h, op_a, op_b, sc.alpha(dt), matB, matD,
                                            sc.beta(dt), matA, dt,
                                            FLAGSPARSE_SDDMM_ALG_DEFAULT, &bufsz);
                 DeviceBuffer scratch(bufsz ? bufsz : 1);
@@ -148,17 +182,20 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                 g_report.measure_vs_baseline(
                     std::move(row),
                     [&]() {
-                        return flagsparseSDDMM(handle.h, NT, NT, sc.alpha(dt), matB,
+                        return flagsparseSDDMM(handle.h, op_a, op_b, sc.alpha(dt), matB,
                                                matD, sc.beta(dt), matA, dt,
                                                FLAGSPARSE_SDDMM_ALG_DEFAULT,
                                                scratch.get());
                     },
                     [&](bool relaxed) { return ratio_against(values.get(), ref, dt, relaxed); },
                     [&](baseline::Timing* t) {
-                        return baseline::sddmm_csr(bA, B.get(), k, k, D.get(), A.cols,
+                        if (v->q4_variant) {
+                            return baseline::Status::no(
+                                "baseline harness has no matching SDDMM op/order path");
+                        }
+                        return baseline::sddmm_csr(bA, B.get(), k, b_ld, D.get(), d_ld,
                                                    sc.alpha(dt), sc.beta(dt),
-                                                   BenchReport::kWarmup,
-                                                   BenchReport::kIters, t);
+                                                   BenchReport::kWarmup, BenchReport::kIters, t);
                     },
                     2.0 * static_cast<double>(A.nnz) * static_cast<double>(k));
 

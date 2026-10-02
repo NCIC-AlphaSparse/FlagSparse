@@ -37,6 +37,19 @@ DTYPES = {
     "i8": ("FLAGSPARSE_R_8I", "i8"),
 }
 
+# q4 names complex values by their component width, unlike the main manifest's
+# c64/c128 value-width spelling.
+# q4 mixed names retain the narrow input dtype in Variant.dt; benchmark code
+# derives the widened output from the exact q4 tag (f16f32/i8f32/i8i32/f32c32).
+Q4_DTYPES = {
+    **DTYPES,
+    "c32": ("FLAGSPARSE_C_32F", "c32"),
+    "f16f32": ("FLAGSPARSE_R_16F", "f16f32"),
+    "i8f32": ("FLAGSPARSE_R_8I", "i8f32"),
+    "i8i32": ("FLAGSPARSE_R_8I", "i8i32"),
+    "f32c32": ("FLAGSPARSE_R_32F", "f32c32"),
+}
+
 FORMATS = {
     "sparse_vector": "spvec",
     "csr": "csr",
@@ -85,7 +98,10 @@ def main():
     args = ap.parse_args()
 
     doc = yaml.safe_load(args.manifest.read_text())
+    q4_manifest = args.manifest.parents[2] / "conf" / "operators.yaml"
+    q4_doc = yaml.safe_load(q4_manifest.read_text()) if q4_manifest.exists() else {}
     rows = []
+    by_id = {op["id"]: op for op in doc["operators"]}
     for op in doc["operators"]:
         if op.get("status") != "implemented":
             continue
@@ -108,7 +124,20 @@ def main():
                 scope = reporting
                 if reporting == "delivery" and narrow and d not in narrow:
                     scope = "retained"
-                rows.append((op["id"], fam, ftag, dtag, enum, scope))
+                rows.append((op["id"], fam, ftag, dtag, enum, scope, None))
+
+    # Q4 has axes (opA/opB/layout) that the ordinary operator registry does
+    # not encode. Emit a second, explicitly tagged entry for each Q4 row so a
+    # benchmark can select and report the exact requested configuration.
+    for q4 in q4_doc.get("q4_variants", []):
+        op = by_id.get(q4["operator"])
+        ent = Q4_DTYPES.get(q4["dtype"])
+        ftag = FORMATS.get(q4["format"])
+        if op is None or ent is None or ftag is None:
+            continue
+        enum, dtag = ent
+        rows.append((op["id"], family_of_operator(op), ftag, dtag, enum,
+                     "retained", q4["id"]))
 
     lines = [
         "// GENERATED from conf/operators.yaml by tools/gen_variants.py -- DO NOT EDIT.",
@@ -130,12 +159,16 @@ def main():
         '    const char* dtype;    // row tag, e.g. "c32"',
         "    flagsparseDataType_t dt;",
         '    const char* reporting;  // "delivery" or "retained"',
+        '    const char* q4_variant; // exact Q4 id, or nullptr for ordinary sweep rows',
         "};",
         "",
         "inline constexpr Variant kVariants[] = {",
     ]
-    for op, fam, ftag, dtag, enum, scope in rows:
-        lines.append(f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}"}},')
+    for op, fam, ftag, dtag, enum, scope, q4 in rows:
+        q4_text = f'"{q4}"' if q4 else "nullptr"
+        lines.append(
+            f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}", {q4_text}}},'
+        )
     lines += [
         "};",
         "",
@@ -149,7 +182,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines))
     fams, scopes = {}, {}
-    for _, fam, _, _, _, scope in rows:
+    for _, fam, _, _, _, scope, _ in rows:
         fams[fam] = fams.get(fam, 0) + 1
         scopes[scope] = scopes.get(scope, 0) + 1
     print(f"variants: {len(rows)} from {args.manifest.name} -> {args.out.name}")

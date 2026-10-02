@@ -175,7 +175,11 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
-                int iters, Timing* out) {
+                int iters, Timing* out, flagsparseOrder_t orderB,
+                flagsparseOrder_t orderC) {
+    if (orderB == FLAGSPARSE_ORDER_ROW || orderC == FLAGSPARSE_ORDER_ROW) {
+        return Status::no("muSPARSE SpMM baseline only supports column-major dense operands");
+    }
     musaDataType_t type; musparseOperation_t ma, mb;
     if (!map_dtype(A.dtype, &type) || !map_op(opA, &ma) || !map_op(opB, &mb))
         return Status::no("muSPARSE: unsupported SpMM type or operation");

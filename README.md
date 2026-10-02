@@ -359,9 +359,10 @@ python tools/run_backend_tests.py --backend cuda --phase accuracy --mode quick
 python tools/run_backend_tests.py --backend rocm --phase both --ops spmv_csr,spmm_csr
 ```
 
-The six profiles are `cuda`, `rocm`, `maca`, `musa`, `ascend`, and `xpu`.
+The seven profiles are `cuda`, `rocm`, `maca`, `musa`, `ascend`, `xpu`, and
+`iluvatar`.
 Their corresponding C API profiles live in `capi/ctest/backends/`; only CUDA
-and MUSA currently have C API adaptors, so the other four remain Python-only.
+and MUSA currently have C API adaptors, so the other five remain Python-only.
 
 **Delivery report variants** - Python and C API summaries use the same
 20-entry `delivery_variants` registry in

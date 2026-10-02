@@ -14,10 +14,11 @@
 q4 新增的 42 个变体（[../NEW_OPERATORS_CUSPARSE_12_5.md](../NEW_OPERATORS_CUSPARSE_12_5.md) 前 42 个）在该后端上的风险点，
 以及跑完后需要带回来的信息。
 
-## 1. q4 在各后端的总体状态（2026-09-28）
+## 1. q4 在各后端的总体状态（2026-10-02）
 
-- **只在 CUDA（RTX 5090）上实测过。** 42 个变体精度全过；5 个国产后端都没有上真机。
-- 海光、沐曦、摩尔、天数与 CUDA 共用同一套 Triton 代码；新代码已按已知限制避坑（见下表），但仍需实机确认。
+- CUDA（RTX 5090）和 MUSA（S5000）已有真机验证；MUSA 的当前调试入口是 C API CTest。
+  42 个变体的 Python 精度历史记录全过，C API 的完整结果以 `capi/bench-musa` 为准。
+- 海光、沐曦、天数与 CUDA 共用同一套 Triton 代码；新代码已按已知限制避坑（见下表），仍需按 Python runner 实机确认。
 - 昇腾：新写的代码都有 torch_npu 路径。在 CUDA 上把所有模块强制切到昇腾分支、并禁止 Triton 启动，
   42 个里 36 个走 torch 路径且正确，5 个仍会启动 Triton，1 个结果错误（详见 [ASCEND.md](ASCEND.md)）。
 
@@ -42,17 +43,19 @@ q4 新增的 42 个变体（[../NEW_OPERATORS_CUSPARSE_12_5.md](../NEW_OPERATORS
    `sudo python3 -m pip show flagsparse` 和 `python3 -I -c "import flagsparse; print(flagsparse.__file__)"`。
 3. **先跑能力探测，再跑测试**：`python3 tools/probe_accel_capabilities.py`，它能告诉你失败属于哪一层
    （分配 / 拷贝、torch 算子、Triton、torch.sparse）。
-4. **q4 变体精度**（42 个变体 × 2 个规模，每个用例名就是变体名）：
+4. **q4 变体精度**（Python-only 后端使用；42 个变体 × 2 个规模，每个用例名就是变体名）：
    ```bash
    PYTHONPATH=src python3 -m pytest tests/pytest/test_q4_variants_accuracy.py -v
    # 只看某个算子：-m spmv_csr ；只看某个变体：-k spmv_csr_f16f32_int_non
    ```
-5. **统一 runner（精度 + 性能，汇总 62 个条目）**：
+5. **Python-only 后端的历史统一 runner（精度 + 性能，汇总 62 个条目）**：
    ```bash
    PYTHONPATH=src python3 run_flagsparse_pytest.py \
      --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spmm_bsr,spmm_bell,sddmm_csr \
      --gpus 0 --results-dir results_<后端>_<日期> --benchmark-input tests/data
    ```
+   当前入口优先使用上面的 `tools/run_backend_tests.py`；本命令仅用于复现已有的
+   Python 侧历史报告。
    **每次都用新的 `--results-dir`**：往已有目录里重跑部分算子会把 `summary.json` 覆盖成只剩这部分。
    `spmm_bell` 的性能测试在 CPU 上转换 Blocked-ELL，每个矩阵要几分钟，是整轮最慢的一步。
 6. **没有厂商库基线时**，按 H800 带宽换算上限判定（`tools/baseline_bound.py`）：
@@ -60,6 +63,32 @@ q4 新增的 42 个变体（[../NEW_OPERATORS_CUSPARSE_12_5.md](../NEW_OPERATORS
    python3 tools/baseline_bound.py <H800结果目录> --vendor <本后端结果目录> --vendor-card <卡名>
    # 卡名：dcu-bw1000 / maca-c550 / musa-s5000 / iluvatar-biv150 / ascend-910b
    ```
+
+### 当前测试入口
+
+调试时按后端选择测试层：MUSA 使用 C API CTest；DCU、MACA、Ascend、
+Iluvatar 和 XPU 使用 Python runner。不要用 MUSA 的 Python benchmark
+结果判断 C API，那里没有 muSPARSE 对比。
+
+MUSA C API：
+
+```bash
+cmake -S capi -B capi/build-musa -G Ninja \
+  -DBACKEND=MUSA -DMUSA_HOME=/usr/local/musa \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build capi/build-musa -j
+ctest --test-dir capi/build-musa -L capi --output-on-failure
+```
+
+其他后端 Python：
+
+```bash
+python3 tools/run_backend_tests.py \
+  --backend rocm --phase both --mode normal
+```
+
+将 `rocm` 替换为 `maca`、`ascend`、`iluvatar` 或 `xpu`。每次调试使用
+新的 `--results-dir`，避免覆盖旧报告。
 
 ## 3. 通用 debug 规则（来自前几次上机）
 

@@ -120,6 +120,8 @@ bool alg_supported(flagsparseFormat_t format, flagsparseSpMVAlg_t alg) {
             return alg == FLAGSPARSE_SPMV_CSR_ALG1 || alg == FLAGSPARSE_SPMV_CSR_ALG2;
         case FLAGSPARSE_FORMAT_COO:
             return alg == FLAGSPARSE_SPMV_COO_ALG1 || alg == FLAGSPARSE_SPMV_COO_ALG2;
+        case FLAGSPARSE_FORMAT_SLICED_ELL:
+            return alg == FLAGSPARSE_SPMV_SELL_ALG1;
         default:
             return false;
     }
@@ -183,13 +185,12 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
 
     switch (A->format) {
         case FLAGSPARSE_FORMAT_CSR:
-            // op(A) = A^T on CSR needs the transposed matrix built first; that is
-            // a prepare step this operator does not have. A caller who has CSC
-            // arrays gets the transposed direction for free -- see run_csc.
-            if (transposes(opA)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            if (transposes(opA) && computeType != FLAGSPARSE_R_32F &&
+                computeType != FLAGSPARSE_C_32F) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
             break;
         case FLAGSPARSE_FORMAT_COO:
-            if (transposes(opA)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            if (transposes(opA) && computeType != FLAGSPARSE_R_32F &&
+                computeType != FLAGSPARSE_C_32F) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
             if (A->nnz > static_cast<int64_t>(INT32_MAX)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
             break;
         case FLAGSPARSE_FORMAT_CSC:
@@ -204,6 +205,12 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
             if (A->row_block_dim != A->col_block_dim) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
             if (A->row_block_dim <= 0) return FLAGSPARSE_STATUS_INVALID_VALUE;
             if (A->order != FLAGSPARSE_ORDER_ROW) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            break;
+        case FLAGSPARSE_FORMAT_SLICED_ELL:
+            if (transposes(opA)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            if (A->slice_size <= 0 || A->slice_size > 1024) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
             break;
         default:
             return FLAGSPARSE_STATUS_NOT_SUPPORTED;
@@ -533,6 +540,132 @@ flagsparseStatus_t validate_real_by_complex_csr(flagsparseHandle_t handle,
     return FLAGSPARSE_STATUS_SUCCESS;
 }
 
+bool is_mixed_sell_request(flagsparseOperation_t opA,
+                           flagsparseConstSpMatDescr_t matA,
+                           flagsparseConstDnVecDescr_t vecX,
+                           flagsparseConstDnVecDescr_t vecY) {
+    if (matA == nullptr || vecX == nullptr || vecY == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    return A->format == FLAGSPARSE_FORMAT_SLICED_ELL && !transposes(opA) &&
+           A->value_type == FLAGSPARSE_R_8I && X->value_type == FLAGSPARSE_R_8I &&
+           Y->value_type == FLAGSPARSE_R_32I;
+}
+
+flagsparseStatus_t validate_mixed_sell(flagsparseHandle_t handle,
+                                       flagsparseOperation_t opA,
+                                       flagsparseConstSpMatDescr_t matA,
+                                       flagsparseConstDnVecDescr_t vecX,
+                                       flagsparseConstDnVecDescr_t vecY,
+                                       flagsparseDataType_t computeType,
+                                       flagsparseSpMVAlg_t alg) {
+    if (handle == nullptr) return FLAGSPARSE_STATUS_NOT_INITIALIZED;
+    if (!is_mixed_sell_request(opA, matA, vecX, vecY) ||
+        computeType != FLAGSPARSE_R_32I) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    const SpMatDescr* A = spmat(matA);
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    if (A->idx_base != FLAGSPARSE_INDEX_BASE_ZERO || !alg_supported(A->format, alg) ||
+        A->slice_size <= 0 || A->slice_size > 1024 ||
+        triton_index_dtype(A->indices_type)[0] == '\0' ||
+        triton_index_dtype(A->offsets_type)[0] == '\0') {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (A->rows > 0 && (A->offsets == nullptr || A->indices == nullptr ||
+                        A->values == nullptr)) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    if (X->size != A->cols || Y->size != A->rows) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+int next_power_of_two(int64_t value) {
+    int out = 1;
+    while (out < value && out < 1024) out *= 2;
+    return out;
+}
+
+flagsparseStatus_t run_mixed_sell(flagsparseHandle_t handle, const SpMatDescr* A,
+                                  const DnVecDescr* X, DnVecDescr* Y) {
+    if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    const int block_r = next_power_of_two(A->slice_size);
+    const int64_t n_slices = (A->rows + A->slice_size - 1) / A->slice_size;
+
+    std::string sig;
+    sig.reserve(128);
+    sig += "*i32:16,*i8:16,*";
+    sig += it; sig += ":16,*";
+    sig += ot; sig += ":16,*i8:16,i32,";
+    sig += std::to_string(A->slice_size) + "," + std::to_string(block_r);
+
+    std::vector<jit::Arg> args;
+    args.reserve(6);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spmv_sell.py"), "spmv_sell_i32acc", sig,
+        ctx(handle)->stream, n_slices, 1, 1, /*num_warps=*/1,
+        /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+flagsparseStatus_t run_sell(flagsparseHandle_t handle, const SpMatDescr* A,
+                            const DnVecDescr* X, DnVecDescr* Y,
+                            const Operands& ops) {
+    if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    const int block_r = next_power_of_two(A->slice_size);
+    const int64_t n_slices = (A->rows + A->slice_size - 1) / A->slice_size;
+    const bool complex = ops.complex_op;
+
+    std::string sig;
+    sig.reserve(144);
+    sig += "*"; sig += ops.vt; sig += ":16,";  // Y (interleaved for complex)
+    sig += "*"; sig += ops.vt; sig += ":16,";  // values
+    sig += "*"; sig += it; sig += ":16,";
+    sig += "*"; sig += ot; sig += ":16,";
+    sig += "*"; sig += ops.vt; sig += ":16,i32,";
+    sig += std::to_string(A->slice_size) + "," + std::to_string(block_r);
+
+    std::vector<jit::Arg> args;
+    args.reserve(6);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+
+    std::string err;
+    if (complex) {
+        args[0] = jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values));
+        args[1] = jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values));
+        args[4] = jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values));
+    }
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spmv_sell.py"),
+        complex ? "_spmv_sell_complex_kernel" : "spmv_sell_f32acc", sig,
+        ctx(handle)->stream, n_slices, 1, 1, /*num_warps=*/1,
+        /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
 // ------------------------------------------------------- mixed-precision COO
 //
 // Same dtype-pair table as CSR, but the kernel is nnz-parallel atomic_add
@@ -764,6 +897,75 @@ flagsparseStatus_t run_csc(flagsparseHandle_t handle, flagsparseOperation_t opA,
     return st;
 }
 
+// CSR/COO transpose cannot use the one-program-per-output row kernels: their
+// storage is indexed by source rows.  Scatter each contribution to its column
+// after the shared prologue has applied beta.  The q4 scope is fp32 transpose
+// and complex32 conjugate-transpose, which are the two atomic types supported
+// by these kernels.
+flagsparseStatus_t run_transpose_atomic(flagsparseHandle_t handle,
+                                        flagsparseOperation_t opA, SpMatDescr* A,
+                                        const DnVecDescr* X, DnVecDescr* Y,
+                                        const Operands& ops) {
+    const int64_t unit = ops.complex_op ? 2 : 1;
+    if (flagsparseStatus_t s = scale_dense(
+            handle, Y->values, component_dtype(A->value_type), ops.complex_op,
+            1, ops.y_len, 0, unit, ops.beta_re, ops.beta_im)) {
+        return s;
+    }
+    if (A->nnz == 0) return FLAGSPARSE_STATUS_SUCCESS;
+
+    constexpr int kBlock = 256;
+    const bool csr = A->format == FLAGSPARSE_FORMAT_CSR;
+    int64_t segments = 1;
+    if (csr) {
+        int64_t max_row_nnz = 0;
+        if (flagsparseStatus_t s = ensure_max_row_nnz(A, &max_row_nnz)) return s;
+        segments = std::max<int64_t>(1, (max_row_nnz + kBlock - 1) / kBlock);
+    }
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    if (it[0] == '\0' || (csr && ot[0] == '\0')) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+
+    std::string sig;
+    sig.reserve(176);
+    sig += "*"; sig += ops.vt; sig += ":16,*";
+    if (csr) { sig += it; sig += ":16,*"; sig += ot; sig += ":16,*"; }
+    else { sig += it; sig += ":16,*"; sig += it; sig += ":16,*"; }
+    sig += ops.vt; sig += ":16,*"; sig += ops.vt; sig += ":16,";
+    sig += ops.vt; sig += ",";
+    if (ops.complex_op) sig += ops.vt + std::string(",");
+    sig += "i32," + std::to_string(kBlock);
+    if (csr) sig += "," + std::to_string(segments);
+    if (ops.complex_op) {
+        sig += ",";
+        sig += (opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) ? "True" : "False";
+    }
+
+    std::vector<jit::Arg> args;
+    args.reserve(9);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(
+        csr ? A->indices : A->row_ind)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(
+        csr ? A->offsets : A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    push_scalar(ops, ops.alpha_re, &args);
+    if (ops.complex_op) push_scalar(ops, ops.alpha_im, &args);
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(csr ? A->rows : A->nnz)));
+
+    const char* kernel = csr
+        ? (ops.complex_op ? "spmv_csr_transpose_atomic_c32" : "spmv_csr_transpose_atomic_f32")
+        : (ops.complex_op ? "spmv_coo_transpose_atomic_c32" : "spmv_coo_transpose_atomic_f32");
+    const int64_t grid_x = csr ? A->rows : (A->nnz + kBlock - 1) / kBlock;
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spmv_transpose.py"), kernel, sig, ctx(handle)->stream,
+        grid_x, csr ? segments : 1, 1, /*num_warps=*/4, kDefaultNumStages, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
 // BSR scatters into y with atomics in both directions, so beta comes from the
 // prologue and only alpha rides in the kernel. The segment index comes from the
 // grid (SEG_FROM_GRID=True) rather than the SEG constexpr: as a constexpr every
@@ -853,11 +1055,15 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
 
     switch (A->format) {
         case FLAGSPARSE_FORMAT_COO:
+            if (transposes(opA)) return run_transpose_atomic(handle, opA, A, X, Y, ops);
             return run_coo(handle, A, X, Y, ops, externalBuffer,
                            alg == FLAGSPARSE_SPMV_COO_ALG2);
         case FLAGSPARSE_FORMAT_CSC: return run_csc(handle, opA, A, X, Y, ops);
         case FLAGSPARSE_FORMAT_BSR: return run_bsr(handle, opA, A, X, Y, ops);
-        default:                    return run_csr(handle, A, X, Y, ops);
+        case FLAGSPARSE_FORMAT_SLICED_ELL: return run_sell(handle, A, X, Y, ops);
+        default:
+            return transposes(opA) ? run_transpose_atomic(handle, opA, A, X, Y, ops)
+                                   : run_csr(handle, A, X, Y, ops);
     }
 }
 
@@ -875,6 +1081,10 @@ flagsparseStatus_t flagsparseSpMV_bufferSize(
     *bufferSize = 0;
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
+            return validate_mixed_sell(handle, opA, matA, vecX, vecY,
+                                       computeType, alg);
+        }
         if (is_real_by_complex_csr_request(opA, matA, vecX, vecY)) {
             return validate_real_by_complex_csr(handle, opA, matA, vecX, vecY,
                                                 computeType, alg);
@@ -905,6 +1115,10 @@ flagsparseStatus_t flagsparseSpMV_preprocess(
     (void)alpha; (void)beta;
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
+            return validate_mixed_sell(handle, opA, matA, vecX, vecY,
+                                       computeType, alg);
+        }
         if (is_real_by_complex_csr_request(opA, matA, vecX, vecY)) {
             return validate_real_by_complex_csr(handle, opA, matA, vecX, vecY,
                                                 computeType, alg);
@@ -937,6 +1151,16 @@ flagsparseStatus_t flagsparseSpMV(
     flagsparseDataType_t computeType, flagsparseSpMVAlg_t alg, void* externalBuffer) {
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
+            if (flagsparseStatus_t s = validate_mixed_sell(
+                    handle, opA, matA, vecX, vecY, computeType, alg)) {
+                return s;
+            }
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            return run_mixed_sell(handle, spmat(matA), dnvec(vecX), dnvec(vecY));
+        }
         if (is_real_by_complex_csr_request(opA, matA, vecX, vecY)) {
             if (flagsparseStatus_t s = validate_real_by_complex_csr(
                     handle, opA, matA, vecX, vecY, computeType, alg)) {

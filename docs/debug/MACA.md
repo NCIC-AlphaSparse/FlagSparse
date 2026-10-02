@@ -2,6 +2,10 @@
 
 `FLAGSPARSE_BACKEND=metax`（设置了 `MACA_PATH` 时能自动识别）。环境、交付复现见 [../MACA.md](../MACA.md)。
 
+当前 debug 入口使用 Python runner：
+`python3 tools/run_backend_tests.py --backend maca --phase both --mode normal`。
+MACA 的 C API adaptor 尚未可构建，调试时不要用 CTest 作为后端结论。
+
 ## 1. 这个后端的特点
 
 - 以 CUDA 兼容栈的方式接入（`torch.version.cuda` 显示 11.6），Triton kernel 与 CUDA 相同。

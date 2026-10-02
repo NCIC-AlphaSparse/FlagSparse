@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <complex>
 #include <vector>
 
 #include "common.hpp"
@@ -311,6 +312,68 @@ TEST_F(SDDMMAccuracy, WorksWithoutPreprocess) {
                  handle.h);
 }
 
+TEST_F(SDDMMAccuracy, Complex64MatchesHostReference) {
+    using C = std::complex<float>;
+    // spy(C) = {(0,0), (0,2), (1,1)}. Keep this deliberately small so the
+    // expected complex products make the interleaved storage contract visible.
+    const std::vector<int32_t> indptr{0, 2, 3};
+    const std::vector<int32_t> indices{0, 2, 1};
+    const std::vector<C> a{C(1, 1), C(2, 0), C(3, 0), C(4, -1)};       // 2 x 2
+    const std::vector<C> b{C(1, 0), C(2, 1), C(3, 0), C(4, -1),
+                           C(5, 0), C(6, 1)};                           // 2 x 3
+    const std::vector<C> initial{C(1, -1), C(2, 3), C(-1, 2)};
+    const float alpha = 1.25f, beta = -0.5f;
+    std::vector<C> expected = initial;
+    for (auto& v : expected) v *= beta;
+    for (int64_t row = 0; row < 2; ++row) {
+        for (int32_t p = indptr[static_cast<std::size_t>(row)];
+             p < indptr[static_cast<std::size_t>(row) + 1]; ++p) {
+            const int32_t col = indices[static_cast<std::size_t>(p)];
+            C acc(0, 0);
+            for (int64_t k = 0; k < 2; ++k) {
+                acc += a[static_cast<std::size_t>(row * 2 + k)] *
+                       b[static_cast<std::size_t>(k * 3 + col)];
+            }
+            expected[static_cast<std::size_t>(p)] += alpha * acc;
+        }
+    }
+
+    DeviceBuffer d_ptr = DeviceBuffer::from(indptr), d_idx = DeviceBuffer::from(indices);
+    DeviceBuffer d_a = DeviceBuffer::from(a), d_b = DeviceBuffer::from(b);
+    DeviceBuffer d_c = DeviceBuffer::from(initial);
+    flagsparseDnMatDescr_t mat_a = nullptr, mat_b = nullptr;
+    flagsparseSpMatDescr_t mat_c = nullptr;
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_a, 2, 2, 2, d_a.get(), FLAGSPARSE_C_32F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnMat(&mat_b, 2, 3, 3, d_b.get(), FLAGSPARSE_C_32F,
+                                    FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateCsr(&mat_c, 2, 3, 3, d_ptr.get(), d_idx.get(), d_c.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    const C alpha_c(alpha, 0), beta_c(beta, 0);
+    size_t bytes = 0;
+    ASSERT_EQ(flagsparseSDDMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                         FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, mat_a,
+                                         mat_b, &beta_c, mat_c, FLAGSPARSE_C_32F,
+                                         FLAGSPARSE_SDDMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+    DeviceBuffer scratch(bytes);
+    ASSERT_EQ(flagsparseSDDMM_preprocess(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                         FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, mat_a,
+                                         mat_b, &beta_c, mat_c, FLAGSPARSE_C_32F,
+                                         FLAGSPARSE_SDDMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSDDMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                              FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, mat_a, mat_b,
+                              &beta_c, mat_c, FLAGSPARSE_C_32F,
+                              FLAGSPARSE_SDDMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const auto got = d_c.download<C>(expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(got[i].real(), expected[i].real(), 2e-5f);
+        EXPECT_NEAR(got[i].imag(), expected[i].imag(), 2e-5f);
+    }
+    flagsparseDestroySpMat(mat_c); flagsparseDestroyDnMat(mat_b); flagsparseDestroyDnMat(mat_a);
+}
+
 TEST_F(SDDMMAccuracy, RejectsUnsupportedAndMalformed) {
     const CsrMatrix C = random_csr(32, 48, 0.1, 2);
     const std::vector<float> vals(C.values.begin(), C.values.end());
@@ -359,22 +422,27 @@ TEST_F(SDDMMAccuracy, RejectsUnsupportedAndMalformed) {
               FLAGSPARSE_STATUS_INVALID_VALUE);
     flagsparseDestroyDnMat(badB);
 
-    // Complex has no kernel in the operator package; say so rather than invent one.
+    // Complex SDDMM uses the interleaved real/imag kernel.
+    using C32 = std::complex<float>;
     flagsparseSpMatDescr_t cplxC = nullptr;
     flagsparseDnMatDescr_t cplxA = nullptr, cplxB = nullptr;
-    flagsparseCreateDnMat(&cplxA, 32, 16, 16, d_a.get(), FLAGSPARSE_C_32F,
+    DeviceBuffer d_ca = DeviceBuffer::from(std::vector<C32>(32 * 16, C32(1.0f, 0.0f)));
+    DeviceBuffer d_cb = DeviceBuffer::from(std::vector<C32>(16 * 48, C32(1.0f, 0.0f)));
+    DeviceBuffer d_cv = DeviceBuffer::from(std::vector<C32>(static_cast<std::size_t>(C.nnz),
+                                                             C32(0.0f, 0.0f)));
+    flagsparseCreateDnMat(&cplxA, 32, 16, 16, d_ca.get(), FLAGSPARSE_C_32F,
                           FLAGSPARSE_ORDER_ROW);
-    flagsparseCreateDnMat(&cplxB, 16, 48, 48, d_b.get(), FLAGSPARSE_C_32F,
+    flagsparseCreateDnMat(&cplxB, 16, 48, 48, d_cb.get(), FLAGSPARSE_C_32F,
                           FLAGSPARSE_ORDER_ROW);
     flagsparseCreateCsr(&cplxC, C.rows, C.cols, C.nnz, d_ptr.get(), d_col.get(),
-                        d_val.get(), FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                        d_cv.get(), FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
                         FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F);
     const float cone[2] = {1.0f, 0.0f}, czero[2] = {0.0f, 0.0f};
     EXPECT_EQ(flagsparseSDDMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                               FLAGSPARSE_OPERATION_NON_TRANSPOSE, cone, cplxA, cplxB,
                               czero, cplxC, FLAGSPARSE_C_32F,
                               FLAGSPARSE_SDDMM_ALG_DEFAULT, scratch.get()),
-              FLAGSPARSE_STATUS_NOT_SUPPORTED);
+              FLAGSPARSE_STATUS_SUCCESS);
     flagsparseDestroySpMat(cplxC);
     flagsparseDestroyDnMat(cplxB);
     flagsparseDestroyDnMat(cplxA);

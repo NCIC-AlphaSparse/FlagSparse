@@ -76,7 +76,8 @@ Status spmv_csr(const DeviceCsr&, const void*, void*, const void*, const void*,
 
 Status spmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, void*, int64_t,
                 const void*, const void*, flagsparseOperation_t,
-                flagsparseOperation_t, int, int, Timing*) {
+                flagsparseOperation_t, int, int, Timing*, flagsparseOrder_t,
+                flagsparseOrder_t) {
     return pending("aclnnSparseTensorDenseMatmul / torch_npu sparse mm");
 }
 

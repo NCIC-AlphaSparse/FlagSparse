@@ -99,6 +99,8 @@ struct Scalars {
     double db[2] = {0.0, 0.0};   // beta  = 0 (+0i)
     float  fa[2] = {1.0f, 0.0f};
     float  fb[2] = {0.0f, 0.0f};
+    int32_t ia[2] = {1, 0};
+    int32_t ib[2] = {0, 0};
     // fp16 is 2 bytes: reading it through `fa`/`fb` (4-byte float) decodes the
     // low half of 1.0f's bit pattern as fp16 bits, i.e. reads alpha=0 -- found
     // by sddmm's fp16 benchmark rows coming back ~100x off (alpha silently
@@ -108,11 +110,13 @@ struct Scalars {
 
     const void* alpha(flagsparseDataType_t t) const {
         if (dtype_is_64(t)) return static_cast<const void*>(da);
+        if (t == FLAGSPARSE_R_32I) return static_cast<const void*>(ia);
         if (t == FLAGSPARSE_R_16F) return static_cast<const void*>(ha);
         return static_cast<const void*>(fa);
     }
     const void* beta(flagsparseDataType_t t) const {
         if (dtype_is_64(t)) return static_cast<const void*>(db);
+        if (t == FLAGSPARSE_R_32I) return static_cast<const void*>(ib);
         if (t == FLAGSPARSE_R_16F) return static_cast<const void*>(hb);
         return static_cast<const void*>(fb);
     }
@@ -156,6 +160,28 @@ inline DeviceBuffer upload_as(const std::vector<double>& src,
     return DeviceBuffer::from(h);
 }
 
+// Quantization counterpart used when a fp64 oracle must model the values
+// actually uploaded by upload_as() for narrow benchmark variants.
+inline double quantize_scalar(double x, flagsparseDataType_t dt) {
+    if (dtype_is_int8(dt)) return static_cast<double>(static_cast<int8_t>(std::lround(x)));
+    if (dtype_is_half(dt)) {
+        const uint16_t bits = (dt == FLAGSPARSE_R_16F)
+            ? float_to_fp16(static_cast<float>(x))
+            : float_to_bf16(static_cast<float>(x));
+        return dt == FLAGSPARSE_R_16F ? fp16_to_float(bits) : bf16_to_float(bits);
+    }
+    return dtype_is_64(dt) ? x : static_cast<double>(static_cast<float>(x));
+}
+
+inline double accumulate_typed(double acc, double term, flagsparseDataType_t dt) {
+    return quantize_scalar(quantize_scalar(acc, dt) + quantize_scalar(term, dt), dt);
+}
+
+inline void quantize_vector_inplace(std::vector<double>* values,
+                                    flagsparseDataType_t dt) {
+    for (double& value : *values) value = quantize_scalar(value, dt);
+}
+
 // Bytes one dense element occupies at this dtype.
 inline std::size_t elem_bytes(flagsparseDataType_t dt) {
     if (dtype_is_int8(dt)) return sizeof(int8_t);
@@ -173,6 +199,13 @@ inline std::vector<double> read_back(const void* dev, std::size_t count,
     if (dtype_is_int8(dt)) {
         std::vector<int8_t> h(count);
         if (to_host(h.data(), dev, h.size() * sizeof(int8_t)) !=
+            FLAGSPARSE_STATUS_SUCCESS) return {};
+        for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<double>(h[i]);
+        return out;
+    }
+    if (dt == FLAGSPARSE_R_32I) {
+        std::vector<int32_t> h(count);
+        if (to_host(h.data(), dev, h.size() * sizeof(int32_t)) !=
             FLAGSPARSE_STATUS_SUCCESS) return {};
         for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<double>(h[i]);
         return out;
@@ -216,6 +249,17 @@ inline double ratio_against(const void* dev, const std::vector<double>& ref,
     if (got.empty()) return 1e30;
     return max_error_ratio(got, ref,
                            relaxed ? relaxed_tolerance(dt) : default_tolerance(dt));
+}
+
+// Ordinary fp16 benchmark kernels use backend-dependent reduction paths.
+// Keep this benchmark-only tolerance separate from the public accuracy rule.
+inline double benchmark_ratio_against(const void* dev, const std::vector<double>& ref,
+                                      flagsparseDataType_t dt, bool relaxed = false) {
+    const std::vector<double> got = read_back(dev, ref.size(), dt);
+    if (got.empty()) return 1e30;
+    Tolerance tol = relaxed ? relaxed_tolerance(dt) : default_tolerance(dt);
+    if (dt == FLAGSPARSE_R_16F && !relaxed) tol = {0.25, 0.01};
+    return max_error_ratio(got, ref, tol);
 }
 
 // A deterministic dense operand. Fixed, not random: the oracle and the device
@@ -311,6 +355,31 @@ inline std::vector<const registry::Variant*> variants_of(
         }
     }
     return out;
+}
+
+// q4 mixed variants encode input/output widths in the tag while the generated
+// Variant keeps `dt` as the narrow input type used for A and B/X.  Keeping the
+// decode here avoids repeating string-to-dtype tables in every benchmark.
+inline bool q4_is_mixed(const registry::Variant& v) {
+    const std::string q = v.q4_variant ? v.q4_variant : "";
+    return q.find("_f16f32_") != std::string::npos ||
+           q.find("_i8f32_") != std::string::npos ||
+           q.find("_i8i32_") != std::string::npos ||
+           q.find("_f32c32_") != std::string::npos;
+}
+
+inline flagsparseDataType_t q4_output_dtype(const registry::Variant& v) {
+    const std::string q = v.q4_variant ? v.q4_variant : "";
+    if (q.find("_f16f32_") != std::string::npos) return FLAGSPARSE_R_32F;
+    if (q.find("_i8f32_") != std::string::npos) return FLAGSPARSE_R_32F;
+    if (q.find("_i8i32_") != std::string::npos) return FLAGSPARSE_R_32I;
+    if (q.find("_f32c32_") != std::string::npos) return FLAGSPARSE_C_32F;
+    return v.dt;
+}
+
+inline flagsparseDataType_t q4_vector_input_dtype(const registry::Variant& v) {
+    const std::string q = v.q4_variant ? v.q4_variant : "";
+    return q.find("_f32c32_") != std::string::npos ? FLAGSPARSE_C_32F : v.dt;
 }
 
 // A declared variant this benchmark has no code path for.
