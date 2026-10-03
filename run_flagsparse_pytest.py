@@ -474,6 +474,8 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-csc",
         "{csv}",
+        "--dtypes",
+        "float16,float32,float64,complex64,complex128",
         "--ops",
         "non,trans,conj",
         "--warmup",
@@ -3436,9 +3438,14 @@ def _is_delivery_performance_row(row: dict[str, str]) -> bool:
 
 
 # A q4 variant shaped like a delivery row -- one plain dtype, int32 indices, `non`
-# op, row-major -- is measured by its script's ordinary rows (spmm_bsr/bell/csc f32,
-# gather/scatter int8), which carry no ``variant`` tag.
-_Q4_DELIVERY_SHAPED_SUFFIXES = ("_int", "_int_non", "_int_non_non_row")
+# op, row-major -- is measured by its script's ordinary rows (spmm_bsr/bell/csc,
+# spgemm, gather/scatter), which carry no ``variant`` tag.
+_Q4_DELIVERY_SHAPED_SUFFIXES = (
+    "_int",
+    "_int_non",
+    "_int_non_non",
+    "_int_non_non_row",
+)
 
 
 def _q4_performance_phase(

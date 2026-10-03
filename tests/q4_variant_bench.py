@@ -108,11 +108,14 @@ VARIANTS = {
     "spmm_coo": [
         Variant("spmm_coo_c32_int_non_non_row", "spmm", "coo", c32, c32),
         Variant("spmm_coo_f16_int_non_non_row", "spmm", "coo", f16, f16),
+        Variant("spmm_coo_i8i32_int_non_non_row", "spmm", "coo", i8, i32),
     ],
     "sddmm_csr": [
         Variant("sddmm_csr_f32_int_non_non_col", "sddmm", "csr", f32, f32, layout="col"),
         Variant("sddmm_csr_f32_int_non_trans_row", "sddmm", "csr", f32, f32, op_b="trans"),
         Variant("sddmm_csr_f32_int_trans_non_row", "sddmm", "csr", f32, f32, op_a="trans"),
+        Variant("sddmm_csr_c32_int_non_non_row", "sddmm", "csr", c32, c32),
+        Variant("sddmm_csr_f16_int_non_non_row", "sddmm", "csr", f16, f16),
     ],
 }
 
@@ -425,9 +428,25 @@ def _spmm(v, mat, gen, warmup, iters, row):
     if v.fmt == "bell":
         return _spmm_bell(v, mat, vals, vals_cpu, B, ref, warmup, iters, row)
     kw = {} if v.out == default_out else {"out_dtype": v.out}
-    if v.fmt == "csr" and mixed_spmx.spmm_needs_mixed(v.value, None, kw.get("out_dtype")):
+    if v.fmt in ("csr", "coo") and mixed_spmx.spmm_needs_mixed(
+        v.value, None, kw.get("out_dtype")
+    ):
         row["timed"] = "call"
-        ours = lambda: fs.flagsparse_spmm_csr(vals, mat.cols, mat.ptr, B, mat.shape, op=v.op_a, op_b=v.op_b, **kw)  # noqa: E731
+        if v.fmt == "csr":
+            ours = lambda: fs.flagsparse_spmm_csr(  # noqa: E731
+                vals, mat.cols, mat.ptr, B, mat.shape, op=v.op_a, op_b=v.op_b, **kw
+            )
+        else:
+            ours = lambda: fs.flagsparse_spmm_coo(  # noqa: E731
+                vals,
+                mat.rows,
+                mat.cols,
+                B,
+                mat.shape,
+                op=v.op_a,
+                dense_layout=v.layout,
+                **kw,
+            )
     else:
         row["timed"] = "prepared"
         B_eff = _op_t(B, v.op_b)  # op(B) as a strided view; the run reads its strides
@@ -505,10 +524,14 @@ def _spmm_bell(v, mat, vals, vals_cpu, B, ref, warmup, iters, row):
 
 
 def _sddmm_ref(mat, a_eff, b_eff):
-    """sum_k A[row, k] * B[k, col] per stored entry, float64, in bounded chunks."""
+    """Compute stored-entry dot products in float64/complex128 chunks."""
     rows = mat.rows.cpu().long().numpy()
     cols = mat.cols.cpu().long().numpy()
-    out = np.empty(rows.size, dtype=np.float64)
+    # Complex q4 SDDMM must retain the imaginary component.  The previous
+    # float64 buffer silently discarded it while assigning the einsum result,
+    # making a correct complex kernel look like a benchmark failure.
+    out_dtype = np.complex128 if np.iscomplexobj(a_eff) or np.iscomplexobj(b_eff) else np.float64
+    out = np.empty(rows.size, dtype=out_dtype)
     for lo in range(0, rows.size, _SDDMM_REF_CHUNK):
         hi = min(lo + _SDDMM_REF_CHUNK, rows.size)
         out[lo:hi] = np.einsum("ij,ij->i", a_eff[rows[lo:hi]], b_eff[:, cols[lo:hi]].T)

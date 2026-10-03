@@ -139,7 +139,22 @@ def test_q4_rows_resolve_to_the_scripts_own_speedup_schema(
 
 def test_every_listed_existing_op_variant_is_covered(variant_bench):
     names = [v.name for vs in variant_bench.VARIANTS.values() for v in vs]
-    assert len(names) == len(set(names)) == 30
+    assert len(names) == len(set(names)) == 33
+
+
+def test_sddmm_complex_reference_preserves_imaginary_values(variant_bench):
+    torch = pytest.importorskip("torch")
+    np = variant_bench.np
+
+    class Matrix:
+        rows = torch.tensor([0], dtype=torch.int64)
+        cols = torch.tensor([0], dtype=torch.int64)
+
+    a = np.array([[1.0 + 2.0j]], dtype=np.complex128)
+    b = np.array([[3.0 + 4.0j]], dtype=np.complex128)
+    result = variant_bench._sddmm_ref(Matrix(), a, b)
+    assert result.dtype == np.complex128
+    assert np.allclose(result, np.array([-5.0 + 10.0j]))
 
 
 def test_registry_holds_20_delivery_and_45_q4_variants():
@@ -204,8 +219,7 @@ def test_q4_performance_slice_takes_only_rows_tagged_with_the_variant(runner):
 
 
 def test_delivery_shaped_q4_variant_falls_back_to_the_untagged_rows(runner):
-    """spmm_bsr/bell/csc f32 and gather/scatter int8 are measured by the scripts'
-    own rows, which carry no ``variant`` tag."""
+    """Some q4 variants are measured by ordinary untagged benchmark rows."""
     rows = [
         {
             "dtype": "float32",
@@ -241,6 +255,15 @@ def test_delivery_shaped_q4_variant_falls_back_to_the_untagged_rows(runner):
     assert "untagged rows" in result.get("matched_by", "")
     # Only the f32 non row: the trans row and the f64 row are off the delivery axes.
     assert [round(v["speedup"], 3) for v in result["data"].values()] == [2.0]
+
+    # SpGEMM has no q4-specific benchmark tag, but its f32/int32/NON rows are
+    # exactly the q4 variant's contract.
+    spgemm = runner._q4_performance_phase(
+        {"status": "PASS", "records": [dict(rows[0], variant="")]},
+        "spgemm_csr_f32_int_non_non",
+        "f32",
+    )
+    assert spgemm["status"] != "NOT_CONFIGURED"
 
     # A variant that is not delivery-shaped gets no fallback -- it would silently
     # report the `non` rows as if they were the transposed ones.
