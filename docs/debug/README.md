@@ -11,16 +11,49 @@
 | 天数智芯 | BI-V150 | `iluvatar` | [ILUVATAR.md](ILUVATAR.md) | [../ILUVATAR.md](../ILUVATAR.md)、[../ILUVATAR_DEBUG.md](../ILUVATAR_DEBUG.md) |
 
 上面「已有的上机文档」讲环境搭建和交付复现；本目录只写 **debug**：出了问题怎么定位、已知的坑、
-q4 新增的 42 个变体（[../NEW_OPERATORS_CUSPARSE_12_5.md](../NEW_OPERATORS_CUSPARSE_12_5.md) 前 42 个）在该后端上的风险点，
+q4 新增的变体（[../NEW_OPERATORS_CUSPARSE_12_5.md](../NEW_OPERATORS_CUSPARSE_12_5.md)）在该后端上的风险点，
 以及跑完后需要带回来的信息。
 
-## 1. q4 在各后端的总体状态（2026-10-02）
+## 0. ⚠️ 2026-10-05：q4 变体清单从 42 条改成了 45 条
+
+`conf/operators.yaml` 的 `q4_variants:` 在 2026-09-29 之后不再是 42 条，是 **45 条**
+（`delivery_variants` 20 条不变，两者合计 65 条，不再是旧文档里的 62）。本目录下
+DCU/MACA/MUSA/ASCEND/ILUVATAR 五个文件里带日期的真机结果（2026-09-28/29）**都是在旧的
+42 条清单上跑的**，下面三条改动之后，这些历史表格本身仍然如实（没有造假），但不等于
+"45 条全部验证过"：
+
+- **删除的 3 条**（不算 q4 失败，是移出了统计范围，代码和实现都还在，仍标记 `retained`）：
+  `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row`。这三个在
+  DCU/MACA 2026-09-28 的表格里原样能查到（都是 PASS），只是现在不再计入 q4 的 45 条。
+- **新增的 6 条**：`sddmm_csr_f16_int_non_non_row`、`sddmm_csr_c32_int_non_non_row`、
+  `spmm_csc_c32_int_non_non_row`、`spmm_csc_f16_int_non_non_row`、
+  `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`。
+  **这 6 条到目前为止只在这台机器的 1 张 CUDA RTX 5090 上验证过**（pytest + 这次新加的 capi
+  ctest），**DCU/MACA/MUSA/昇腾/天数没有任何一条真机记录**——下面各后端文件原有的"42 个变体"
+  表格和结论不包含这 6 条，上机复测时请把它们也带上。
+- capi（C API 层）这段时间进展很快：`docs/Q4_CAPI_HANDOFF.md` 已经被重写过一次（不再是中文版，
+  现在是 2026-10-02 的英文版），`capi/conf/operators.yaml` 补上了 `spvv`/`axpby`/`spmv_sell`/
+  `spmm_csc` 的完整算子组，`spmv`/`spmm` 的 opA=TRANSPOSE 也接上了。**2026-10-05 复核结论：
+  跑 `cd capi && python3 tools/write_summary_q4.py` 现在是 45/45 全部 Measured/Passed，0 个未覆盖**
+  ——中途一度看到 39 个未覆盖，排查后发现是 `capi/capi_results/` 被 `.gitignore` 排除、这次会话里
+  这些 benchmark JSON 本来就不存在，不是代码退化；把 `test_spmm`/`test_sddmm`/`test_spmv`/
+  `test_scatter`/`test_spgemm`/`test_axpby`/`test_spvv` 这几个 benchmark 二进制用
+  `FLAGSPARSE_BENCH_OUT=capi_results` 重新跑一遍就全补齐了，**没有改任何代码**。这部分工作**同样
+  只在 CUDA 上验证过**，DCU/MACA/MUSA/昇腾/天数都还没碰过新接的这些算子组和 transpose 支持。
+
+## 1. q4 在各后端的总体状态（2026-10-02，部分已被上面第 0 条更新覆盖）
 
 - CUDA（RTX 5090）和 MUSA（S5000）已有真机验证；MUSA 的当前调试入口是 C API CTest。
-  42 个变体的 Python 精度历史记录全过，C API 的完整结果以 `capi/bench-musa` 为准。
-- 海光、沐曦、天数与 CUDA 共用同一套 Triton 代码；新代码已按已知限制避坑（见下表），仍需按 Python runner 实机确认。
+  旧 42 个变体的 Python 精度历史记录全过，C API 的完整结果以 `capi/bench-musa` 为准；
+  新增 6 个变体和 capi 这轮混合精度 dispatch 工作都还没有在 MUSA 真机上跑过。
+- 海光、沐曦、天数与 CUDA 共用同一套 Triton 代码；旧 42 个变体的新代码已按已知限制避坑
+  （见下表），新增 6 个变体和混合精度 dispatch 仍需按 Python runner 实机确认。
 - 昇腾：新写的代码都有 torch_npu 路径。在 CUDA 上把所有模块强制切到昇腾分支、并禁止 Triton 启动，
-  42 个里 36 个走 torch 路径且正确，5 个仍会启动 Triton，1 个结果错误（详见 [ASCEND.md](ASCEND.md)）。
+  **按现在 45 条清单重跑**（`tools/q4_ascend_dispatch_check.py`，2026-10-05）：39/45 走 torch 路径且
+  路由正确；6 个仍会调用 Triton——`spmv_csc_f32/c32_int_non`、`spmm_csc_f32/c32/f16_int_non_non_row`、
+  **`spgemm_csr_f32_int_non_non`**（这条是新增变体里才出现的缺口，之前的 36/42 统计里没有它）。
+  详见 [ASCEND.md](ASCEND.md)。这仍然只是"在 CUDA 上模拟昇腾分支路由对不对"的静态检查，不是
+  910B 真机结果。
 
 新代码针对已知限制做的规避：
 

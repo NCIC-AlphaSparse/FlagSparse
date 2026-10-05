@@ -26,9 +26,18 @@
 | DCU 那边 `spmm_csr.py` 里的两个缺陷（`row_ids` 多余分配、短行路由忽略 `accuracy`） | 本仓库已修；DCU 那边每次发来的包都还带着，不要合回来 |
 | 2026-09-27：ROCm 上 int64→int32 索引压缩导致精度测试失败 | 已删除；代价是 int64 输入在 ROCm 上用不了 opt 路径 |
 
-## 3. q4 42 个变体的风险点
+## 3. q4 变体的风险点
 
-- 与 CUDA 同一套 Triton 代码，CUDA 上全过。重点确认：
+> ⚠️ 2026-10-05：q4 清单已从 42 条改成 45 条（删 3 加 6，见 [README.md](README.md) 第 0 节）。
+> 下面这节和第 4 节 2026-09-28 的实测表格都是**旧 42 条清单**的内容——表格里仍能看到
+> `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row`
+> 这三个已经移出 q4 统计范围的变体（它们在 DCU 上测过且 PASS，继续保留实现，只是不再计入
+> q4 的 45 条）。新增的 6 个变体（`sddmm_csr_f16/c32_int_non_non_row`、
+> `spmm_csc_c32/f16_int_non_non_row`、`spmm_coo_i8i32_int_non_non_row`、
+> `spgemm_csr_f32_int_non_non`）**在 DCU 上一次都没跑过**，只在 CUDA 验证过。上机复测时
+> 把这 6 个也加进 `tests/pytest/test_q4_variants_accuracy.py -k` 或 runner 的范围里。
+
+- 与 CUDA 同一套 Triton 代码，CUDA 上全过（含新增 6 个）。重点确认：
   - **int8**（`spmv_*_i8i32`、`spmv_csr_i8f32`、`spmm_csr_i8i32`、`spvv_i8i32`、`gather/scatter_i8`）：int8 读、int32 累加，
     以及 int32 的 `tl.atomic_add`（`spmv_coo_i8i32` 用到）；
   - **float16**：新代码不做 f16 原子加，但读 f16、在 f32 里算；
@@ -37,7 +46,7 @@
   DCU 上这些行的 cuSPARSE 列为空并写明原因，runner 会改用 PyTorch 加速比，再用 `tools/baseline_bound.py --vendor-card dcu-bw1000` 判定。
   如果需要 hipSPARSE 基线，可以按 `cusparse_generic_baseline.py` 的结构用 `hip-python` 补（hipSPARSE 的 SpVV / Axpby / SELL SpMV 接口名一一对应）。
 
-## 4. 2026-09-28 BW1000 实测结果
+## 4. 2026-09-28 BW1000 实测结果（旧 42 条清单，新增 6 个变体未测）
 
 测试提交为 `8492853`（工作区只新增结果目录，测试过程中没有修改源码或测试文件）。
 

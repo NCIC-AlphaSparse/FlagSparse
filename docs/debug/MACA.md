@@ -27,14 +27,23 @@ MACA 的 C API adaptor 尚未可构建，调试时不要用 CTest 作为后端�
 | q4 `gather_i8_int` 没有性能行 | runner 的 `DELIVERY_BENCHMARK_ARGS["gather"]` 限定的 `--value-dtypes` 漏了 `int8`；`tests/test_gather.py` 本身支持 int8，且 q4 精度已通过。q4 对 gather 复用普通（不带 `variant`）性能行，因此汇总为 `NOT_CONFIGURED`。应把 `int8` 加入该 runner 配置后重跑。 |
 | q4 `spmm_bell_f32_int_non_non_row` 在 `ASIC_680ks` 不能测 | q4 路径以 `block_dim=2` 转 Blocked-ELL 时，`398,703,808` 个 float32 values 超过专用的 1 GiB values 上限，转换在 FlagSparse、PyTorch 和厂商 baseline 之前报 `MemoryError`。其余 9 个矩阵通过。见第 4.2 节。 |
 
-## 3. q4 42 个变体的风险点
+## 3. q4 变体的风险点
+
+> ⚠️ 2026-10-05：q4 清单已从 42 条改成 45 条（删 3 加 6，见 [README.md](README.md) 第 0 节）。
+> 下面这节和第 4 节 2026-09-28 的实测表格都是**旧 42 条清单**的内容，表格里的
+> `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row`
+> 现在已经移出 q4 统计范围（继续保留实现，MACA 上测过且 PASS）。新增的 6 个变体
+> （`sddmm_csr_f16/c32_int_non_non_row`、`spmm_csc_c32/f16_int_non_non_row`、
+> `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`）**在 MACA 上一次都没跑过**，
+> 只在 CUDA 验证过。`spmm_csc_f16` 用的新 kernel（fp32 累加缓冲区、最后转回 f16，见
+> `spmm_csc.py` 的 upcast shim）没有在私有内存受限的 MACA C550 上测过，上机时优先看它。
 
 - 新代码的循环都是运行时 `range`，没有依赖私有内存的长展开；复数路径最该验证：
   `spmv_csr/coo/csc_c32`、`spmm_csr/coo_c32`、`spvv_c32_int_conj`、`spmv_sell_c32`、`spmv_csr_f32c32`。
 - `spmv_csr` 的混合精度 kernel 每个程序处理 `ROWS x BLOCK` 个元素（共 512 个），按 4 个 warp 调；warp 大小是 64 时每个 warp 分到的元素数不同，需要实测性能。
 - 无 cuSPARSE 基线：用 `--vendor-card maca-c550`（1440 GB/s）判定；接上 mcSPARSE 后可以直接比。
 
-## 4. q4 实测结果（2026-09-28）
+## 4. q4 实测结果（2026-09-28，旧 42 条清单，新增 6 个变体未测）
 
 **环境**：MetaX C550，MACA SDK 3.8.2.6，torch `2.10.0+metax3.8.1.0`，
 triton `3.6.0+metax3.8.1.0`，Python 3.12；显式设置

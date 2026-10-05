@@ -1,5 +1,27 @@
 # Q4 C API Coverage Handoff (2026-10-02)
 
+## Re-verified 2026-10-05: 45/45 reproduced from a clean `capi_results/`
+
+`capi/capi_results/` is gitignored (`capi/.gitignore`: "Test artifacts... measurements
+of one machine at one moment, not source"), so the "45/45 measured, 0
+NotCoveredYet" claim below does **not** persist across a fresh checkout or a
+new session — only `summary_q4.json` existed on disk this time, with no
+`*_benchmark.json` files, so `write_summary_q4.py` initially reported 39
+`NotCoveredYet` again (looking like a regression from this doc's claim). It
+was not one: every one of those 39 resolved by simply re-running the already-
+implemented benchmark binaries with `FLAGSPARSE_BENCH_OUT=capi_results` set
+(`test_spmm`, `test_sddmm`, `test_spmv`, `test_scatter`, `test_spgemm`,
+`test_axpby`, `test_spvv`), then re-running `write_summary_q4.py`. No source
+code changes were needed; the dispatch and benchmark-axis code this doc
+describes was already correct, the JSON files just weren't on disk yet in
+this session. Re-ran it end to end and reproduced the same **45/45 measured,
+0 NotCoveredYet, 0 dispatch-only** result claimed below.
+
+**Takeaway for the next session**: if `write_summary_q4.py` shows anything
+less than 45/45, re-run the benchmark binaries listed above with
+`FLAGSPARSE_BENCH_OUT` pointed at `capi_results` before assuming any
+dispatch work is missing -- check `capi_results/*.json` exists first.
+
 ## Latest batch: CSR transpose SpMM
 
 Implemented `spmm_csr_f32_int_trans_non_row` end to end:

@@ -47,7 +47,24 @@ FLAGSPARSE_BENCH_OUT=./capi/bench-musa \
 | `torch.sparse` 无矩阵乘，`_mthreads_vendor_sparse_library()` 默认返回 `None` | 基线列为 N/A 并写明原因 |
 | `index_add_` / `scatter_add_` 的复数版本同样可能缺 | spgemm / spsm 只支持实数，目前走不到 |
 
-## 3. q4 42 个变体的风险点
+## 3. q4 变体的风险点
+
+> ⚠️ 2026-10-05：q4 清单已从 42 条改成 45 条（删 3 加 6，见 [README.md](README.md) 第 0 节）。
+> 下面这节和第 4 节 2026-09-28/29 的真机结果都是**旧 42 条清单**的内容，表格里的
+> `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row` 现在已经
+> 移出 q4 统计范围（MUSA 上测过，精度 PASS，性能部分见第 4 节原有的 Failed/NotFound 记录）。
+> 新增的 6 个变体（`sddmm_csr_f16/c32_int_non_non_row`、`spmm_csc_c32/f16_int_non_non_row`、
+> `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`）**在 MUSA 上一次都没跑过**，
+> 只在 CUDA 验证过——其中 `spmm_csc_c32`/`f16` 要特别小心：本文件第 2 节已经记录了 MUSA 的
+> "复数高级索引没有 kernel"限制，而 `spmm_csc` 的 kernel 直接 `tl.atomic_add` 进输出 dtype
+> 缓冲区（没有 ACC_DTYPE 累加层），f16 变体新写的 kernel 用了 fp32 累加缓冲区再转回 f16，这条
+> 路径在 MUSA 上有没有踩到 atomic_add 的 dtype 限制，完全没验证过。
+>
+> 另外，这轮 capi（C API 层）在 `capi/src/ops/spmv.cpp` 新增了 `spmv_csr`/`spmv_coo` 的混合精度
+> dispatch（int8→int32/float32、fp16→float32），本文件第 0 节描述的 **MUSA C API CTest 入口**
+> 从未跑过这部分新代码——如果要给 MUSA 的 C API 结果加上混合精度变体，需要先确认 MUSA 这边的
+> `capi/build-musa` 配置能不能编译这次新加的 `capi/flagsparse_codegen/mixed_spmx.py`
+> （未提交进仓库前是 `??` 状态的新文件，拉取时确认它在）。
 
 - q4 的复数路径全部拆成实部 / 虚部平面，不用复数索引、复数 `sum`：`spvv_c32_int_conj`、`spmv_sell_c32` 等应当可用，需实测确认。
 - **PyTorch 基线**：q4 benchmark 的 PyTorch 列用 `torch.sparse` 做矩阵乘，在 MUSA 上会失败，
