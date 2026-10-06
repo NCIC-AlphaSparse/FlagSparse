@@ -1,7 +1,7 @@
 # 沐曦 MACA（C550）debug
 
 2026-10-06：CSR 默认转置 prepared gather、复数 SELL 调度及 SpGEMM matrix-worker 参数修复已实现，
-MACA 真机复测待完成。历史性能数字未替换，见 [基线复测报告](Q4_BASELINE_RETEST_20261006.md)。
+MACA 真机复测待完成。历史性能数字未替换，见 [CUDA 手册](CUDA.md)。
 
 `FLAGSPARSE_BACKEND=metax`（设置了 `MACA_PATH` 时能自动识别）。环境、交付复现见 [../MACA.md](../MACA.md)。
 

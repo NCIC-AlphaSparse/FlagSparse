@@ -1,7 +1,7 @@
 # 摩尔线程 MUSA（S5000）debug
 
 2026-10-06：C API CSR SpMM 转置增加不均匀行的 nnz 均衡路由；本机 CUDA 验证见
-[基线复测报告](Q4_BASELINE_RETEST_20261006.md)。新的 workspace gather 仅 CUDA 启用；
+[CUDA 手册](CUDA.md)。新的 workspace gather 仅 CUDA 启用；
 MUSA 真机精度/性能待复测，历史数字未替换。
 
 `FLAGSPARSE_BACKEND=mthreads`。环境、交付复现见 [../MUSA.md](../MUSA.md)。

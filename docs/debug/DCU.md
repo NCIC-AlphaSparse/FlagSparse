@@ -1,7 +1,7 @@
 # 海光 DCU（BW1000，gfx936）debug
 
 2026-10-06：CSR 默认转置 prepared gather、SELL 多 slice 调度已实现，DCU 真机复测待完成；
-下方历史加速比仍为原始数据。本机 CUDA 验证见 [基线复测报告](Q4_BASELINE_RETEST_20261006.md)。
+下方历史加速比仍为原始数据。本机 CUDA 验证见 [CUDA 手册](CUDA.md)。
 
 `FLAGSPARSE_BACKEND=rocm`（通常能自动识别：`torch.version.hip` 不为空）。环境、交付复现见 [../DCU.md](../DCU.md)。
 

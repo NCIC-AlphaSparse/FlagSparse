@@ -1,144 +1,113 @@
-# 各后端 debug 手册（q4）
+# Q4 后端调试文档索引
 
-本目录记录 5 个国产后端在 q4 分支上的排查方法、已知问题和待确认项。每个后端一个文件：
+本目录按后端维护一份手册，涵盖调试方法、有效结果、已知问题和待办。
+CUDA 的分轮优化/补测报告已合并到 CUDA.md；原始 JSON/CSV 保留。
 
-| 后端 | 厂商 / 卡 | `FLAGSPARSE_BACKEND` | 文件 | 已有的上机文档 |
+| 后端 | 设备 | FLAGSPARSE_BACKEND | 调试手册 | 环境 / 交付文档 |
 |---|---|---|---|---|
-| 海光 DCU | BW1000（gfx936，ROCm/HIP） | `rocm` | [DCU.md](DCU.md) | [../DCU.md](../DCU.md) |
-| 沐曦 MACA | C550 | `metax` | [MACA.md](MACA.md) | [../MACA.md](../MACA.md) |
-| 摩尔线程 MUSA | S5000 | `mthreads` | [MUSA.md](MUSA.md) | [../MUSA.md](../MUSA.md) |
-| 华为昇腾 | 910B（交付测试用卡） | `ascend` | [ASCEND.md](ASCEND.md) | [../ASCEND.md](../ASCEND.md) |
-| 天数智芯 | BI-V150 | `iluvatar` | [ILUVATAR.md](ILUVATAR.md) | [../ILUVATAR.md](../ILUVATAR.md)、[../ILUVATAR_DEBUG.md](../ILUVATAR_DEBUG.md) |
+| NVIDIA CUDA | RTX 5090 | cuda | [CUDA.md](CUDA.md) | [C API 交付](../Q4_CAPI_HANDOFF.md) |
+| 海光 DCU | BW1000 / gfx936 | rocm | [DCU.md](DCU.md) | [DCU 环境](../DCU.md) |
+| 沐曦 MACA | C550 | metax | [MACA.md](MACA.md) | [MACA 环境](../MACA.md) |
+| 摩尔线程 MUSA | S5000 | mthreads | [MUSA.md](MUSA.md) | [MUSA 环境](../MUSA.md) |
+| 华为昇腾 | 910B | ascend | [ASCEND.md](ASCEND.md) | [Ascend 环境](../ASCEND.md) |
+| 天数智芯 | BI-V150 | iluvatar | [ILUVATAR.md](ILUVATAR.md) | [Iluvatar 环境](../ILUVATAR.md)、[排查记录](../ILUVATAR_DEBUG.md) |
 
-上面「已有的上机文档」讲环境搭建和交付复现；本目录只写 **debug**：出了问题怎么定位、已知的坑、
-q4 新增的变体（[../NEW_OPERATORS_CUSPARSE_12_5.md](../NEW_OPERATORS_CUSPARSE_12_5.md)）在该后端上的风险点，
-以及跑完后需要带回来的信息。
+当前 CUDA 45 项均有 CuPy 加速比，44 项逐算子平均 ≥0.8；
+SpGEMM 0.789× 仍需优化。43 项为 2026-10-06 数据，2 项 CSC SpMM 保留历史值。
+这不是其他后端的验收结果，也不是 45 项同轮重跑，详情见 [CUDA.md](CUDA.md)。
 
-## 0. ⚠️ 2026-10-05：q4 变体清单从 42 条改成了 45 条
+## 0. Q4 变体范围与历史结果
 
-`conf/operators.yaml` 的 `q4_variants:` 在 2026-09-29 之后不再是 42 条，是 **45 条**
-（`delivery_variants` 20 条不变，两者合计 65 条，不再是旧文档里的 62）。本目录下
-DCU/MACA/MUSA/ASCEND/ILUVATAR 五个文件里带日期的真机结果（2026-09-28/29）**都是在旧的
-42 条清单上跑的**，下面三条改动之后，这些历史表格本身仍然如实（没有造假），但不等于
-"45 条全部验证过"：
+当前 Q4 清单为 **45 个变体**，delivery 20 个，合计 65 个；
+以 conf/operators.yaml、capi/conf/operators.yaml 和
+tests/pytest/test_q4_variants_accuracy.py 中的清单为准。
 
-- **删除的 3 条**（不算 q4 失败，是移出了统计范围，代码和实现都还在，仍标记 `retained`）：
-  `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row`。这三个在
-  DCU/MACA 2026-09-28 的表格里原样能查到（都是 PASS），只是现在不再计入 q4 的 45 条。
-- **新增的 6 条**：`sddmm_csr_f16_int_non_non_row`、`sddmm_csr_c32_int_non_non_row`、
-  `spmm_csc_c32_int_non_non_row`、`spmm_csc_f16_int_non_non_row`、
-  `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`。
-  **这 6 条到目前为止只在这台机器的 1 张 CUDA RTX 5090 上验证过**（pytest + 这次新加的 capi
-  ctest），**DCU/MACA/MUSA/昇腾/天数没有任何一条真机记录**——下面各后端文件原有的"42 个变体"
-  表格和结论不包含这 6 条，上机复测时请把它们也带上。
-- capi（C API 层）这段时间进展很快：`docs/Q4_CAPI_HANDOFF.md` 已经被重写过一次（不再是中文版，
-  现在是 2026-10-02 的英文版），`capi/conf/operators.yaml` 补上了 `spvv`/`axpby`/`spmv_sell`/
-  `spmm_csc` 的完整算子组，`spmv`/`spmm` 的 opA=TRANSPOSE 也接上了。**2026-10-05 复核结论：
-  跑 `cd capi && python3 tools/write_summary_q4.py` 现在是 45/45 全部 Measured/Passed，0 个未覆盖**
-  ——中途一度看到 39 个未覆盖，排查后发现是 `capi/capi_results/` 被 `.gitignore` 排除、这次会话里
-  这些 benchmark JSON 本来就不存在，不是代码退化；把 `test_spmm`/`test_sddmm`/`test_spmv`/
-  `test_scatter`/`test_spgemm`/`test_axpby`/`test_spvv` 这几个 benchmark 二进制用
-  `FLAGSPARSE_BENCH_OUT=capi_results` 重新跑一遍就全补齐了，**没有改任何代码**。这部分工作**同样
-  只在 CUDA 上验证过**，DCU/MACA/MUSA/昇腾/天数都还没碰过新接的这些算子组和 transpose 支持。
+2026-09-28/29 的旧报告按 42 项统计，不能直接当成现行 45 项覆盖：
+移出统计范围的 3 项仍保留实现：
+gather_i8_int、spmm_bell_f32_int_non_non_row、spmm_bsr_f32_int_non_non_row。
+新增的 6 项是：
 
-## 1. q4 在各后端的总体状态（2026-10-02，部分已被上面第 0 条更新覆盖）
+- sddmm_csr_f16_int_non_non_row
+- sddmm_csr_c32_int_non_non_row
+- spmm_csc_c32_int_non_non_row
+- spmm_csc_f16_int_non_non_row
+- spmm_coo_i8i32_int_non_non_row
+- spgemm_csr_f32_int_non_non
 
-- CUDA（RTX 5090）和 MUSA（S5000）已有真机验证；MUSA 的当前调试入口是 C API CTest。
-  旧 42 个变体的 Python 精度历史记录全过，C API 的完整结果以 `capi/bench-musa` 为准；
-  新增 6 个变体和 capi 这轮混合精度 dispatch 工作都还没有在 MUSA 真机上跑过。
-- 海光、沐曦、天数与 CUDA 共用同一套 Triton 代码；旧 42 个变体的新代码已按已知限制避坑
-  （见下表），新增 6 个变体和混合精度 dispatch 仍需按 Python runner 实机确认。
-- 昇腾：新写的代码都有 torch_npu 路径。在 CUDA 上把所有模块强制切到昇腾分支、并禁止 Triton 启动，
-  **按现在 45 条清单重跑**（`tools/q4_ascend_dispatch_check.py`，2026-10-05）：39/45 走 torch 路径且
-  路由正确；6 个仍会调用 Triton——`spmv_csc_f32/c32_int_non`、`spmm_csc_f32/c32/f16_int_non_non_row`、
-  **`spgemm_csr_f32_int_non_non`**（这条是新增变体里才出现的缺口，之前的 36/42 统计里没有它）。
-  详见 [ASCEND.md](ASCEND.md)。这仍然只是"在 CUDA 上模拟昇腾分支路由对不对"的静态检查，不是
-  910B 真机结果。
+各后端已有不同日期、不同测试层的记录，必须以对应手册的最新带日期章节为准。
+旧 42 项全过、CUDA 模拟 Ascend 分支通过、C API dispatch 覆盖，
+均不能替代对应设备当前 45 项的精度与性能验收。
 
-新代码针对已知限制做的规避：
+## 1. 数据组织
 
-| 已知限制 | 出现在 | q4 新代码的做法 |
-|---|---|---|
-| fp16 / 复数原子加不一定可用 | 多个后端 | COO 等需要原子加的路径先在 float32 / int32 缓冲区累加，最后再转回 |
-| 单线程私有内存 4 KB 上限 | 沐曦 C550 | 循环一律用运行时 `range`，不做编译期展开 |
-| 复数高级索引、复数求和没有 kernel | 摩尔 S5000 | 复数全部按 `view_as_real` 拆成实部 / 虚部两个平面计算 |
-| Triton 缺 shmem、`associative_scan` | 昇腾 910B | 每条新路径都有 torch_npu 实现（`index_add_` 等） |
-| fp64 H2D 拷贝静默得到 0 | 天数 BI-V150 | 不在 q4 范围（q4 不含 f64 / c64） |
+- [CUDA 45 项汇总 JSON](Q4_CUDA_45_SPEEDUPS_20261006.json)、
+  [CSV](Q4_CUDA_45_SPEEDUPS_20261006.csv)：机器可读均值及各项原始来源。
+- 有效 CUDA 数据批次、基线差异和复现命令统一由 [CUDA.md](CUDA.md) 索引；
+  results_cuda_q4_* 中的初轮和 v1/v2/v3 目录是实验归档，不默认视为最终结果。
+- results_metax_q4_45_perf_20261005/、musa_test/ 等后端归档及其原始数据保留，
+  解读方法见对应后端手册。
+- summary.csv、q4_accuracy_result.json 等现有历史汇总保留；
+  日期、变体范围和测试层不明确时，不用它们覆盖新结果。
+- 性能按每个变体各案例加速比的算术平均汇总，不能混为所有算子的整体平均；
+  Python/Triton、C API 和厂商基线属于不同路径。
 
 ## 2. 通用排查顺序
 
-1. **先确认后端识别对了。**
+1. 确认后端识别和安装包来源：
+
    ```bash
    PYTHONPATH=src python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._ACCEL_DEVICE_TYPE)"
+   python3 -I -c "import flagsparse; print(flagsparse.__file__)"
    ```
-   不对就设 `FLAGSPARSE_BACKEND=<上表的值>`。
-2. **先排除跑到了旧的已安装包。** 一律用 `PYTHONPATH=src` 跑；某个基线列无缘无故变成 N/A 时，先查
-   `sudo python3 -m pip show flagsparse` 和 `python3 -I -c "import flagsparse; print(flagsparse.__file__)"`。
-3. **先跑能力探测，再跑测试**：`python3 tools/probe_accel_capabilities.py`，它能告诉你失败属于哪一层
-   （分配 / 拷贝、torch 算子、Triton、torch.sparse）。
-4. **q4 变体精度**（Python-only 后端使用；42 个变体 × 2 个规模，每个用例名就是变体名）：
+
+   识别不符时设置表中的 FLAGSPARSE_BACKEND；运行源码时使用 PYTHONPATH=src。
+2. 先做能力探测，区分张量分配/拷贝、Torch 算子、Triton 和 sparse 库问题：
+
+   ```bash
+   python3 tools/probe_accel_capabilities.py
+   ```
+
+3. 单独检查 Q4 精度：
+
    ```bash
    PYTHONPATH=src python3 -m pytest tests/pytest/test_q4_variants_accuracy.py -v
-   # 只看某个算子：-m spmv_csr ；只看某个变体：-k spmv_csr_f16f32_int_non
+   # 按 marker/变体筛选：-m spmv_csr 或 -k spmv_csr_f16f32_int_non
    ```
-5. **Python-only 后端的历史统一 runner（精度 + 性能，汇总 62 个条目）**：
+
+4. 按后端选择测试层。MUSA 以 C API CTest 为入口，不能用 Python 结果替代 muSPARSE 对比：
+
    ```bash
-   PYTHONPATH=src python3 run_flagsparse_pytest.py \
-     --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spmm_bsr,spmm_bell,sddmm_csr \
-     --gpus 0 --results-dir results_<后端>_<日期> --benchmark-input tests/data
+   cmake -S capi -B capi/build-musa -G Ninja \
+     -DBACKEND=MUSA -DMUSA_HOME=/usr/local/musa -DCMAKE_BUILD_TYPE=Release
+   cmake --build capi/build-musa -j
+   ctest --test-dir capi/build-musa -L capi --output-on-failure
    ```
-   当前入口优先使用上面的 `tools/run_backend_tests.py`；本命令仅用于复现已有的
-   Python 侧历史报告。
-   **每次都用新的 `--results-dir`**：往已有目录里重跑部分算子会把 `summary.json` 覆盖成只剩这部分。
-   `spmm_bell` 的性能测试在 CPU 上转换 Blocked-ELL，每个矩阵要几分钟，是整轮最慢的一步。
-6. **没有厂商库基线时**，按 H800 带宽换算上限判定（`tools/baseline_bound.py`）：
+
+   其他后端使用 Python runner：
+
    ```bash
-   python3 tools/baseline_bound.py <H800结果目录> --vendor <本后端结果目录> --vendor-card <卡名>
-   # 卡名：dcu-bw1000 / maca-c550 / musa-s5000 / iluvatar-biv150 / ascend-910b
+   python3 tools/run_backend_tests.py --backend rocm --phase both --mode normal
    ```
 
-### 当前测试入口
+   将 rocm 替换为 maca、ascend、iluvatar 或 xpu。CUDA 专项命令见 CUDA.md。
+   每次测试使用新结果目录，避免局部重跑覆盖整批 summary。
 
-调试时按后端选择测试层：MUSA 使用 C API CTest；DCU、MACA、Ascend、
-Iluvatar 和 XPU 使用 Python runner。不要用 MUSA 的 Python benchmark
-结果判断 C API，那里没有 muSPARSE 对比。
+## 3. 通用 debug 规则
 
-MUSA C API：
+- 先用测试本身的操作复现，再加入诊断操作；诊断依赖的后端算子也可能不支持。
+- 怀疑不确定性前先固定参数和输入，用重复测试定位，不凭单次异常结论。
+- 检查设备上实际使用的源码与 kernel，不用本地代码推断另一台机器。
+- 按输入结构二分：对角、双对角、稠密三角等比只改变规模更有帮助。
+- 非法访存使用 CUDA_LAUNCH_BLOCKING=1；求解器测试设置进程超时，
+  卡死的 kernel 未必能用 Ctrl-C 中断。
+- 会污染运行时的故障每个配置单独启动进程；不要使用 pytest --forked，
+  GPU 上下文不能安全继承，按 marker 分开跑。
+- benchmark 独占 GPU，与精度测试串行执行；prepare、格式转换和同步的计时边界必须注明。
+- 移植修复使用带断言的局部补丁，避免整文件覆盖；诊断脚本放在容器重建后仍保留的位置。
 
-```bash
-cmake -S capi -B capi/build-musa -G Ninja \
-  -DBACKEND=MUSA -DMUSA_HOME=/usr/local/musa \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build capi/build-musa -j
-ctest --test-dir capi/build-musa -L capi --output-on-failure
-```
+## 4. 上机后带回的信息
 
-其他后端 Python：
-
-```bash
-python3 tools/run_backend_tests.py \
-  --backend rocm --phase both --mode normal
-```
-
-将 `rocm` 替换为 `maca`、`ascend`、`iluvatar` 或 `xpu`。每次调试使用
-新的 `--results-dir`，避免覆盖旧报告。
-
-## 3. 通用 debug 规则（来自前几次上机）
-
-- **先用测试自己的操作复现，再加诊断代码。** 在还没验证过的运行时上，诊断代码里的额外张量操作本身就可能出错。
-- **怪到“不确定性”之前，先确认其他参数都固定了。** 用重复次数说话，不要用一对反常结果下结论。
-- **读机器上那份源码，不要读本地的。** 两边的代码经常已经不一样；移植修复用带断言的补丁脚本，不要整文件复制。
-- **先查这个用例实际走了哪个 kernel。** 通过的用例可能根本没走到出问题的 kernel。
-- **按输入结构二分，不只按规模。**（对角 / 双对角 / 稠密三角能把两个不同缺陷分开）
-- 查非法访存时加 `CUDA_LAUNCH_BLOCKING=1`（报错位置才准）；求解器类测试一律套 `timeout -s KILL`，
-  卡死的 kernel 用 Ctrl-C 停不下来。
-- 一个故障会让整个运行时失效时，**每种配置单独起一个进程**。
-- 不要用 `pytest --forked`：GPU 上下文在 fork 后不可用，所有 GPU 用例都会失败。按算子 marker 分开跑即可。
-- 诊断脚本放在容器重建后仍保留的目录里。
-
-## 4. 跑完需要带回来的信息
-
-- `results_*/summary.json`、`summary.csv`、每个算子目录下的 `accuracy_result.json` 和 `performance.csv`；
-- 失败用例的完整报错（加 `CUDA_LAUNCH_BLOCKING=1` 重跑一次）；
-- 第 2 节第 1 步的输出、`pip list | grep -iE "torch|triton|flagtree"`、驱动 / SDK 版本；
-- 各后端文件「待确认」一节里列出的具体问题的答案。
+- 新结果目录的 summary.json、summary.csv、逐算子 accuracy_result.json/performance.csv。
+- 失败用例完整报错、必要时 CUDA_LAUNCH_BLOCKING=1 的复现结果。
+- 后端识别、包版本、驱动/SDK 版本和代码版本。
+- 对应后端手册待确认项的复测结果。
