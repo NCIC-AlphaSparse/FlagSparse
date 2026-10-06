@@ -357,6 +357,16 @@ inline std::vector<const registry::Variant*> variants_of(
     return out;
 }
 
+// Optional exact q4 IDs for focused performance sweeps; accuracy suites and
+// default benchmark coverage keep their full variant lists.
+inline bool benchmark_variant_selected(const registry::Variant& variant) {
+    const char* filter = std::getenv("FLAGSPARSE_BENCH_VARIANTS");
+    if (!filter || !*filter) return true;
+    if (!variant.q4_variant) return false;
+    const std::string ids = std::string(",") + filter + ",";
+    return ids.find(std::string(",") + variant.q4_variant + ",") != std::string::npos;
+}
+
 // q4 mixed variants encode input/output widths in the tag while the generated
 // Variant keeps `dt` as the narrow input type used for A and B/X.  Keeping the
 // decode here avoids repeating string-to-dtype tables in every benchmark.

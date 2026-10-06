@@ -37,6 +37,7 @@
 #include "core/internal.hpp"
 #include "core/jit.hpp"
 #include "core/prologue.hpp"
+#include "core/sparse_gather.hpp"
 
 using namespace flagsparse;
 
@@ -937,6 +938,17 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
         return s;
     }
     if (ops.m == 0 || ops.n == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    if (musa_gather_type(A)) {
+        const bool indirect = A->format == FLAGSPARSE_FORMAT_CSC ||
+            (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA));
+        const bool direct = A->format == FLAGSPARSE_FORMAT_CSR &&
+            !transposes(opA) && ops.complex_op && ops.n == 8;
+        if ((indirect && externalBuffer) || direct)
+            return launch_sparse_gather(handle, A, B->values, C->values,
+                C->rows, ops.n, ops.stride_bk, ops.stride_bn, ops.stride_cm, ops.stride_cn,
+                ops.alpha_re, ops.alpha_im, ops.beta_re, ops.beta_im,
+                opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, externalBuffer, indirect);
+    }
 
     return (A->format == FLAGSPARSE_FORMAT_COO)
                ? run_coo(handle, A, B, C, ops, externalBuffer)
@@ -974,6 +986,11 @@ flagsparseStatus_t flagsparseSpMM_bufferSize(
         // has to be given one, so the caller allocates rows + 1 int32 and passes
         // it to preprocess and to every solve.
         const SpMatDescr* A = spmat(matA);
+        if (musa_gather_type(A) && (A->format == FLAGSPARSE_FORMAT_CSC ||
+            (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA)))) {
+            *bufferSize = gather_bytes(A);
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
         if (transposes(opA) && transpose_gather_available(A)) {
             *bufferSize = (transpose_ptr_count(A) + 2 * transpose_nnz_count(A)) * sizeof(int64_t);
         }
@@ -1004,6 +1021,10 @@ flagsparseStatus_t flagsparseSpMM_preprocess(
         // builds the row-offsets array the kernel cannot run without, which is
         // also where a COO that is not sorted by row gets rejected.
         auto* A = const_cast<SpMatDescr*>(spmat(matA));
+        if (musa_gather_type(A) && externalBuffer &&
+            (A->format == FLAGSPARSE_FORMAT_CSC ||
+             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA))))
+            return prepare_sparse_gather(A, externalBuffer);
         if (transposes(opA) && transpose_gather_available(A) && externalBuffer)
             return prepare_transpose_topology(A, externalBuffer);
         if (A->format == FLAGSPARSE_FORMAT_COO) {

@@ -504,10 +504,13 @@ TEST_F(SpMMAccuracy, CscFloat32RowMajorIdentity) {
                                         FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b,
                                         &zero, mat_c, FLAGSPARSE_R_32F,
                                         FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
-    EXPECT_EQ(bytes, 0u);
+    DeviceBuffer scratch(bytes);
+    ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+        FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
+        FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
     ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                              FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
-                             FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+                             FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
     dev_sync();
     EXPECT_EQ(d_c.download<float>(4), expected);
     flagsparseDestroyDnMat(mat_c); flagsparseDestroyDnMat(mat_b); flagsparseDestroySpMat(a);
@@ -557,10 +560,25 @@ TEST_F(SpMMAccuracy, CscComplex64RowMajorIdentity) {
     ASSERT_EQ(flagsparseCreateDnMat(&mat_c, 2, 2, 2, d_c.get(), FLAGSPARSE_C_32F,
                                     FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
     const C one(1, 0), zero(0, 0);
+    size_t bytes = 0;
+    ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+        FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
+        FLAGSPARSE_C_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+    DeviceBuffer scratch(bytes);
+    // Lazy preparation with genuinely complex values, followed by a live-value update.
     ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                              FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
-                             FLAGSPARSE_C_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+                             FLAGSPARSE_C_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
     dev_sync(); EXPECT_EQ(d_c.download<C>(4), expected);
+    auto updated = values;
+    for (auto& v : updated) v *= 2.f;
+    ASSERT_EQ(to_device(d_values.get(), updated.data(), updated.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+        FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, a, mat_b, &zero, mat_c,
+        FLAGSPARSE_C_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const auto got = d_c.download<C>(4);
+    for (size_t i = 0; i < got.size(); ++i) EXPECT_EQ(got[i], 2.f * expected[i]);
     flagsparseDestroyDnMat(mat_c); flagsparseDestroyDnMat(mat_b); flagsparseDestroySpMat(a);
 }
 
@@ -671,83 +689,85 @@ TEST_F(SpMMAccuracy, CsrTransposeFloat32MatchesHostReference) {
 }
 
 TEST_F(SpMMAccuracy, CsrTransposeSkewedRowsAndLayouts) {
-    constexpr int64_t m = 129, k = 97, n = 33;
-    std::vector<int32_t> ptr(m + 1, 97), cols;
-    ptr[0] = 0;
-    ptr[m] = 100;
-    for (int32_t i = 0; i < 97; ++i) cols.push_back(i);
-    cols.insert(cols.end(), {0, 0, 96});  // duplicates and empty interior rows
-    std::vector<float> values(100, 1.0f);
-    for (auto index_type : {FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_64I}) {
-        for (auto order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL}) {
-            for (auto opB : {FLAGSPARSE_OPERATION_NON_TRANSPOSE, FLAGSPARSE_OPERATION_TRANSPOSE}) {
-                const int64_t br = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? n : m;
-                const int64_t bc = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? m : n;
-                Layout layout{order, 3};
-                std::vector<float> b(layout.elems(br, bc), 0.f);
-                for (int64_t r = 0; r < m; ++r) {
-                    for (int64_t j = 0; j < n; ++j) {
-                        b[opB == FLAGSPARSE_OPERATION_TRANSPOSE
-                              ? layout.at(j, r, br, bc) : layout.at(r, j, br, bc)] =
-                            static_cast<float>((r + j) % 11 - 5);
+    constexpr int64_t m = 129, k = 97;
+    for (const int64_t n : {8, 33}) {
+        std::vector<int32_t> ptr(m + 1, 97), cols;
+        ptr[0] = 0;
+        ptr[m] = 100;
+        for (int32_t i = 0; i < 97; ++i) cols.push_back(i);
+        cols.insert(cols.end(), {0, 0, 96});  // duplicates and empty interior rows
+        std::vector<float> values(100, 1.0f);
+        for (auto index_type : {FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_64I}) {
+            for (auto order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL}) {
+                for (auto opB : {FLAGSPARSE_OPERATION_NON_TRANSPOSE, FLAGSPARSE_OPERATION_TRANSPOSE}) {
+                    const int64_t br = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? n : m;
+                    const int64_t bc = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? m : n;
+                    Layout layout{order, 3};
+                    std::vector<float> b(layout.elems(br, bc), 0.f);
+                    for (int64_t r = 0; r < m; ++r) {
+                        for (int64_t j = 0; j < n; ++j) {
+                            b[opB == FLAGSPARSE_OPERATION_TRANSPOSE
+                                  ? layout.at(j, r, br, bc) : layout.at(r, j, br, bc)] =
+                                static_cast<float>((r + j) % 11 - 5);
+                        }
                     }
-                }
-                std::vector<float> initial(layout.elems(k, n), 2.f), expected = initial;
-                for (int64_t c = 0; c < k; ++c)
-                    for (int64_t j = 0; j < n; ++j) expected[layout.at(c, j, k, n)] *= 0.5f;
-                for (int64_t r = 0; r < m; ++r)
-                    for (int32_t p = ptr[r]; p < ptr[r + 1]; ++p)
+                    std::vector<float> initial(layout.elems(k, n), 2.f), expected = initial;
+                    for (int64_t c = 0; c < k; ++c)
+                        for (int64_t j = 0; j < n; ++j) expected[layout.at(c, j, k, n)] *= 0.5f;
+                    for (int64_t r = 0; r < m; ++r)
+                        for (int32_t p = ptr[r]; p < ptr[r + 1]; ++p)
+                            for (int64_t j = 0; j < n; ++j)
+                                expected[layout.at(cols[p], j, k, n)] +=
+                                    2.f * static_cast<float>((r + j) % 11 - 5);
+                    auto dv = DeviceBuffer::from(values);
+                    auto dp = upload_indices(ptr, index_type);
+                    auto di = upload_indices(cols, index_type);
+                    auto db = DeviceBuffer::from(b);
+                    auto dc = DeviceBuffer::from(initial);
+                    flagsparseSpMatDescr_t a = nullptr;
+                    flagsparseDnMatDescr_t bd = nullptr, cd = nullptr;
+                    ASSERT_EQ(flagsparseCreateCsr(&a, m, k, 100, dp.get(), di.get(), dv.get(),
+                        index_type, index_type, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+                    ASSERT_EQ(flagsparseCreateDnMat(&bd, br, bc, layout.ld(br, bc), db.get(),
+                        FLAGSPARSE_R_32F, order), FLAGSPARSE_STATUS_SUCCESS);
+                    ASSERT_EQ(flagsparseCreateDnMat(&cd, k, n, layout.ld(k, n), dc.get(),
+                        FLAGSPARSE_R_32F, order), FLAGSPARSE_STATUS_SUCCESS);
+                    const float alpha = 2.f, beta = 0.5f;
+                    size_t workspace_bytes = 0;
+                    ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                        &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
+                        FLAGSPARSE_SPMM_ALG_DEFAULT, &workspace_bytes), FLAGSPARSE_STATUS_SUCCESS);
+                    DeviceBuffer workspace(workspace_bytes);
+                    ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                        &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
+                        FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
+                    ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                        &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
+                        FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
+                    dev_sync();
+                    const auto got = dc.download<float>(initial.size());
+                    for (int64_t c = 0; c < k; ++c)
                         for (int64_t j = 0; j < n; ++j)
-                            expected[layout.at(cols[p], j, k, n)] +=
-                                2.f * static_cast<float>((r + j) % 11 - 5);
-                auto dv = DeviceBuffer::from(values);
-                auto dp = upload_indices(ptr, index_type);
-                auto di = upload_indices(cols, index_type);
-                auto db = DeviceBuffer::from(b);
-                auto dc = DeviceBuffer::from(initial);
-                flagsparseSpMatDescr_t a = nullptr;
-                flagsparseDnMatDescr_t bd = nullptr, cd = nullptr;
-                ASSERT_EQ(flagsparseCreateCsr(&a, m, k, 100, dp.get(), di.get(), dv.get(),
-                    index_type, index_type, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
-                ASSERT_EQ(flagsparseCreateDnMat(&bd, br, bc, layout.ld(br, bc), db.get(),
-                    FLAGSPARSE_R_32F, order), FLAGSPARSE_STATUS_SUCCESS);
-                ASSERT_EQ(flagsparseCreateDnMat(&cd, k, n, layout.ld(k, n), dc.get(),
-                    FLAGSPARSE_R_32F, order), FLAGSPARSE_STATUS_SUCCESS);
-                const float alpha = 2.f, beta = 0.5f;
-                size_t workspace_bytes = 0;
-                ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
-                    &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
-                    FLAGSPARSE_SPMM_ALG_DEFAULT, &workspace_bytes), FLAGSPARSE_STATUS_SUCCESS);
-                DeviceBuffer workspace(workspace_bytes);
-                ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
-                    &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
-                    FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
-                ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
-                    &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
-                    FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
-                dev_sync();
-                const auto got = dc.download<float>(initial.size());
-                for (int64_t c = 0; c < k; ++c)
-                    for (int64_t j = 0; j < n; ++j)
-                        EXPECT_FLOAT_EQ(got[layout.at(c, j, k, n)], expected[layout.at(c, j, k, n)]);
-                // Reuse topology but change values in place: no stale value cache.
-                std::vector<float> updated_values(100, 2.f);
-                ASSERT_EQ(to_device(dv.get(), updated_values.data(), updated_values.size() * sizeof(float)),
-                    FLAGSPARSE_STATUS_SUCCESS);
-                const float zero_beta = 0.f;
-                ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
-                    &alpha, a, bd, &zero_beta, cd, FLAGSPARSE_R_32F,
-                    FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
-                dev_sync();
-                const auto updated = dc.download<float>(initial.size());
-                for (int64_t c = 0; c < k; ++c)
-                    for (int64_t j = 0; j < n; ++j) {
-                        const auto pos = layout.at(c, j, k, n);
-                        EXPECT_FLOAT_EQ(updated[pos], 2.f * (expected[pos] - 1.f));
-                    }
-                flagsparseDestroyDnMat(cd);
-                flagsparseDestroyDnMat(bd);
-                flagsparseDestroySpMat(a);
+                            EXPECT_FLOAT_EQ(got[layout.at(c, j, k, n)], expected[layout.at(c, j, k, n)]);
+                    // Reuse topology but change values in place: no stale value cache.
+                    std::vector<float> updated_values(100, 2.f);
+                    ASSERT_EQ(to_device(dv.get(), updated_values.data(), updated_values.size() * sizeof(float)),
+                        FLAGSPARSE_STATUS_SUCCESS);
+                    const float zero_beta = 0.f;
+                    ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                        &alpha, a, bd, &zero_beta, cd, FLAGSPARSE_R_32F,
+                        FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
+                    dev_sync();
+                    const auto updated = dc.download<float>(initial.size());
+                    for (int64_t c = 0; c < k; ++c)
+                        for (int64_t j = 0; j < n; ++j) {
+                            const auto pos = layout.at(c, j, k, n);
+                            EXPECT_FLOAT_EQ(updated[pos], 2.f * (expected[pos] - 1.f));
+                        }
+                    flagsparseDestroyDnMat(cd);
+                    flagsparseDestroyDnMat(bd);
+                    flagsparseDestroySpMat(a);
+                }
             }
         }
     }
@@ -793,6 +813,18 @@ TEST_F(SpMMAccuracy, Complex64MatchesHostReference) {
     Case c; c.n = 28;
     const RunResult r = run_spmm_complex<float>(handle.h, A, FLAGSPARSE_C_32F, c);
     expect_close(r, "c64", handle.h);
+}
+
+TEST_F(SpMMAccuracy, Complex64NarrowRowsWithAlphaBetaAndLayouts) {
+    const CsrMatrix A = random_csr(65, 81, 0.06, 41);
+    for (auto order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL}) {
+        for (auto opB : {FLAGSPARSE_OPERATION_NON_TRANSPOSE, FLAGSPARSE_OPERATION_TRANSPOSE}) {
+            Case c; c.n = 8; c.alpha = 1.25; c.beta = -0.5;
+            c.lb = Layout{order, 3}; c.lc = Layout{order, 2}; c.opB = opB;
+            expect_close(run_spmm_complex<float>(handle.h, A, FLAGSPARSE_C_32F, c),
+                "c32_n8_alpha_beta_layout", handle.h);
+        }
+    }
 }
 
 TEST_F(SpMMAccuracy, Complex128WithComplexAlphaBeta) {

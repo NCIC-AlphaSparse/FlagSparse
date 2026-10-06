@@ -428,7 +428,13 @@ flagsparseStatus_t flagsparseSpGEMM_compute(
         }
         *bufferSize2 = buffer2_bytes(A->rows);
         if (externalBuffer2 == nullptr) return FLAGSPARSE_STATUS_SUCCESS;
-        if (A->rows == 0) { C->nnz = 0; d->computed = true; return FLAGSPARSE_STATUS_SUCCESS; }
+        if (A->rows == 0) {
+            // copy() still has to publish the CSR sentinel for an empty result.
+            d->host_indptr.assign(1, 0);
+            C->nnz = 0;
+            d->computed = true;
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
 
         auto* base = static_cast<unsigned char*>(externalBuffer2);
         const size_t rows_bytes = align_up(static_cast<size_t>(A->rows) * sizeof(std::int32_t));
@@ -562,8 +568,6 @@ flagsparseStatus_t flagsparseSpGEMM_copy(
                 "allocate, then attach them with flagsparseCsrSetPointers.";
             return FLAGSPARSE_STATUS_INVALID_VALUE;
         }
-        if (A->rows == 0 || C->nnz == 0) return FLAGSPARSE_STATUS_SUCCESS;
-
         // C's own offsets array gets the indptr compute derived.
         if (C->offsets_type == FLAGSPARSE_INDEX_32I) {
             if (flagsparseStatus_t s = adaptor::memcpy_h2d(
@@ -576,6 +580,11 @@ flagsparseStatus_t flagsparseSpGEMM_copy(
                     reinterpret_cast<adaptor::DevicePtr>(C->offsets), wide.data(),
                     wide.size() * sizeof(std::int64_t))) return s;
         }
+
+        // An empty product still has a meaningful CSR structure: every row
+        // offset must be zero. Publish it before returning; otherwise callers
+        // read uninitialized device memory from C->offsets.
+        if (C->nnz == 0) return FLAGSPARSE_STATUS_SUCCESS;
 
         // Triton's MUSA shared-memory fill kernel is not reliable on the current
         // toolchain: depending on the generated ABI it can write through the

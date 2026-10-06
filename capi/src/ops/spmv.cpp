@@ -25,6 +25,7 @@
 #include "core/internal.hpp"
 #include "core/jit.hpp"
 #include "core/prologue.hpp"
+#include "core/sparse_gather.hpp"
 
 using namespace flagsparse;
 
@@ -641,6 +642,7 @@ flagsparseStatus_t run_sell(flagsparseHandle_t handle, const SpMatDescr* A,
     sig += "*"; sig += ot; sig += ":16,";
     sig += "*"; sig += ops.vt; sig += ":16,i32,";
     sig += std::to_string(A->slice_size) + "," + std::to_string(block_r);
+    if (complex) sig += ",1";  // GROUP in the shared complex SELL kernel
 
     std::vector<jit::Arg> args;
     args.reserve(6);
@@ -1052,6 +1054,18 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
         return s;
     }
     if (ops.y_len == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    if (musa_gather_type(A)) {
+        const bool indirect = (A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
+            (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA));
+        const bool direct = A->format == FLAGSPARSE_FORMAT_CSR &&
+            !transposes(opA) && ops.complex_op;
+        const int unit = ops.complex_op ? 2 : 1;
+        if ((indirect && externalBuffer) || direct)
+            return launch_sparse_gather(handle, A, X->values, Y->values,
+                ops.y_len, 1, unit, unit, unit, unit,
+                ops.alpha_re, ops.alpha_im, ops.beta_re, ops.beta_im,
+                opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, externalBuffer, indirect);
+    }
 
     switch (A->format) {
         case FLAGSPARSE_FORMAT_COO:
@@ -1100,6 +1114,12 @@ flagsparseStatus_t flagsparseSpMV_bufferSize(
         // segments. COO has to be given one -- rows + 1 int32 for the row-offsets
         // array its segment route runs on.
         const SpMatDescr* A = spmat(matA);
+        if (musa_gather_type(A) &&
+            ((A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
+             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA)))) {
+            *bufferSize = gather_bytes(A);
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
         if (A->format == FLAGSPARSE_FORMAT_COO) {
             *bufferSize = static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t);
         }
@@ -1134,6 +1154,10 @@ flagsparseStatus_t flagsparseSpMV_preprocess(
         // get their segment count from it; COO gets the row-offsets array it
         // cannot run without, and an unsorted COO is rejected right here.
         auto* A = const_cast<SpMatDescr*>(spmat(matA));
+        if (musa_gather_type(A) && externalBuffer &&
+            ((A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
+             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA))))
+            return prepare_sparse_gather(A, externalBuffer);
         if (A->format == FLAGSPARSE_FORMAT_COO) {
             if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
             if (externalBuffer == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;

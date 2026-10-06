@@ -203,6 +203,7 @@ flagsparseStatus_t flagsparseCsrSetPointers(flagsparseSpMatDescr_t descr,
     d->max_row_nnz = -1;
     d->coo_offsets_buffer = nullptr;
     d->spmm_transpose_buffer = nullptr;
+    d->sparse_gather_buffer = nullptr;
     d->sddmm_row_ids_buffer = nullptr;
     return FLAGSPARSE_STATUS_SUCCESS;
 }

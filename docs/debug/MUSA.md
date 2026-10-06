@@ -1,8 +1,7 @@
 # 摩尔线程 MUSA（S5000）debug
 
-2026-10-06：C API CSR SpMM 转置增加不均匀行的 nnz 均衡路由；本机 CUDA 验证见
-[CUDA 手册](CUDA.md)。新的 workspace gather 仅 CUDA 启用；
-MUSA 真机精度/性能待复测，历史数字未替换。
+2026-10-06：MUSA C API 已完成 q4 全部 45 变体的 10 个真实 MatrixMarket 矩阵复测。
+当前权威数据、精度状态与复现命令见下一节；10 月 5 日合成矩阵结果保留为历史快照。
 
 `FLAGSPARSE_BACKEND=mthreads`。环境、交付复现见 [../MUSA.md](../MUSA.md)。
 
@@ -28,7 +27,99 @@ FLAGSPARSE_BENCH_OUT=./capi/bench-musa \
 交付报告需要合并 Python 精度与 muSPARSE 性能时，使用
 `run_flagsparse_split_delivery.py`；它不替代上述 C API 全量调试入口。
 
-### 2026-10-05 本机 45 变体复现
+### 2026-10-06：45 变体、10 个真实矩阵完整复测（当前结果）
+
+本轮在 MTT S5000（MUSA arch 31、muSPARSE 4.3.5）完成。输入固定为
+`capi/bench-musa-real-corpus/` 的 10 个 MatrixMarket 文件：ASIC_680ks、GL7d14、
+NACA0015、amazon0601、auto、cage12、cfd2、filter3D、roadNet-TX、wave。
+该目录特意不含 `tests/data/q4_worker_smoke.mtx`，后者只用于 SpGEMM runner smoke，
+不得计入性能平均。
+
+完整性能轮次 **7/7 通过，1078.74 秒**；warmup=10、iters=100，取同步墙钟时间中位数。
+45/45 q4 变体都实际进入 C API benchmark，共 464 条 q4 测量行：445 strict pass、
+5 pass_relaxed、10 fail、4 unchecked。`pass_relaxed` 和厂商基线未严格通过的行不计入
+下表加速比。修复 SpGEMM 空结果行指针后，C API 独立 accuracy 已为 **7/7 测试族通过**；
+性能轮次的 SpGEMM 也通过。
+
+加速比定义为 `muSPARSE_ms / FlagSparse_ms`；大于 1 表示 FlagSparse 更快。P/R/F/U 分别为
+FlagSparse 严格通过/放宽通过/失败/未校验的行数。加速比只对 FlagSparse 与 muSPARSE **双方
+严格通过**的行取算术平均；N/A 表示本轮没有可比的厂商基线，并不表示未执行。
+
+| 变体 | P/R/F/U | 双方严格平均（行数） |
+|---|---:|---:|
+| `axpby_f16_int` | 1/0/0/0 | N/A |
+| `scatter_i8_int` | 10/0/0/0 | N/A |
+| `sddmm_csr_c32_int_non_non_row` | 20/0/0/0 | 13.546x (20) |
+| `sddmm_csr_f16_int_non_non_row` | 20/0/0/0 | N/A |
+| `sddmm_csr_f32_int_non_non_col` | 20/0/0/0 | 35.218x (20) |
+| `sddmm_csr_f32_int_non_trans_row` | 20/0/0/0 | 34.687x (20) |
+| `sddmm_csr_f32_int_trans_non_row` | 20/0/0/0 | 22.732x (20) |
+| `spgemm_csr_f32_int_non_non` | 6/0/0/4 | 0.669x (5) |
+| `spmm_coo_c32_int_non_non_row` | 10/0/0/0 | 0.944x (10) |
+| `spmm_coo_f16_int_non_non_row` | 9/0/1/0 | N/A |
+| `spmm_coo_i8i32_int_non_non_row` | 10/0/0/0 | N/A |
+| `spmm_csc_c32_int_non_non_row` | 10/0/0/0 | 3.528x (10) |
+| `spmm_csc_f16_int_non_non_row` | 9/0/1/0 | N/A |
+| `spmm_csc_f32_int_non_non_row` | 10/0/0/0 | 2.127x (9) |
+| `spmm_csr_c32_int_non_non_row` | 10/0/0/0 | 1.071x (10) |
+| `spmm_csr_f16_int_non_non_row` | 9/0/1/0 | N/A |
+| `spmm_csr_f16f32_int_non_non_row` | 9/0/1/0 | N/A |
+| `spmm_csr_f32_int_non_non_col` | 10/0/0/0 | 0.887x (10) |
+| `spmm_csr_f32_int_non_trans_row` | 10/0/0/0 | 0.785x (10) |
+| `spmm_csr_f32_int_trans_non_row` | 9/1/0/0 | 1.725x (8) |
+| `spmm_csr_i8i32_int_non_non_row` | 10/0/0/0 | N/A |
+| `spmv_coo_c32_int_conj` | 9/1/0/0 | 0.978x (9) |
+| `spmv_coo_c32_int_non` | 10/0/0/0 | 2.585x (10) |
+| `spmv_coo_f16_int_non` | 9/0/1/0 | N/A |
+| `spmv_coo_f16f32_int_non` | 9/0/1/0 | N/A |
+| `spmv_coo_f32_int_trans` | 9/1/0/0 | 0.877x (9) |
+| `spmv_coo_i8i32_int_non` | 10/0/0/0 | N/A |
+| `spmv_csc_c32_int_non` | 10/0/0/0 | 0.904x (10) |
+| `spmv_csc_f16_int_non` | 9/0/1/0 | N/A |
+| `spmv_csc_f32_int_non` | 10/0/0/0 | 1.009x (10) |
+| `spmv_csr_c32_int_conj` | 9/1/0/0 | 0.905x (9) |
+| `spmv_csr_c32_int_non` | 10/0/0/0 | 0.924x (10) |
+| `spmv_csr_f16_int_non` | 9/0/1/0 | N/A |
+| `spmv_csr_f16f32_int_non` | 9/0/1/0 | N/A |
+| `spmv_csr_f32_int_trans` | 9/1/0/0 | 0.977x (9) |
+| `spmv_csr_f32c32_int_non` | 10/0/0/0 | N/A |
+| `spmv_csr_i8f32_int_non` | 10/0/0/0 | N/A |
+| `spmv_csr_i8i32_int_non` | 10/0/0/0 | N/A |
+| `spmv_sell_c32_int_non` | 10/0/0/0 | N/A |
+| `spmv_sell_f16_int_non` | 9/0/1/0 | N/A |
+| `spmv_sell_f32_int_non` | 10/0/0/0 | N/A |
+| `spmv_sell_i8i32_int_non` | 10/0/0/0 | N/A |
+| `spvv_c32_int_conj` | 1/0/0/0 | 0.686x (1) |
+| `spvv_f16f32_int_non` | 1/0/0/0 | N/A |
+| `spvv_i8i32_int_non` | 1/0/0/0 | N/A |
+
+此前 8 项 MUSA gather 优化的真实矩阵提升已纳入上表：CSC f32 SpMV 0.376x -> 1.009x、
+CSR c32 SpMV 0.142x -> 0.924x、CSR f32 transpose SpMV 0.386x -> 0.977x、CSC c32 SpMV
+0.396x -> 0.904x；CSR c32 SpMM 0.203x -> 1.071x、CSC f32 SpMM 0.017x -> 2.127x、CSR f32
+transpose SpMM 0.541x -> 1.725x、CSC c32 SpMM 0.017x -> 3.528x。前后均为双方严格通过行的
+算术平均；前后独立运行，微小波动属正常。
+
+原始结果在 [最终汇总](../../capi/bench-musa-real-q4-real10-20261006/summary_q4.json)、
+[SpMV](../../capi/bench-musa-real-q4-real10-20261006/spmv_benchmark.json)、
+[SpMM](../../capi/bench-musa-real-q4-real10-20261006/spmm_benchmark.json) 及同目录的其余
+`*_benchmark.json` / `*_accuracy.json`。所有 benchmark JSON 已用 `python -m json.tool`
+验证。报告器现将非有限误差写成 JSON `null`，避免此前 `inf` 令
+`write_summary_q4.py` 解析失败；失败状态和错误详情仍保留。
+
+复现：
+
+```bash
+cmake --build capi/build-musa -j16
+export FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa
+export FLAGSPARSE_MATRIX_DIR="$PWD/capi/bench-musa-real-corpus"
+export FLAGSPARSE_BENCH_OUT="$PWD/capi/bench-musa-real-q4-retest"
+ctest --test-dir capi/build-musa -L capi \
+  -R '^benchmark\\.(axpby|spmv|spmm|spvv|spgemm|sddmm|scatter)$' --output-on-failure
+python3 capi/tools/write_summary_q4.py \
+  --bench-dir "$FLAGSPARSE_BENCH_OUT" --out "$FLAGSPARSE_BENCH_OUT"
+```
+
+### 2026-10-05：合成矩阵历史记录
 
 以下命令均在仓库根目录执行。当前本机为 MTT S5000，torch / torch_musa
 2.7.1、Triton 3.6.0，环境检查返回 `mthreads musa None`。C API 已在
@@ -121,7 +212,7 @@ python3 capi/tools/write_summary_q4.py \
   SpMM 重跑中 **2/2 通过，415.51 秒**。这些轮次都只重跑受影响的算子族；其余结果仍以
   上述完整 45 变体产物为准。
 
-### 2026-10-05：最新合并结果与打包说明
+### 2026-10-05：历史合并结果与打包说明
 
 本节按算子族选取最后一次有效复跑，未重新执行整套测试。前文首轮统计保留作历史对照。
 
@@ -141,7 +232,7 @@ CTest 通过只表示测试进程通过，不代表其中每行精度通过。
 
 测试使用合成方阵：8192 阶、密度 0.001；32768 阶、密度 0.0005；131072 阶、密度 0.0001。
 SpMM 的稠密输出列数为 8；SDDMM 的 K 为 16/64，每变体 6 行；AXPBY/SpVV 使用长度 4、
-稀疏 nnz=3 的小用例，各 1 行；Scatter 各 3 行。尚无真实 MatrixMarket 语料性能结论。
+稀疏 nnz=3 的小用例，各 1 行；Scatter 各 3 行。该历史批次尚无真实 MatrixMarket 语料性能结论。
 预热 10 次、测量 100 次，取含同步的墙钟中位数；不包含首次 JIT 和矩阵生成。
 
 下表 P/R/F/U 分别为严格通过、放宽通过、失败、未校验的行数。严格通过指现有测试器的

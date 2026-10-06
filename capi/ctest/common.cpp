@@ -485,14 +485,15 @@ void write_accuracy_json(const std::string& op, const std::vector<BenchRow>& row
             out << ", \"" << kv.first << "\": \"" << kv.second << "\"";
         }
         out << ", \"accuracy\": \"" << r.accuracy << "\"";
-        if (r.accuracy != "unchecked") {
+        if (r.accuracy != "unchecked" && std::isfinite(r.error_ratio) &&
+            std::isfinite(r.relaxed_error_ratio)) {
             out << ", \"error_ratio\": " << std::setprecision(6) << r.error_ratio
                 << ", \"relaxed_error_ratio\": " << r.relaxed_error_ratio;
         } else {
             out << ", \"error_ratio\": null, \"relaxed_error_ratio\": null";
         }
         out << ", \"baseline_accuracy\": \"" << r.baseline_accuracy << "\"";
-        if (r.baseline_accuracy != "unchecked") {
+        if (r.baseline_accuracy != "unchecked" && std::isfinite(r.baseline_error_ratio)) {
             out << ", \"baseline_error_ratio\": " << std::setprecision(6)
                 << r.baseline_error_ratio;
         }
@@ -558,7 +559,8 @@ void BenchReport::write() const {
         // value: a fabricated baseline is worse than none, and a speedup over an
         // answer we did not check is worse still.
         out << ", \"accuracy\": \"" << r.accuracy << "\"";
-        if (r.accuracy != "unchecked") {
+        if (r.accuracy != "unchecked" && std::isfinite(r.error_ratio) &&
+            std::isfinite(r.relaxed_error_ratio)) {
             out << ", \"error_ratio\": " << std::setprecision(6) << r.error_ratio
                 << ", \"relaxed_error_ratio\": " << r.relaxed_error_ratio;
         } else {
@@ -566,7 +568,7 @@ void BenchReport::write() const {
         }
         out << ", \"baseline\": \"" << baseline::name() << "\"";
         out << ", \"baseline_accuracy\": \"" << r.baseline_accuracy << "\"";
-        if (r.baseline_accuracy != "unchecked") {
+        if (r.baseline_accuracy != "unchecked" && std::isfinite(r.baseline_error_ratio)) {
             out << ", \"baseline_error_ratio\": " << std::setprecision(6)
                 << r.baseline_error_ratio;
         } else {
@@ -581,7 +583,7 @@ void BenchReport::write() const {
         } else {
             out << ", \"baseline_ms\": null";
         }
-        if (r.speedup > 0) {
+        if (r.speedup > 0 && std::isfinite(r.speedup)) {
             out << ", \"speedup\": " << std::setprecision(6) << r.speedup;
         } else {
             out << ", \"speedup\": null";

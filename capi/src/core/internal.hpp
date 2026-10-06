@@ -100,6 +100,8 @@ struct SpMatDescr {
     void* coo_offsets_buffer = nullptr;
     // CSR transpose topology lives in caller-owned SpMM scratch, never values.
     void* spmm_transpose_buffer = nullptr;
+    // MUSA SpMV/SpMM output-row topology in caller-owned scratch.
+    void* sparse_gather_buffer = nullptr;
 
     // SDDMM expands the CSR pattern to one row id per nonzero, into the caller's
     // externalBuffer. Same contract as coo_offsets_buffer: remembering which

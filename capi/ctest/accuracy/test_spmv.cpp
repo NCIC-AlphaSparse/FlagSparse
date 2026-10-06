@@ -1038,6 +1038,74 @@ TEST_F(SpMVAccuracy, CooEmptyRowsStillApplyBeta) {
 // per column); the non-transposed one scatters with atomics and takes its beta
 // from the dense prologue, so it is the one that would break first if that
 // prologue were wrong.
+TEST_F(SpMVAccuracy, GatherComplexDuplicatesEmptyRowsAndLiveTopology) {
+    using C = std::complex<float>;
+    // Same compressed structure denotes CSR(4x5)^H or CSC(5x4).
+    const std::vector<int32_t> ptr{0, 2, 2, 3, 4}, indices{0, 0, 2, 1};
+    const std::vector<C> values{C(1, 2), C(-2, 1), C(3, -1), C(2, 4)};
+    const std::vector<C> x{C(2, 1), C(-1, 3), C(1, -2), C(4, 1)};
+    const std::vector<C> initial(5, C(1, -1));
+    const C alpha(1.25f, -0.75f), beta(-0.5f, 0.25f);
+    for (auto format : {FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_FORMAT_CSC}) {
+        const bool csr = format == FLAGSPARSE_FORMAT_CSR;
+        const auto op = csr ? FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE
+                            : FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+        auto dp = DeviceBuffer::from(ptr), di = DeviceBuffer::from(indices);
+        auto dv = DeviceBuffer::from(values), dx = DeviceBuffer::from(x);
+        auto dy = DeviceBuffer::from(initial);
+        flagsparseSpMatDescr_t a = nullptr;
+        flagsparseDnVecDescr_t xd = nullptr, yd = nullptr;
+        if (csr) {
+            ASSERT_EQ(flagsparseCreateCsr(&a, 4, 5, 4, dp.get(), di.get(), dv.get(),
+                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        } else {
+            ASSERT_EQ(flagsparseCreateCsc(&a, 5, 4, 4, dp.get(), di.get(), dv.get(),
+                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        }
+        ASSERT_EQ(flagsparseCreateDnVec(&xd, 4, dx.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnVec(&yd, 5, dy.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, op, &alpha, a, xd, &beta, yd,
+            FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+        DeviceBuffer scratch(bytes), second(bytes);
+        ASSERT_EQ(flagsparseSpMV_preprocess(handle.h, op, &alpha, a, xd, &beta, yd,
+            FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+        auto current_ptr = ptr;
+        auto current_values = values;
+        for (int step = 0; step < 3; ++step) {
+            // New scratch must prepare lazily; replacing CSR pointers invalidates topology.
+            if (step == 1) {
+                for (auto& v : current_values) v *= C(0.5f, 0.25f);
+                ASSERT_EQ(to_device(dv.get(), current_values.data(), current_values.size() * sizeof(C)),
+                    FLAGSPARSE_STATUS_SUCCESS);
+            }
+            if (step == 2 && csr) {
+                current_ptr = {0, 1, 1, 2, 4};
+                ASSERT_EQ(to_device(dp.get(), current_ptr.data(), current_ptr.size() * sizeof(int32_t)),
+                    FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(flagsparseCsrSetPointers(a, dp.get(), di.get(), dv.get()), FLAGSPARSE_STATUS_SUCCESS);
+            }
+            ASSERT_EQ(to_device(dy.get(), initial.data(), initial.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(flagsparseSpMV(handle.h, op, &alpha, a, xd, &beta, yd,
+                FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT,
+                step == 0 ? scratch.get() : second.get()), FLAGSPARSE_STATUS_SUCCESS);
+            dev_sync();
+            std::vector<C> expected(5, beta * initial[0]);
+            for (int r = 0; r < 4; ++r)
+                for (int p = current_ptr[r]; p < current_ptr[r + 1]; ++p)
+                    expected[indices[p]] += alpha * (csr ? std::conj(current_values[p]) : current_values[p]) * x[r];
+            const auto got = dy.download<C>(5);
+            for (size_t i = 0; i < got.size(); ++i) {
+                EXPECT_NEAR(got[i].real(), expected[i].real(), 1e-5f);
+                EXPECT_NEAR(got[i].imag(), expected[i].imag(), 1e-5f);
+            }
+        }
+        flagsparseDestroyDnVec(yd); flagsparseDestroyDnVec(xd); flagsparseDestroySpMat(a);
+    }
+}
+
 TEST_F(SpMVAccuracy, CscBothDirections) {
     for (auto shape : {std::pair<int64_t, int64_t>{64, 96}, {129, 257}}) {
         const CsrMatrix A = random_csr(shape.first, shape.second, 0.05, 55);

@@ -165,6 +165,7 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
             }
 
             for (const registry::Variant* v : declared) {
+            if (!benchmark_variant_selected(*v)) continue;
                 if (delivery_csr_only &&
                     (std::string(v->format) != "csr" ||
                      (std::string(v->dtype) != "f32" && std::string(v->dtype) != "f64"))) {
