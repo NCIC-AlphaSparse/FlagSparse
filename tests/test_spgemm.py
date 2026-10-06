@@ -785,7 +785,6 @@ def _run_matrix_worker(args):
             ref_isolated_retry=args.ref_isolated_retry,
             ref_cleanup=args.ref_cleanup,
             compare_device=args.compare_device,
-            isolate_matrices=ast_common._is_maca_runtime(),
         )
         torch.save({"success": True, "entry": entry}, args._worker_output)
         return 0
@@ -2329,7 +2328,13 @@ def main():
     parser.add_argument(
         "--_worker-no-cleanup", action="store_true", help=argparse.SUPPRESS
     )
+    parser.add_argument("--_matrix-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args._matrix_worker:
+        if not args._worker_mtx or not args._worker_output:
+            raise SystemExit("worker mode requires --_worker-mtx and --_worker-output")
+        raise SystemExit(_run_matrix_worker(args))
 
     if args._ref_worker is not None:
         if not args._worker_mtx or not args._worker_output:

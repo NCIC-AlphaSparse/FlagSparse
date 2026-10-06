@@ -110,6 +110,9 @@ VARIANTS = {
         Variant("spmm_coo_f16_int_non_non_row", "spmm", "coo", f16, f16),
         Variant("spmm_coo_i8i32_int_non_non_row", "spmm", "coo", i8, i32),
     ],
+    "spmm_csc": [
+        Variant("spmm_csc_f16_int_non_non_row", "spmm", "csc", f16, f16),
+    ],
     "sddmm_csr": [
         Variant("sddmm_csr_f32_int_non_non_col", "sddmm", "csr", f32, f32, layout="col"),
         Variant("sddmm_csr_f32_int_non_trans_row", "sddmm", "csr", f32, f32, op_b="trans"),
@@ -357,6 +360,35 @@ def _time_pytorch(row, build, warmup, iters):
         row["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
 
 
+def _time_cupy(row, mat, values, dense, op_a, op_b, warmup, iters, reference):
+    """CuPy CSR of op(A), with the same outside-timing setup as PyTorch."""
+    try:
+        import cupy as cp
+        import cupyx.scipy.sparse as cps
+        compute = torch.float32 if values.dtype in (torch.float16, torch.bfloat16, torch.int8) else values.dtype
+        compute = torch.promote_types(compute, dense.dtype)
+        row["cupy_compute_dtype"] = _name(compute)
+        a = cps.csr_matrix((cp.from_dlpack(values.to(compute)),
+                            cp.from_dlpack(mat.cols), cp.from_dlpack(mat.ptr)), shape=mat.shape)
+        if op_a != "non":
+            a = (a.conj().T if op_a == "conj" else a.T).tocsr()
+        b = cp.from_dlpack(_op_t(dense, op_b).to(compute).contiguous())
+        if b.ndim == 2:
+            # CuPy converts a row-major RHS inside sparse matmul. Hoist it out,
+            # just like its sparse-format setup and our prepared layout setup.
+            b = cp.asfortranarray(b)
+        row["cupy_rhs_layout"] = "column-major" if b.ndim == 2 else "vector"
+        run = lambda: a @ b
+        output, elapsed = _benchmark_cuda_op(run, warmup, iters)
+        error = _error(cp.asnumpy(output), reference)
+        row["cupy_max_error"] = error
+        if error > _TOL.get(compute, 1e-10):
+            raise RuntimeError(f"CuPy correctness check failed: {error}")
+        row["cupy_ms"] = elapsed
+    except Exception as exc:
+        row["cupy_reason"] = f"{type(exc).__name__}: {exc}"
+
+
 def _spmv(v, mat, gen, warmup, iters, row):
     m, n = mat.shape
     x_len = n if v.op_a == "non" else m
@@ -411,6 +443,8 @@ def _spmv(v, mat, gen, warmup, iters, row):
         return lambda: a @ xc
 
     _time_pytorch(row, build_torch, warmup, iters)
+    if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
+        _time_cupy(row, mat, vals, x, v.op_a, "non", warmup, iters, ref)
     return v.out
 
 
@@ -428,7 +462,13 @@ def _spmm(v, mat, gen, warmup, iters, row):
     if v.fmt == "bell":
         return _spmm_bell(v, mat, vals, vals_cpu, B, ref, warmup, iters, row)
     kw = {} if v.out == default_out else {"out_dtype": v.out}
-    if v.fmt in ("csr", "coo") and mixed_spmx.spmm_needs_mixed(
+    if v.fmt == "csc":
+        row["timed"] = "call"
+        csc_vals, csc_rows, csc_ptr = mat.arrays("csc", vals)
+        ours = lambda: fs.flagsparse_spmm_csc(
+            csc_vals, csc_rows, csc_ptr, _op_t(B, v.op_b), mat.shape, op=v.op_a, **kw
+        )
+    elif v.fmt in ("csr", "coo") and mixed_spmx.spmm_needs_mixed(
         v.value, None, kw.get("out_dtype")
     ):
         row["timed"] = "call"
@@ -481,6 +521,23 @@ def _spmm(v, mat, gen, warmup, iters, row):
         return lambda: torch.sparse.mm(a, bc)
 
     _time_pytorch(row, build_torch, warmup, iters)
+    if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
+        _time_cupy(row, mat, vals, B, v.op_a, v.op_b, warmup, iters, ref)
+    if (os.environ.get("FLAGSPARSE_BENCH_CAPI") == "1"
+            and v.fmt == "csr" and v.value == torch.float32 and v.op_a == "trans"):
+        from flagsparse_capi_bench import prepare_spmm
+        target = torch.empty(m_eff, DENSE_COLS, dtype=v.out, device=mat.dev)
+        run, close = prepare_spmm(vals, mat.cols, mat.ptr, mat.shape, B, target, v.op_a, v.op_b)
+        try:
+            result, elapsed = _benchmark_cuda_op(run, warmup, iters)
+            row["capi_max_error"] = _error(result, ref)
+            if not _passes(v.out, row["capi_max_error"]):
+                raise RuntimeError("C API correctness check failed")
+            row["capi_ms"] = elapsed
+            row["capi_speedup_vs_pytorch"] = _ratio(row.get("pytorch_ms"), elapsed)
+            row["capi_speedup_vs_cupy"] = _ratio(row.get("cupy_ms"), elapsed)
+        finally:
+            close()
     return v.out
 
 
@@ -558,9 +615,7 @@ def _sddmm(v, mat, gen, warmup, iters, row):
             x=A, y=B, prepared=prepared, op_a=v.op_a, op_b=v.op_b, dense_layout=v.layout
         )
 
-    first = fs.flagsparse_sddmm_csr(
-        None, mat.cols, mat.ptr, A, B, shape=mat.shape, op_a=v.op_a, op_b=v.op_b, dense_layout=v.layout
-    )
+    first = ours()
     row["max_error"] = _error(first, ref)
     row["out_dtype"] = _name(first.dtype)
     row["dense_cols"] = kd
@@ -577,14 +632,51 @@ def _sddmm(v, mat, gen, warmup, iters, row):
     _time_vendor(row, plan, warmup, iters)
 
     def build_torch():
+        compute = torch.float32 if v.value == torch.float16 else v.value
         pattern = torch.sparse_csr_tensor(
-            mat.ptr.long(), mat.cols.long(), torch.zeros(mat.csr.nnz, dtype=v.value, device=mat.dev), mat.shape
+            mat.ptr.long(), mat.cols.long(), torch.zeros(mat.csr.nnz, dtype=compute, device=mat.dev), mat.shape
         )
-        a_op, b_op = _op_t(A, v.op_a), _op_t(B, v.op_b)
+        row["pytorch_compute_dtype"] = _name(compute)
+        a_op, b_op = _op_t(A, v.op_a).to(compute), _op_t(B, v.op_b).to(compute)
         return lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
 
     _time_pytorch(row, build_torch, warmup, iters)
+    if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
+        _time_cupy_sddmm(row, mat, A, B, v.op_a, v.op_b, warmup, iters, ref)
     return v.out
+
+
+def _time_cupy_sddmm(row, mat, A, B, op_a, op_b, warmup, iters, reference):
+    """CuPy gather/product/reduction; CuPy has no native sampled_addmm API.
+
+    Chunking bounds temporary memory; gathering and reduction remain timed.
+    Complex multiplication is not conjugated, matching sampled_addmm.
+    """
+    try:
+        import cupy as cp
+        compute = torch.float32 if A.dtype == torch.float16 else A.dtype
+        a = cp.from_dlpack(_op_t(A, op_a).to(compute).contiguous())
+        bt = cp.from_dlpack(_op_t(B, op_b).t().to(compute).contiguous())
+        rows, cols = cp.from_dlpack(mat.rows), cp.from_dlpack(mat.cols)
+        row["cupy_compute_dtype"] = _name(compute)
+        row["cupy_method"] = "chunked gather, multiply, sum (not native cuSPARSE SDDMM)"
+        row["cupy_chunk_nnz"] = 262144
+
+        def run():
+            out = cp.empty(cols.size, dtype=a.dtype)
+            for lo in range(0, cols.size, 262144):
+                hi = min(lo + 262144, cols.size)
+                out[lo:hi] = cp.sum(a[rows[lo:hi]] * bt[cols[lo:hi]], axis=1)
+            return out
+
+        output, elapsed = _benchmark_cuda_op(run, warmup, iters)
+        error = _error(cp.asnumpy(output), reference)
+        row["cupy_max_error"] = error
+        if error > _TOL.get(compute, 1e-10):
+            raise RuntimeError(f"CuPy correctness check failed: {error}")
+        row["cupy_ms"] = elapsed
+    except Exception as exc:
+        row["cupy_reason"] = f"{type(exc).__name__}: {exc}"
 
 
 _KINDS = {"spmv": _spmv, "spmm": _spmm, "sddmm": _sddmm}

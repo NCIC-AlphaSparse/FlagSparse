@@ -767,6 +767,7 @@ class PreparedCooSpmmRoute:
         "compute_dtype",
         "op",
         "alg",
+        "gather_ptr",
     )
 
     def __init__(
@@ -798,6 +799,10 @@ class PreparedCooSpmmRoute:
         self.compute_dtype = compute_dtype
         self.op = str(op)
         self.alg = str(alg)
+        self.gather_ptr = None
+        if _backend_name() == "cuda" and self.output_dtype == torch.complex64:
+            counts = torch.bincount(row.long(), minlength=self.n_rows)
+            self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
 
 
 @triton.jit
@@ -1938,7 +1943,7 @@ def _prepare_spmm_coo_matrix(data, row, col, shape):
     return data.contiguous(), kernel_row, kernel_col, (n_rows, n_cols)
 
 
-def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout):
+def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, *, wide=True):
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -1955,7 +1960,7 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout):
         )
     B_compute = (
         B
-        if prepared.compute_dtype == prepared.output_dtype
+        if not wide or prepared.compute_dtype == prepared.output_dtype
         else B.to(prepared.compute_dtype)
     )
     return _materialize_dense_layout(B_compute, dense_layout)
@@ -1965,7 +1970,9 @@ def _run_spmm_coo_rowrun_route(
     prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
 ):
     dense_layout = _normalize_dense_layout(dense_layout)
-    B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
+    use_gather = (prepared.gather_ptr is not None and torch.is_tensor(B)
+                  and B.ndim == 2 and int(B.shape[1]) == 32)
+    B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, wide=not use_gather)
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -1974,20 +1981,26 @@ def _run_spmm_coo_rowrun_route(
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    C = _triton_spmm_coo_rowrun_impl(
-        prepared.data,
-        prepared.row,
-        prepared.col,
-        B,
-        prepared.n_rows,
-        int(B.shape[1]),
-        block_n=launch["block_n"],
-        block_nnz=launch["block_nnz"],
-        output_dtype=prepared.output_dtype,
-        dense_layout=dense_layout,
-        seg_starts=prepared.seg_starts,
-        num_warps=launch["num_warps"],
-    )
+    if use_gather:
+        from . import _spmm_row_gather
+        C = _empty_dense_layout((prepared.n_rows, int(B.shape[1])), prepared.output_dtype,
+                                prepared.data.device, dense_layout)
+        C = _spmm_row_gather.compute(prepared.data, prepared.col, prepared.gather_ptr, B, C)
+    else:
+        C = _triton_spmm_coo_rowrun_impl(
+            prepared.data,
+            prepared.row,
+            prepared.col,
+            B,
+            prepared.n_rows,
+            int(B.shape[1]),
+            block_n=launch["block_n"],
+            block_nnz=launch["block_nnz"],
+            output_dtype=prepared.output_dtype,
+            dense_layout=dense_layout,
+            seg_starts=prepared.seg_starts,
+            num_warps=launch["num_warps"],
+        )
     if timing:
         end.record()
         _ACCEL.synchronize()
@@ -2031,6 +2044,12 @@ def _run_spmm_coo_rowrun_route(
             "c_stride": tuple(int(v) for v in C.stride()),
             "output_layout": _dense_layout_name(C),
         }
+        if use_gather:
+            batch, lanes = (8, 4) if prepared.avg_nnz_per_row <= 4 else (4, 8)
+            meta["diagnostics"].update(launch_version="coo_batched_gather_v1",
+                block_n=32, block_nnz=lanes, batch_rows=batch, num_warps=4,
+                grid_m=triton.cdiv(prepared.n_rows, batch), grid_n=1,
+                compute_dtype="complex64")
     return C, meta
 
 

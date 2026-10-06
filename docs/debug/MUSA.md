@@ -1,5 +1,9 @@
 # 摩尔线程 MUSA（S5000）debug
 
+2026-10-06：C API CSR SpMM 转置增加不均匀行的 nnz 均衡路由；本机 CUDA 验证见
+[基线复测报告](Q4_BASELINE_RETEST_20261006.md)。新的 workspace gather 仅 CUDA 启用；
+MUSA 真机精度/性能待复测，历史数字未替换。
+
 `FLAGSPARSE_BACKEND=mthreads`。环境、交付复现见 [../MUSA.md](../MUSA.md)。
 
 ## 0. 当前入口：MUSA C API
@@ -23,6 +27,236 @@ FLAGSPARSE_BENCH_OUT=./capi/bench-musa \
 
 交付报告需要合并 Python 精度与 muSPARSE 性能时，使用
 `run_flagsparse_split_delivery.py`；它不替代上述 C API 全量调试入口。
+
+### 2026-10-05 本机 45 变体复现
+
+以下命令均在仓库根目录执行。当前本机为 MTT S5000，torch / torch_musa
+2.7.1、Triton 3.6.0，环境检查返回 `mthreads musa None`。C API 已在
+`capi/build-musa` 配置并编译成功，基线找到 `/usr/local/musa/lib/libmusparse.so`。
+
+```bash
+export FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+export FLAGSPARSE_BENCH_OUT="$PWD/capi/bench-musa-local"
+mkdir -p "$FLAGSPARSE_BENCH_OUT"
+
+# 45 个变体 × 两个规模，加一项清单检查。
+python3 -m pytest tests/pytest/test_q4_variants_accuracy.py -v \
+  --record json --output "$FLAGSPARSE_BENCH_OUT/q4_accuracy_result.json"
+
+cmake -S capi -B capi/build-musa -G Ninja \
+  -DBACKEND=MUSA -DMUSA_HOME="$MUSA_HOME" \
+  -DCMAKE_BUILD_TYPE=Release -DFLAGSPARSE_CTEST_TIMEOUT=3600
+cmake --build capi/build-musa -j 16
+
+# q4 涉及的七个 C API 算子族；每个族内部覆盖多个变体。
+ctest --test-dir capi/build-musa -L capi \
+  -R '^accuracy\.(axpby|spmv|spmm|spvv|spgemm|sddmm|scatter)$' --output-on-failure
+
+# 性能：先用默认合成矩阵检查覆盖；真实语料则设置为 "$PWD/tests/data"。
+unset FLAGSPARSE_MATRIX_DIR
+ctest --test-dir capi/build-musa -L capi \
+  -R '^benchmark\.(axpby|spmv|spmm|spvv|spgemm|sddmm|scatter)$' --output-on-failure
+python3 capi/tools/write_summary_q4.py \
+  --bench-dir "$FLAGSPARSE_BENCH_OUT" --out "$FLAGSPARSE_BENCH_OUT"
+```
+
+输出目录用绝对路径，避免 CTest 切换工作目录后将 JSON 写到意外位置。
+`run_flagsparse_split_delivery.py` 是 20 变体交付入口，不能代替这里的 45 变体检查。
+
+本次精度验证：
+
+- Python 精度 **91 passed，50.22 秒**。SpGEMM 测试原先在 MUSA 上展开 CSR
+  结果，因缺少 `aten::_to_dense` 而失败；现将算子输出搬到 CPU 再展开比较，
+  算子本身仍在 MUSA 执行。
+- C API 七个相关精度测试族 **6 passed、1 failed**。SpGEMM 的 `Float32` 等
+  四项通过，`EmptyRowsAndEmptyResult` 失败：`empty_a` 的输出行指针未初始化。
+  `capi/src/ops/spgemm.cpp` 的 copy 路径在 `C->nnz == 0` 时直接返回，未复制
+  行指针；这是独立的 C API 边界问题，不能将本次结果描述成 C API 全通过。
+- 原始记录在 `capi/bench-musa-local/python-accuracy.log`、
+  `q4_accuracy_result.json` 和 `capi-accuracy.log`。
+
+本次性能验证（2026-10-05，默认合成矩阵）：
+
+- 七个 benchmark 测试族串行运行结束，CTest **7/7 通过，1439.34 秒**。
+  预热 10 次、计时 100 次，取包含设备同步的墙钟时间中位数；首次 JIT 与矩阵
+  生成在计时之外。合成矩阵为 8192、32768、131072 阶；向量算子使用各自的小用例。
+  当前生成器逐元素扫描，且各进程重复生成，是整轮约 24 分钟的主要准备开销。
+- **45/45 变体有有效性能行**。`summary_q4.json` 为 8 `Passed`、37 `Measured`：
+  前者有可用 muSPARSE 加速比，后者只有自身耗时。此状态只要求至少一行有效，
+  **不能解释为 45 个变体的全部用例精度通过**。
+- q4 共 **142 行**：111 严格精度通过、7 放宽精度通过、23 精度失败、1 未校验。
+  失败分布于 SpMV 的 7 个变体（9 行）和 SpMM 的 7 个变体（14 行）。SDDMM
+  五个 q4 变体共 30 行全部通过，但当前测试框架未接入相应 op/order 厂商基线。
+- SpGEMM 的最大规模超过检查预算，标为 `unchecked` 且不提供加速比。SpGEMM
+  只计 `compute`，不包含 `copy` 中的 MUSA CPU 结果生成，不能视为端到端耗时。
+- 产物在 `capi/bench-musa-q4-20261005T154023Z/`：`REPORT.md` 为 45 变体表，
+  `q4_rows.csv` 保留包括 K 值在内的逐行参数和失败原因，`q4_variants.csv` 为变体汇总，
+  另有原始 `*_benchmark.json`、`summary_q4.json`、`ctest.log`、`ctest-detail.log`
+  和 `run_metadata.json`。这是合成性能验证，尚未运行真实 MatrixMarket 语料性能测试。
+
+### 2026-10-05：muSPARSE 基线扩展（仅 MUSA）
+
+`FLAGSPARSE_MUSA_BASELINE_EXTENSIONS` 只在 `BACKEND=MUSA` 的 CTest 构建中定义；
+其他后端保留原有 benchmark 分支；共享结构和 Python 测试的影响见下方范围说明。扩展了 13 个此前缺基线的 f32/c32
+候选，4 个测试族在默认合成矩阵上 **4/4 通过，839.06 秒**。
+
+- 已获得有效基线的 13 个变体：`spvv_c32_int_conj`；
+  `spmv_csc_f32_int_non`、`spmv_csc_c32_int_non`；
+  `spmm_csr_f32_int_non_trans_row`、`spmm_csr_c32_int_non_non_row`、
+  `spmm_coo_c32_int_non_non_row`、`spmm_csr_f32_int_trans_non_row`；以及
+  `spmm_csc_f32_int_non_non_row`、`spmm_csc_c32_int_non_non_row`；以及
+  `sddmm_csr_f32_int_non_non_col`、`sddmm_csr_f32_int_non_trans_row`、
+  `sddmm_csr_f32_int_trans_non_row`、`sddmm_csr_c32_int_non_non_row`。
+- 原生 CSC descriptor 在 muSPARSE setup / buffer-size 阶段返回 status 2；实测后采用
+  CSC(A) 与 CSR(A^T) 的等价表示，把 CSC 缓冲区作为 `A^T` 的 CSR 并翻转 opA；这不引入
+  格式转换或额外计时。本文件将其说明为 CSC 的 CSR-transpose 回退基线，原始 JSON 尚无独立标记。
+- SDDMM 的四个变体在三种矩阵规模、K=16/64 的 24 行均通过 FlagSparse 和 muSPARSE
+  的严格精度检查；SpVV c32 也通过。SpMM 的四个新路径可运行；较大两种规模按既有
+  规则为 `pass_relaxed`，因为两边都未过严格 CPU oracle。
+- 首轮四族结果位于 `capi/bench-musa-q4-baseline-20261005T161300Z/`，包括四个原始
+  `*_benchmark.json` 与 `ctest.log`；随后修复 COO descriptor 兼容性后，SpMM 在
+  `capi/bench-musa-q4-baseline-20261005T164200Z/` 复跑并通过，后者是 COO SpMM c32
+  基线的中间记录。CSC 回退在 `capi/bench-musa-q4-baseline-20261005T205000Z/` 的 SpMV/
+  SpMM 重跑中 **2/2 通过，415.51 秒**。这些轮次都只重跑受影响的算子族；其余结果仍以
+  上述完整 45 变体产物为准。
+
+### 2026-10-05：最新合并结果与打包说明
+
+本节按算子族选取最后一次有效复跑，未重新执行整套测试。前文首轮统计保留作历史对照。
+
+| 算子族 | 最新原始结果目录（仓库根目录相对路径） |
+|---|---|
+| SpMV / SpMM | `capi/bench-musa-q4-baseline-20261005T205000Z` |
+| SpVV / SDDMM | `capi/bench-musa-q4-baseline-20261005T161300Z` |
+| AXPBY / Scatter / SpGEMM | `capi/bench-musa-q4-20261005T154023Z` |
+
+Python 精度为 **91 passed、1 warning，50.22 秒**，覆盖 45 变体的两组规模
+`64×48×16`、`257×129×33` 及清单检查。C API 独立精度测试仍为 **6/7 测试族通过**；
+SpGEMM 空结果行指针问题尚未修复，基线扩展后没有重跑该独立精度测试。
+
+最新性能结果共 **45 变体、142 行：114 pass、20 pass_relaxed、7 fail、1 unchecked**。
+**28 个变体全部行严格通过，5 个变体包含失败行；21 个变体有加速比，24 个没有。**
+CTest 通过只表示测试进程通过，不代表其中每行精度通过。
+
+测试使用合成方阵：8192 阶、密度 0.001；32768 阶、密度 0.0005；131072 阶、密度 0.0001。
+SpMM 的稠密输出列数为 8；SDDMM 的 K 为 16/64，每变体 6 行；AXPBY/SpVV 使用长度 4、
+稀疏 nnz=3 的小用例，各 1 行；Scatter 各 3 行。尚无真实 MatrixMarket 语料性能结论。
+预热 10 次、测量 100 次，取含同步的墙钟中位数；不包含首次 JIT 和矩阵生成。
+
+下表 P/R/F/U 分别为严格通过、放宽通过、失败、未校验的行数。严格通过指现有测试器的
+dtype 对应容差，不代表统一的高精度阈值。误差比例为 `max(|actual-ref|/(atol+rtol*|ref|))`，
+不超过 1 为通过；`pass_relaxed` 表示两边均未过严格检查而 FlagSparse 通过放宽检查。
+加速比为 `muSPARSE_ms / FlagSparse_ms`，大于 1 表示 FlagSparse 较快。
+“已有比值均值”对 JSON 中非空比值作算术平均，**可能包含 muSPARSE 严格精度失败的行**；
+“双方严格均值”只保留两边均为 `pass` 的行。括号为参与平均的行数，N/A 不表示没执行算子。
+
+| 变体 | P/R/F/U | 已有比值均值（行数） | 双方严格均值（行数） |
+|---|---:|---:|---:|
+| `axpby_f16_int` | 1/0/0/0 | N/A | N/A |
+| `scatter_i8_int` | 3/0/0/0 | N/A | N/A |
+| `sddmm_csr_c32_int_non_non_row` | 6/0/0/0 | 4.022× (6) | 4.022× (6) |
+| `sddmm_csr_f16_int_non_non_row` | 6/0/0/0 | N/A | N/A |
+| `sddmm_csr_f32_int_non_non_col` | 6/0/0/0 | 18.834× (6) | 18.834× (6) |
+| `sddmm_csr_f32_int_non_trans_row` | 6/0/0/0 | 18.298× (6) | 18.298× (6) |
+| `sddmm_csr_f32_int_trans_non_row` | 6/0/0/0 | 6.881× (6) | 6.881× (6) |
+| `spgemm_csr_f32_int_non_non` | 0/2/0/1 | 1.746× (2) | N/A |
+| `spmm_coo_c32_int_non_non_row` | 1/2/0/0 | 0.945× (3) | 0.998× (1) |
+| `spmm_coo_f16_int_non_non_row` | 3/0/0/0 | N/A | N/A |
+| `spmm_coo_i8i32_int_non_non_row` | 3/0/0/0 | N/A | N/A |
+| `spmm_csc_c32_int_non_non_row` | 1/2/0/0 | 0.032× (3) | 0.054× (1) |
+| `spmm_csc_f16_int_non_non_row` | 1/0/2/0 | N/A | N/A |
+| `spmm_csc_f32_int_non_non_row` | 1/2/0/0 | 0.041× (3) | 0.079× (1) |
+| `spmm_csr_c32_int_non_non_row` | 1/2/0/0 | 0.355× (3) | 0.569× (1) |
+| `spmm_csr_f16_int_non_non_row` | 3/0/0/0 | N/A | N/A |
+| `spmm_csr_f16f32_int_non_non_row` | 3/0/0/0 | N/A | N/A |
+| `spmm_csr_f32_int_non_non_col` | 1/2/0/0 | 0.903× (3) | 0.858× (1) |
+| `spmm_csr_f32_int_non_trans_row` | 1/2/0/0 | 0.910× (3) | 0.846× (1) |
+| `spmm_csr_f32_int_trans_non_row` | 1/2/0/0 | 0.676× (3) | 0.894× (1) |
+| `spmm_csr_i8i32_int_non_non_row` | 3/0/0/0 | N/A | N/A |
+| `spmv_coo_c32_int_conj` | 2/1/0/0 | 0.907× (3) | 0.884× (1) |
+| `spmv_coo_c32_int_non` | 2/0/1/0 | 4.174× (2) | 4.174× (2) |
+| `spmv_coo_f16_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_coo_f16f32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_coo_f32_int_trans` | 2/1/0/0 | 0.914× (3) | 0.906× (2) |
+| `spmv_coo_i8i32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_csc_c32_int_non` | 3/0/0/0 | 0.724× (3) | 0.868× (2) |
+| `spmv_csc_f16_int_non` | 2/0/1/0 | N/A | N/A |
+| `spmv_csc_f32_int_non` | 3/0/0/0 | 0.786× (3) | 0.953× (2) |
+| `spmv_csr_c32_int_conj` | 1/0/2/0 | 0.967× (1) | 0.967× (1) |
+| `spmv_csr_c32_int_non` | 2/1/0/0 | 0.497× (3) | 0.514× (2) |
+| `spmv_csr_f16_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_csr_f16f32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_csr_f32_int_trans` | 2/1/0/0 | 0.781× (3) | 0.951× (2) |
+| `spmv_csr_f32c32_int_non` | 2/0/1/0 | N/A | N/A |
+| `spmv_csr_i8f32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_csr_i8i32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_sell_c32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_sell_f16_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_sell_f32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spmv_sell_i8i32_int_non` | 3/0/0/0 | N/A | N/A |
+| `spvv_c32_int_conj` | 1/0/0/0 | 1.043× (1) | 1.043× (1) |
+| `spvv_f16f32_int_non` | 1/0/0/0 | N/A | N/A |
+| `spvv_i8i32_int_non` | 1/0/0/0 | N/A | N/A |
+
+失败行明细（原始误差比例保留在 JSON 中）：
+
+| 变体 | 矩阵 | 严格误差比例 | 放宽误差比例 |
+|---|---|---:|---:|
+| `spmv_csr_f32c32_int_non` | synthetic_32k_d0.0005 | 1.20418 | 0.0120418 |
+| `spmv_coo_c32_int_non` | synthetic_32k_d0.0005 | 1.44216 | 0.0144216 |
+| `spmv_csc_f16_int_non` | synthetic_32k_d0.0005 | 1.10425 | 117.34 |
+| `spmv_csr_c32_int_conj` | synthetic_32k_d0.0005 | 1.22078 | 0.0122078 |
+| `spmv_csr_c32_int_conj` | synthetic_128k_d0.0001 | 1.59704 | 0.0159704 |
+| `spmm_csc_f16_int_non_non_row` | synthetic_32k_d0.0005 | 1.03109 | 112.303 |
+| `spmm_csc_f16_int_non_non_row` | synthetic_128k_d0.0001 | 1.23457 | 143.603 |
+
+无比值变体的原始基线原因：
+
+| 变体 | 原始 baseline_detail / detail |
+|---|---|
+| `axpby_f16_int` | no matching cuSPARSE Axpby baseline in harness |
+| `scatter_i8_int` | muSPARSE: Scatter dtype unsupported |
+| `sddmm_csr_f16_int_non_non_row` | muSPARSE: unsupported SDDMM dtype or operation |
+| `spmm_coo_f16_int_non_non_row` | muSPARSE: unsupported SpMM type or operation |
+| `spmm_coo_i8i32_int_non_non_row` | mixed-precision SpMM has no matching vendor baseline |
+| `spmm_csc_f16_int_non_non_row` | muSPARSE: unsupported SpMM type or operation |
+| `spmm_csr_f16_int_non_non_row` | muSPARSE: unsupported SpMM type or operation |
+| `spmm_csr_f16f32_int_non_non_row` | mixed-precision SpMM has no matching vendor baseline |
+| `spmm_csr_i8i32_int_non_non_row` | mixed-precision SpMM has no matching vendor baseline |
+| `spmv_coo_f16_int_non` | muSPARSE: unsupported SpMV type or operation |
+| `spmv_coo_f16f32_int_non` | mixed-precision SpMV has no matching vendor baseline |
+| `spmv_coo_i8i32_int_non` | mixed-precision SpMV has no matching vendor baseline |
+| `spmv_csc_f16_int_non` | muSPARSE: unsupported SpMV type or operation |
+| `spmv_csr_f16_int_non` | muSPARSE: unsupported SpMV type or operation |
+| `spmv_csr_f16f32_int_non` | mixed-precision SpMV has no matching vendor baseline |
+| `spmv_csr_f32c32_int_non` | mixed-precision SpMV has no matching vendor baseline |
+| `spmv_csr_i8f32_int_non` | mixed-precision SpMV has no matching vendor baseline |
+| `spmv_csr_i8i32_int_non` | mixed-precision SpMV has no matching vendor baseline |
+| `spmv_sell_c32_int_non` | no matching cuSPARSE SELL SpMV baseline |
+| `spmv_sell_f16_int_non` | no matching cuSPARSE SELL SpMV baseline |
+| `spmv_sell_f32_int_non` | no matching cuSPARSE SELL SpMV baseline |
+| `spmv_sell_i8i32_int_non` | no matching cuSPARSE SELL SpMV baseline |
+| `spvv_f16f32_int_non` | muSPARSE: unsupported SpVV dtype or operation |
+| `spvv_i8i32_int_non` | muSPARSE: unsupported SpVV dtype or operation |
+
+已补齐的 13 个基线变体均至少有一行可用比值，但不能据此认为所有规模精度合格。
+CSC f32/c32 使用 CSC(A)=CSR(Aᵀ) 加翻转 opA 的 muSPARSE 回退；原始 JSON 没有单独标注回退类型。
+原生 CSC 返回 status 2（NOT_IMPLEMENTED）。SpGEMM 最大用例因结果 nnz 超过 2000 万检查预算
+而为 unchecked；其计时仅含 compute，不含在 MUSA copy 阶段的 CPU 结果生成，不能当作端到端加速比。
+
+轮次记录：完整七族 1439.34 秒；首次基线四族 839.06 秒；COO 修正后 SpMM 218.29 秒；
+最终 CSC 回退 SpMV/SpMM 415.51 秒。`20261005T160900Z` 为中断尝试；
+`20261005T164200Z` 的 SpMM 已被 `20261005T205000Z` 替代。各轮结果保留，不混作一次完整运行。
+
+修改范围核对：新增基线分支由 MUSA 宏控制，未修改算子 kernel；但共享 `DeviceCsr` 的
+`Format` 字段以及 Python SpGEMM 的 CPU 展开目前没有 MUSA 条件保护。因此当前补丁不能声称
+所有共享代码改动仅影响 MUSA；其他后端未在本机回归验证。
+
+归档包含相对本地 `origin/q4`（`031496a`）修改的 9 个文件，以及本次所有 `capi/bench-musa-*`
+结果目录（含中断尝试）、已有的两轮 `results_musa_q4_20260928*` 历史结果和可用的 CTest Testing 日志。
+归档中的 `ARCHIVE_MANIFEST.txt` 列出文件路径与 SHA-256；不包含编译产物和整个源码仓库。
+原始各轮 REPORT/CSV/summary 是该轮快照，最新合并口径以本节及上面的源目录映射为准。
 
 ## 1. 这个后端的特点（实测于 torch_musa 2.7.1 / muDNN v3105）
 
@@ -53,12 +287,12 @@ FLAGSPARSE_BENCH_OUT=./capi/bench-musa \
 > 下面这节和第 4 节 2026-09-28/29 的真机结果都是**旧 42 条清单**的内容，表格里的
 > `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row` 现在已经
 > 移出 q4 统计范围（MUSA 上测过，精度 PASS，性能部分见第 4 节原有的 Failed/NotFound 记录）。
-> 新增的 6 个变体（`sddmm_csr_f16/c32_int_non_non_row`、`spmm_csc_c32/f16_int_non_non_row`、
-> `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`）**在 MUSA 上一次都没跑过**，
-> 只在 CUDA 验证过——其中 `spmm_csc_c32`/`f16` 要特别小心：本文件第 2 节已经记录了 MUSA 的
+> 以下风险描述为本轮测试前的历史判断；新增的 6 个变体现已在 MUSA 测试，结果见第 0 节。
+> 新增项为 `sddmm_csr_f16/c32_int_non_non_row`、`spmm_csc_c32/f16_int_non_non_row`、
+> `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`。其中 CSC 路径曾因 MUSA 的
 > "复数高级索引没有 kernel"限制，而 `spmm_csc` 的 kernel 直接 `tl.atomic_add` 进输出 dtype
 > 缓冲区（没有 ACC_DTYPE 累加层），f16 变体新写的 kernel 用了 fp32 累加缓冲区再转回 f16，这条
-> 路径在 MUSA 上有没有踩到 atomic_add 的 dtype 限制，完全没验证过。
+> 路径现已实测；CSC f16 的较大用例仍有精度失败，详见本轮失败明细。
 >
 > 另外，这轮 capi（C API 层）在 `capi/src/ops/spmv.cpp` 新增了 `spmv_csr`/`spmv_coo` 的混合精度
 > dispatch（int8→int32/float32、fp16→float32），本文件第 0 节描述的 **MUSA C API CTest 入口**

@@ -330,6 +330,47 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
 
 
 @triton.jit
+def _csc_spmv_mixed_kernel(A, I, P, X, Y, N, R: tl.constexpr, K: tl.constexpr):
+    cols = tl.program_id(0) * R + tl.arange(0, R)
+    valid_cols = cols < N
+    starts = tl.load(P + cols, valid_cols, other=0)
+    ends = tl.load(P + cols + 1, valid_cols, other=0)
+    x = tl.load(X + cols, valid_cols, other=0.).to(tl.float32)
+    lanes = tl.arange(0, K)
+    for base in range(0, tl.max(ends - starts, 0), K):
+        pos = starts[:, None] + base + lanes[None, :]
+        mask = valid_cols[:, None] & (pos < ends[:, None])
+        row = tl.load(I + pos, mask, other=0)
+        v = tl.load(A + pos, mask, other=0.).to(tl.float32)
+        tl.atomic_add(Y + row, v * x[:, None], mask, sem="relaxed")
+
+
+def spmv_csc_half(data, indices, indptr, x, shape, *, out=None, out_dtype=None, return_time=False):
+    """Read CSC half values directly; avoid expanding column IDs every call."""
+    _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"), (x, "x"))
+    m, n = map(int, shape)
+    if x.numel() != n:
+        raise ValueError("x shape does not match CSC operation")
+    result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, False)
+    if acc_dtype != torch.float32:
+        raise TypeError("CSC half route requires float32 accumulation")
+    if out is not None and (out.shape != (m,) or out.device != x.device):
+        raise ValueError("out shape/device must match CSC SpMV result")
+    t0 = _start(return_time)
+    acc = torch.zeros(m, dtype=torch.float32, device=x.device)
+    if n and data.numel():
+        batch, lanes = _csr_row_tile(data.numel(), n)
+        # Atomic CSC tiles are sensitive to skewed column lengths: fewer columns
+        # per program avoid looping an entire large batch for one long column.
+        if data.numel() / n > 4:
+            batch, lanes = 16, 32
+        _csc_spmv_mixed_kernel[(triton.cdiv(n, batch),)](
+            data.contiguous(), indices.contiguous(), indptr.contiguous(), x.contiguous(),
+            acc, n, batch, lanes, num_warps=4, num_stages=1)
+    return _finish(acc.to(result_dtype), out, t0, return_time)
+
+
+@triton.jit
 def _csr_spmm_mixed_kernel(
     c_ptr, data_ptr, cols_ptr, indptr_ptr, b_ptr, n_dense,
     stride_bk, stride_bn, stride_cm, stride_cn,
@@ -397,6 +438,25 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
 
 
 @triton.jit
+def _coo_spmm_mixed_batched_kernel(
+    c_ptr, data_ptr, rows_ptr, cols_ptr, b_ptr, nnz, n_dense,
+    stride_bk, stride_bn, stride_cm, stride_cn,
+    ACC: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_P: tl.constexpr,
+):
+    p = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
+    n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid = p < nnz
+    row = tl.load(rows_ptr + p, valid, other=0)
+    col = tl.load(cols_ptr + p, valid, other=0)
+    a = tl.load(data_ptr + p, valid, other=0).to(ACC)
+    mask = valid[:, None] & (n[None, :] < n_dense)
+    b = tl.load(b_ptr + col[:, None] * stride_bk + n[None, :] * stride_bn,
+                mask, other=0).to(ACC)
+    tl.atomic_add(c_ptr + row[:, None] * stride_cm + n[None, :] * stride_cn,
+                  a[:, None] * b, mask=mask)
+
+
+@triton.jit
 def _coo_spmm_mixed_kernel(
     c_ptr, data_ptr, rows_ptr, cols_ptr, b_ptr, nnz, n_dense,
     stride_bk, stride_bn, stride_cm, stride_cn,
@@ -449,10 +509,17 @@ def spmm_coo_mixed(data, row, col, B, shape, *, op=None, transpose=None,
     nnz = data.numel()
     if nnz and n_dense:
         block_n = min(128, max(16, triton.next_power_of_2(n_dense)))
-        _coo_spmm_mixed_kernel[(nnz, triton.cdiv(n_dense, block_n))](
-            acc, data, rows, cols, B, nnz, n_dense,
-            B.stride(0), B.stride(1), acc.stride(0), acc.stride(1),
-            ACC=_TL_ACC[acc_dtype], BLOCK_N=block_n, num_warps=2,
-        )
+        if _backend_name() == "cuda":
+            _coo_spmm_mixed_batched_kernel[(triton.cdiv(nnz, 16), triton.cdiv(n_dense, block_n))](
+                acc, data, rows, cols, B, nnz, n_dense,
+                B.stride(0), B.stride(1), acc.stride(0), acc.stride(1),
+                ACC=_TL_ACC[acc_dtype], BLOCK_N=block_n, BLOCK_P=16, num_warps=4,
+            )
+        else:
+            _coo_spmm_mixed_kernel[(nnz, triton.cdiv(n_dense, block_n))](
+                acc, data, rows, cols, B, nnz, n_dense,
+                B.stride(0), B.stride(1), acc.stride(0), acc.stride(1),
+                ACC=_TL_ACC[acc_dtype], BLOCK_N=block_n, num_warps=2,
+            )
     y = acc if acc_dtype == result_dtype else acc.to(result_dtype)
     return _finish(y, out, t0, return_time)

@@ -81,6 +81,10 @@ FIELDS = [
     "triton_ms",
     "cusparse_ms",
     "pytorch_ms",
+    "cupy_ms",
+    "cupy_max_error",
+    "cupy_reason",
+    "triton_speedup_vs_cupy",
     "triton_speedup_vs_cusparse",
     "triton_speedup_vs_pytorch",
     "triton_max_error",
@@ -210,6 +214,12 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
     row["cusparse_reason"] = reason
+    if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
+        from types import SimpleNamespace
+        from q4_variant_bench import _time_cupy
+        _time_cupy(row, SimpleNamespace(ptr=ptr_d, cols=cols_d, shape=(m, k)),
+                   data, x, "non", "non", warmup, iters, ref.numpy())
+        row["triton_speedup_vs_cupy"] = _ratio(row.get("cupy_ms"), row["triton_ms"])
     row["triton_speedup_vs_cusparse"] = _ratio(row.get("cusparse_ms"), row["triton_ms"])
     row["triton_speedup_vs_pytorch"] = _ratio(row.get("pytorch_ms"), row["triton_ms"])
     row["status"] = "PASS" if _passes(odt, row["triton_max_error"]) else "FAIL"

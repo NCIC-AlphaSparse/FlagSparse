@@ -189,6 +189,12 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                     },
                     [&](bool relaxed) { return ratio_against(values.get(), ref, dt, relaxed); },
                     [&](baseline::Timing* t) {
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+                        return baseline::sddmm_csr(bA, B.get(), k, b_ld, D.get(), d_ld,
+                                                   sc.alpha(dt), sc.beta(dt),
+                                                   op_a, op_b, order, order,
+                                                   BenchReport::kWarmup, BenchReport::kIters, t);
+#else
                         if (v->q4_variant) {
                             return baseline::Status::no(
                                 "baseline harness has no matching SDDMM op/order path");
@@ -196,6 +202,7 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                         return baseline::sddmm_csr(bA, B.get(), k, b_ld, D.get(), d_ld,
                                                    sc.alpha(dt), sc.beta(dt),
                                                    BenchReport::kWarmup, BenchReport::kIters, t);
+#endif
                     },
                     2.0 * static_cast<double>(A.nnz) * static_cast<double>(k));
 

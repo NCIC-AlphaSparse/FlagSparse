@@ -715,6 +715,91 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     return st;
 }
 
+size_t transpose_ptr_count(const SpMatDescr* A) {
+    return static_cast<size_t>((A->cols + 2) / 2 * 2);
+}
+
+size_t transpose_nnz_count(const SpMatDescr* A) {
+    return static_cast<size_t>((A->nnz + 1) / 2 * 2);
+}
+
+bool transpose_gather_available(const SpMatDescr* A) {
+    return A->format == FLAGSPARSE_FORMAT_CSR && A->value_type == FLAGSPARSE_R_32F &&
+        std::strcmp(flagsparseGetBackendName(), "cuda") == 0;
+}
+
+flagsparseStatus_t prepare_transpose_topology(SpMatDescr* A, void* buffer) {
+    if (buffer == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
+    const size_t os = index_size(A->offsets_type), is = index_size(A->indices_type);
+    std::vector<unsigned char> offsets(static_cast<size_t>(A->rows + 1) * os);
+    std::vector<unsigned char> indices(static_cast<size_t>(A->nnz) * is);
+    if (auto s = adaptor::memcpy_d2h(offsets.data(), reinterpret_cast<adaptor::DevicePtr>(A->offsets), offsets.size())) return s;
+    if (!indices.empty()) {
+        if (auto s = adaptor::memcpy_d2h(indices.data(), reinterpret_cast<adaptor::DevicePtr>(A->indices), indices.size())) return s;
+    }
+    auto at = [](const std::vector<unsigned char>& v, size_t size, int64_t pos) -> int64_t {
+        return size == 4 ? reinterpret_cast<const int32_t*>(v.data())[pos]
+                         : reinterpret_cast<const int64_t*>(v.data())[pos];
+    };
+    const size_t pc = transpose_ptr_count(A), nc = transpose_nnz_count(A);
+    std::vector<int64_t> topology(pc + 2 * nc, 0);
+    auto* ptr = topology.data();
+    auto* order = ptr + pc;
+    auto* rows = order + nc;
+    for (int64_t p = 0; p < A->nnz; ++p) {
+        const int64_t col = at(indices, is, p);
+        if (col < 0 || col >= A->cols) return FLAGSPARSE_STATUS_INVALID_VALUE;
+        ++ptr[col + 1];
+    }
+    for (int64_t c = 0; c < A->cols; ++c) ptr[c + 1] += ptr[c];
+    std::vector<int64_t> cursor(ptr, ptr + A->cols);
+    if (at(offsets, os, 0) != 0 || at(offsets, os, A->rows) != A->nnz) return FLAGSPARSE_STATUS_INVALID_VALUE;
+    for (int64_t r = 0; r < A->rows; ++r) {
+        const int64_t begin = at(offsets, os, r), end = at(offsets, os, r + 1);
+        if (begin < 0 || end < begin || end > A->nnz) return FLAGSPARSE_STATUS_INVALID_VALUE;
+        for (int64_t p = begin; p < end; ++p) {
+            const int64_t dst = cursor[at(indices, is, p)]++;
+            order[dst] = p;
+            rows[dst] = r;
+        }
+    }
+    if (auto s = adaptor::memcpy_h2d(reinterpret_cast<adaptor::DevicePtr>(buffer), topology.data(), topology.size() * sizeof(int64_t))) return s;
+    A->spmm_transpose_buffer = buffer;
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+flagsparseStatus_t run_csr_transpose_gather(flagsparseHandle_t handle, SpMatDescr* A,
+                                          const DnMatDescr* B, DnMatDescr* C,
+                                          const Operands& ops, void* buffer) {
+    if (A->spmm_transpose_buffer != buffer) {
+        if (auto s = prepare_transpose_topology(A, buffer)) return s;
+    }
+    const int bn = std::min(64, mixed_block_n(C->cols));
+    const int r = A->nnz / std::max<int64_t>(A->cols, 1) <= 4 ? 8 : 4;
+    const int k = r == 8 ? 8 : 16;
+    auto* ptr = static_cast<int64_t*>(buffer);
+    auto* order = ptr + transpose_ptr_count(A);
+    auto* rows = order + transpose_nnz_count(A);
+    std::string sig = "*fp32:16,*i64:16,*i64:16,*i64:16,*fp32:16,*fp32:16,fp32,fp32,i32,i32,i64,i64,i64,i64,";
+    sig += std::to_string(r) + "," + std::to_string(k) + "," + std::to_string(bn);
+    std::vector<jit::Arg> args;
+    for (void* p : {A->values, static_cast<void*>(ptr), static_cast<void*>(order),
+                   static_cast<void*>(rows), B->values, C->values})
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p)));
+    args.push_back(jit::Arg::f(static_cast<float>(ops.alpha_re)));
+    args.push_back(jit::Arg::f(static_cast<float>(ops.beta_re)));
+    args.push_back(jit::Arg::i(static_cast<int32_t>(A->cols)));
+    args.push_back(jit::Arg::i(static_cast<int32_t>(C->cols)));
+    for (int64_t stride : {ops.stride_bk, ops.stride_bn, ops.stride_cm, ops.stride_cn})
+        args.push_back(jit::Arg::i64v(stride));
+    std::string err;
+    const auto status = jit::launch(jit::codegen_module("spmm_transpose.py"),
+        "spmm_csr_transpose_gather_f32", sig, ctx(handle)->stream,
+        (A->cols + r - 1) / r, (C->cols + bn - 1) / bn, 1, 4, 2, args, &err);
+    if (status != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return status;
+}
+
 // CSR transpose has no output-row owner: every source row can contribute to
 // many output rows.  Apply beta in a dense prologue, then scatter each source
 // row's nonzeros into C with f32 atomics.
@@ -732,8 +817,10 @@ flagsparseStatus_t run_csr_transpose_atomic(flagsparseHandle_t handle,
 
     constexpr int block_nnz = 32;
     const int block_n = std::max(1, std::min(128, mixed_block_n(C->cols)));
-    const int64_t segments = std::max<int64_t>(
-        1, (max_row_nnz + block_nnz - 1) / block_nnz);
+    // Search source rows only when a rectangular row/segment grid wastes work.
+    const bool balanced = max_row_nnz > 64 &&
+        max_row_nnz > 4 * (A->nnz / std::max<int64_t>(A->rows, 1) + 1);
+    const int64_t segments = std::max<int64_t>(1, (max_row_nnz + block_nnz - 1) / block_nnz);
     const char* it = triton_index_dtype(A->indices_type);
     const char* ot = triton_index_dtype(A->offsets_type);
     if (it[0] == '\0' || ot[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
@@ -746,11 +833,12 @@ flagsparseStatus_t run_csr_transpose_atomic(flagsparseHandle_t handle,
     sig += "*"; sig += triton_dtype(B->value_type); sig += ":16,"; // B
     sig += "*"; sig += triton_dtype(C->value_type); sig += ":16,"; // C
     sig += triton_dtype(C->value_type); sig += ",";                // alpha
-    sig += "i32,i32,i64,i64,i64,i64,";
+    sig += "i32,i64,i32,i64,i64,i64,i64,";
     sig += std::to_string(block_n) + "," + std::to_string(block_nnz);
+    sig += balanced ? ",True" : ",False";
 
     std::vector<jit::Arg> args;
-    args.reserve(12);
+    args.reserve(13);
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
@@ -758,6 +846,7 @@ flagsparseStatus_t run_csr_transpose_atomic(flagsparseHandle_t handle,
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(C->values)));
     args.push_back(jit::Arg::f(static_cast<float>(ops.alpha_re)));
     args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+    args.push_back(jit::Arg::i64v(A->nnz));
     args.push_back(jit::Arg::i(static_cast<std::int32_t>(C->cols)));
     args.push_back(jit::Arg::i64v(ops.stride_bk));
     args.push_back(jit::Arg::i64v(ops.stride_bn));
@@ -768,7 +857,8 @@ flagsparseStatus_t run_csr_transpose_atomic(flagsparseHandle_t handle,
     const flagsparseStatus_t st = jit::launch(
         jit::codegen_module("spmm_transpose.py"),
         "spmm_csr_transpose_atomic_f32", sig, ctx(handle)->stream,
-        A->rows, (C->cols + block_n - 1) / block_n, segments,
+        balanced ? (A->nnz + block_nnz - 1) / block_nnz : A->rows,
+        (C->cols + block_n - 1) / block_n, balanced ? 1 : segments,
         /*num_warps=*/4, /*num_stages=*/2, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
@@ -853,7 +943,9 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
                : (A->format == FLAGSPARSE_FORMAT_CSC
                       ? run_csc_q4(handle, A, B, C, ops)
                       : (transposes(opA)
-                             ? run_csr_transpose_atomic(handle, A, B, C, ops)
+                             ? (externalBuffer && transpose_gather_available(A)
+                                    ? run_csr_transpose_gather(handle, A, B, C, ops, externalBuffer)
+                                    : run_csr_transpose_atomic(handle, A, B, C, ops))
                              : run_csr(handle, A, B, C, computeType, ops)));
 }
 
@@ -882,6 +974,9 @@ flagsparseStatus_t flagsparseSpMM_bufferSize(
         // has to be given one, so the caller allocates rows + 1 int32 and passes
         // it to preprocess and to every solve.
         const SpMatDescr* A = spmat(matA);
+        if (transposes(opA) && transpose_gather_available(A)) {
+            *bufferSize = (transpose_ptr_count(A) + 2 * transpose_nnz_count(A)) * sizeof(int64_t);
+        }
         if (A->format == FLAGSPARSE_FORMAT_COO) {
             *bufferSize = static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t);
         }
@@ -909,6 +1004,8 @@ flagsparseStatus_t flagsparseSpMM_preprocess(
         // builds the row-offsets array the kernel cannot run without, which is
         // also where a COO that is not sorted by row gets rejected.
         auto* A = const_cast<SpMatDescr*>(spmat(matA));
+        if (transposes(opA) && transpose_gather_available(A) && externalBuffer)
+            return prepare_transpose_topology(A, externalBuffer);
         if (A->format == FLAGSPARSE_FORMAT_COO) {
             if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
             if (externalBuffer == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;

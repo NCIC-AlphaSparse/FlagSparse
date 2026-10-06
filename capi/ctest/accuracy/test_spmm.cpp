@@ -670,6 +670,89 @@ TEST_F(SpMMAccuracy, CsrTransposeFloat32MatchesHostReference) {
     flagsparseDestroySpMat(matA);
 }
 
+TEST_F(SpMMAccuracy, CsrTransposeSkewedRowsAndLayouts) {
+    constexpr int64_t m = 129, k = 97, n = 33;
+    std::vector<int32_t> ptr(m + 1, 97), cols;
+    ptr[0] = 0;
+    ptr[m] = 100;
+    for (int32_t i = 0; i < 97; ++i) cols.push_back(i);
+    cols.insert(cols.end(), {0, 0, 96});  // duplicates and empty interior rows
+    std::vector<float> values(100, 1.0f);
+    for (auto index_type : {FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_64I}) {
+        for (auto order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL}) {
+            for (auto opB : {FLAGSPARSE_OPERATION_NON_TRANSPOSE, FLAGSPARSE_OPERATION_TRANSPOSE}) {
+                const int64_t br = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? n : m;
+                const int64_t bc = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? m : n;
+                Layout layout{order, 3};
+                std::vector<float> b(layout.elems(br, bc), 0.f);
+                for (int64_t r = 0; r < m; ++r) {
+                    for (int64_t j = 0; j < n; ++j) {
+                        b[opB == FLAGSPARSE_OPERATION_TRANSPOSE
+                              ? layout.at(j, r, br, bc) : layout.at(r, j, br, bc)] =
+                            static_cast<float>((r + j) % 11 - 5);
+                    }
+                }
+                std::vector<float> initial(layout.elems(k, n), 2.f), expected = initial;
+                for (int64_t c = 0; c < k; ++c)
+                    for (int64_t j = 0; j < n; ++j) expected[layout.at(c, j, k, n)] *= 0.5f;
+                for (int64_t r = 0; r < m; ++r)
+                    for (int32_t p = ptr[r]; p < ptr[r + 1]; ++p)
+                        for (int64_t j = 0; j < n; ++j)
+                            expected[layout.at(cols[p], j, k, n)] +=
+                                2.f * static_cast<float>((r + j) % 11 - 5);
+                auto dv = DeviceBuffer::from(values);
+                auto dp = upload_indices(ptr, index_type);
+                auto di = upload_indices(cols, index_type);
+                auto db = DeviceBuffer::from(b);
+                auto dc = DeviceBuffer::from(initial);
+                flagsparseSpMatDescr_t a = nullptr;
+                flagsparseDnMatDescr_t bd = nullptr, cd = nullptr;
+                ASSERT_EQ(flagsparseCreateCsr(&a, m, k, 100, dp.get(), di.get(), dv.get(),
+                    index_type, index_type, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(flagsparseCreateDnMat(&bd, br, bc, layout.ld(br, bc), db.get(),
+                    FLAGSPARSE_R_32F, order), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(flagsparseCreateDnMat(&cd, k, n, layout.ld(k, n), dc.get(),
+                    FLAGSPARSE_R_32F, order), FLAGSPARSE_STATUS_SUCCESS);
+                const float alpha = 2.f, beta = 0.5f;
+                size_t workspace_bytes = 0;
+                ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                    &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
+                    FLAGSPARSE_SPMM_ALG_DEFAULT, &workspace_bytes), FLAGSPARSE_STATUS_SUCCESS);
+                DeviceBuffer workspace(workspace_bytes);
+                ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                    &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
+                    FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                    &alpha, a, bd, &beta, cd, FLAGSPARSE_R_32F,
+                    FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
+                dev_sync();
+                const auto got = dc.download<float>(initial.size());
+                for (int64_t c = 0; c < k; ++c)
+                    for (int64_t j = 0; j < n; ++j)
+                        EXPECT_FLOAT_EQ(got[layout.at(c, j, k, n)], expected[layout.at(c, j, k, n)]);
+                // Reuse topology but change values in place: no stale value cache.
+                std::vector<float> updated_values(100, 2.f);
+                ASSERT_EQ(to_device(dv.get(), updated_values.data(), updated_values.size() * sizeof(float)),
+                    FLAGSPARSE_STATUS_SUCCESS);
+                const float zero_beta = 0.f;
+                ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, opB,
+                    &alpha, a, bd, &zero_beta, cd, FLAGSPARSE_R_32F,
+                    FLAGSPARSE_SPMM_ALG_DEFAULT, workspace.get()), FLAGSPARSE_STATUS_SUCCESS);
+                dev_sync();
+                const auto updated = dc.download<float>(initial.size());
+                for (int64_t c = 0; c < k; ++c)
+                    for (int64_t j = 0; j < n; ++j) {
+                        const auto pos = layout.at(c, j, k, n);
+                        EXPECT_FLOAT_EQ(updated[pos], 2.f * (expected[pos] - 1.f));
+                    }
+                flagsparseDestroyDnMat(cd);
+                flagsparseDestroyDnMat(bd);
+                flagsparseDestroySpMat(a);
+            }
+        }
+    }
+}
+
 // Column-major and a padded leading dimension are the same kernel with
 // different strides. If that claim is wrong, it is wrong here.
 TEST_F(SpMMAccuracy, DenseLayoutSweep) {

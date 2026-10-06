@@ -245,7 +245,7 @@ def _spvv_real_kernel(
 @triton.jit
 def _spvv_complex_kernel(
     part_re_ptr, part_im_ptr, x_ri_ptr, y_ri_ptr, idx_ptr, nnz,
-    CONJ: tl.constexpr, BLOCK: tl.constexpr,
+    CONJ: tl.constexpr, BLOCK: tl.constexpr, PACKED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -257,8 +257,18 @@ def _spvv_complex_kernel(
         xi = -xi
     yr = tl.load(y_ri_ptr + 2 * idx, mask=mask, other=0.0)
     yi = tl.load(y_ri_ptr + 2 * idx + 1, mask=mask, other=0.0)
-    tl.store(part_re_ptr + pid, tl.sum(xr * yr - xi * yi, axis=0))
-    tl.store(part_im_ptr + pid, tl.sum(xr * yi + xi * yr, axis=0))
+    pos = 2 * pid if PACKED else pid
+    tl.store(part_re_ptr + pos, tl.sum(xr * yr - xi * yi, axis=0))
+    tl.store(part_im_ptr + pos + (1 if PACKED else 0), tl.sum(xr * yi + xi * yr, axis=0))
+
+
+@triton.jit
+def _spvv_complex_finalize(P, Y, N, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    real = tl.load(P + 2 * offsets, offsets < N, other=0.)
+    imag = tl.load(P + 2 * offsets + 1, offsets < N, other=0.)
+    tl.store(Y, tl.sum(real, 0))
+    tl.store(Y + 1, tl.sum(imag, 0))
 
 
 def _torch_spvv(values, indices, y, op):
@@ -301,7 +311,20 @@ def flagsparse_spvv(values, indices, y, op="non", return_time=False, *, validate
         nnz = values.numel()
         n_parts = max(1, triton.cdiv(nnz, _VECTOR_BLOCK))
         real = _real_dtype(compute)
-        if _is_complex_dtype(compute):
+        if _is_complex_dtype(compute) and _backend_name() == "cuda" and n_parts <= 1024:
+            result = torch.empty((), dtype=compute, device=y.device)
+            target = torch.view_as_real(result)
+            if not nnz:
+                result.zero_()
+            else:
+                part = target if n_parts == 1 else torch.empty((n_parts, 2), dtype=real, device=y.device)
+                _spvv_complex_kernel[(n_parts,)](
+                    part, part, torch.view_as_real(values), torch.view_as_real(y),
+                    kernel_idx, nnz, CONJ=(op == "conj"), BLOCK=_VECTOR_BLOCK, PACKED=True)
+                if n_parts > 1:
+                    _spvv_complex_finalize[(1,)](part, target, n_parts,
+                                                BLOCK=triton.next_power_of_2(n_parts))
+        elif _is_complex_dtype(compute):
             # Each program writes its own slot; only the nnz == 0 case needs zeros.
             alloc = torch.empty if nnz else torch.zeros
             part_re = alloc(n_parts, dtype=real, device=y.device)

@@ -244,8 +244,10 @@ def spgemm(dtype):
         c_data, c_indices, c_indptr, c_shape = fs.flagsparse_spgemm_csr(
             *_csr(A), tuple(A.shape), *_csr(B), tuple(B.shape)
         )
+        # Densify the computed result on the host: MUSA has no CSR to_dense.
         C = torch.sparse_csr_tensor(
-            c_indptr.to(torch.int64), c_indices.to(torch.int64), c_data, c_shape
+            c_indptr.cpu().to(torch.int64), c_indices.cpu().to(torch.int64),
+            c_data.cpu(), c_shape
         ).to_dense()
         return C, _wide(A) @ _wide(B), dtype
     return build

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "baseline/baseline.hpp"
 #include "sweep.hpp"
 
 using namespace fstest;
@@ -81,8 +82,15 @@ TEST(SpvvBenchmark, SparseVectorDot) {
                                        relaxed ? relaxed_tolerance(out_dt)
                                                : default_tolerance(out_dt));
             },
-            [&](baseline::Timing*) {
+            [&](baseline::Timing* t) {
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+                return baseline::spvv(d_sparse.get(), d_idx.get(), d_dense.get(), 3, 4,
+                                      result.data(), dt, out_dt, op,
+                                      BenchReport::kWarmup, BenchReport::kIters, t);
+#else
+                (void)t;
                 return baseline::Status::no("no matching cuSPARSE SpVV baseline in harness");
+#endif
             },
             0.0);
         flagsparseDestroyDnVec(y);

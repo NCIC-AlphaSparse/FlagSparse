@@ -58,6 +58,11 @@ add_custom_target(flagsparse_variants DEPENDS "${_fs_variants}")
 # The vendor baseline a speedup is measured against. Its own CMakeLists is the
 # table of which backend has which sparse library; a backend without one compiles
 # the `none` provider, which answers "unavailable" with a reason.
+# The extended descriptor paths below are MUSA SDK 4.3.5-specific.  Keep their
+# declarations and benchmark routing out of every other backend build.
+if(BACKEND STREQUAL "MUSA")
+    add_compile_definitions(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS=1)
+endif()
 add_subdirectory(baseline)
 
 # One profile owns the test policy for the backend selected at configure time.

@@ -319,6 +319,9 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                 baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
                                        A.rows, A.cols, A.nnz, dt,
                                        is_coo ? rowind.get() : nullptr};
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+                if (is_csc) bA.format = baseline::DeviceCsr::Format::Csc;
+#endif
                 g_report.measure_vs_baseline(
                     std::move(row),
                     [&]() {
@@ -337,15 +340,17 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                                             out_dt, relaxed);
                     },
                     [&](baseline::Timing* t) {
-                        if (is_csc || mixed) {
+                        if (mixed
+#if !defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+                            || is_csc
+#endif
+                        ) {
                             return baseline::Status::no(
-                                is_csc ? "no matching cuSPARSE CSC SpMM baseline in harness"
-                                       : "mixed-precision SpMM has no matching vendor baseline");
+                                mixed ? "mixed-precision SpMM has no matching vendor baseline"
+                                      : "no matching cuSPARSE CSC SpMM baseline in harness");
                         }
-                        // cuSPARSE supports opA=TRANSPOSE and row-major dense
-                        // descriptors. Pass the same layout and descriptor
-                        // extents as the C API path so its result overwrites
-                        // the buffer that verify() reads below.
+                        // Pass the exact descriptors and layouts to the vendor
+                        // library so its result overwrites the verify() buffer.
                         const int64_t b_ld = order == FLAGSPARSE_ORDER_ROW ? b_cols : b_rows;
                         const int64_t c_ld = order == FLAGSPARSE_ORDER_ROW ? n : out_rows;
                         return baseline::spmm_csr(

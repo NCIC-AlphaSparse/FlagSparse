@@ -308,9 +308,12 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                 continue;
             }
 
-                baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
+            baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
                                    A.rows, A.cols, A.nnz, dt,
                                    is_coo ? rowind.get() : nullptr};
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+            if (is_csc) bA.format = baseline::DeviceCsr::Format::Csc;
+#endif
             g_report.measure_vs_baseline(
                 std::move(row),
                 [&]() {
@@ -325,7 +328,11 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                         : ratio_against(y.get(), ref_variant, out_dt, relaxed);
                 },
                 [&](baseline::Timing* t) {
-                    if (is_sell || mixed || is_csc) {
+                    if (is_sell || mixed
+#if !defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+                        || is_csc
+#endif
+                    ) {
                         return baseline::Status::no(
                             is_sell ? "no matching cuSPARSE SELL SpMV baseline"
                             : (mixed ? "mixed-precision SpMV has no matching vendor baseline"

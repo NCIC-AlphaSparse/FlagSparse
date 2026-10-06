@@ -1,5 +1,8 @@
 # 沐曦 MACA（C550）debug
 
+2026-10-06：CSR 默认转置 prepared gather、复数 SELL 调度及 SpGEMM matrix-worker 参数修复已实现，
+MACA 真机复测待完成。历史性能数字未替换，见 [基线复测报告](Q4_BASELINE_RETEST_20261006.md)。
+
 `FLAGSPARSE_BACKEND=metax`（设置了 `MACA_PATH` 时能自动识别）。环境、交付复现见 [../MACA.md](../MACA.md)。
 
 当前 debug 入口使用 Python runner：
@@ -34,14 +37,104 @@ MACA 的 C API adaptor 尚未可构建，调试时不要用 CTest 作为后端�
 > `gather_i8_int`、`spmm_bell_f32_int_non_non_row`、`spmm_bsr_f32_int_non_non_row`
 > 现在已经移出 q4 统计范围（继续保留实现，MACA 上测过且 PASS）。新增的 6 个变体
 > （`sddmm_csr_f16/c32_int_non_non_row`、`spmm_csc_c32/f16_int_non_non_row`、
-> `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`）**在 MACA 上一次都没跑过**，
-> 只在 CUDA 验证过。`spmm_csc_f16` 用的新 kernel（fp32 累加缓冲区、最后转回 f16，见
-> `spmm_csc.py` 的 upcast shim）没有在私有内存受限的 MACA C550 上测过，上机时优先看它。
+> `spmm_coo_i8i32_int_non_non_row`、`spgemm_csr_f32_int_non_non`）已于 2026-10-05 在
+> MACA C550 上完成 Python 精度验证（均为 2/2 PASS）；本节旧表仍不含它们的性能结果。
 
 - 新代码的循环都是运行时 `range`，没有依赖私有内存的长展开；复数路径最该验证：
   `spmv_csr/coo/csc_c32`、`spmm_csr/coo_c32`、`spvv_c32_int_conj`、`spmv_sell_c32`、`spmv_csr_f32c32`。
 - `spmv_csr` 的混合精度 kernel 每个程序处理 `ROWS x BLOCK` 个元素（共 512 个），按 4 个 warp 调；warp 大小是 64 时每个 warp 分到的元素数不同，需要实测性能。
-- 无 cuSPARSE 基线：用 `--vendor-card maca-c550`（1440 GB/s）判定；接上 mcSPARSE 后可以直接比。
+- 当前 Python runner 没有 mcSPARSE binding，因而本节性能均以 PyTorch 为基线；SDK 实际已有
+  `libmcsparse.so` 及 `<mcsparse/mcsparse.h>`，但尚未接入。接入后可直接比厂商库；当前可先用
+  `--vendor-card maca-c550`（1440 GB/s）作带宽上限判定。
+
+### 3.1 当前 45 条 q4 精度结果（2026-10-05）
+
+在 MetaX C550 的 MACA Python 3.12 环境，显式设置
+`FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550 FLAGSPARSE_MACA_VENDOR=torch` 后执行：
+
+```bash
+PYTHONPATH=src python3 -m pytest tests/pytest/test_q4_variants_accuracy.py -v
+```
+
+结果为 **91 passed, 2 warnings in 23.15s**：45 个当前 q4 变体在两个 shape 上均通过（90 个
+数值用例），另有 1 个“清单恰有 45 条且名称不重复”的断言通过。新增的
+`sddmm_csr_f16/c32`、`spmm_csc_c32/f16`、`spmm_coo_i8i32` 和 `spgemm_csr_f32` 6 条均已覆盖。
+warning 是缺少 `flash_attn` 与 PyTorch CSR beta 提示，不影响精度判定。性能结果尚不写入本节的
+第 4 节旧 42 条历史表；当前 45 条性能结果见下一节。
+
+### 3.2 当前 45 条 q4 性能结果（2026-10-05）
+
+使用 `tests/data` 的 10 个 MatrixMarket 矩阵（向量算子为 4 个合成规模）、5 次预热、20 次计时：
+
+```bash
+PYTHONPATH=src FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550 \
+FLAGSPARSE_MACA_VENDOR=torch python3 -u tools/run_backend_tests.py \
+  --backend maca --phase benchmark --mode normal --gpus 0 \
+  --ops scatter,axpby,spmv_sell,spmv_csr,spvv,spmm_csr,spmv_csc,spmv_coo,spmm_csc,sddmm_csr,spmm_coo,spgemm_csr \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' --timeout 4500 \
+  --results-dir results_metax_q4_45_perf_20261005
+```
+
+12 个父算子串行耗时合计 **1h50m45s**；最慢的是 `sddmm_csr`（26m51s）、`spmm_csc`
+（24m40s）和 `spmm_csr`（22m02s）。下表的加速比是逐矩阵的 FlagSparse / PyTorch 比值的算术均值，
+不是 mcSPARSE 比值；SDDMM 的 PyTorch 基线是未融合的 gather/multiply/sum，不能据此推断厂商 SDDMM
+加速比。
+
+| 变体 | 精度 | 性能 | PyTorch 加速比 |
+|---|---:|---:|---:|
+| `scatter_i8_int` | 2/2 PASS | PASS | 2.186x |
+| `axpby_f16_int` | 2/2 PASS | PASS | 1.198x |
+| `spmv_sell_f32_int_non` | 2/2 PASS | PASS | 1.270x |
+| `spmv_csr_f16f32_int_non` | 2/2 PASS | PASS | 4.002x |
+| `spvv_f16f32_int_non` | 2/2 PASS | PASS | 1.257x |
+| `spmv_csr_f16_int_non` | 2/2 PASS | PASS | 1.532x |
+| `spmv_csr_f32c32_int_non` | 2/2 PASS | PASS | 2.842x |
+| `spmv_sell_f16_int_non` | 2/2 PASS | PASS | 2.104x |
+| `spmm_csr_f16f32_int_non_non_row` | 2/2 PASS | PASS | 59.914x |
+| `spmm_csr_f16_int_non_non_row` | 2/2 PASS | PASS | 24.860x |
+| `spmm_csr_f32_int_non_non_col` | 2/2 PASS | PASS | 18.155x |
+| `spmm_csr_f32_int_non_trans_row` | 2/2 PASS | PASS | 18.007x |
+| `spmv_csc_f32_int_non` | 2/2 PASS | PASS | 3.536x |
+| `spmv_csr_c32_int_non` | 2/2 PASS | PASS | 1.605x |
+| `spmv_sell_c32_int_non` | 2/2 PASS | PASS | 0.592x |
+| `spvv_c32_int_conj` | 2/2 PASS | PASS | 0.808x |
+| `spmv_coo_f16f32_int_non` | 2/2 PASS | PASS | 3.064x |
+| `spmm_csr_c32_int_non_non_row` | 2/2 PASS | PASS | 14.268x |
+| `spmv_coo_f32_int_trans` | 2/2 PASS | PASS | 0.691x |
+| `spmv_csr_f32_int_trans` | 2/2 PASS | PASS | 0.089x |
+| `spmv_csr_i8f32_int_non` | 2/2 PASS | PASS | 4.061x |
+| `spmv_csr_i8i32_int_non` | 2/2 PASS | PASS | 3.811x |
+| `spmv_sell_i8i32_int_non` | 2/2 PASS | PASS | 1.316x |
+| `spvv_i8i32_int_non` | 2/2 PASS | PASS | 1.849x |
+| `spmm_csc_f32_int_non_non_row` | 2/2 PASS | PASS | 81.381x |
+| `spmm_csr_i8i32_int_non_non_row` | 2/2 PASS | PASS | 58.599x |
+| `spmv_coo_c32_int_non` | 2/2 PASS | PASS | 0.628x |
+| `spmv_coo_f16_int_non` | 2/2 PASS | PASS | 2.621x |
+| `spmv_csc_c32_int_non` | 2/2 PASS | PASS | 1.299x |
+| `spmv_csc_f16_int_non` | 2/2 PASS | PASS | 0.502x |
+| `sddmm_csr_f32_int_non_non_col` | 2/2 PASS | PASS | 597.426x |
+| `sddmm_csr_f32_int_non_trans_row` | 2/2 PASS | PASS | 843.804x |
+| `sddmm_csr_f32_int_trans_non_row` | 2/2 PASS | PASS | 190.029x |
+| `spmm_coo_c32_int_non_non_row` | 2/2 PASS | PASS | 25.837x |
+| `spmm_coo_f16_int_non_non_row` | 2/2 PASS | PASS | 99.646x |
+| `spmm_csr_f32_int_trans_non_row` | 2/2 PASS | PASS | 13.336x |
+| `spmv_coo_c32_int_conj` | 2/2 PASS | PASS | 0.574x |
+| `spmv_coo_i8i32_int_non` | 2/2 PASS | PASS | 3.242x |
+| `spmv_csr_c32_int_conj` | 2/2 PASS | PASS | 0.075x |
+| `spmm_coo_i8i32_int_non_non_row` | 2/2 PASS | PASS | 20.605x |
+| `spmm_csc_c32_int_non_non_row` | 2/2 PASS | PASS | 20.232x |
+| `sddmm_csr_c32_int_non_non_row` | 2/2 PASS | PASS | 79.960x |
+| `sddmm_csr_f16_int_non_non_row` | 2/2 PASS | PASS | N/A |
+| `spmm_csc_f16_int_non_non_row` | 2/2 PASS | PASS | N/A |
+| `spgemm_csr_f32_int_non_non` | 2/2 PASS | **ERROR** | N/A |
+
+**原始结果复查（不要只看 runner 的 `summary.csv`）：**42 条有有效 PyTorch 加速比；
+`sddmm_csr_f16_int_non_non_row` 因 PyTorch `sampled_addmm` 不支持 `Half` 而无基线；
+`spmm_csc_f16_int_non_non_row` 的 FlagSparse 实现正确但会 upcast 到 fp32，MACA PyTorch CSC fp16
+同样不支持，故无可比基线。`spgemm_csr_f32_int_non_non` 的 10 个原始性能行均为 ERROR：
+`test_spgemm.py` 不识别它给 worker 传入的 `--_matrix-worker` 参数。当前 runner 因父进程退出码为 0，
+误将该 q4 汇总行标成 Passed；该加速比必须视为**未测**，不能用于报告。
 
 ## 4. q4 实测结果（2026-09-28，旧 42 条清单，新增 6 个变体未测）
 

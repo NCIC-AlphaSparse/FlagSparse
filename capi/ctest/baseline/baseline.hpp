@@ -71,6 +71,8 @@ struct Status {
 // frees these: the caller owns them, which keeps the allocator out of the timed
 // region for both sides of the comparison.
 struct DeviceCsr {
+    enum class Format { Csr, Coo, Csc };
+
     void* indptr = nullptr;   // int32, rows + 1  (CSR only)
     void* indices = nullptr;  // int32, nnz -- column indices in both formats
     void* values = nullptr;   // `dtype`, nnz
@@ -87,8 +89,11 @@ struct DeviceCsr {
     // CSR and sliced-ELL only -- simply returns its own status, which becomes a
     // blank speedup with that reason rather than a missing row.
     void* coo_rows = nullptr;  // int32, nnz
+    Format format = Format::Csr;
 
-    bool is_coo() const { return coo_rows != nullptr; }
+    // Existing backends identify COO by supplying coo_rows; preserve that ABI.
+    bool is_coo() const { return format == Format::Coo || coo_rows != nullptr; }
+    bool is_csc() const { return format == Format::Csc; }
 };
 
 // One timed run. `iters` samples are taken after `warmup` untimed ones and the
@@ -118,9 +123,23 @@ Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void*
                 flagsparseOrder_t orderB = FLAGSPARSE_ORDER_COL,
                 flagsparseOrder_t orderC = FLAGSPARSE_ORDER_COL);
 
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+// muSPARSE 4.3.5-specific descriptor axes, compiled only by the MUSA profile.
+Status sddmm_csr(const DeviceCsr& A, const void* Bd, int64_t k, int64_t ldb,
+                 const void* Cd, int64_t ldc, const void* alpha, const void* beta,
+                 flagsparseOperation_t opA, flagsparseOperation_t opB,
+                 flagsparseOrder_t orderB, flagsparseOrder_t orderD,
+                 int warmup, int iters, Timing* out);
+
+Status spvv(const void* sparse_val, const void* sparse_idx, const void* dense,
+            int64_t nnz, int64_t size, void* result, flagsparseDataType_t dtype,
+            flagsparseDataType_t compute_dtype, flagsparseOperation_t op,
+            int warmup, int iters, Timing* out);
+#else
 Status sddmm_csr(const DeviceCsr& A, const void* Bd, int64_t k, int64_t ldb,
                  const void* Cd, int64_t ldc, const void* alpha, const void* beta,
                  int warmup, int iters, Timing* out);
+#endif
 
 // C's arrays as the baseline produced them. Allocated by the baseline because
 // their size is DISCOVERED -- the caller cannot size them in advance, which is

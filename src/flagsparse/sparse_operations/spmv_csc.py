@@ -98,6 +98,7 @@ class PreparedCscSpmv:
         "max_col_nnz",
         "col_ids",
         "csr_delegate",
+        "non_gather_plan",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -143,6 +144,13 @@ class PreparedCscSpmv:
         self.col_lengths = col_lengths
         self.col_ids = col_ids
         self.csr_delegate = csr_delegate
+        self.non_gather_plan = None
+        if (_SPMV_CSC_CUDA and _normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_NON
+                and data.dtype == torch.complex64):
+            from . import _spmv_csr_transpose
+            # CSC(A) is CSR(A.T); transposing this topology gives row owners of A.
+            self.non_gather_plan = _spmv_csr_transpose.prepare(
+                kernel_indices, kernel_indptr, (self.n_cols, self.n_rows))
         self.max_col_nnz = int(max_col_nnz)
         self.op = _normalize_spmv_csc_op(op, transpose=transpose)
         self.transpose = _spmv_csc_op_transposes(self.op)
@@ -572,6 +580,9 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if not trans and prepared.non_gather_plan is not None:
+        from . import _spmv_csr_transpose
+        return _spmv_csr_transpose.gather(prepared.data, x, prepared.non_gather_plan, out_len)
     if trans and prepared.nnz != 0:
         csr_delegate = getattr(prepared, "csr_delegate", None)
         if csr_delegate is not None:
@@ -766,6 +777,9 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
             data, indices, indptr, x, (n_cols, n_rows),
             out=out, out_dtype=out_dtype, return_time=timed,
         )
+    elif _SPMV_CSC_CUDA and data.dtype == torch.float16:
+        y = _mixed_spmx.spmv_csc_half(
+            data, indices, indptr, x, shape, out=out, out_dtype=out_dtype, return_time=timed)
     else:
         lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
         col_ids = torch.repeat_interleave(

@@ -85,6 +85,12 @@ FIELDS = [
     "pytorch_ms",
     "triton_speedup_vs_cusparse",
     "triton_speedup_vs_pytorch",
+    "cupy_ms",
+    "cupy_max_error",
+    "cupy_reason",
+    "cupy_compute_dtype",
+    "cupy_method",
+    "triton_speedup_vs_cupy",
     "triton_max_error",
     "cusparse_max_error",
     "cusparse_reason",
@@ -176,6 +182,41 @@ def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen):
         _, row["pytorch_ms"] = _benchmark_cuda_op(torch_op, warmup, iters)
     except Exception as exc:  # e.g. a backend without complex index/sum kernels
         row["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
+
+    if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
+        try:
+            import cupy as cp
+            xc, ic = cp.from_dlpack(x.to(compute)), cp.from_dlpack(idx)
+            row["cupy_compute_dtype"] = str(compute).replace("torch.", "")
+            if op == "spvv":
+                yc = cp.from_dlpack(y.to(compute))
+                # Include the dense gather and reduction on each call.
+                if dtype == torch.int8:
+                    cupy_op = lambda: cp.sum(xc * yc[ic], dtype=cp.int32)
+                    row["cupy_method"] = "int32 gather/product/sum"
+                else:
+                    cupy_op = lambda: (cp.vdot(xc, yc[ic]) if spvv_op == "conj" else cp.dot(xc, yc[ic]))
+                    row["cupy_method"] = "gather/dot"
+            else:
+                # Independent input: ours and torch have already updated theirs.
+                yc = cp.from_dlpack(y_cpu.to(dev)).copy()
+
+                def cupy_op():
+                    cp.multiply(yc, _BETA, out=yc)
+                    yc[ic] = yc[ic].astype(xc.dtype) + _ALPHA * xc
+                    return yc
+
+                row["cupy_method"] = "in-place scale and unique indexed axpy"
+            actual = cupy_op()
+            actual_cpu = torch.as_tensor(cp.asnumpy(actual))
+            row["cupy_max_error"] = _error(actual_cpu.reshape(1) if op == "spvv" else actual_cpu, ref)
+            if row["cupy_max_error"] > _TOL.get(dtype, 1e-10):
+                raise RuntimeError("CuPy correctness check failed")
+            _, elapsed = _benchmark_cuda_op(cupy_op, warmup, iters)
+            row["cupy_ms"] = elapsed
+            row["triton_speedup_vs_cupy"] = elapsed / row["triton_ms"]
+        except Exception as exc:
+            row["cupy_reason"] = f"{type(exc).__name__}: {exc}"
 
     reason = cusparse_baseline.skip_reason()
     if reason is None:

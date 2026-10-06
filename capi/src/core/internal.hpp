@@ -98,6 +98,8 @@ struct SpMatDescr {
     // lets a repeated solve skip the rebuild; a caller that hands over a
     // different buffer, or reuses one buffer across matrices, gets it rebuilt.
     void* coo_offsets_buffer = nullptr;
+    // CSR transpose topology lives in caller-owned SpMM scratch, never values.
+    void* spmm_transpose_buffer = nullptr;
 
     // SDDMM expands the CSR pattern to one row id per nonzero, into the caller's
     // externalBuffer. Same contract as coo_offsets_buffer: remembering which

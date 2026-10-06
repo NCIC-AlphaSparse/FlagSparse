@@ -24,8 +24,8 @@ Type rules (cuSPARSE SpMV): half types and int8 accumulate in float32 / int32.
 ``out_dtype`` picks the output type where cuSPARSE allows a different Y type:
 ``f16/bf16 -> f32`` and ``i8 -> i32`` (default) or ``i8 -> f32``.
 
-One Triton program per slice walks its slots with a *runtime* loop: nothing is
-unrolled, so the per-thread private memory stays flat (MetaX caps it at 4 KB).
+Real programs group slices; complex programs use one warp or parallel slot lanes.
+Both use runtime loops, keeping per-thread private memory flat (MetaX caps it at 4 KB).
 Complex values run on interleaved real/imag planes; Ascend takes a torch_npu path.
 """
 
@@ -76,16 +76,18 @@ _TL = {
 def _spmv_sell_real_kernel(
     y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
     SLICE: tl.constexpr, BLOCK_R: tl.constexpr, ACC: tl.constexpr,
+    GROUP: tl.constexpr = 1,
 ):
-    s = tl.program_id(0)
-    r = tl.arange(0, BLOCK_R)
-    rmask = r < SLICE
-    start = tl.load(offsets_ptr + s)
-    width = (tl.load(offsets_ptr + s + 1) - start) // SLICE
-    acc = tl.zeros((BLOCK_R,), dtype=ACC)
-    for j in range(0, width):
+    s = tl.program_id(0) * GROUP + tl.arange(0, GROUP)[:, None]
+    r = tl.arange(0, BLOCK_R)[None, :]
+    smask = s * SLICE < n_rows
+    rmask = (r < SLICE) & smask
+    start = tl.load(offsets_ptr + s, mask=smask, other=0)
+    width = (tl.load(offsets_ptr + s + 1, mask=smask, other=0) - start) // SLICE
+    acc = tl.zeros((GROUP, BLOCK_R), dtype=ACC)
+    for j in range(0, tl.max(tl.max(width, 0), 0)):
         pos = start + j * SLICE + r
-        col = tl.load(cols_ptr + pos, mask=rmask, other=-1)
+        col = tl.load(cols_ptr + pos, mask=rmask & (j < width), other=-1)
         valid = col >= 0
         v = tl.load(values_ptr + pos, mask=valid, other=0).to(ACC)
         xv = tl.load(x_ptr + col, mask=valid, other=0).to(ACC)
@@ -97,18 +99,19 @@ def _spmv_sell_real_kernel(
 @triton.jit
 def _spmv_sell_complex_kernel(
     y_ri_ptr, values_ri_ptr, cols_ptr, offsets_ptr, x_ri_ptr, n_rows,
-    SLICE: tl.constexpr, BLOCK_R: tl.constexpr,
+    SLICE: tl.constexpr, BLOCK_R: tl.constexpr, GROUP: tl.constexpr = 1,
 ):
-    s = tl.program_id(0)
-    r = tl.arange(0, BLOCK_R)
-    rmask = r < SLICE
-    start = tl.load(offsets_ptr + s)
-    width = (tl.load(offsets_ptr + s + 1) - start) // SLICE
-    acc_re = tl.zeros((BLOCK_R,), dtype=tl.float32).to(y_ri_ptr.dtype.element_ty)
-    acc_im = tl.zeros((BLOCK_R,), dtype=tl.float32).to(y_ri_ptr.dtype.element_ty)
-    for j in range(0, width):
+    s = tl.program_id(0) * GROUP + tl.arange(0, GROUP)[:, None]
+    r = tl.arange(0, BLOCK_R)[None, :]
+    smask = s * SLICE < n_rows
+    rmask = (r < SLICE) & smask
+    start = tl.load(offsets_ptr + s, mask=smask, other=0)
+    width = (tl.load(offsets_ptr + s + 1, mask=smask, other=0) - start) // SLICE
+    acc_re = tl.zeros((GROUP, BLOCK_R), dtype=tl.float32).to(y_ri_ptr.dtype.element_ty)
+    acc_im = tl.zeros((GROUP, BLOCK_R), dtype=tl.float32).to(y_ri_ptr.dtype.element_ty)
+    for j in range(0, tl.max(tl.max(width, 0), 0)):
         pos = start + j * SLICE + r
-        col = tl.load(cols_ptr + pos, mask=rmask, other=-1)
+        col = tl.load(cols_ptr + pos, mask=rmask & (j < width), other=-1)
         valid = col >= 0
         vr = tl.load(values_ri_ptr + 2 * pos, mask=valid, other=0.0)
         vi = tl.load(values_ri_ptr + 2 * pos + 1, mask=valid, other=0.0)
@@ -120,6 +123,35 @@ def _spmv_sell_complex_kernel(
     mask = rmask & (row < n_rows)
     tl.store(y_ri_ptr + 2 * row, acc_re, mask=mask)
     tl.store(y_ri_ptr + 2 * row + 1, acc_im, mask=mask)
+
+
+@triton.jit
+def _spmv_sell_complex_parallel_kernel(
+    Y, V, C, P, X, M,
+    SLICE: tl.constexpr, BLOCK_R: tl.constexpr, SLOTS: tl.constexpr,
+):
+    s = tl.program_id(0)
+    r = tl.arange(0, BLOCK_R)
+    slots = tl.arange(0, SLOTS)
+    start = tl.load(P + s)
+    width = (tl.load(P + s + 1) - start) // SLICE
+    re = tl.zeros((SLOTS, BLOCK_R), tl.float32).to(Y.dtype.element_ty)
+    im = tl.zeros((SLOTS, BLOCK_R), tl.float32).to(Y.dtype.element_ty)
+    for base in range(0, width, SLOTS):
+        j = base + slots
+        pos = start + j[:, None] * SLICE + r[None, :]
+        col = tl.load(C + pos, (j[:, None] < width) & (r[None, :] < SLICE), other=-1)
+        valid = col >= 0
+        vr = tl.load(V + 2 * pos, valid, other=0.)
+        vi = tl.load(V + 2 * pos + 1, valid, other=0.)
+        xr = tl.load(X + 2 * col, valid, other=0.)
+        xi = tl.load(X + 2 * col + 1, valid, other=0.)
+        re += vr * xr - vi * xi
+        im += vr * xi + vi * xr
+    rows = s * SLICE + r
+    valid_rows = (r < SLICE) & (rows < M)
+    tl.store(Y + 2 * rows, tl.sum(re, 0), valid_rows)
+    tl.store(Y + 2 * rows + 1, tl.sum(im, 0), valid_rows)
 
 
 def _sell_entry_rows(cols, offsets, slice_size):
@@ -250,19 +282,31 @@ def flagsparse_spmv_sell(
     else:
         y = torch.empty(n_rows, dtype=out_dtype, device=x.device)
         block_r = triton.next_power_of_2(slice_size)
+        # Group existing slices; changing SLICE would reinterpret the storage.
+        # Fill all four warps (64 lanes on ROCm) without repacking the matrix.
+        group = max(1, min(8, (256 if _is_rocm_runtime() else 128) // block_r))
+        grid = (triton.cdiv(n_slices, group),)
         if n_slices:
             if _is_complex_dtype(values.dtype):
-                _spmv_sell_complex_kernel[(n_slices,)](
-                    torch.view_as_real(y).reshape(-1),
-                    torch.view_as_real(values).reshape(-1),
+                complex_args = (
+                    torch.view_as_real(y),
+                    torch.view_as_real(values),
                     cols, offsets,
-                    torch.view_as_real(x).reshape(-1),
-                    n_rows, SLICE=slice_size, BLOCK_R=block_r,
+                    torch.view_as_real(x),
+                    n_rows,
                 )
+                if block_r <= 32 and not (_is_rocm_runtime() or _is_maca_runtime()):
+                    _spmv_sell_complex_kernel[(n_slices,)](
+                        *complex_args, SLICE=slice_size, BLOCK_R=block_r, num_warps=1,
+                    )
+                else:
+                    _spmv_sell_complex_parallel_kernel[(n_slices,)](
+                        *complex_args, SLICE=slice_size, BLOCK_R=block_r, SLOTS=4,
+                    )
             else:
-                _spmv_sell_real_kernel[(n_slices,)](
+                _spmv_sell_real_kernel[grid](
                     y, values, cols, offsets, x, n_rows,
-                    SLICE=slice_size, BLOCK_R=block_r, ACC=_TL[acc_dtype],
+                    SLICE=slice_size, BLOCK_R=block_r, ACC=_TL[acc_dtype], GROUP=group,
                 )
     if out is not None:
         out.copy_(y)

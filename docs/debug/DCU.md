@@ -1,5 +1,8 @@
 # 海光 DCU（BW1000，gfx936）debug
 
+2026-10-06：CSR 默认转置 prepared gather、SELL 多 slice 调度已实现，DCU 真机复测待完成；
+下方历史加速比仍为原始数据。本机 CUDA 验证见 [基线复测报告](Q4_BASELINE_RETEST_20261006.md)。
+
 `FLAGSPARSE_BACKEND=rocm`（通常能自动识别：`torch.version.hip` 不为空）。环境、交付复现见 [../DCU.md](../DCU.md)。
 
 当前 debug 入口使用 Python runner：
@@ -198,3 +201,114 @@ python3 run_flagsparse_pytest.py \
 3. `tools/probe_accel_capabilities.py` 已确认分配、H2D/D2H、逐元素运算和归约在
    f32/f64/c64/c128 上正常；后续某个隔离探针超过 90 秒没有返回，手工中止。正式的 84 个 q4
    计算用例和 runner 不受影响。
+
+## 5. 2026-10-05：45 条新清单的完整结果（BW1000 64G）
+
+第 4 节是 2026-09-28 旧的 42 条清单；这里是按现在 45 条清单重新跑的结果，**精度和性能全部
+通过，0 个失败**，第一次把新增的 6 个变体和 10-02 之后新接的 `spvv`/`axpby`/`spmv_sell`/
+`spmm_csc` 算子组、transpose 支持覆盖到了。
+
+### 5.1 精度
+
+权威来源仍是 `tests/pytest/test_q4_variants_accuracy.py`：
+
+```bash
+PYTHONPATH=src FLAGSPARSE_BACKEND=rocm CUDA_LAUNCH_BLOCKING=1 \
+  python3 -m pytest tests/pytest/test_q4_variants_accuracy.py -v --tb=short
+```
+
+结果 **91 passed, 1 warning, 129.29s**：1 个清单检查 + 45 个变体 × 2 个规模，即
+**90/90 个计算用例通过**，覆盖全部 45 个变体（含新增 6 个）。warning 是 PyTorch CSR beta
+提示，和 q4 无关。
+
+### 5.2 性能
+
+分两轮跑的 `run_flagsparse_pytest.py`（第一轮漏了 `sddmm_csr`/`spgemm_csr`/`spmm_csc`，
+补了第二轮；第二轮第一次因为机器环境没配对，`accuracy=CRASH performance=FAIL`，重配后
+重跑干净过了，不是算子问题）：
+
+```bash
+# 第一轮：前 36 个变体所在的算子
+PYTHONPATH=src FLAGSPARSE_BACKEND=rocm python3 run_flagsparse_pytest.py \
+  --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_bsr,spmv_bsr \
+  --gpus 0 --phase both --mode normal \
+  --results-dir pytest_results_20261005_150803 --benchmark-input tests/data
+
+# 第二轮：补 sddmm_csr/spgemm_csr/spmm_csc 这 3 个算子（9 个变体）
+PYTHONPATH=src FLAGSPARSE_BACKEND=rocm python3 run_flagsparse_pytest.py \
+  --ops sddmm_csr,spgemm_csr,spmm_csc \
+  --gpus 0 --phase both --mode normal \
+  --results-dir pytest_results_20261005_dcu_tail --benchmark-input tests/data
+```
+
+两轮加起来：65 个变体（45 个 q4 + 20 个交付）全部 `Passed`，0 个 `Failed`、0 个 `CRASH`。
+下表只列 q4 的 45 个，逐变体从 `performance.csv` 的逐行数据聚合（不是 `summary.csv` 里那种
+"同一个父脚本内所有变体共享一个数字"的粗粒度平均）；"-" 表示这个 dtype/op 组合没有对应的
+PyTorch 参考实现（`torch.sparse` 覆盖不到，不是测试失败）：
+
+| 变体 | 精度 | 对 PyTorch 加速比 |
+|---|---|---:|
+| `gather`/`scatter` 族 | | |
+| `scatter_i8_int` | PASS | 1.586x |
+| `axpby` 族 | | |
+| `axpby_f16_int` | PASS | 0.460x |
+| `spvv` 族 | | |
+| `spvv_c32_int_conj` | PASS | 0.360x |
+| `spvv_f16f32_int_non` | PASS | 0.582x |
+| `spvv_i8i32_int_non` | PASS | 0.644x |
+| `spmv_sell` 族 | | |
+| `spmv_sell_c32_int_non` | PASS | 0.212x |
+| `spmv_sell_f16_int_non` | PASS | 0.363x |
+| `spmv_sell_f32_int_non` | PASS | 0.354x |
+| `spmv_sell_i8i32_int_non` | PASS | 0.376x |
+| `spmv_csr` 族 | | |
+| `spmv_csr_c32_int_conj` | PASS | 0.039x |
+| `spmv_csr_c32_int_non` | PASS | 0.739x |
+| `spmv_csr_f16_int_non` | PASS | 0.799x |
+| `spmv_csr_f16f32_int_non` | PASS | 0.909x |
+| `spmv_csr_f32_int_trans` | PASS | 0.034x |
+| `spmv_csr_f32c32_int_non` | PASS | 0.886x |
+| `spmv_csr_i8f32_int_non` | PASS | 0.934x |
+| `spmv_csr_i8i32_int_non` | PASS | 0.943x |
+| `spmv_coo` 族 | | |
+| `spmv_coo_c32_int_conj` | PASS | - |
+| `spmv_coo_c32_int_non` | PASS | - |
+| `spmv_coo_f16_int_non` | PASS | - |
+| `spmv_coo_f16f32_int_non` | PASS | - |
+| `spmv_coo_f32_int_trans` | PASS | - |
+| `spmv_coo_i8i32_int_non` | PASS | - |
+| `spmv_csc` 族 | | |
+| `spmv_csc_c32_int_non` | PASS | - |
+| `spmv_csc_f16_int_non` | PASS | - |
+| `spmv_csc_f32_int_non` | PASS | - |
+| `spmm_csr` 族 | | |
+| `spmm_csr_c32_int_non_non_row` | PASS | 2.105x |
+| `spmm_csr_f16_int_non_non_row` | PASS | 2.048x |
+| `spmm_csr_f16f32_int_non_non_row` | PASS | 2.164x |
+| `spmm_csr_f32_int_non_non_col` | PASS | 4.894x |
+| `spmm_csr_f32_int_non_trans_row` | PASS | 4.881x |
+| `spmm_csr_f32_int_trans_non_row` | PASS | 1.001x |
+| `spmm_csr_i8i32_int_non_non_row` | PASS | 2.246x |
+| `spmm_coo` 族 | | |
+| `spmm_coo_c32_int_non_non_row` | PASS | 2.004x |
+| `spmm_coo_f16_int_non_non_row` | PASS | 3.924x |
+| `spmm_coo_i8i32_int_non_non_row` | PASS | 0.350x |
+| `spmm_csc` 族 | | |
+| `spmm_csc_c32_int_non_non_row` | PASS | - |
+| `spmm_csc_f16_int_non_non_row` | PASS | - |
+| `spmm_csc_f32_int_non_non_row` | PASS | - |
+| `sddmm_csr` 族 | | |
+| `sddmm_csr_c32_int_non_non_row` | PASS | 1.241x |
+| `sddmm_csr_f16_int_non_non_row` | PASS | - |
+| `sddmm_csr_f32_int_non_non_col` | PASS | 2.878x |
+| `sddmm_csr_f32_int_non_trans_row` | PASS | 6.876x |
+| `sddmm_csr_f32_int_trans_non_row` | PASS | 1.350x |
+| `spgemm_csr` 族 | | |
+| `spgemm_csr_f32_int_non_non` | PASS | 0.245x（hipSPARSE 基线 0.48x） |
+
+45/45 行精度全部 PASS。性能上，`spmv_csr_f32_int_trans`（0.034x）和
+`spmv_csr_c32_int_conj`（0.039x）明显偏慢——这不是 DCU 特有问题，CUDA 上同样的
+transpose/conj atomic-scatter 路由是 0.30x 左右，MACA 上是 0.074-0.085x，DCU 更慢但
+同一个已知瓶颈，不是新 bug。`-` 的变体（`spmv_coo`/`spmv_csc`/`spmm_csc` 全系列、
+`sddmm_csr_f16`）是 PyTorch 没有对应的稀疏实现可比，不代表变体本身有问题，精度照样
+PASS。
