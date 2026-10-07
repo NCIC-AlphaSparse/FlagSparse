@@ -131,6 +131,12 @@ class PreparedCsrSpmv:
         "index_fallback_reason",
         "_baseline_compute_dtype",
         "_baseline_data",
+        "_rocm_torch_matrix",
+        "_rocm_torch_values",
+        "_rocm_torch_version",
+        "_rocm_torch_x",
+        "_rocm_torch_x_ptr",
+        "_rocm_torch_x_version",
         "alg_requested",
         "alg",
         "config",
@@ -183,6 +189,12 @@ class PreparedCsrSpmv:
         self.index_fallback_reason = index_fallback_reason
         self._baseline_compute_dtype = _spmv_baseline_compute_dtype(data.dtype)
         self._baseline_data = None
+        self._rocm_torch_matrix = None
+        self._rocm_torch_values = None
+        self._rocm_torch_version = None
+        self._rocm_torch_x = None
+        self._rocm_torch_x_ptr = None
+        self._rocm_torch_x_version = None
         self.alg_requested = "auto"
         self.alg = None
         self.config = {}
@@ -1717,6 +1729,64 @@ def _spmv_execution_matrix(prepared):
 
 
 def _execute_spmv_route(prepared, x, out=None, timing=False):
+    # Optional ROCm native f16 experiment.  The public f16 output requires a
+    # float32 -> f16 conversion, which loses to the native Triton path on the
+    # Q4 corpus; keep it opt-in for backend investigation only.
+    rocm_torch_route = (
+        _is_rocm_runtime()
+        and prepared.alg_requested == "auto"
+        and os.environ.get("FLAGSPARSE_ROCM_SPMV_F16_NATIVE") == "1"
+        and (
+            (prepared.data.dtype == torch.float16 and not prepared.transpose)
+        )
+    )
+    if rocm_torch_route:
+        compute_dtype = _spmv_baseline_compute_dtype(prepared.data.dtype)
+        if prepared._rocm_torch_matrix is None:
+            values = prepared.data.to(compute_dtype)
+            rows = prepared.kernel_indptr.to(torch.int64)
+            cols = prepared.kernel_indices.to(torch.int64)
+            prepared._rocm_torch_values = values
+            prepared._rocm_torch_matrix = torch.sparse_csr_tensor(
+                rows, cols, values, size=prepared.shape, device=prepared.data.device
+            )
+            prepared._rocm_torch_version = getattr(prepared.data, "_version", -1)
+        else:
+            version = getattr(prepared.data, "_version", -1)
+            if version != prepared._rocm_torch_version:
+                prepared._rocm_torch_values.copy_(prepared.data.to(compute_dtype))
+                prepared._rocm_torch_version = version
+        matrix = prepared._rocm_torch_matrix
+        if prepared.op == SPMV_OP_TRANS:
+            matrix = matrix.transpose(0, 1)
+        elif prepared.op == SPMV_OP_CONJ_TRANS:
+            matrix = matrix.conj().transpose(0, 1)
+        x_ptr = x.data_ptr()
+        x_version = getattr(x, "_version", -1)
+        if (
+            prepared._rocm_torch_x is None
+            or prepared._rocm_torch_x_ptr != x_ptr
+            or prepared._rocm_torch_x_version != x_version
+        ):
+            prepared._rocm_torch_x = x.to(compute_dtype)
+            prepared._rocm_torch_x_ptr = x_ptr
+            prepared._rocm_torch_x_version = x_version
+        vector = prepared._rocm_torch_x
+        y, compute_ms = _spmv_phase(
+            lambda: torch.sparse.mm(matrix, vector.unsqueeze(1)).squeeze(1), timing
+        )
+        if y.dtype != prepared.data.dtype:
+            y = y.to(prepared.data.dtype)
+        if out is not None:
+            out.copy_(y)
+            y = out
+        return y, {
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": compute_ms,
+            "execution_indices_dtype": "int64",
+            "execution_indptr_dtype": "int64",
+        }
     if prepared.non_gather_plan is not None and prepared.alg_requested == "auto":
         from . import _spmv_csr_transpose
         y, compute_ms = _spmv_phase(

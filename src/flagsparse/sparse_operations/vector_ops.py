@@ -192,7 +192,15 @@ def flagsparse_axpby(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    if _is_ascend_runtime():
+    # On gfx936, the native half-precision indexed add is substantially faster
+    # than launching separate fp32 scale and scatter kernels.  AXPBY's indices
+    # are required to be unique, so doing the update in the requested dtype is
+    # deterministic and matches the documented half output contract.
+    if _is_rocm_runtime() and y.dtype in (torch.float16, torch.bfloat16):
+        y.mul_(b_re)
+        if values.numel():
+            y.index_add_(0, kernel_idx.to(torch.int64), values * a_re)
+    elif _is_ascend_runtime():
         _torch_axpby(values, kernel_idx, y, complex(a_re, a_im) if is_complex else a_re,
                      complex(b_re, b_im) if is_complex else b_re)
     else:
@@ -305,7 +313,22 @@ def flagsparse_spvv(values, indices, y, op="non", return_time=False, *, validate
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    if _is_ascend_runtime():
+    # Match the ROCm PyTorch baseline for the variants whose Triton reduction
+    # is launch-bound.  Keeping the expression native is also important for
+    # complex values: the real-plane fallback needs two extra reductions.
+    if _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
+        idx = kernel_idx.to(torch.int64)
+        rhs = y.index_select(0, idx).to(compute)
+        lhs = values.to(compute)
+        if values.dtype == torch.complex64:
+            # vdot fuses the complex multiply and reduction into one device
+            # reduction; unlike ``(conj(x) * y).sum()`` it avoids a temporary.
+            result = torch.vdot(lhs, rhs) if op == "conj" else torch.dot(lhs, rhs)
+        elif values.dtype == torch.int8:
+            result = (lhs * rhs).sum(dtype=compute)
+        else:
+            result = torch.dot(lhs, rhs)
+    elif _is_ascend_runtime():
         result = _torch_spvv(values, kernel_idx, y, op)
     else:
         nnz = values.numel()

@@ -31,6 +31,7 @@ Complex values run on interleaved real/imag planes; Ascend takes a torch_npu pat
 
 from ._common import *
 
+import os
 import time
 
 import triton
@@ -70,7 +71,6 @@ _TL = {
     torch.float64: tl.float64,
     torch.int32: tl.int32,
 }
-
 
 @triton.jit
 def _spmv_sell_real_kernel(
@@ -283,8 +283,26 @@ def flagsparse_spmv_sell(
         y = torch.empty(n_rows, dtype=out_dtype, device=x.device)
         block_r = triton.next_power_of_2(slice_size)
         # Group existing slices; changing SLICE would reinterpret the storage.
-        # Fill all four warps (64 lanes on ROCm) without repacking the matrix.
         group = max(1, min(8, (256 if _is_rocm_runtime() else 128) // block_r))
+        # On gfx936, fp32 benefits from four slices in one wave while f16/int8
+        # use the wider eight-slice tile.  The latter have lower per-entry work
+        # and need two waves to hide the gather latency.  These values were
+        # selected over the ten Q4 matrices; callers can still tune explicitly.
+        if _is_rocm_runtime():
+            if values.dtype == torch.float32:
+                group, num_warps = 4, 1
+            else:
+                group, num_warps = 8, 2
+        else:
+            num_warps = 4
+        # gfx936 wavefront occupancy is sensitive to how many slices one
+        # program owns.  Keep an opt-in override for backend tuning.
+        override = os.environ.get("FLAGSPARSE_SELL_ROCM_GROUP")
+        if _is_rocm_runtime() and override:
+            group = max(1, min(8, int(override)))
+        warp_override = os.environ.get("FLAGSPARSE_SELL_ROCM_WARPS")
+        if _is_rocm_runtime() and warp_override:
+            num_warps = max(1, min(8, int(warp_override)))
         grid = (triton.cdiv(n_slices, group),)
         if n_slices:
             if _is_complex_dtype(values.dtype):
@@ -301,12 +319,14 @@ def flagsparse_spmv_sell(
                     )
                 else:
                     _spmv_sell_complex_parallel_kernel[(n_slices,)](
-                        *complex_args, SLICE=slice_size, BLOCK_R=block_r, SLOTS=4,
+                        *complex_args, SLICE=slice_size, BLOCK_R=block_r,
+                        SLOTS=(8 if _is_rocm_runtime() else 4),
                     )
             else:
                 _spmv_sell_real_kernel[grid](
                     y, values, cols, offsets, x, n_rows,
                     SLICE=slice_size, BLOCK_R=block_r, ACC=_TL[acc_dtype], GROUP=group,
+                    num_warps=num_warps,
                 )
     if out is not None:
         out.copy_(y)

@@ -155,7 +155,7 @@ class PreparedCoo:
             counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
             ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(self.row_trans.dtype)
             self.transpose_csr_plan = _spmv_csr_transpose.make_plan(self.col_trans, ptr, None, self.n_cols)
-            if (_backend_name() == "cuda" or _is_maca_runtime()) and self.data_non.dtype == torch.complex64:
+            if (_backend_name() == "cuda" or _is_maca_runtime() or _is_rocm_runtime()) and self.data_non.dtype == torch.complex64:
                 counts = torch.bincount(self.row_non.long(), minlength=self.n_rows)
                 ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(self.row_non.dtype)
                 self.non_csr_plan = _spmv_csr_transpose.make_plan(self.col_non, ptr, None, self.n_rows)
