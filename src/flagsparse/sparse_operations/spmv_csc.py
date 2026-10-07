@@ -777,7 +777,7 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
             data, indices, indptr, x, (n_cols, n_rows),
             out=out, out_dtype=out_dtype, return_time=timed,
         )
-    elif _SPMV_CSC_CUDA and data.dtype == torch.float16:
+    elif (_SPMV_CSC_CUDA or _is_maca_runtime()) and data.dtype == torch.float16:
         y = _mixed_spmx.spmv_csc_half(
             data, indices, indptr, x, shape, out=out, out_dtype=out_dtype, return_time=timed)
     else:

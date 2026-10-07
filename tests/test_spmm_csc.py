@@ -740,6 +740,11 @@ def main():
     parser.add_argument("--iters", type=int, default=ITERS)
     parser.add_argument("--timing", action="store_true")
     parser.add_argument(
+        "--q4-variants",
+        action="store_true",
+        help="also measure this operator's q4 variants and append them to the CSV",
+    )
+    parser.add_argument(
         "--no-cusparse",
         action="store_true",
         help="Disable vendor sparse reference (cuSPARSE on CUDA, hipSPARSE on ROCm)",
@@ -877,6 +882,16 @@ def main():
         if fh is not None:
             fh.close()
     failures = sum(1 for row in rows if row.get("status") in ("FAIL", "ERROR"))
+    if args.q4_variants:
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmm_csc",
+            [path for _name, path, _shape, _cols in cases if path is not None],
+            args.csv_csc,
+            args.warmup,
+            args.iters,
+        )
     if failures:
         raise SystemExit(1)
 

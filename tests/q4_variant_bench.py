@@ -112,6 +112,8 @@ VARIANTS = {
     ],
     "spmm_csc": [
         Variant("spmm_csc_f16_int_non_non_row", "spmm", "csc", f16, f16),
+        Variant("spmm_csc_f32_int_non_non_row", "spmm", "csc", f32, f32),
+        Variant("spmm_csc_c32_int_non_non_row", "spmm", "csc", c32, c32),
     ],
     "sddmm_csr": [
         Variant("sddmm_csr_f32_int_non_non_col", "sddmm", "csr", f32, f32, layout="col"),
@@ -152,6 +154,12 @@ COLUMN_MAPS = {
         "speedup_vs_vendor": "cusparse_vs_alg_speedup", "speedup_vs_pytorch": "triton_speedup_vs_pytorch",
         "vendor_max_error": "err_vs_cusparse", "vendor_reason": "cusparse_reason", "error": "reason",
     },
+    "spmm_csc": {
+        "value_dtype": "dtype", "ours_ms": "ms", "vendor_ms": "cusparse_ms",
+        "pytorch_ms": "pytorch_ms", "speedup_vs_vendor": "cusparse_vs_alg_speedup",
+        "speedup_vs_pytorch": "triton_speedup_vs_pytorch", "vendor_max_error": "err_vs_cusparse",
+        "vendor_reason": "cusparse_reason", "error": "reason",
+    },
     "sddmm_csr": {
         "ours_ms": "triton_ms", "vendor_ms": "cusparse_ms", "speedup_vs_vendor": "triton_speedup_vs_cusparse",
         "speedup_vs_pytorch": "triton_speedup_vs_pytorch", "vendor_max_error": "err_cu",
@@ -162,6 +170,7 @@ COLUMN_MAPS = {
 CONSTANTS = {
     "spmv_csr": {"alg": "q4"},
     "spmm_coo": {"alg": "q4"},
+    "spmm_csc": {"alg": "q4"},
     "spmm_bell": {"alg": "q4", "block_dim": 2, "layout": "row", "index_dtype": "int32"},
 }
 BELL_BLOCK = 2  # the runner's spmm_bell command measures --block-dims 2

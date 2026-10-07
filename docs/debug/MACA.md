@@ -136,6 +136,27 @@ FLAGSPARSE_MACA_VENDOR=torch python3 -u tools/run_backend_tests.py \
 `test_spgemm.py` 不识别它给 worker 传入的 `--_matrix-worker` 参数。当前 runner 因父进程退出码为 0，
 误将该 q4 汇总行标成 Passed；该加速比必须视为**未测**，不能用于报告。
 
+### 3.3 MACA-only kernel 复测（2026-10-07）
+
+针对 3 个平均加速比低于 0.8 的变体做了 MACA 专用优化，其他后端路由不变：
+
+- `spvv_c32_int_conj` 在 MACA 启用 packed 实部/虚部 partial reduction；
+- `spmv_coo_c32_int_non` 在 MACA 使用预构建 CSR-gather 拓扑；
+- `spmv_csc_f16_int_non` 在 MACA 使用 CSC 分块 mixed kernel，避免 CSC 展开为 COO。
+
+在 C550 上按 `warmup=5, iters=20` 复测，使用 `tests/data` 的 11 个矩阵（SpVV 使用 4 个合成规模），
+精度为 6/6 PASS，加速比定义仍为逐 case 的 `FlagSparse / PyTorch` 算术平均：
+
+| 变体 | 精度 | PyTorch 平均加速比 | 有效 case |
+|---|---:|---:|---:|
+| `spvv_c32_int_conj` | 2/2 PASS | **1.066x** | 4 |
+| `spmv_coo_c32_int_non` | 2/2 PASS | **1.583x** | 11 |
+| `spmv_csc_f16_int_non` | 2/2 PASS | **1.965x** | 11 |
+
+定向原始日志保存在 `results_metax_q4_targets_fixed_20261007/`；CSC SpMM 的修复后完整结果保存在
+`results_metax_spmm_csc_q4_fixed_20261007/`。因此，当前 MACA 45 项中有有效 PyTorch baseline 的 44 项
+平均加速比均已超过 0.8x；SpGEMM 仍因 baseline/reference 不一致而不计入。
+
 ## 4. q4 实测结果（2026-09-28，旧 42 条清单，新增 6 个变体未测）
 
 **环境**：MetaX C550，MACA SDK 3.8.2.6，torch `2.10.0+metax3.8.1.0`，

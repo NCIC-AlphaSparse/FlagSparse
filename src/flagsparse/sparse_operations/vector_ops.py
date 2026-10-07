@@ -311,7 +311,16 @@ def flagsparse_spvv(values, indices, y, op="non", return_time=False, *, validate
         nnz = values.numel()
         n_parts = max(1, triton.cdiv(nnz, _VECTOR_BLOCK))
         real = _real_dtype(compute)
-        if _is_complex_dtype(compute) and _backend_name() == "cuda" and n_parts <= 1024:
+        # MACA benefits from the same packed real/imaginary partial layout as
+        # CUDA: one reduction kernel replaces two independent ``Tensor.sum``
+        # launches and avoids a temporary complex construction.  Keep this
+        # opt-in backend-specific because other Triton targets have different
+        # complex lowering behavior.
+        if (
+            _is_complex_dtype(compute)
+            and (_backend_name() == "cuda" or _is_maca_runtime())
+            and n_parts <= 1024
+        ):
             result = torch.empty((), dtype=compute, device=y.device)
             target = torch.view_as_real(result)
             if not nnz:

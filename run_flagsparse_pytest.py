@@ -474,6 +474,7 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "{input}",
         "--csv-csc",
         "{csv}",
+        "--q4-variants",
         "--dtypes",
         "float16,float32,float64,complex64,complex128",
         "--ops",
