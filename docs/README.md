@@ -1,10 +1,13 @@
 # 后端文档索引
 
-四处文档，各回答一个问题：`docs/<BACKEND>.md` 怎么在那台机器上跑、
-`capi/docs/<BACKEND>.md` C API 那一层、[`modified/<BACKEND>.md`](../modified/README.md)
-这轮在实机上改了哪些文件（改动台账，省得后端文件来回传）、
-[`docs/debug/`](debug/README.md) 这次"20→65 变体统一"这件事该后端还要上机验证什么
-（2026-10-08 起新增，只管这一次改动，不是通用调试手册）。
+三处文档，各回答一个问题：`docs/<BACKEND>.md` 怎么在那台机器上跑、
+`capi/docs/<BACKEND>.md` C API 那一层、[`docs/debug/<BACKEND>.md`](debug/README.md)
+该后端还要上机验证什么，以及在实机上改了哪些文件（每个文件末尾的"实机改动记录"一节，
+省得后端文件来回传）。
+
+原来的改动台账目录 `modified/` 已于 2026-10-08 停用，之后的实机改动一律记到 `docs/debug/`。
+各文档里"见 `modified/<BACKEND>.md` 第 N 节"这类引用指向的是当时的本地台账，它从未进过 git，
+只作为出处保留。
 
 **一个后端一个文件。** Python 侧在 `docs/`，C API 侧在 `capi/docs/`，同名对应：
 `docs/MUSA.md` 讲怎么在摩尔线程上跑 Python/Triton 这套，`capi/docs/MUSA.md` 讲 C API

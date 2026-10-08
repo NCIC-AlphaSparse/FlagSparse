@@ -3,8 +3,9 @@
 GPU sparse operations package (SpMV, SpMM, SpGEMM, SDDMM, gather, scatter, sparse formats).
 
 > **Bringing this up on a non-NVIDIA accelerator?** Start at [`prompt.md`](prompt.md), then
-> read `docs/<BACKEND>.md` (how to run there) and `modified/<BACKEND>.md` (what previous
-> work changed, and why). This README documents the CUDA reference path.
+> read `docs/<BACKEND>.md` (how to run there) and `docs/debug/<BACKEND>.md` (what still needs
+> verifying there, and what previous work changed on that machine, and why). This README
+> documents the CUDA reference path.
 
 ## Install
 
@@ -320,7 +321,7 @@ environment checks and known limits.
 | `benchmark/` | Backend probes and vendor-baseline benchmarks |
 | `capi/` | The cuSPARSE-compatible C API wrapper, its CTest suite and per-backend baselines |
 | `docs/` | One document per backend: how to run on that machine. `docs/README.md` is the index |
-| `modified/` | One change ledger per backend: what was changed on that machine, where, and why -- so backends exchange descriptions instead of whole files |
+| `docs/debug/` | One file per backend: what still needs verifying on that machine, plus its change ledger (what was changed there, where, and why -- so backends exchange descriptions instead of whole files) |
 | `prompt.md` | Start here when bringing up a new backend |
 
 ## Tests
