@@ -356,13 +356,17 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+    # `auto`, not `compare`: the delivery number is the path a caller actually
+    # gets (row_tile on ROCm, legacy_segbin on CUDA, ...). `compare` writes one
+    # row per registered algorithm, and _is_delivery_performance_row drops those
+    # -- pass `--op-benchmark-args 'spmv_csr=--alg compare'` to tune, not deliver.
     "spmv_csr": (
         "tests/test_spmv_csr.py",
         "{input}",
         "--csv-csr",
         "{csv}",
         "--alg",
-        "compare",
+        "auto",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -3504,7 +3508,31 @@ def _is_delivery_performance_row(row: dict[str, str]) -> bool:
         if op and op != "non":
             return False
     transpose = str(_row_value(row, "transpose") or "").strip().lower()
-    return transpose not in {"true", "1"}
+    if transpose in {"true", "1"}:
+        return False
+    # A script that sweeps several algorithms (spmv_csr --alg compare) records
+    # which one each row asked for; only the `auto` row is the path a caller
+    # gets. Averaging the others in made spmv_csr's delivery speedup the mean of
+    # seven algorithms, most of which no caller ever runs.
+    requested = str(_row_value(row, "alg_requested") or "").strip().lower()
+    return requested in ("", "auto")
+
+
+def _only_non_production_algorithm_rows(records: list[object]) -> str | None:
+    """Why a delivery projection found no rows, when the cause is that every
+    on-axis row asked for a specific algorithm rather than `auto`."""
+    requested = {
+        str(_row_value(row, "alg_requested") or "").strip().lower()
+        for row in records
+        if isinstance(row, dict) and not row.get("variant")
+    }
+    if not requested or requested & {"", "auto"}:
+        return None
+    return (
+        "the benchmark measured only specific algorithms "
+        f"({', '.join(sorted(requested))}), none with --alg auto, so none of "
+        "its rows is the path a caller gets; rerun it with --alg auto"
+    )
 
 
 # A variant shaped like the original 20 -- one plain dtype, int32 indices, `non`
@@ -3598,8 +3626,13 @@ def _delivery_performance_phase(
             result = dict(phase_result)
             result["data"] = {}
             return result
+        why = (
+            _only_non_production_algorithm_rows(records)
+            if isinstance(records, list)
+            else None
+        )
         return _delivery_not_configured_phase(
-            "performance", f"the benchmark recorded no {dtype} rows"
+            "performance", why or f"the benchmark recorded no {dtype} rows"
         )
     result = dict(phase_result)
     result["data"] = selected
@@ -3607,6 +3640,21 @@ def _delivery_performance_phase(
         result["records"] = delivery_rows
         result["delivery_row_count"] = len(delivery_rows)
         result["non_delivery_row_count"] = len(records) - len(delivery_rows)
+        # Same rule as _q4_performance_phase: a failed row of this variant fails
+        # the variant, instead of disappearing into a mean over the passing ones.
+        failed = [
+            row
+            for row in delivery_rows
+            if _row_value(row, "dtype")
+            and str(_row_value(row, "dtype")).lower() in _DELIVERY_PERF_DTYPES[dtype]
+            and str(row.get("status") or "").strip().upper() in {"FAIL", "ERROR"}
+        ]
+        if failed:
+            result["status"] = "FAIL"
+            result["failed_rows"] = [
+                _row_value(row, "matrix") or _row_value(row, "name") or "?"
+                for row in failed
+            ]
         if dtype in ("c32", "c64"):
             dtype_rows = [
                 row

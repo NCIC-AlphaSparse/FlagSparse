@@ -8,7 +8,7 @@
 ```bash
 python3 run_flagsparse_pytest.py \
   --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
-  --phase both --benchmark-input <矩阵目录>
+  --phase both --benchmark-input tests/data
 ```
 
 跑完用 `python3 tools/delivery_table.py <结果目录>` 看汇总，第一行就是 `N registered variants, M
@@ -26,7 +26,7 @@ Ascend 这 5 个后端，没有一个在真机上跑过这条命令**——下�
 - `docs/debug/<BACKEND>.md`（本目录）：**这次"20→65合并"这件事**，该后端还缺什么验证、要上机做什么、
   带回来的数据怎么判断对不对。只管这一件事，不要在这里重复 `docs/<BACKEND>.md` 已经写过的环境搭建内容。
 - **交给 Codex 的 prompt 也在这里**：每个文件末尾"交给 Codex 的 prompt"一节，后端名和路径已经填好，
-  整段贴给代理就能开工（DCU 要先换掉 `<矩阵目录>` 和 `<卡号>`）。
+  整段贴给代理就能开工（DCU 要先换掉 `<卡号>`）。
 - **改动台账也在这里**：每个文件末尾的"实机改动记录"一节，取代了 2026-10-08 停用的 `modified/` 目录。
   在实机上改了任何文件，都按那一节的格式追加一条，和代码改动放在同一个 commit 里推上来。
 
@@ -58,6 +58,22 @@ Triton 驱动真实报出 `backend=="hip"`/`arch` 以 `"gfx"` 开头——这个
 3. `python3 tools/delivery_table.py <结果目录>`，把完整输出（尤其是不是 `0 missing` 这一行）贴回来。
 4. 如果有 `FAIL` 或非 0 的 `missing`，把对应变体名和 `<结果目录>/<算子>/performance.csv`（或
    `accuracy_result.json`）里那一行的 `reason`/`error` 字段一起带回来，不要只说"跑挂了"。
+
+## spmv_csr 交付加速比的口径（2026-10-08 修正，影响所有后端）
+
+DCU 实测时发现：runner 给 spmv_csr 跑的是 `--alg compare`，7 种算法各写一行，交付表把它们**算术平均**，
+不是调用方实际走的那条路径。修正前的数字：BW1000 报 `0.207x`/`0.236x`（生产路径 `row_tile` 实为
+`0.738x`/`0.795x`），CUDA 报 `0.379x`/`0.423x`（生产路径 `legacy_segbin` 重跑为 `0.912x`/`0.827x`）。
+runner 现在默认 `--alg auto`，交付投影只认 `alg_requested=auto` 的行，有失败行时变体判 FAIL（以前会被
+平均值掩盖）。**修正前各后端交付报告里的 `spmv_csr_f32/f64_int_non` 加速比都不能直接用**，要么重跑，要么
+从原始 `performance.csv` 里只取各自生产路径那个算法的行。其余 63 个变体不受影响（CUDA 原始结果按新规则
+重新投影，只有这两个变了）。
+
+## MUSA 还有一个开发任务
+
+MUSA 的交付性能取自 C API（对 muSPARSE），而 C API 目前只覆盖 65 个变体里的 25 个。`MUSA.md` 的"第二阶段"
+一节是让其余 40 个也进 C API 性能统计的开发任务（大部分可以从 `origin/q4` 分支移植），有单独的 prompt。
+它改的是所有后端共用的 C API 分发层，推上来之后要在 CUDA 机器上重新编译、跑一遍 `ctest -L capi`。
 
 ## 昇腾（Ascend）的任务不一样，范围和工作量都更大
 
