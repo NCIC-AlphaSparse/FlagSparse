@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <complex>
+#include <cstdint>
 #include <numeric>
 #include <random>
 
@@ -65,6 +66,14 @@ std::vector<double> random_values<double>(int64_t n, uint32_t seed) {
     std::normal_distribution<double> d(0.0, 1.0);
     std::vector<double> v(static_cast<std::size_t>(n));
     for (auto& e : v) e = d(rng);
+    return v;
+}
+template <>
+std::vector<int8_t> random_values<int8_t>(int64_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> d(-128, 127);
+    std::vector<int8_t> v(static_cast<std::size_t>(n));
+    for (auto& e : v) e = static_cast<int8_t>(d(rng));
     return v;
 }
 template <>
@@ -148,6 +157,12 @@ TEST_F(GatherAccuracy, Complex64) {
 TEST_F(GatherAccuracy, Complex128) {
     check_gather<std::complex<double>, int32_t>(handle.h, FLAGSPARSE_C_64F,
                                                 FLAGSPARSE_INDEX_32I, 2048, 512, "c128/i32");
+}
+// i8 gather: same dispatch path as the other dtypes (gather/scatter move
+// bytes, no arithmetic), just int8 end to end.
+TEST_F(GatherAccuracy, Int8) {
+    check_gather<int8_t, int32_t>(handle.h, FLAGSPARSE_R_8I, FLAGSPARSE_INDEX_32I,
+                                  4096, 1024, "i8/i32");
 }
 
 // Index width is a descriptor property, not part of the function name, and both

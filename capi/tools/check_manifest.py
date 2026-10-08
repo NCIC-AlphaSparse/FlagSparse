@@ -170,8 +170,22 @@ def tested_variants(bench_dir, scope="all"):
                 continue
             if scope == "delivery" and row.get("reporting") != "delivery":
                 continue
-            found.setdefault((family, fmt, dt), []).append(row.get("status"))
+            found.setdefault((family, fmt, dt), []).append(
+                (row.get("status"), row.get("variant"))
+            )
     return found
+
+
+def registry_variants():
+    """The repo-root delivery registry (conf/operators.yaml `delivery_variants`).
+
+    A benchmark row tagged with a `variant` id is declared there, not here: this
+    manifest has no opA/opB/layout/mixed-type axes to declare it with.
+    """
+    sys.path.insert(0, str(ROOT.parent))
+    from tools.delivery_variants import load_delivery_variants
+
+    return load_delivery_variants()
 
 
 def main():
@@ -263,15 +277,37 @@ def main():
                 f"  NOT MEASURED    {oid:<22} {fmt}/{dt}  "
                 f"(expected a row in {fam}_benchmark.json)"
             )
-        # The other direction: rows nobody declared.
+        # The other direction: rows nobody declared. A row tagged with a
+        # delivery variant id is declared by the registry, checked just below.
         declared_set = {(fam_of.get(o), f, d) for o, f, d in variants}
-        extra = [k for k in tested if k not in declared_set]
+        extra = [
+            k
+            for k, rows in tested.items()
+            if k not in declared_set and any(vid is None for _, vid in rows)
+        ]
         for fam, fmt, dt in sorted(extra):
             print(
                 f"  UNDECLARED ROW  {fam:<22} {fmt}/{dt}  "
                 f"(measured, but the manifest does not declare it)"
             )
-        n = len(undeclared_test) + len(uncovered) + len(extra)
+        # Registry variants: every one the C API implements (`capi: true`) must
+        # have a tagged row, and every tag must name a registered variant.
+        registry = registry_variants()
+        tagged = {vid for rows in tested.values() for _, vid in rows if vid}
+        expected = {v["id"] for v in registry if v["capi"]}
+        missing = sorted(expected - tagged)
+        unknown = sorted(tagged - {v["id"] for v in registry})
+        for vid in missing:
+            print(f"  NOT MEASURED    {vid}  (capi: true in conf/operators.yaml)")
+        for vid in unknown:
+            print(f"  UNKNOWN VARIANT {vid}  (tagged row, not in conf/operators.yaml)")
+        n = (
+            len(undeclared_test)
+            + len(uncovered)
+            + len(extra)
+            + len(missing)
+            + len(unknown)
+        )
         print(f"  {n} disagreements\n" if n else "  manifest and rows agree\n")
         drift += n
 

@@ -43,6 +43,7 @@ import triton.language as tl  # noqa: E402
 
 from flagsparse.sparse_operations.sddmm_csr import (  # noqa: E402,F401
     _row_ids_kernel,
+    _sddmm_csr_complex_kernel,
     _sddmm_csr_real_kernel,
 )
 
@@ -91,4 +92,19 @@ def sddmm_csr_real(
     )
 
 
-__all__ = ["_row_ids_kernel", "_sddmm_csr_real_kernel", "sddmm_csr_real"]
+@triton.jit
+def sddmm_csr_complex(
+    indices_ptr, row_ids_ptr, x_ri_ptr, y_ri_ptr, in_ri_ptr, out_ri_ptr,
+    nnz, k_dim, stride_xm, stride_xk, stride_ym, stride_yk, alpha, beta,
+    HAS_IN: tl.constexpr, BLOCK_P: tl.constexpr, BLOCK_K: tl.constexpr,
+    ACC_IS_FP64: tl.constexpr,
+):
+    _sddmm_csr_complex_kernel(
+        indices_ptr, row_ids_ptr, x_ri_ptr, y_ri_ptr, in_ri_ptr, out_ri_ptr,
+        nnz, k_dim, stride_xm, stride_xk, stride_ym, stride_yk, alpha, beta,
+        HAS_IN, BLOCK_P, BLOCK_K, tl.float64 if ACC_IS_FP64 else tl.float32,
+    )
+
+
+__all__ = ["_row_ids_kernel", "_sddmm_csr_real_kernel", "sddmm_csr_real",
+           "sddmm_csr_complex"]

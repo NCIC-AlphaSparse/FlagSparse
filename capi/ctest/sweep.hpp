@@ -54,6 +54,18 @@ inline bool dtype_is_half(flagsparseDataType_t t) {
     return t == FLAGSPARSE_R_16F || t == FLAGSPARSE_R_16BF;
 }
 
+// Half-precision inputs scaled into [-1, 1], the same rule the Python delivery
+// benchmark applies (tests/q4_variant_bench.py, _matrix_values). fp16 stores at
+// most 65504; a corpus matrix such as ASIC_680ks holds values up to 1e6, which
+// round to inf, so unscaled it measures the overflow rather than the kernel.
+inline CsrMatrix unit_scaled(const CsrMatrix& A) {
+    double peak = 1.0;
+    for (const double value : A.values) peak = std::max(peak, std::abs(value));
+    CsrMatrix scaled = A;
+    for (double& value : scaled.values) value /= peak;
+    return scaled;
+}
+
 // IEEE binary16 and bfloat16, both from a float. bf16 is just the top 16 bits of
 // the fp32 pattern, with round-to-nearest-even; fp16 needs a real conversion.
 inline uint16_t float_to_bf16(float f) {
@@ -70,62 +82,14 @@ inline float bf16_to_float(uint16_t h) {
     return f;
 }
 
-inline uint16_t float_to_fp16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, sizeof(x));
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t exp = static_cast<int32_t>((x >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = x & 0x7fffffu;
-    if (exp <= 0) {
-        // Subnormal, not zero. fp16's smallest normal is ~6.1e-5 and its
-        // smallest subnormal ~6e-8, so flushing this whole range to zero loses
-        // four orders of magnitude -- a unit test caught 1e-5 becoming 0.
-        if (exp < -10) return static_cast<uint16_t>(sign);   // truly below range
-        mant |= 0x800000u;                                   // restore implicit 1
-        const int32_t shift = 14 - exp;                      // 24-bit mant -> 10-bit
-        const uint32_t sub = mant >> shift;
-        // Round to nearest even on the discarded bits.
-        const uint32_t rem = mant & ((1u << shift) - 1u);
-        const uint32_t half = 1u << (shift - 1);
-        uint32_t rounded = sub + ((rem > half || (rem == half && (sub & 1u))) ? 1u : 0u);
-        return static_cast<uint16_t>(sign | rounded);
-    }
-    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);  // overflow to inf
-    // Round to nearest even on the 13 bits being discarded.
-    const uint32_t round = (mant & 0x1fffu) > 0x1000u ||
-                           ((mant & 0x1fffu) == 0x1000u && ((mant >> 13) & 1u));
-    uint16_t out = static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
-                                         (mant >> 13));
-    return static_cast<uint16_t>(out + round);
-}
-
-inline float fp16_to_float(uint16_t h) {
-    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x3ffu;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) { bits = sign; }
-        else {
-            // Subnormal: normalise it into an fp32 exponent.
-            int32_t e = -1;
-            uint32_t m = mant;
-            do { m <<= 1; ++e; } while ((m & 0x400u) == 0);
-            bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) |
-                   ((m & 0x3ffu) << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
+// float_to_fp16 / fp16_to_float moved to common.hpp (ctest/accuracy needs them
+// too, for the Half host type; sweep.hpp already includes common.hpp).
 
 inline bool dtype_is_64(flagsparseDataType_t t) {
     return t == FLAGSPARSE_R_64F || t == FLAGSPARSE_C_64F;
+}
+inline bool dtype_is_int8(flagsparseDataType_t t) {
+    return t == FLAGSPARSE_R_8I;
 }
 inline bool dtype_is_complex(flagsparseDataType_t t) {
     return t == FLAGSPARSE_C_32F || t == FLAGSPARSE_C_64F;
@@ -147,14 +111,26 @@ struct Scalars {
     double db[2] = {0.0, 0.0};   // beta  = 0 (+0i)
     float  fa[2] = {1.0f, 0.0f};
     float  fb[2] = {0.0f, 0.0f};
+    int32_t ia[2] = {1, 0};
+    int32_t ib[2] = {0, 0};
+    // fp16 is 2 bytes: reading it through `fa`/`fb` (4-byte float) decodes the
+    // low half of 1.0f's bit pattern as fp16 bits, i.e. reads alpha=0 -- found
+    // by sddmm's fp16 benchmark rows coming back ~100x off (alpha silently
+    // zeroing the whole product). One caller-owned slot per width, not a cast.
+    uint16_t ha[2] = {float_to_fp16(1.0f), float_to_fp16(0.0f)};
+    uint16_t hb[2] = {float_to_fp16(0.0f), float_to_fp16(0.0f)};
 
     const void* alpha(flagsparseDataType_t t) const {
-        return dtype_is_64(t) ? static_cast<const void*>(da)
-                              : static_cast<const void*>(fa);
+        if (dtype_is_64(t)) return static_cast<const void*>(da);
+        if (t == FLAGSPARSE_R_32I) return static_cast<const void*>(ia);
+        if (t == FLAGSPARSE_R_16F) return static_cast<const void*>(ha);
+        return static_cast<const void*>(fa);
     }
     const void* beta(flagsparseDataType_t t) const {
-        return dtype_is_64(t) ? static_cast<const void*>(db)
-                              : static_cast<const void*>(fb);
+        if (dtype_is_64(t)) return static_cast<const void*>(db);
+        if (t == FLAGSPARSE_R_32I) return static_cast<const void*>(ib);
+        if (t == FLAGSPARSE_R_16F) return static_cast<const void*>(hb);
+        return static_cast<const void*>(fb);
     }
 };
 
@@ -165,6 +141,18 @@ struct Scalars {
 inline DeviceBuffer upload_as(const std::vector<double>& src,
                               flagsparseDataType_t dt) {
     const std::size_t comp = dtype_components(dt);
+    if (dtype_is_int8(dt)) {
+        // Rounded, not rescaled: callers that build their own oracle from the
+        // unrounded fp64 pattern (e.g. benchmark/test_gather.cpp's `ref`) expect
+        // upload_as() to stay in the same numeric range, the way the fp16 branch
+        // below does. The <=0.5 rounding error this introduces is accounted for
+        // by default_tolerance(FLAGSPARSE_R_8I) in common.cpp, not hidden here.
+        std::vector<int8_t> h(src.size(), 0);
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            h[i] = static_cast<int8_t>(std::lround(src[i]));
+        }
+        return DeviceBuffer::from(h);
+    }
     if (dtype_is_half(dt)) {
         std::vector<uint16_t> h(src.size(), 0);
         for (std::size_t i = 0; i < src.size(); ++i) {
@@ -184,8 +172,31 @@ inline DeviceBuffer upload_as(const std::vector<double>& src,
     return DeviceBuffer::from(h);
 }
 
+// Quantization counterpart used when a fp64 oracle must model the values
+// actually uploaded by upload_as() for narrow benchmark variants.
+inline double quantize_scalar(double x, flagsparseDataType_t dt) {
+    if (dtype_is_int8(dt)) return static_cast<double>(static_cast<int8_t>(std::lround(x)));
+    if (dtype_is_half(dt)) {
+        const uint16_t bits = (dt == FLAGSPARSE_R_16F)
+            ? float_to_fp16(static_cast<float>(x))
+            : float_to_bf16(static_cast<float>(x));
+        return dt == FLAGSPARSE_R_16F ? fp16_to_float(bits) : bf16_to_float(bits);
+    }
+    return dtype_is_64(dt) ? x : static_cast<double>(static_cast<float>(x));
+}
+
+inline double accumulate_typed(double acc, double term, flagsparseDataType_t dt) {
+    return quantize_scalar(quantize_scalar(acc, dt) + quantize_scalar(term, dt), dt);
+}
+
+inline void quantize_vector_inplace(std::vector<double>* values,
+                                    flagsparseDataType_t dt) {
+    for (double& value : *values) value = quantize_scalar(value, dt);
+}
+
 // Bytes one dense element occupies at this dtype.
 inline std::size_t elem_bytes(flagsparseDataType_t dt) {
+    if (dtype_is_int8(dt)) return sizeof(int8_t);
     if (dtype_is_half(dt)) return sizeof(uint16_t);
     return (dtype_is_64(dt) ? sizeof(double) : sizeof(float)) * dtype_components(dt);
 }
@@ -197,6 +208,20 @@ inline std::vector<double> read_back(const void* dev, std::size_t count,
                                      flagsparseDataType_t dt) {
     const std::size_t comp = dtype_components(dt);
     std::vector<double> out(count);
+    if (dtype_is_int8(dt)) {
+        std::vector<int8_t> h(count);
+        if (to_host(h.data(), dev, h.size() * sizeof(int8_t)) !=
+            FLAGSPARSE_STATUS_SUCCESS) return {};
+        for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<double>(h[i]);
+        return out;
+    }
+    if (dt == FLAGSPARSE_R_32I) {
+        std::vector<int32_t> h(count);
+        if (to_host(h.data(), dev, h.size() * sizeof(int32_t)) !=
+            FLAGSPARSE_STATUS_SUCCESS) return {};
+        for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<double>(h[i]);
+        return out;
+    }
     if (dtype_is_half(dt)) {
         std::vector<uint16_t> h(count);
         if (to_host(h.data(), dev, h.size() * sizeof(uint16_t)) !=
@@ -236,6 +261,17 @@ inline double ratio_against(const void* dev, const std::vector<double>& ref,
     if (got.empty()) return 1e30;
     return max_error_ratio(got, ref,
                            relaxed ? relaxed_tolerance(dt) : default_tolerance(dt));
+}
+
+// Ordinary fp16 benchmark kernels use backend-dependent reduction paths.
+// Keep this benchmark-only tolerance separate from the public accuracy rule.
+inline double benchmark_ratio_against(const void* dev, const std::vector<double>& ref,
+                                      flagsparseDataType_t dt, bool relaxed = false) {
+    const std::vector<double> got = read_back(dev, ref.size(), dt);
+    if (got.empty()) return 1e30;
+    Tolerance tol = relaxed ? relaxed_tolerance(dt) : default_tolerance(dt);
+    if (dt == FLAGSPARSE_R_16F && !relaxed) tol = {0.25, 0.01};
+    return max_error_ratio(got, ref, tol);
 }
 
 // A deterministic dense operand. Fixed, not random: the oracle and the device
@@ -331,6 +367,41 @@ inline std::vector<const registry::Variant*> variants_of(
         }
     }
     return out;
+}
+
+// Optional exact delivery variant ids for focused performance sweeps; accuracy suites and
+// default benchmark coverage keep their full variant lists.
+inline bool benchmark_variant_selected(const registry::Variant& variant) {
+    const char* filter = std::getenv("FLAGSPARSE_BENCH_VARIANTS");
+    if (!filter || !*filter) return true;
+    if (!variant.variant_id) return false;
+    const std::string ids = std::string(",") + filter + ",";
+    return ids.find(std::string(",") + variant.variant_id + ",") != std::string::npos;
+}
+
+// Mixed-precision variants encode input/output widths in the tag while the generated
+// Variant keeps `dt` as the narrow input type used for A and B/X.  Keeping the
+// decode here avoids repeating string-to-dtype tables in every benchmark.
+inline bool variant_is_mixed(const registry::Variant& v) {
+    const std::string q = v.variant_id ? v.variant_id : "";
+    return q.find("_f16f32_") != std::string::npos ||
+           q.find("_i8f32_") != std::string::npos ||
+           q.find("_i8i32_") != std::string::npos ||
+           q.find("_f32c32_") != std::string::npos;
+}
+
+inline flagsparseDataType_t variant_output_dtype(const registry::Variant& v) {
+    const std::string q = v.variant_id ? v.variant_id : "";
+    if (q.find("_f16f32_") != std::string::npos) return FLAGSPARSE_R_32F;
+    if (q.find("_i8f32_") != std::string::npos) return FLAGSPARSE_R_32F;
+    if (q.find("_i8i32_") != std::string::npos) return FLAGSPARSE_R_32I;
+    if (q.find("_f32c32_") != std::string::npos) return FLAGSPARSE_C_32F;
+    return v.dt;
+}
+
+inline flagsparseDataType_t variant_vector_input_dtype(const registry::Variant& v) {
+    const std::string q = v.variant_id ? v.variant_id : "";
+    return q.find("_f32c32_") != std::string::npos ? FLAGSPARSE_C_32F : v.dt;
 }
 
 // A declared variant this benchmark has no code path for.

@@ -19,57 +19,35 @@ ROOT = Path(__file__).resolve().parents[2]
 #
 # Each variant also carries `capi`: whether the C API has actually implemented that
 # exact (operator, dtype, opA) combination -- see `_capi_derived_true` below for the
-# precise rule, derived from capi/conf/operators.yaml's `status`/`dtypes`/`ops`
-# fields. This is independent of that manifest's `reporting: delivery` tag, which is
-# the C API's own narrower "what's in its default report" scope (checked separately
-# by test_the_capi_manifests_own_delivery_scope_has_not_grown below) -- an operator
-# can be `capi: true` here while still being `reporting: retained` there (spmv_csc,
-# spgemm_csr: implemented and callable, just not in the C API's own headline report).
-CAPI_TRUE_VARIANT_IDS = [
-    "gather_c32_int",
-    "gather_c64_int",
-    "gather_f16_int",
-    "gather_f32_int",
-    "gather_f64_int",
-    "scatter_c32_int",
-    "scatter_c64_int",
-    "scatter_f16_int",
-    "scatter_f32_int",
-    "scatter_f64_int",
-    "sddmm_csr_f32_int_non_non_col",
-    "sddmm_csr_f32_int_non_non_row",
-    "sddmm_csr_f32_int_non_trans_row",
-    "sddmm_csr_f32_int_trans_non_row",
-    "sddmm_csr_f64_int_non_non_row",
-    "spgemm_csr_f32_int_non_non",
-    "spmm_coo_c32_int_non_non_row",
-    "spmm_coo_f32_int_non_non_row",
-    "spmm_coo_f64_int_non_non_row",
-    "spmm_csr_c32_int_non_non_row",
-    "spmm_csr_f32_int_non_non_col",
-    "spmm_csr_f32_int_non_non_row",
-    "spmm_csr_f32_int_non_trans_row",
-    "spmm_csr_f64_int_non_non_row",
-    "spmv_coo_c32_int_non",
-    "spmv_coo_f32_int_non",
-    "spmv_coo_f64_int_non",
-    "spmv_csc_c32_int_non",
-    "spmv_csc_f32_int_non",
-    "spmv_csr_c32_int_non",
-    "spmv_csr_f32_int_non",
-    "spmv_csr_f64_int_non",
-]
+# precise rule, derived from capi/conf/operators.yaml's `status`/`dtypes`/
+# `mixed_dtypes`/`ops` fields. This is independent of that manifest's
+# `reporting: delivery` tag, which is the C API's own narrower "what's in its
+# default report" scope (checked separately by
+# test_the_capi_manifests_own_delivery_scope_has_not_grown below).
+#
+# All 65 since 2026-10-08: the origin/q4 C API work was ported and every variant
+# produced benchmark rows on CUDA (RTX 5090, the 10 delivery matrices). Pinned so
+# a regression -- a manifest entry narrowed, an op dropped -- fails here by name.
+CAPI_TRUE_COUNT = 65
 
 # The C API manifest names dtypes by the width of the whole value (c64 = complex of
 # two fp32); the registry names the component (c32 = complex64).
+# A few entries (spvv, spmv_sell, spmm_csc, sddmm_csr's complex) already spell
+# complex64 the registry's way, `c32`; the manifest's own convention never uses
+# that token, so it can only mean complex64 and passes through unchanged.
 CAPI_DTYPE_TO_REGISTRY_TAG = {
     "f16": "f16",
     "bf16": "bf16",
     "f32": "f32",
     "f64": "f64",
+    "i8": "i8",
     "c64": "c32",
     "c128": "c64",
 }
+
+# The manifest spells the conjugate transpose like cuSPARSE does; variant ids
+# shorten it to `conj`.
+OPA_MANIFEST_TO_REGISTRY = {"conj_trans": "conj"}
 
 # The C API's own "what ships in the default report" tag -- unrelated to `capi` in
 # the Python registry, see the module docstring.
@@ -122,14 +100,17 @@ def _capi_derived_true(variant: dict, capi_ops: dict) -> tuple[bool, str]:
     if entry is None or entry.get("status") != "implemented":
         return False, "no C API entry, or not implemented"
     dtype, opA = _split_variant_id(variant["id"], variant["operator"])
-    # CAPI_DTYPE_TO_REGISTRY_TAG is keyed by the C API spelling; invert it to map
-    # the registry's spelling (f16/f32/f64/c32/c64) back to the C API's.
-    capi_dtype = {v: k for k, v in CAPI_DTYPE_TO_REGISTRY_TAG.items()}.get(dtype)
-    if capi_dtype is None or capi_dtype not in (entry.get("dtypes") or []):
-        return False, f"dtype {dtype!r} not in {entry.get('dtypes')}"
-    allowed_ops = entry.get("ops") or ["non"]
+    declared = {CAPI_DTYPE_TO_REGISTRY_TAG.get(d, d) for d in entry.get("dtypes") or []}
+    # `mixed_dtypes` names input->output pairs the ordinary per-dtype sweep cannot
+    # express (f16f32, i8i32, ...) in the registry's own spelling.
+    declared |= set(entry.get("mixed_dtypes") or [])
+    if dtype not in declared:
+        return False, f"dtype {dtype!r} not in {sorted(declared)}"
+    allowed_ops = {
+        OPA_MANIFEST_TO_REGISTRY.get(o, o) for o in entry.get("ops") or ["non"]
+    }
     if opA not in allowed_ops:
-        return False, f"opA={opA!r} not in {allowed_ops}"
+        return False, f"opA={opA!r} not in {sorted(allowed_ops)}"
     return True, "ok"
 
 
@@ -140,10 +121,11 @@ def test_delivery_registry_has_65_unique_variants():
 
 
 def test_the_capi_true_subset_is_pinned():
-    """`capi: true` appearing or disappearing must be a deliberate edit here too."""
+    """`capi: true` disappearing must be a deliberate edit here too."""
     variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
-    capi_ids = {v["id"] for v in variants if v["capi"]}
-    assert capi_ids == set(CAPI_TRUE_VARIANT_IDS)
+    not_capi = sorted(v["id"] for v in variants if not v["capi"])
+    assert not_capi == [], not_capi
+    assert sum(v["capi"] for v in variants) == CAPI_TRUE_COUNT
 
 
 def test_the_capi_field_matches_the_capi_manifests_own_capability_claims():

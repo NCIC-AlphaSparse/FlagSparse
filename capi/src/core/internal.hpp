@@ -45,6 +45,15 @@ flagsparseDataType_t component_dtype(flagsparseDataType_t dtype);
 std::size_t index_size(flagsparseIndexType_t idx);
 const char* triton_index_dtype(flagsparseIndexType_t idx);
 
+// IEEE binary16 <-> double, host-side only (alpha/beta scalars are read/built
+// once per call, not a hot path). Shared because every dispatch file that
+// reads a caller-supplied alpha/beta (spmv.cpp, spmm.cpp, sddmm.cpp, ...)
+// needs this once fp16 is one of its dtypes -- triton_dtype() already maps
+// FLAGSPARSE_R_16F, but that says nothing about how to decode a host fp16
+// scalar, which has no native C++ type.
+double fp16_to_double(std::uint16_t bits);
+std::uint16_t double_to_fp16(double value);
+
 // ---------------------------------------------------------------- handle ---
 
 struct Context {
@@ -89,6 +98,10 @@ struct SpMatDescr {
     // lets a repeated solve skip the rebuild; a caller that hands over a
     // different buffer, or reuses one buffer across matrices, gets it rebuilt.
     void* coo_offsets_buffer = nullptr;
+    // CSR transpose topology lives in caller-owned SpMM scratch, never values.
+    void* spmm_transpose_buffer = nullptr;
+    // MUSA SpMV/SpMM output-row topology in caller-owned scratch.
+    void* sparse_gather_buffer = nullptr;
 
     // SDDMM expands the CSR pattern to one row id per nonzero, into the caller's
     // externalBuffer. Same contract as coo_offsets_buffer: remembering which

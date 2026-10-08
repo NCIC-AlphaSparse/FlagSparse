@@ -69,11 +69,13 @@ runner 现在默认 `--alg auto`，交付投影只认 `alg_requested=auto` 的�
 从原始 `performance.csv` 里只取各自生产路径那个算法的行。其余 63 个变体不受影响（CUDA 原始结果按新规则
 重新投影，只有这两个变了）。
 
-## MUSA 还有一个开发任务
+## C API 现在覆盖全部 65 个变体（2026-10-08）
 
-MUSA 的交付性能取自 C API（对 muSPARSE），而 C API 目前只覆盖 65 个变体里的 25 个。`MUSA.md` 的"第二阶段"
-一节是让其余 40 个也进 C API 性能统计的开发任务（大部分可以从 `origin/q4` 分支移植），有单独的 prompt。
-它改的是所有后端共用的 C API 分发层，推上来之后要在 CUDA 机器上重新编译、跑一遍 `ctest -L capi`。
+`origin/q4` 在 MUSA 上做完并实测过的 C API 工作（45 个新变体、muSPARSE 基线扩展、MUSA 专用 gather 路径）已经
+移植进 main，CUDA 上端到端跑通：split 一次出全部 65 个，精度 65/65，性能 34 个有 cuSPARSE 加速比、31 个
+`NoBaseline`。这对 MUSA 最重要（交付性能取自 C API），细节、MUSA 专属未在 CUDA 上测过的路径、以及 q4 当时的
+MUSA 实测表见 [`MUSA.md`](MUSA.md)。另外注意口径变化：`spmm_csr/coo_f32/f64_int_non_non_row` 在 C API 里以前
+其实测的是列主序，现在按名字测行主序，数字会变。
 
 ## 昇腾（Ascend）的任务不一样，范围和工作量都更大
 

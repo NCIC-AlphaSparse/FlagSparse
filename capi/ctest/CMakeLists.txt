@@ -51,6 +51,9 @@ add_custom_command(
             --out "${_fs_variants}"
     DEPENDS "${CMAKE_SOURCE_DIR}/conf/operators.yaml"
             "${CMAKE_SOURCE_DIR}/tools/gen_variants.py"
+            # The delivery variants' tagged entries come from the repo-root registry.
+            "${CMAKE_SOURCE_DIR}/../conf/operators.yaml"
+            "${CMAKE_SOURCE_DIR}/../tools/delivery_variants.py"
     COMMENT "Generating ctest variant registry from conf/operators.yaml"
     VERBATIM)
 add_custom_target(flagsparse_variants DEPENDS "${_fs_variants}")
@@ -58,6 +61,11 @@ add_custom_target(flagsparse_variants DEPENDS "${_fs_variants}")
 # The vendor baseline a speedup is measured against. Its own CMakeLists is the
 # table of which backend has which sparse library; a backend without one compiles
 # the `none` provider, which answers "unavailable" with a reason.
+# The extended descriptor paths below are MUSA SDK 4.3.5-specific.  Keep their
+# declarations and benchmark routing out of every other backend build.
+if(BACKEND STREQUAL "MUSA")
+    add_compile_definitions(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS=1)
+endif()
 add_subdirectory(baseline)
 
 # One profile owns the test policy for the backend selected at configure time.
@@ -132,7 +140,7 @@ endfunction()
 
 # Every operator in the spec's list. Files that do not exist yet are skipped,
 # so adding an operator is: drop in test_<op>.cpp, rebuild.
-set(FLAGSPARSE_OPS spmv spmm spsv spsm spgemm sddmm gather scatter)
+set(FLAGSPARSE_OPS axpby spmv spmm spvv spsv spsm spgemm sddmm gather scatter)
 if(FLAGSPARSE_CTEST_CAPI_BUILDABLE)
     foreach(op ${FLAGSPARSE_OPS})
         flagsparse_add_test(accuracy ${op})

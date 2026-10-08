@@ -45,62 +45,10 @@ import platform
 import subprocess
 import sys
 
-import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.delivery_variants import load_delivery_variants  # noqa: E402
-
-# capi/conf/operators.yaml names dtypes by the width of the whole value (c64 =
-# complex of two fp32); the registry -- and this writer's own DTYPE_ALIASES below,
-# and every row's `dtype` field -- names the component (c32 = complex64). Only
-# needed to translate the manifest's `reporting: delivery` scope into registry
-# spelling; nothing else in this file touches the manifest's spelling.
-_CAPI_MANIFEST_DTYPE_TO_REGISTRY = {"c64": "c32", "c128": "c64"}
-
-
-def _variant_opA(variant_id: str, operator: str) -> str:
-    """The sparse-side transpose axis from a variant id, e.g. `non` from
-    `spmv_csr_f32_int_non` -- see docs/NEW_OPERATORS_CUSPARSE_12_5.md's naming
-    rule. Defaults to `non` for operators with no transpose axis at all (gather,
-    scatter), where nothing follows `_int`."""
-    rest = variant_id[len(operator) + 1 :]
-    tail = rest.split("_int_", 1)
-    opA_tail = tail[1].split("_") if len(tail) == 2 and tail[1] else []
-    return opA_tail[0] if opA_tail else "non"
-
-
-def _capi_delivery_variant_ids() -> set[str]:
-    """Variant ids the C API manifest headlines with `reporting: delivery`.
-
-    This is the narrow scope every benchmark row is already filtered to by its own
-    `reporting` tag (below) when `--all` is not passed; `expected_variants` has to
-    agree with it or a `retained` variant (e.g. a `trans` case the manifest's `ops:`
-    does not list) with no delivery-tagged row reports as a false NotFound. Not
-    just an (operator, dtype) match: `reporting: delivery` operators only ever
-    deliver their `non` direction today, so opA has to agree too.
-    """
-    manifest = yaml.safe_load(
-        (ROOT / "capi" / "conf" / "operators.yaml").read_text(encoding="utf-8")
-    )
-    scope: set[tuple[str, str]] = set()
-    allowed_ops: dict[str, list[str]] = {}
-    for op in manifest["operators"]:
-        if op.get("status") != "implemented" or op.get("reporting") != "delivery":
-            continue
-        allowed_ops[op["id"]] = op.get("ops") or ["non"]
-        for dtype in op.get("delivery_dtypes") or op.get("dtypes") or []:
-            scope.add((op["id"], _CAPI_MANIFEST_DTYPE_TO_REGISTRY.get(dtype, dtype)))
-    ids = set()
-    for variant in load_delivery_variants():
-        key = (variant["operator"], variant["dtype"])
-        if key not in scope:
-            continue
-        opA = _variant_opA(variant["id"], variant["operator"])
-        if opA in allowed_ops.get(variant["operator"], ["non"]):
-            ids.add(variant["id"])
-    return ids
-
 
 # Verbatim from run_flagsparse_pytest.py -- if that table changes this must too.
 STATUS_TO_FLAGGEMS = {
@@ -139,7 +87,17 @@ DELIVERY_BY_OPERATOR_DTYPE = {}
 
 
 def variant_name(row):
-    """The delivery-list name for a measured row, e.g. spmv_csr_f32_int_non."""
+    """The delivery-list name for a measured row, e.g. spmv_csr_f32_int_non.
+
+    A row the benchmark tagged with its delivery `variant` id is that variant:
+    the id is what configured it (opA, opB, layout, mixed types). An untagged
+    row -- the ordinary per-dtype sweep, or a JSON from before the tag existed --
+    falls back to (operator, dtype), which is only a name when exactly one
+    delivery variant has that pair.
+    """
+    tagged = row.get("variant")
+    if tagged:
+        return str(tagged)
     op = str(row.get("operator") or row.get("_op", ""))
     dtype = str(row.get("dtype", ""))
     matches = DELIVERY_BY_OPERATOR_DTYPE.get((op, dtype), [])
@@ -246,8 +204,8 @@ def main():
     ap.add_argument(
         "--all",
         action="store_true",
-        help="include retained variants; the default is the "
-        "registered delivery variants only (conf/operators.yaml)",
+        help="also read rows tagged `retained`; either way the summary has one "
+        "entry per registered delivery variant (conf/operators.yaml)",
     )
     args = ap.parse_args()
 
@@ -255,21 +213,11 @@ def main():
     if not files:
         sys.exit(f"no *_benchmark.json under {args.bench_dir}")
 
-    # conf/operators.yaml's delivery_variants now holds 65: the 20 the C API's own
-    # `reporting: delivery` tag headlines, plus 45 more it has not wrapped yet (or,
-    # for the `capi: true` subset of those, HAS wrapped but only as `retained` --
-    # see tests/ci/test_delivery_variant_registry.py). Each benchmark ROW already
-    # carries its own `reporting` tag from the same manifest and is filtered on it
-    # a few lines below; `expected_variants` has to select the matching scope here
-    # too, or a retained variant with no surviving `delivery`-tagged row would be
-    # reported as a false NotFound under the default (non-`--all`) scope.
-    if args.all:
-        delivery_variants = [v for v in load_delivery_variants() if v["capi"]]
-    else:
-        narrow_ids = _capi_delivery_variant_ids()
-        delivery_variants = [
-            v for v in load_delivery_variants() if v["id"] in narrow_ids
-        ]
+    # Every registered delivery variant is expected, whether or not this C API
+    # implements it: one it cannot run reports NotFound (or not_supported, from
+    # the row the benchmark still emits for it) instead of dropping out of the
+    # report. `--all` only widens which ROWS are read (retained ones too).
+    delivery_variants = load_delivery_variants()
     expected_variants = {variant["id"]: variant for variant in delivery_variants}
     DELIVERY_BY_OPERATOR_DTYPE.clear()
     for variant in delivery_variants:
@@ -305,10 +253,17 @@ def main():
         if not rows:
             continue
 
-        # Group by variant: one summary entry per delivery-list name.
+        # Group by variant: one summary entry per delivery-list name. A variant
+        # measured by a tagged row ignores untagged rows that would fall back to
+        # the same name: those come from the ordinary sweep, whose configuration
+        # (layout, op) is the benchmark's default rather than the variant's.
+        tagged_here = {str(r["variant"]) for r in rows if r.get("variant")}
         by_variant = {}
         for r in rows:
-            by_variant.setdefault(variant_name(r), []).append(r)
+            name = variant_name(r)
+            if not r.get("variant") and name in tagged_here:
+                continue
+            by_variant.setdefault(name, []).append(r)
 
         # ---- accuracy artifact, indexed by variant so each entry cites the
         # rows that decided it. From the operator's own file when the
@@ -325,7 +280,10 @@ def main():
         # than from an operator-wide total that would hide which variant failed.
         acc_by_variant = {}
         for r in acc_rows:
-            acc_by_variant.setdefault(variant_name(r), []).append(r)
+            name = variant_name(r)
+            if not r.get("variant") and name in tagged_here:
+                continue
+            acc_by_variant.setdefault(name, []).append(r)
 
         for vname, vrows in by_variant.items():
             if vname not in expected_variants:

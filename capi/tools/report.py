@@ -82,6 +82,11 @@ def main():
     total_rows = len(rows)
     if not args.all:
         rows = [r for r in rows if r.get("reporting", "delivery") == "delivery"]
+        # Rows tagged with a delivery variant id are the delivery measurement; an
+        # untagged `delivery` row is the ordinary sweep of the same kernel in the
+        # benchmark's default layout/op, so it is left out once tagged rows exist.
+        if any(r.get("variant") for r in rows):
+            rows = [r for r in rows if r.get("variant")]
     held = total_rows - len(rows)
     backend = rows[0]["_backend"] if rows else "?"
     arch = rows[0]["_arch"] if rows else "?"
@@ -100,7 +105,14 @@ def main():
             )
         )
         if args.by_matrix
-        else (lambda r: (r["_op"], r.get("format", "?"), r.get("dtype", "?")))
+        else (
+            lambda r: (
+                r["_op"],
+                r.get("format", "?"),
+                r.get("dtype", "?"),
+                r.get("variant", ""),
+            )
+        )
     )
 
     groups = collections.OrderedDict()
@@ -127,6 +139,7 @@ def main():
     all_speedups = []
     for k, rs in groups.items():
         op, fmt, dt = k[0], k[1], k[2]
+        vid = rs[0].get("variant", "")
         checked = [r for r in rs if r.get("accuracy") in ("pass", "fail")]
         passed = [r for r in rs if r.get("accuracy") == "pass"]
         worst = max((r.get("error_ratio") or 0.0) for r in checked) if checked else None
@@ -148,10 +161,12 @@ def main():
             f"{op:<9}{fmt:<6}{dt:<6}{acc:>12}"
             f"{(f'{worst:.3g}' if worst is not None else '-'):>11}"
             f"{(f'{gm:.3f}' if gm else '-'):>10}{rng:>17}{status:>10}"
+            + (f"  {vid}" if vid else "")
         )
         out_csv.append(
             {
                 "operator": op,
+                "variant": vid,
                 "format": fmt,
                 "dtype": dt,
                 "matrices_checked": len(checked),

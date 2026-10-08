@@ -14,7 +14,58 @@
 
 #include "core/internal.hpp"
 
+#include <cstring>
+
 namespace flagsparse {
+
+double fp16_to_double(std::uint16_t h) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
+    const std::uint32_t exp = (h >> 10) & 0x1fu;
+    const std::uint32_t mant = h & 0x3ffu;
+    std::uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            std::int32_t e = -1;
+            std::uint32_t m = mant;
+            do { m <<= 1; ++e; } while ((m & 0x400u) == 0);
+            bits = sign | (static_cast<std::uint32_t>(127 - 15 - e) << 23) | ((m & 0x3ffu) << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return static_cast<double>(f);
+}
+
+std::uint16_t double_to_fp16(double d) {
+    float f = static_cast<float>(d);
+    std::uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const std::uint32_t sign = (x >> 16) & 0x8000u;
+    std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xffu) - 127 + 15;
+    std::uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<std::uint16_t>(sign);
+        mant |= 0x800000u;
+        const std::int32_t shift = 14 - exp;
+        const std::uint32_t sub = mant >> shift;
+        const std::uint32_t rem = mant & ((1u << shift) - 1u);
+        const std::uint32_t half = 1u << (shift - 1);
+        std::uint32_t rounded = sub + ((rem > half || (rem == half && (sub & 1u))) ? 1u : 0u);
+        return static_cast<std::uint16_t>(sign | rounded);
+    }
+    if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7c00u);
+    const std::uint32_t round = (mant & 0x1fffu) > 0x1000u ||
+                                ((mant & 0x1fffu) == 0x1000u && ((mant >> 13) & 1u));
+    std::uint16_t out = static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) |
+                                                   (mant >> 13));
+    return static_cast<std::uint16_t>(out + round);
+}
 
 std::size_t dtype_size(flagsparseDataType_t dtype) {
     switch (dtype) {

@@ -362,12 +362,11 @@ def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
 
 # The bundle was built from the 2026-09-22 H800 run (conf/h800_reference.json's own
 # "reference" block), which predates both the 45 q4 variants and the `capi` field --
-# it is NOT the same set as `capi: true` (35 ids today, including spgemm_csr,
-# column-major and complex variants the 2026-09-22 run never touched). Pinned here
-# on purpose, same reasoning as CAPI_TRUE_VARIANT_IDS in
-# test_delivery_variant_registry.py: a real H800 run adding or dropping an id must
-# be a deliberate edit to this test too, not something a count or subset check
-# would silently absorb.
+# it is NOT the same set as `capi: true` (all 65 since 2026-10-08, including
+# spgemm_csr, column-major and complex variants the 2026-09-22 run never touched).
+# Pinned here on purpose: a real H800 run adding or dropping an id must be a
+# deliberate edit to this test too, not something a count or subset check would
+# silently absorb.
 H800_MEASURED_VARIANT_IDS = {
     "gather_c32_int",
     "gather_c64_int",
