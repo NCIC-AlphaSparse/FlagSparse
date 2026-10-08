@@ -12,7 +12,7 @@
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
   --phase both --mode normal --gpus 0 --timeout 4500 \
-  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
   --op-benchmark-args='sddmm_csr=--no-cusparse' \
   --results-dir results_metax_65_<日期> \
   > results_metax_65_<日期>.log 2>&1 < /dev/null &
@@ -20,6 +20,9 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 python3 tools/delivery_table.py results_metax_65_<日期>
 ```
 
+- `--benchmark-input tests/data`：仓库里的 `tests/data` 正好就是 `conf/operators.yaml` 的 10 个交付矩阵（在 git
+  里，拉下来就有）。这条命令没带 `--delivery-only`，runner 不会再筛矩阵，给 30 个矩阵的目录就会 30 个全跑，
+  汇总出来的加速比也会掺进非交付矩阵，所以不要换成别的目录。
 - `sddmm_csr=--no-cusparse`、`--timeout 4500` 沿用 `../MACA.md` 0.5 节的 20 变体交付命令，原因见那一节
   （C550 没有可用厂商稀疏库；SDDMM 的 4 个 K 值不收窄，单阶段耗时长）。
 
@@ -54,7 +57,7 @@ python3 tools/delivery_table.py results_metax_65_<日期>
 
 ## 交给 Codex 的 prompt
 
-上机时把下面整段原样贴给 Codex（或其他代理）。命令里的矩阵目录已经是 `/root/gcx/matrix`，不用改。
+上机时把下面整段原样贴给 Codex（或其他代理）。不用改任何内容。
 
 ````text
 你在 MetaX C550（MACA） 实机上复测 FlagSparse 的 65 个交付变体。仓库在当前目录，main 分支。

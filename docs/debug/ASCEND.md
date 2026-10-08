@@ -64,7 +64,7 @@
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 export PYTHONPATH="$PWD/src:$PWD" FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch
 python3 run_flagsparse_pytest.py --ops axpby,spvv,spmv_sell --phase both \
-  --benchmark-input /home/matrix --results-dir results_ascend_newops_<日期>
+  --benchmark-input tests/data --results-dir results_ascend_newops_<日期>
 python3 tools/delivery_table.py results_ascend_newops_<日期>
 ```
 
