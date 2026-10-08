@@ -101,6 +101,7 @@ def _capi_delivery_variant_ids() -> set[str]:
             ids.add(variant["id"])
     return ids
 
+
 # Verbatim from run_flagsparse_pytest.py -- if that table changes this must too.
 STATUS_TO_FLAGGEMS = {
     "PASS": "Passed",
