@@ -361,9 +361,21 @@ def _time_vendor(row, plan, warmup, iters):
         plan.close()
 
 
-def _time_pytorch(row, build, warmup, iters):
+def _time_pytorch(row, build, warmup, iters, reference):
     try:
         op = build()
+        # Checked like the vendor baseline: Iluvatar's torch.sparse returns wrong
+        # values without raising, and a speedup over a wrong result is meaningless.
+        got = op()
+        if got.layout != torch.strided:
+            got = got.values()
+        elif got.dim() and got.shape[0] > reference.shape[0]:
+            got = got[: reference.shape[0]]  # BELL pads rows
+        err = _error(got, reference)
+        row["pytorch_max_error"] = err
+        if err > _VENDOR_MAX_ERROR:
+            row["pytorch_reason"] = f"PyTorch result off by {err:.3g} (relative); baseline not used"
+            return
         _, row["pytorch_ms"] = _benchmark_cuda_op(op, warmup, iters)
     except Exception as exc:  # e.g. MUSA registers no sparse matmul, no sparse int8
         row["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
@@ -451,7 +463,7 @@ def _spmv(v, mat, gen, warmup, iters, row):
         xc = x.to(c)
         return lambda: a @ xc
 
-    _time_pytorch(row, build_torch, warmup, iters)
+    _time_pytorch(row, build_torch, warmup, iters, ref)
     if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
         _time_cupy(row, mat, vals, x, v.op_a, "non", warmup, iters, ref)
     return v.out
@@ -529,7 +541,7 @@ def _spmm(v, mat, gen, warmup, iters, row):
         bc = _op_t(B, v.op_b).to(c)
         return lambda: torch.sparse.mm(a, bc)
 
-    _time_pytorch(row, build_torch, warmup, iters)
+    _time_pytorch(row, build_torch, warmup, iters, ref)
     if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
         _time_cupy(row, mat, vals, B, v.op_a, v.op_b, warmup, iters, ref)
     if (os.environ.get("FLAGSPARSE_BENCH_CAPI") == "1"
@@ -585,7 +597,7 @@ def _spmm_bell(v, mat, vals, vals_cpu, B, ref, warmup, iters, row):
         a = _sparse_torch(mat.ptr, mat.cols, vals.to(v.value), mat.shape, "non")
         return lambda: torch.sparse.mm(a, B)
 
-    _time_pytorch(row, build_torch, warmup, iters)
+    _time_pytorch(row, build_torch, warmup, iters, ref)
     return v.out
 
 
@@ -649,7 +661,7 @@ def _sddmm(v, mat, gen, warmup, iters, row):
         a_op, b_op = _op_t(A, v.op_a).to(compute), _op_t(B, v.op_b).to(compute)
         return lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
 
-    _time_pytorch(row, build_torch, warmup, iters)
+    _time_pytorch(row, build_torch, warmup, iters, ref)
     if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
         _time_cupy_sddmm(row, mat, A, B, v.op_a, v.op_b, warmup, iters, ref)
     return v.out

@@ -28,9 +28,11 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
   理论上不受影响，但如果测试过程中任何中间步骤意外提升到 fp64 精度（比如某个参考实现），结果会静默
   错误而不是报错，这是这张卡上最危险的一类问题，运行时多留意。
 - **`torch.sparse` 在这张卡上结果是错的，不是不支持**（`../ILUVATAR_DEBUG.md`）。早期一版文档把它
-  当作性能基线，已经改成默认 `cupy_cusparse`。`tests/q4_variant_bench.py` 的 PyTorch 基线路径
-  （`_time_pytorch`）包了 try/except，但这只是不会崩溃，**不代表 PyTorch 列里出现的数字是对的**——
-  如果 PyTorch 列在这张卡上给出了"看起来正常"的数字，先怀疑它，不要直接当真。
+  当作性能基线，已经改成默认 `cupy_cusparse`。45 个新变体走的 `tests/q4_variant_bench.py`
+  （`_time_pytorch`）从 2026-10-08 起会先拿 PyTorch 结果和 CPU 参考值比，相对误差超过 1e-2 就不计时、
+  在 `pytorch_reason` 里写 `PyTorch result off by ...`——**所以这张卡上 45 个新变体的 PyTorch 列大量
+  出现这个 reason 是预期行为**，说明拦截生效了。原有 20 个变体走各自脚本，不经过这道校验，那部分的
+  PyTorch 数字仍然要先怀疑。
 - **通用 `cusparseSpMV` 在这张卡上会申请约 140 TB 显存**，只能用 CoreX 的 legacy
   `cusparseScsrmv`/`cusparseScsrmm`，且只覆盖 fp32 + int32 + 不转置。45 个新变体里的转置/共轭/
   混合精度/int8 变体大概率没有厂商基线，这是预期行为。

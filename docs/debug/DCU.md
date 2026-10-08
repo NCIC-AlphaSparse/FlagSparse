@@ -40,8 +40,9 @@ python3 tools/delivery_table.py results_rocm_65_<日期>
   `_spmv_backend_caps()` 算出 `verified=True`——这个值只在 `triton.runtime.driver.active
   .get_current_target()` 真的报 `backend=="hip"` 且 `arch` 以 `"gfx"` 开头时才成立
   （`spmv_csr.py:_spmv_backend_caps`）。这条在 CUDA 机器上**不可能**模拟到（Triton 驱动查的是真实
-  硅片，设什么环境变量都测不出 `hip`/`gfx`），所以这 4 个变体在这次 CUDA 模拟里全部挂在这一步，是
-  模拟方法的结构性盲区，不代表代码有问题——但前提是真实 DCU 上 Triton-ROCm 驱动能正确报出
+  硅片，设什么环境变量都测不出 `hip`/`gfx`），所以这 4 个变体在单纯设环境变量的 CUDA 模拟里全部挂在
+  这一步。之后补测过：把 `_spmv_backend_caps()` 改成返回 gfx936 的已验证能力，让 `row_tile` 带着
+  ROCm 调优参数真实跑起来，45 个新变体 91/91 全过——逻辑本身没问题，但前提是真实 DCU 上 Triton-ROCm 驱动能正确报出
   `hip`/`gfx*`。**如果真机上也报这个 `NotImplementedError`，说明 Triton-ROCm 驱动没有正确识别硬件，
   这是真 bug（或者环境没装对），务必带回具体的 `arch`/`target` 字符串。**
 
