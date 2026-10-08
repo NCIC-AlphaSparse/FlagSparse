@@ -50,7 +50,9 @@ Triton 驱动真实报出 `backend=="hip"`/`arch` 以 `"gfx"` 开头——这个
 **共同的验证步骤**：
 
 1. 照 `docs/<BACKEND>.md` 把环境配好、过一遍环境自检。
-2. 跑本目录对应文件里给的命令（和上面通用命令一样，只是 `--results-dir` 建议带上后端名和日期）。
+2. 跑本目录对应文件里给的命令。**不要直接用上面那条通用命令**：各后端文件里的版本在它的基础上补了这张卡
+   必需的参数（外层 KILL 限时、`--timeout`、MACA 的 `sddmm_csr=--no-cusparse`、天数挡 fp64 的 `-k` 和
+   各脚本的 dtype 限制），都沿用自各自 `docs/<BACKEND>.md` 里已经实机跑通的 20 变体交付命令。
 3. `python3 tools/delivery_table.py <结果目录>`，把完整输出（尤其是不是 `0 missing` 这一行）贴回来。
 4. 如果有 `FAIL` 或非 0 的 `missing`，把对应变体名和 `<结果目录>/<算子>/performance.csv`（或
    `accuracy_result.json`）里那一行的 `reason`/`error` 字段一起带回来，不要只说"跑挂了"。

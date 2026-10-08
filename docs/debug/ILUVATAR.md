@@ -9,16 +9,46 @@
 不要用 `torch`**——见下面第一条风险点）：
 
 ```bash
-env FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
-python3 run_flagsparse_pytest.py \
-  --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
-  --phase both --benchmark-input tests/data \
-  --results-dir results_iluvatar_65_<日期>
+setsid timeout -s KILL 43200 \
+  env FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python3 -u run_flagsparse_pytest.py \
+    --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
+    --phase both --mode normal --gpus 0 --timeout 3600 \
+    --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+    --h800-reference \
+    --pytest-args='-k "test_q4_variant or (((float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)) or (complex64 and (gather or scatter)))"' \
+    --op-benchmark-args='gather=--value-dtypes float16,float32,complex64' \
+    --op-benchmark-args='scatter=--value-dtypes float16,float32,complex64,int8' \
+    --op-benchmark-args='spmv_csr=--dtypes float32 --alg auto' \
+    --op-benchmark-args='spmv_coo=--dtypes float32' \
+    --op-benchmark-args='spmv_csc=--dtypes float32,complex64' \
+    --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
+    --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
+    --op-benchmark-args='spmm_csc=--dtypes float32,complex64' \
+    --op-benchmark-args='sddmm_csr=--dtype float32' \
+    --results-dir results_iluvatar_65_<日期> \
+  > results_iluvatar_65_<日期>.log 2>&1 < /dev/null &
+# 跑完后
 python3 tools/delivery_table.py results_iluvatar_65_<日期>
 ```
 
-45 个新变体不含 f64/c64（complex128），理论上不会撞到下面第一条 fp64 的坑，但 `torch.sparse` 的坑
-（第二条）对新变体同样适用，务必按上面的方式显式指定 vendor，不要依赖默认探测。
+这条命令是 `../ILUVATAR.md` 第 2 节 20 变体交付命令的扩展，三处改动都在 CUDA 上核对过：
+
+- **`-k` 前面加了 `test_q4_variant or`**。原来的 `-k` 是为了挡掉 fp64（本卡 fp64 H2D 静默返回 0），但它
+  同时会把 45 个新变体里的 c32/i8 精度用例筛掉（只剩 54/91）；加上之后 91/91 全保留，fp64/complex128
+  用例仍然一个不收。新变体自己不含 fp64，精度对照是 CPU 上算的。
+- **`scatter` 加了 `int8`**：`scatter_i8_int` 的性能取自 scatter 脚本自己的 int8 行，原来的
+  `float16,float32,complex64` 会让它变成 `NotFound`。
+- **新增 `spmv_csc`/`spmm_csc` 的 dtype 限制**：这两个脚本默认会跑 float64/complex128，先跑 fp64 万一
+  卡死或崩溃，排在最后追加的新变体行就丢了；它们的交付变体只要 f32/c32/f16，f16 由新变体那一路单独测。
+- 原 20 个变体里的 9 个 f64/c64 在本卡上照旧测不了，`delivery_table.py` 里显示 `NotFound` 是预期的；
+  `spgemm_csr` 的 runner 会按 dtype 拆开分别跑 float32/float64，float64 那一组的结果不要当真，交付变体
+  只用 float32。
+
+- 外层 `timeout -s KILL` 是整条命令的总限时（内核卡死时 Ctrl-C 送不进去，只能靠 KILL）；`--timeout` 是
+  每个算子每个阶段的限时。这两个数是 20 变体时期定的，65 变体多了 6 个父算子，**没有在本机实测过总耗时**，
+  到点被杀的话按 `delivery_table.py` 里 `NotFound` 的算子单独补跑（补跑要用新的 `--results-dir`）。
+- `--results-dir` 每次都用新目录：`summary.json` 每跑一次就整体重写，往旧目录里补跑一部分会把之前的结果冲掉。
 
 把 `delivery_table.py` 的完整输出带回来，尤其是第一行的 `missing` 数字。
 

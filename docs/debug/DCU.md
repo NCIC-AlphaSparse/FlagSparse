@@ -11,12 +11,22 @@
 task_tmp=$(mktemp -d /tmp/flagsparse-dcu-65.XXXXXX)
 export TMPDIR="$task_tmp" TMP="$task_tmp" TEMP="$task_tmp"   # Slurm 残留的 TMPDIR 会让 clang 编译失败，见 ../DCU.md 第 0 节
 export HIP_VISIBLE_DEVICES=<卡号>                              # runner 用 CUDA_VISIBLE_DEVICES 隔离设备，ROCm 上会打乱随机种子
-python3 run_flagsparse_pytest.py \
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
-  --phase both --benchmark-input <矩阵目录> \
-  --results-dir results_rocm_65_<日期>
+  --phase both --mode normal --gpus 0 --timeout 3600 \
+  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir results_rocm_65_<日期> \
+  > results_rocm_65_<日期>.log 2>&1 < /dev/null &
+# 跑完后
 python3 tools/delivery_table.py results_rocm_65_<日期>
 ```
+
+- `--timeout 3600`、外层 KILL 限时沿用 `../DCU.md` 的 20 变体交付命令。
+
+- 外层 `timeout -s KILL` 是整条命令的总限时（内核卡死时 Ctrl-C 送不进去，只能靠 KILL）；`--timeout` 是
+  每个算子每个阶段的限时。这两个数是 20 变体时期定的，65 变体多了 6 个父算子，**没有在本机实测过总耗时**，
+  到点被杀的话按 `delivery_table.py` 里 `NotFound` 的算子单独补跑（补跑要用新的 `--results-dir`）。
+- `--results-dir` 每次都用新目录：`summary.json` 每跑一次就整体重写，往旧目录里补跑一部分会把之前的结果冲掉。
 
 把 `delivery_table.py` 的完整输出带回来，尤其是第一行的 `missing` 数字。
 

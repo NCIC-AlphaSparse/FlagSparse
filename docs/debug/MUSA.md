@@ -8,12 +8,26 @@
 环境按 `../MUSA.md` 第 2 节配好后：
 
 ```bash
-python3 run_flagsparse_pytest.py \
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
-  --phase both --benchmark-input tests/data \
-  --results-dir results_musa_65_<日期>
+  --phase both --mode normal --gpus 0 --timeout 3600 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir results_musa_65_<日期> \
+  > results_musa_65_<日期>.log 2>&1 < /dev/null &
+# 跑完后
 python3 tools/delivery_table.py results_musa_65_<日期>
 ```
+
+- 这里用通用 runner，不用 `../MUSA.md` 0.5 节的 `run_flagsparse_split_delivery.py`：后者的性能取自 C API，
+  新增的 45 个变体大多没有 C API 实现，覆盖不全。代价是 Python 侧没有厂商基线，性能列只有 FlagSparse 自己的
+  时间，加速比大多为空——这一轮要的是 65 个变体精度全过、性能都能跑出时间；muSPARSE 加速比照旧走
+  `split_delivery`，这轮不要求。
+- `--timeout 3600` 沿用 `../MUSA.md` 的结论（`900` 不够）。
+
+- 外层 `timeout -s KILL` 是整条命令的总限时（内核卡死时 Ctrl-C 送不进去，只能靠 KILL）；`--timeout` 是
+  每个算子每个阶段的限时。这两个数是 20 变体时期定的，65 变体多了 6 个父算子，**没有在本机实测过总耗时**，
+  到点被杀的话按 `delivery_table.py` 里 `NotFound` 的算子单独补跑（补跑要用新的 `--results-dir`）。
+- `--results-dir` 每次都用新目录：`summary.json` 每跑一次就整体重写，往旧目录里补跑一部分会把之前的结果冲掉。
 
 把 `delivery_table.py` 的完整输出带回来，尤其是第一行的 `missing` 数字。
 
