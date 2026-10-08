@@ -64,6 +64,47 @@ python3 tools/delivery_table.py results_rocm_65_<日期>
 
 把这三条的结果写回来，不用额外分析，原始数据最有用。
 
+## 交给 Codex 的 prompt
+
+上机时把下面整段原样贴给 Codex（或其他代理）。**贴之前把 `<矩阵目录>` 和 `<卡号>` 换成本机实际值。**
+
+````text
+你在 海光 DCU（ROCm） 实机上复测 FlagSparse 的 65 个交付变体。仓库在当前目录，main 分支。
+
+背景：65 个变体（原 20 个 + 新合并的 45 个）只在 CUDA 上实测过，本机从没跑过。
+任务是在本机跑一遍，把原始结果带回来。主要目的是收集数据，不是修代码。
+
+步骤：
+1. git pull --ff-only origin main。
+2. 按 docs/DCU.md 配好环境，做完它的环境自检。
+3. 确认导入的是仓库源码：python3 -c "import flagsparse; print(flagsparse.__file__)"
+   输出必须在当前目录的 src/ 下。如果指向 site-packages / dist-packages，先停下来汇报，不要继续。
+   旧安装包会让基线列全部变成 N/A，看起来像正常结果。
+4. 完整读一遍 docs/debug/DCU.md，照"要做的事"一节的命令原样跑。
+   命令里的 --benchmark-input 填 <矩阵目录>，HIP_VISIBLE_DEVICES 填 <卡号>。
+   不要自己删减或改写参数，每个参数的来由那一节都写了。
+   - --results-dir 用新目录（<日期> 填今天），不要复用旧目录。
+   - 命令本身已经用 setsid 放到后台，定期看日志进度，不要中途打断。
+   - 不要用 pytest --forked，它在 GPU 上会让所有用例失败。
+5. 跑完执行 python3 tools/delivery_table.py <结果目录>。
+
+规矩：
+- 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实非改不可（比如环境适配）时，每改一个文件，
+  都按 docs/debug/DCU.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动放在同一个
+  commit 里。没改就在那一节写"无"。
+- 不要猜根因。遇到报错就给出完整报错原文，以及出错变体在结果目录里那一行的 reason/error 字段。
+- 如果 spmv_csr_f16_int_non / c32_int_non / f32_int_trans / c32_int_conj 报
+  unverified capabilities for rocm/...，这是真问题，要带回这行命令的输出：
+  python3 -c "import triton; t=triton.runtime.driver.active.get_current_target(); print(t.backend, t.arch, t.warp_size)"
+
+汇报包含：
+1. delivery_table.py 的完整输出，尤其是第一行 "N registered variants, M missing"。
+2. 所有非 Passed 的变体：变体名、阶段（精度/性能）、reason 或 error 原文。
+3. 逐条回答 docs/debug/DCU.md "跑完要确认"一节。
+4. 环境指纹：torch、triton 版本，设备名，warp size，驱动/SDK 版本，整轮总耗时。
+5. docs/debug/DCU.md "实机改动记录"一节的内容。
+````
+
 ## 实机改动记录
 
 在这台机器上为了跑通而改过的每一个文件都记在这里，跟着 commit 一起推上来。没改就写"无"，不要留空。

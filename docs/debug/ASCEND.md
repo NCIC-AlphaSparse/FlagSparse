@@ -109,6 +109,35 @@ sweep、单次 `index_add`）。涉及对 CSC 格式和 SpGEMM 哈希表算法�
    报错，或者判 TRITON 但其实某个新版本 CANN 能编过），这个工具本身需要更新——它是 CUDA 模拟，不是
    NPU 本身的真值。
 
+## 交给 Codex 的 prompt
+
+上机时把下面整段原样贴给 Codex（或其他代理），不用改任何内容。
+
+````text
+你在昇腾 910B 实机上做 FlagSparse 65 变体的剩余工作。仓库在当前目录，main 分支。
+git pull --ff-only origin main 之后，完整读一遍 docs/debug/ASCEND.md，按里面的优先级做：
+
+1. 先跑 PYTHONPATH=src python3 tools/q4_ascend_dispatch_check.py。它的结论是在 CUDA 上模拟出来的
+   （38/45 OK），本机结果如果不一样（判 OK 但真机报错，或者判 TRITON 但真机能编过），本身就是重要发现。
+2. 做优先级 1（8 个变体，命令在文档里），带回 delivery_table.py 的输出。
+3. 优先级 2 只挑 spmv_csr_f16_int_non 一个变体试着接通，接通后先停下来汇报，不要一次接完 30 个。
+4. 优先级 3 不做。
+
+规矩：
+- 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实要改（优先级 2 本身就要改 benchmark_ascend.py）
+  时，每改一个文件，都按 docs/debug/ASCEND.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动
+  放在同一个 commit 里。没改就在那一节写"无"。
+- 不要猜根因。遇到报错就给出完整报错原文。
+- --results-dir 用新目录，不要复用旧目录。不要用 pytest --forked。
+
+汇报包含：
+1. q4_ascend_dispatch_check.py 的完整输出。
+2. 优先级 1 的 delivery_table.py 输出（8 行），以及非 Passed 变体的 reason/error 原文。
+3. 如果做了优先级 2：那个变体第一次在真机上跑出的 performance.csv 原始行。
+4. 环境指纹：torch、torch_npu、CANN 版本，设备名。
+5. docs/debug/ASCEND.md "实机改动记录"一节的内容。
+````
+
 ## 实机改动记录
 
 在这台机器上为了跑通而改过的每一个文件都记在这里，跟着 commit 一起推上来。没改就写"无"，不要留空。
