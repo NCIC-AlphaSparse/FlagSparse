@@ -173,6 +173,7 @@ def runtime_namespace():
         "_execute_spmv_route",
         "_execute_spmv_route_with_fallback",
         "_spmv_execution_matrix",
+        "_spmv_transpose_scatter_enabled",
     }
     tree = ast.parse((SOURCE / "spmv_csr.py").read_text(encoding="utf-8"))
     nodes = [
@@ -185,6 +186,7 @@ def runtime_namespace():
         def __init__(self):
             self.alg = self.alg_requested = "row_adaptive_split"
             self.op, self.transpose, self.n_rows = 0, False, 3
+            self.non_gather_plan = None
             self.shape = (3, 4)
             self.backend_caps = policy.BackendCaps(
                 "cuda", "80", "cuda", 32, 1024, True, True, True

@@ -19,6 +19,7 @@ import math
 
 from . import _common as _common_mod
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
@@ -1062,17 +1063,24 @@ def _run_spmm_csr_base_route_impl(
         end = _ACCEL.Event(enable_timing=True)
         start.record()
     use_batched_short_rows = (
-        _spmm_is_hip_device(device_props)
+        (_spmm_is_hip_device(device_props) or _backend_name() == "cuda")
         # The batched kernels accumulate in the value dtype, so they cannot serve
         # the accuracy route -- csr_base_accuracy exists to accumulate wider.
         and not accuracy
         and dense_layout == "row"
-        and prepared.data.dtype in (torch.float32, torch.float64)
+        and (prepared.data.dtype in (torch.float32, torch.float64)
+             or (_backend_name() == "cuda" and prepared.data.dtype == torch.float16))
         and int(B.shape[1]) == 32
         and prepared.avg_nnz_per_row <= 32.0
         and prepared.max_row_nnz <= 256
     )
-    if use_batched_short_rows:
+    use_gather = (_backend_name() == "cuda" and not accuracy
+                  and prepared.data.dtype == torch.complex64 and int(B.shape[1]) == 32)
+    if use_gather:
+        from . import _spmm_row_gather
+        C = _spmm_row_gather.compute(prepared.data, prepared.kernel_indices,
+                                    prepared.kernel_indptr, B, C_out)
+    elif use_batched_short_rows:
         C = _triton_spmm_csr_batched_short_rows_impl(prepared, B, C_out)
     else:
         C = _triton_spmm_csr_impl(
@@ -1125,6 +1133,15 @@ def _run_spmm_csr_base_route_impl(
             "c_stride": tuple(int(v) for v in C.stride()),
             "output_layout": _dense_layout_name(C),
         }
+        if use_gather:
+            batch, lanes = (8, 4) if prepared.avg_nnz_per_row <= 4 else (4, 8)
+            meta["diagnostics"].update(launch_version="csr_batched_gather_v1",
+                block_n=32, block_nnz=lanes, batch_rows=batch, num_warps=4, num_stages=1)
+        elif use_batched_short_rows:
+            batch = (8 if prepared.data.dtype != torch.float64 and prepared.avg_nnz_per_row <= 4
+                     else 4 if prepared.data.dtype != torch.float64 else 2)
+            meta["diagnostics"].update(launch_version="csr_batched_short_rows_v1",
+                block_n=32, block_nnz=16, batch_rows=batch, num_warps=1, num_stages=1)
     return C, meta
 
 
@@ -3834,7 +3851,7 @@ def _spmm_csr_two_rows_f32_kernel(
         offs_k = chunk_start + tl.arange(0, BLOCK_K)
         positions = start[:, None] + offs_k[None, :]
         valid = active[:, None] & (positions < end[:, None])
-        values = tl.load(data_ptr + positions, mask=valid, other=0.0)
+        values = tl.load(data_ptr + positions, mask=valid, other=0.0).to(tl.float32)
         cols = tl.load(indices_ptr + positions, mask=valid, other=0)
         dense = tl.load(
             b_ptr
@@ -3843,7 +3860,7 @@ def _spmm_csr_two_rows_f32_kernel(
             mask=valid[:, :, None],
             other=0.0,
         )
-        acc += tl.sum(values[:, :, None] * dense, axis=1)
+        acc += tl.sum(values[:, :, None] * dense.to(tl.float32), axis=1)
     tl.store(
         c_ptr + rows[:, None] * stride_cm + offs_n[None, :] * stride_cn,
         acc,
@@ -3904,9 +3921,9 @@ def _triton_spmm_csr_batched_short_rows_impl(prepared, B, C_out):
     # More rows amortize dispatch and CSR metadata traffic for extremely short
     # fp32 rows. Float64 and less sparse matrices use two rows to avoid the
     # much larger accumulator footprint.
-    if prepared.data.dtype == torch.float32 and prepared.avg_nnz_per_row <= 4.0:
+    if prepared.data.dtype in (torch.float16, torch.float32) and prepared.avg_nnz_per_row <= 4.0:
         batch_rows = 8
-    elif prepared.data.dtype == torch.float32 and prepared.avg_nnz_per_row <= 32.0:
+    elif prepared.data.dtype in (torch.float16, torch.float32) and prepared.avg_nnz_per_row <= 32.0:
         batch_rows = 4
     else:
         batch_rows = 2
@@ -4396,6 +4413,23 @@ def _spmm_csr_auto_prefers_alg1(data, indptr, shape):
     return mean < 9.0 and (max_row_nnz / mean) < 5.0
 
 
+def _apply_spmm_op_b(B, op_b):
+    """View ``op(B)``: a transpose is a strided view, conj materialises (complex only)."""
+    token = "non" if op_b is None else str(op_b).strip().lower()
+    token = {"0": "non", "n": "non", "non_trans": "non", "1": "trans", "t": "trans",
+             "2": "conj", "c": "conj", "conj_trans": "conj"}.get(token, token)
+    if token == "non":
+        return B
+    if token not in ("trans", "conj"):
+        raise ValueError("op_b must be one of: non, trans, conj")
+    if not torch.is_tensor(B) or B.ndim != 2:
+        raise ValueError("B must be a 2D tensor")
+    B_t = B.transpose(0, 1)
+    if token == "conj" and B.is_complex():
+        B_t = B_t.conj().resolve_conj()
+    return B_t
+
+
 def flagsparse_spmm_csr(
     data,
     indices,
@@ -4410,12 +4444,32 @@ def flagsparse_spmm_csr(
     transpose=None,
     op=None,
     return_meta=False,
+    *,
+    op_b=None,
+    out_dtype=None,
 ):
     """CSR SpMM using Triton.
 
     op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
     2/'conj' for A.conj().T @ B.
+    op_b: 'non' (B is K x N), 'trans' (B is N x K, uses B.T) or 'conj' (B.T.conj()),
+    as cusparseSpMM's opB. B may be row- or column-major.
+    out_dtype (or out.dtype): float16 / bfloat16 -> float32 and int8 -> int32 /
+    float32 run in ``mixed_spmx``.
     """
+    B = _apply_spmm_op_b(B, op_b)
+    if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
+        C = _mixed_spmx.spmm_csr_mixed(
+            data, indices, indptr, B, shape, op=op, transpose=transpose,
+            out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return C
+        C, elapsed = C
+        if return_meta:
+            meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (C, elapsed, meta) if return_time else (C, meta)
+        return C, elapsed
     op_explicit = op is not None
     op_code = _normalize_spmm_op(
         op,
@@ -4460,10 +4514,12 @@ def flagsparse_spmm_csr(
         t0 = time.perf_counter()
         if transposed:
             out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
-            out_mat.index_add_(0, cols, data[:, None] * B[row_ids])
+            # op(A) = A^H needs the values conjugated too, not just row/col swapped.
+            vals = data.conj() if op_code == SPMM_OP_CONJ_TRANS else data
+            _index_add_values(out_mat, 0, cols, vals[:, None] * _gather_values(B, row_ids))
         else:
             out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
-            out_mat.index_add_(0, row_ids, data[:, None] * B[cols])
+            _index_add_values(out_mat, 0, row_ids, data[:, None] * _gather_values(B, cols))
         if out is not None:
             out.copy_(out_mat)
             out_mat = out

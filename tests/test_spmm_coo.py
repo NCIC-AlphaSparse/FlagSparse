@@ -3202,6 +3202,11 @@ def main():
             alg_names=alg_names,
             diagnose=args.diagnose,
         )
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmm_coo", paths, csv_path, args.warmup, args.iters
+        )
         return
 
     print("=" * 140)

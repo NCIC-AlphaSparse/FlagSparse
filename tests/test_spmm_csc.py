@@ -42,7 +42,7 @@ from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
 
 
-VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+VALUE_DTYPES = (torch.float16, torch.float32, torch.float64, torch.complex64, torch.complex128)
 INDEX_DTYPES = (torch.int32, torch.int64)
 OPS = ("non", "trans", "conj")
 SUPPORTED_OPS = OPS
@@ -79,11 +79,13 @@ PERF_FIELDS = [
     "err_vs_cusparse",
     "status",
     "reason",
+    "fallback_used",
     "cusparse_reason",
 ]
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
 DTYPE_MAP = {
+    "float16": torch.float16,
     "float32": torch.float32,
     "float64": torch.float64,
     "complex64": torch.complex64,
@@ -111,6 +113,8 @@ def _ratio(numerator, denominator):
 
 
 def _reference_dtype(dtype):
+    if dtype == torch.float16:
+        return torch.float32
     if dtype == torch.float32:
         return torch.float64
     if dtype == torch.complex64:
@@ -119,6 +123,8 @@ def _reference_dtype(dtype):
 
 
 def _reference_tolerance(dtype):
+    if dtype == torch.float16:
+        return 2e-3, 2e-2
     if dtype in (torch.float32, torch.complex64):
         return 1.3e-6, 1e-3
     if dtype in (torch.float64, torch.complex128):
@@ -224,7 +230,7 @@ def _stride_string(tensor):
 
 
 def _random_values(shape, dtype, device):
-    if dtype in (torch.float32, torch.float64):
+    if dtype in (torch.float16, torch.float32, torch.float64):
         return torch.randn(shape, dtype=dtype, device=device)
     if dtype == torch.complex64:
         return torch.complex(
@@ -581,10 +587,32 @@ def _run_case(
         "process_gpu_ms": None,
         "compute_ms": None,
     }
+    # CSC has no native fp16 kernel yet. Keep the q4 benchmark visible by using
+    # the validated fp32 route and casting its result back to fp16; the row is
+    # marked so its timing is not mistaken for native fp16 throughput.
+    benchmark_data = data
+    benchmark_B = B
+    promoted_fp16 = dtype == torch.float16
+    if promoted_fp16:
+        benchmark_data = data.float()
+        benchmark_B = B.float()
+        row["fallback_used"] = "fp16_to_fp32"
+        row["reason"] = "fp16 promoted to fp32: native CSC fp16 route is unavailable"
     try:
         csc = _time_flagsparse_csc(
-            data, indices, indptr, B, shape, alg, op, warmup, iters, timing=timing
+            benchmark_data,
+            indices,
+            indptr,
+            benchmark_B,
+            shape,
+            alg,
+            op,
+            warmup,
+            iters,
+            timing=timing,
         )
+        if promoted_fp16:
+            csc["out"] = csc["out"].to(dtype)
         row.update(
             {
                 "ms": csc["ms"],
@@ -616,7 +644,15 @@ def _run_case(
     if row["status"] != "ERROR" and run_cusparse:
         try:
             cu_ms, cu_reason, cu_out = _time_cusparse_csc(
-                data, indices, indptr, B, shape, op, layout, warmup, iters
+                benchmark_data,
+                indices,
+                indptr,
+                benchmark_B,
+                shape,
+                op,
+                layout,
+                warmup,
+                iters,
             )
             row["cusparse_ms"] = cu_ms
             row["cusparse_reason"] = cu_reason or ""
@@ -690,7 +726,11 @@ def main():
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories")
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--csv-csc", type=str, default=None, metavar="FILE")
-    parser.add_argument("--dtypes", default="float32,float64,complex64,complex128")
+    parser.add_argument(
+        "--dtypes",
+        default="float32,float64,complex64,complex128",
+        help="Comma-separated dtype grid; float16 is available for q4 coverage.",
+    )
     parser.add_argument("--index-dtypes", default="int32,int64")
     parser.add_argument("--ops", default="non")
     parser.add_argument("--alg", default="auto")
@@ -757,15 +797,26 @@ def main():
         for dtype in dtypes:
             for index_dtype in index_dtypes:
                 for case_name, path, synthetic_shape, dense_cols in cases:
+                    # The fp16 q4 benchmark uses the fp32 CSC fallback. Keep
+                    # MatrixMarket values in fp32 while the row remains tagged
+                    # as fp16; converting large entries to fp16 first can turn
+                    # them into inf before the fallback gets a chance to run.
+                    storage_dtype = torch.float32 if dtype == torch.float16 else dtype
                     if path is None:
                         data, indices, indptr, shape = _make_synthetic_case(
-                            synthetic_shape[0], synthetic_shape[1], dtype, index_dtype, device
+                            synthetic_shape[0], synthetic_shape[1], storage_dtype, index_dtype, device
                         )[1:]
                     else:
                         entries, shape = _read_mtx_entries(path)
                         data, indices, indptr = _entries_to_csc(
-                            entries, shape, dtype, index_dtype, device
+                            entries, shape, storage_dtype, index_dtype, device
                         )
+                    if dtype == torch.float16 and data.numel():
+                        # Match the other q4 fp16 benchmarks: large MatrixMarket
+                        # magnitudes would overflow the fp16 output before the
+                        # promoted fp32 fallback can be checked.
+                        scale = max(1.0, float(data.abs().max().item()))
+                        data = data / scale
                     for op in ops:
                         expanded_algs = _expand_algs(algs, op, dtype)
                         if not expanded_algs:
@@ -826,6 +877,15 @@ def main():
         if fh is not None:
             fh.close()
     failures = sum(1 for row in rows if row.get("status") in ("FAIL", "ERROR"))
+    import q4_variant_bench
+
+    q4_variant_bench.run_and_append(
+        "spmm_csc",
+        [path for _name, path, _shape, _cols in cases if path is not None],
+        args.csv_csc,
+        args.warmup,
+        args.iters,
+    )
     if failures:
         raise SystemExit(1)
 

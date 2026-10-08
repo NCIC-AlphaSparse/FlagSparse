@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from . import _common as _common_mod
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
     _select_spmm_alg1_warp_and_factor,
@@ -766,6 +767,7 @@ class PreparedCooSpmmRoute:
         "compute_dtype",
         "op",
         "alg",
+        "gather_ptr",
     )
 
     def __init__(
@@ -797,6 +799,10 @@ class PreparedCooSpmmRoute:
         self.compute_dtype = compute_dtype
         self.op = str(op)
         self.alg = str(alg)
+        self.gather_ptr = None
+        if _backend_name() == "cuda" and self.output_dtype == torch.complex64:
+            counts = torch.bincount(row.long(), minlength=self.n_rows)
+            self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
 
 
 @triton.jit
@@ -1773,10 +1779,11 @@ def _spmm_coo_ascend_scatter(
 
     rows64 = row.to(torch.int64)
     cols64 = col.to(torch.int64)
-    # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]].
-    contrib = data.unsqueeze(1) * B[cols64]
+    # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]]. conj (for
+    # op=conj_trans) is already folded into `data` by _materialize_spmm_coo_op.
+    contrib = data.unsqueeze(1) * _gather_values(B, cols64)
     acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
-    acc.index_add_(0, rows64, contrib)
+    _index_add_values(acc, 0, rows64, contrib)
     acc = acc.to(dtype)
 
     if out is not None:
@@ -1936,7 +1943,7 @@ def _prepare_spmm_coo_matrix(data, row, col, shape):
     return data.contiguous(), kernel_row, kernel_col, (n_rows, n_cols)
 
 
-def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout):
+def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, *, wide=True):
     if B is None or not torch.is_tensor(B):
         raise TypeError("B must be a torch.Tensor")
     if B.ndim != 2:
@@ -1953,7 +1960,7 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout):
         )
     B_compute = (
         B
-        if prepared.compute_dtype == prepared.output_dtype
+        if not wide or prepared.compute_dtype == prepared.output_dtype
         else B.to(prepared.compute_dtype)
     )
     return _materialize_dense_layout(B_compute, dense_layout)
@@ -1963,7 +1970,9 @@ def _run_spmm_coo_rowrun_route(
     prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
 ):
     dense_layout = _normalize_dense_layout(dense_layout)
-    B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout)
+    use_gather = (prepared.gather_ptr is not None and torch.is_tensor(B)
+                  and B.ndim == 2 and int(B.shape[1]) == 32)
+    B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, wide=not use_gather)
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -1972,20 +1981,26 @@ def _run_spmm_coo_rowrun_route(
         start = _ACCEL.Event(enable_timing=True)
         end = _ACCEL.Event(enable_timing=True)
         start.record()
-    C = _triton_spmm_coo_rowrun_impl(
-        prepared.data,
-        prepared.row,
-        prepared.col,
-        B,
-        prepared.n_rows,
-        int(B.shape[1]),
-        block_n=launch["block_n"],
-        block_nnz=launch["block_nnz"],
-        output_dtype=prepared.output_dtype,
-        dense_layout=dense_layout,
-        seg_starts=prepared.seg_starts,
-        num_warps=launch["num_warps"],
-    )
+    if use_gather:
+        from . import _spmm_row_gather
+        C = _empty_dense_layout((prepared.n_rows, int(B.shape[1])), prepared.output_dtype,
+                                prepared.data.device, dense_layout)
+        C = _spmm_row_gather.compute(prepared.data, prepared.col, prepared.gather_ptr, B, C)
+    else:
+        C = _triton_spmm_coo_rowrun_impl(
+            prepared.data,
+            prepared.row,
+            prepared.col,
+            B,
+            prepared.n_rows,
+            int(B.shape[1]),
+            block_n=launch["block_n"],
+            block_nnz=launch["block_nnz"],
+            output_dtype=prepared.output_dtype,
+            dense_layout=dense_layout,
+            seg_starts=prepared.seg_starts,
+            num_warps=launch["num_warps"],
+        )
     if timing:
         end.record()
         _ACCEL.synchronize()
@@ -2029,6 +2044,12 @@ def _run_spmm_coo_rowrun_route(
             "c_stride": tuple(int(v) for v in C.stride()),
             "output_layout": _dense_layout_name(C),
         }
+        if use_gather:
+            batch, lanes = (8, 4) if prepared.avg_nnz_per_row <= 4 else (4, 8)
+            meta["diagnostics"].update(launch_version="coo_batched_gather_v1",
+                block_n=32, block_nnz=lanes, batch_rows=batch, num_warps=4,
+                grid_m=triton.cdiv(prepared.n_rows, batch), grid_n=1,
+                compute_dtype="complex64")
     return C, meta
 
 
@@ -2738,12 +2759,31 @@ def flagsparse_spmm_coo(
     op=None,
     return_meta=False,
     dense_layout="auto",
+    *,
+    out_dtype=None,
 ):
     """COO SpMM using a native Triton COO row-run kernel by default.
 
     op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
     2/'conj' for A.conj().T @ B.
+    out_dtype (or out.dtype): int8 -> int32 (default) or float32; float16/
+    bfloat16 -> same type or float32. Both run in ``mixed_spmx`` -- see
+    flagsparse_spmm_csr's identical out_dtype for the CSR counterpart.
     """
+    if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
+        if transpose or (op is not None and str(op).strip().lower() not in ("0", "n", "non", "non_trans")):
+            raise NotImplementedError("mixed-precision/int8 COO SpMM supports op='non' only")
+        C = _mixed_spmx.spmm_coo_mixed(
+            data, row, col, B, shape,
+            out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return C
+        C, elapsed = C
+        if return_meta:
+            meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (C, elapsed, meta) if return_time else (C, meta)
+        return C, elapsed
     return _run_spmm_coo_route(
         data,
         row,

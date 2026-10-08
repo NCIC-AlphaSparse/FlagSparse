@@ -1264,6 +1264,11 @@ def main():
             run_cusparse=not args.no_cusparse,
             timing=args.timing,
         )
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmv_coo", paths, args.csv_coo, args.warmup, args.iters
+        )
         return
 
     if args.csv_tocsr:

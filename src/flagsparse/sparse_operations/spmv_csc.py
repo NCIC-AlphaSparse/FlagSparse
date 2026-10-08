@@ -15,6 +15,7 @@
 """Native CSC SpMV kernels and public helpers."""
 
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 
 import triton
 import triton.language as tl
@@ -97,6 +98,7 @@ class PreparedCscSpmv:
         "max_col_nnz",
         "col_ids",
         "csr_delegate",
+        "non_gather_plan",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -142,6 +144,13 @@ class PreparedCscSpmv:
         self.col_lengths = col_lengths
         self.col_ids = col_ids
         self.csr_delegate = csr_delegate
+        self.non_gather_plan = None
+        if (_SPMV_CSC_CUDA and _normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_NON
+                and data.dtype == torch.complex64):
+            from . import _spmv_csr_transpose
+            # CSC(A) is CSR(A.T); transposing this topology gives row owners of A.
+            self.non_gather_plan = _spmv_csr_transpose.prepare(
+                kernel_indices, kernel_indptr, (self.n_cols, self.n_rows))
         self.max_col_nnz = int(max_col_nnz)
         self.op = _normalize_spmv_csc_op(op, transpose=transpose)
         self.transpose = _spmv_csc_op_transposes(self.op)
@@ -571,6 +580,9 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if not trans and prepared.non_gather_plan is not None:
+        from . import _spmv_csr_transpose
+        return _spmv_csr_transpose.gather(prepared.data, x, prepared.non_gather_plan, out_len)
     if trans and prepared.nnz != 0:
         csr_delegate = getattr(prepared, "csr_delegate", None)
         if csr_delegate is not None:
@@ -743,6 +755,51 @@ def _run_spmv_csc_prepared_with_fallback(prepared, x, op_code):
         return _triton_spmv_csc_kernel(fallback_prepared, x, op_code)
 
 
+_SPMV_CSC_VIA_MIXED_DTYPES = (torch.float16, torch.bfloat16, torch.int8)
+
+
+def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype,
+                        return_time, return_meta):
+    """CSC(A) arrays read two ways, both accumulating in float32 / int32.
+
+    op='non': entry p of column c is (row=indices[p], col=c) -- a COO product.
+    op='trans'/'conj': CSC(A) is CSR(A.T), so it is a plain CSR product
+    (conj is the identity on these real dtypes).
+    """
+    if _is_complex_dtype(data.dtype):
+        raise TypeError("mixed CSC SpMV takes real values")
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
+        raise ValueError("invalid CSC dimensions")
+    timed = bool(return_time or return_meta)
+    if _spmv_csc_op_transposes(op_code):
+        y = _mixed_spmx.spmv_csr_mixed(
+            data, indices, indptr, x, (n_cols, n_rows),
+            out=out, out_dtype=out_dtype, return_time=timed,
+        )
+    elif (_SPMV_CSC_CUDA or _is_maca_runtime()) and data.dtype == torch.float16:
+        y = _mixed_spmx.spmv_csc_half(
+            data, indices, indptr, x, shape, out=out, out_dtype=out_dtype, return_time=timed)
+    else:
+        lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
+        col_ids = torch.repeat_interleave(
+            torch.arange(n_cols, device=indptr.device, dtype=torch.int64),
+            lengths,
+            output_size=int(data.numel()),
+        )
+        y = _mixed_spmx.spmv_coo_mixed(
+            data, indices, col_ids, x, (n_rows, n_cols),
+            out=out, out_dtype=out_dtype, return_time=timed,
+        )
+    if not timed:
+        return y
+    y, elapsed = y
+    if return_meta:
+        meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+        return (y, elapsed, meta) if return_time else (y, meta)
+    return y, elapsed
+
+
 def flagsparse_spmv_csc(
     data=None,
     indices=None,
@@ -758,8 +815,15 @@ def flagsparse_spmv_csc(
     transpose=None,
     op=None,
     index_fallback_policy="auto",
+    *,
+    out_dtype=None,
 ):
-    """CSC SpMV using native Triton CSC kernels."""
+    """CSC SpMV using native Triton CSC kernels.
+
+    float16 / bfloat16 / int8 values (and widened ``out_dtype``) avoid the native
+    kernels, whose op='non' path atomically adds in the value dtype -- fp16 atomics
+    are not available on every backend. See ``_spmv_csc_via_mixed``.
+    """
     op_explicit = op is not None
     op_code = _normalize_spmv_csc_op(
         op,
@@ -771,6 +835,19 @@ def flagsparse_spmv_csc(
         and bool(transpose) != _spmv_csc_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
+    if (
+        prepared is None
+        and torch.is_tensor(data)
+        and (
+            data.dtype in _SPMV_CSC_VIA_MIXED_DTYPES
+            or _mixed_spmx.spmv_needs_mixed(
+                data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype
+            )
+        )
+    ):
+        return _spmv_csc_via_mixed(
+            data, indices, indptr, x, shape, op_code, out, out_dtype, return_time, return_meta
+        )
     if prepared is None:
         if any(arg is None for arg in (data, indices, indptr, shape)):
             raise ValueError(

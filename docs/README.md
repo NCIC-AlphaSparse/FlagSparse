@@ -1,8 +1,10 @@
 # 后端文档索引
 
-三处文档，各回答一个问题：`docs/<BACKEND>.md` 怎么在那台机器上跑、
+四处文档，各回答一个问题：`docs/<BACKEND>.md` 怎么在那台机器上跑、
 `capi/docs/<BACKEND>.md` C API 那一层、[`modified/<BACKEND>.md`](../modified/README.md)
-这轮在实机上改了哪些文件（改动台账，省得后端文件来回传）。
+这轮在实机上改了哪些文件（改动台账，省得后端文件来回传）、
+[`docs/debug/`](debug/README.md) 这次"20→65 变体统一"这件事该后端还要上机验证什么
+（2026-10-08 起新增，只管这一次改动，不是通用调试手册）。
 
 **一个后端一个文件。** Python 侧在 `docs/`，C API 侧在 `capi/docs/`，同名对应：
 `docs/MUSA.md` 讲怎么在摩尔线程上跑 Python/Triton 这套，`capi/docs/MUSA.md` 讲 C API
@@ -50,6 +52,11 @@
 | Iluvatar | [`ILUVATAR_DEBUG.md`](ILUVATAR_DEBUG.md) 5.3 节 | 与 MACA 相同的通用 runner，基线 PyTorch；**20 个变体里 9 个（f64/c64）跑不了**，精度和性能要分别挡 fp64 |
 
 跑完统一用 `python3 tools/delivery_table.py <结果目录>` 看结果。
+
+**这张表是各后端已验证过的 20 变体窄口径命令，2026-10-08 起没有改动。** 交付列表本身已经扩展到 65
+个变体（见 [`debug/README.md`](debug/README.md)），一条通用命令能跑全部 65 个，但目前只在 CUDA 上
+验证过；上面这张表列的各后端命令仍然只覆盖原有 20 个，各后端要验证新增的 45 个请看
+[`docs/debug/<BACKEND>.md`](debug/README.md)。
 
 ## 每个文件里有什么
 

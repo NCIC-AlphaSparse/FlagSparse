@@ -43,6 +43,36 @@ ops:
     stages:
       - beta: "1.0"
 
+  - id: axpby
+    description: |
+      Computes y = alpha * x + beta * y for a sparse vector x (cusparseAxpby).
+    for:
+      - flagsparse_axpby
+    labels:
+      - flagsparse
+      - sparse
+      - triton
+      - public-api
+    kind:
+      - Sparse
+    stages:
+      - alpha: "1.0"
+
+  - id: spvv
+    description: |
+      Computes the dot product of a sparse and a dense vector (cusparseSpVV).
+    for:
+      - flagsparse_spvv
+    labels:
+      - flagsparse
+      - sparse
+      - triton
+      - public-api
+    kind:
+      - Sparse
+    stages:
+      - alpha: "1.0"
+
   - id: spmv_csr
     description: |
       Computes sparse matrix-vector multiplication for a CSR matrix.
@@ -99,6 +129,24 @@ ops:
       - SparseLinearAlg
     stages:
       - beta: "1.0"
+
+  - id: spmv_sell
+    description: |
+      Computes sparse matrix-vector multiplication for a sliced-ELLPACK matrix (cusparseSpMV SELL_ALG1).
+    for:
+      - flagsparse_spmv_sell
+      - dense_to_sell
+      - csr_to_sell
+    labels:
+      - flagsparse
+      - sparse
+      - sell
+      - triton
+      - public-api
+    kind:
+      - SparseLinearAlg
+    stages:
+      - alpha: "1.0"
 
   - id: spmv_bsr
     description: |
@@ -488,33 +536,89 @@ ops:
 # Delivery-report registrations. Python and C API summary writers both consume
 # this field. Add a record here before wiring a new reportable variant.
 #
-# The delivery list is the 20 variants in fork/list.xlsx (2026-09-21). It replaced
-# a list of 40 (2026-09-18): the complex spmv/spmm variants, spgemm_csr, spsv_csr,
-# spsv_coo and spsm_csr are no longer delivered. They are still implemented and
-# still covered by accuracy tests; capi/conf/operators.yaml marks them `retained`
-# (or narrows them with `delivery_dtypes`), which tests/ci keeps in step with this
-# list. To deliver one again, register it here AND flip it in that manifest.
+# One registry, 65 variants: the original 20 delivered to the C API (`capi: true`,
+# the list in fork/list.xlsx, 2026-09-21) plus 45 more from
+# docs/NEW_OPERATORS_CUSPARSE_12_5.md (`capi: false` -- implemented and accuracy-
+# tested, but not yet wrapped by the C API / c_fs layer; flip a variant's `capi`
+# to `true` once it is). There is no longer a separate `q4_variants:` list -- a
+# variant's pytest cases and benchmark rows are found by its `id`
+# (tests/pytest/test_q4_variants_accuracy.py, the `variant` CSV column), same as
+# before. `--delivery-only` and the runner's delivery-parent derivation read this
+# whole list, not just the `capi: true` subset; the C API manifest
+# (capi/conf/operators.yaml's `reporting: delivery`) is checked against only the
+# `capi: true` subset -- see tests/ci/test_delivery_variant_registry.py.
+#
+# A complex spmv/spmm variant, spgemm_csr, spsv_csr, spsv_coo and spsm_csr are
+# implemented and accuracy-tested; some are `capi: false` here, the rest are not
+# in this list at all if narrower than that (capi/conf/operators.yaml marks what
+# it has as `retained` or narrows via `delivery_dtypes`). To deliver one to the
+# C API, flip `capi` here AND in that manifest.
 delivery_variants:
-  - {id: gather_f16_int, operator: gather, format: sparse_vector, dtype: f16}
-  - {id: gather_f32_int, operator: gather, format: sparse_vector, dtype: f32}
-  - {id: gather_f64_int, operator: gather, format: sparse_vector, dtype: f64}
-  - {id: gather_c32_int, operator: gather, format: sparse_vector, dtype: c32}
-  - {id: gather_c64_int, operator: gather, format: sparse_vector, dtype: c64}
-  - {id: scatter_f16_int, operator: scatter, format: sparse_vector, dtype: f16}
-  - {id: scatter_f32_int, operator: scatter, format: sparse_vector, dtype: f32}
-  - {id: scatter_f64_int, operator: scatter, format: sparse_vector, dtype: f64}
-  - {id: scatter_c32_int, operator: scatter, format: sparse_vector, dtype: c32}
-  - {id: scatter_c64_int, operator: scatter, format: sparse_vector, dtype: c64}
-  - {id: spmv_csr_f32_int_non, operator: spmv_csr, format: csr, dtype: f32}
-  - {id: spmv_csr_f64_int_non, operator: spmv_csr, format: csr, dtype: f64}
-  - {id: spmv_coo_f32_int_non, operator: spmv_coo, format: coo, dtype: f32}
-  - {id: spmv_coo_f64_int_non, operator: spmv_coo, format: coo, dtype: f64}
-  - {id: spmm_csr_f32_int_non_non_row, operator: spmm_csr, format: csr, dtype: f32}
-  - {id: spmm_csr_f64_int_non_non_row, operator: spmm_csr, format: csr, dtype: f64}
-  - {id: spmm_coo_f32_int_non_non_row, operator: spmm_coo, format: coo, dtype: f32}
-  - {id: spmm_coo_f64_int_non_non_row, operator: spmm_coo, format: coo, dtype: f64}
-  - {id: sddmm_csr_f32_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f32}
-  - {id: sddmm_csr_f64_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f64}
+  - {id: gather_f16_int, operator: gather, format: sparse_vector, dtype: f16, capi: true}
+  - {id: gather_f32_int, operator: gather, format: sparse_vector, dtype: f32, capi: true}
+  - {id: gather_f64_int, operator: gather, format: sparse_vector, dtype: f64, capi: true}
+  - {id: gather_c32_int, operator: gather, format: sparse_vector, dtype: c32, capi: true}
+  - {id: gather_c64_int, operator: gather, format: sparse_vector, dtype: c64, capi: true}
+  - {id: scatter_f16_int, operator: scatter, format: sparse_vector, dtype: f16, capi: true}
+  - {id: scatter_f32_int, operator: scatter, format: sparse_vector, dtype: f32, capi: true}
+  - {id: scatter_f64_int, operator: scatter, format: sparse_vector, dtype: f64, capi: true}
+  - {id: scatter_c32_int, operator: scatter, format: sparse_vector, dtype: c32, capi: true}
+  - {id: scatter_c64_int, operator: scatter, format: sparse_vector, dtype: c64, capi: true}
+  - {id: spmv_csr_f32_int_non, operator: spmv_csr, format: csr, dtype: f32, capi: true}
+  - {id: spmv_csr_f64_int_non, operator: spmv_csr, format: csr, dtype: f64, capi: true}
+  - {id: spmv_coo_f32_int_non, operator: spmv_coo, format: coo, dtype: f32, capi: true}
+  - {id: spmv_coo_f64_int_non, operator: spmv_coo, format: coo, dtype: f64, capi: true}
+  - {id: spmm_csr_f32_int_non_non_row, operator: spmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: spmm_csr_f64_int_non_non_row, operator: spmm_csr, format: csr, dtype: f64, capi: true}
+  - {id: spmm_coo_f32_int_non_non_row, operator: spmm_coo, format: coo, dtype: f32, capi: true}
+  - {id: spmm_coo_f64_int_non_non_row, operator: spmm_coo, format: coo, dtype: f64, capi: true}
+  - {id: sddmm_csr_f32_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: sddmm_csr_f64_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f64, capi: true}
+  - {id: scatter_i8_int, operator: scatter, format: sparse_vector, dtype: i8, capi: false}
+  - {id: axpby_f16_int, operator: axpby, format: sparse_vector, dtype: f16, capi: false}
+  - {id: spmv_sell_f32_int_non, operator: spmv_sell, format: sell, dtype: f32, capi: false}
+  - {id: spmv_csr_f16f32_int_non, operator: spmv_csr, format: csr, dtype: f16f32, capi: false}
+  - {id: spvv_f16f32_int_non, operator: spvv, format: sparse_vector, dtype: f16f32, capi: false}
+  - {id: spmv_csr_f16_int_non, operator: spmv_csr, format: csr, dtype: f16, capi: false}
+  - {id: spmv_csr_f32c32_int_non, operator: spmv_csr, format: csr, dtype: f32c32, capi: false}
+  - {id: spmv_sell_f16_int_non, operator: spmv_sell, format: sell, dtype: f16, capi: false}
+  - {id: spmm_csr_f16f32_int_non_non_row, operator: spmm_csr, format: csr, dtype: f16f32, capi: false}
+  - {id: spmm_csr_f16_int_non_non_row, operator: spmm_csr, format: csr, dtype: f16, capi: false}
+  - {id: spmm_csr_f32_int_non_non_col, operator: spmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: spmm_csr_f32_int_non_trans_row, operator: spmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: spmv_csc_f32_int_non, operator: spmv_csc, format: csc, dtype: f32, capi: true}
+  - {id: spmv_csr_c32_int_non, operator: spmv_csr, format: csr, dtype: c32, capi: true}
+  - {id: spmv_sell_c32_int_non, operator: spmv_sell, format: sell, dtype: c32, capi: false}
+  - {id: spvv_c32_int_conj, operator: spvv, format: sparse_vector, dtype: c32, capi: false}
+  - {id: spmv_coo_f16f32_int_non, operator: spmv_coo, format: coo, dtype: f16f32, capi: false}
+  - {id: spmm_csr_c32_int_non_non_row, operator: spmm_csr, format: csr, dtype: c32, capi: true}
+  - {id: spmv_coo_f32_int_trans, operator: spmv_coo, format: coo, dtype: f32, capi: false}
+  - {id: spmv_csr_f32_int_trans, operator: spmv_csr, format: csr, dtype: f32, capi: false}
+  - {id: spmv_csr_i8f32_int_non, operator: spmv_csr, format: csr, dtype: i8f32, capi: false}
+  - {id: spmv_csr_i8i32_int_non, operator: spmv_csr, format: csr, dtype: i8i32, capi: false}
+  - {id: spmv_sell_i8i32_int_non, operator: spmv_sell, format: sell, dtype: i8i32, capi: false}
+  - {id: spvv_i8i32_int_non, operator: spvv, format: sparse_vector, dtype: i8i32, capi: false}
+  - {id: spmm_csc_f32_int_non_non_row, operator: spmm_csc, format: csc, dtype: f32, capi: false}
+  - {id: spmm_csr_i8i32_int_non_non_row, operator: spmm_csr, format: csr, dtype: i8i32, capi: false}
+  - {id: spmv_coo_c32_int_non, operator: spmv_coo, format: coo, dtype: c32, capi: true}
+  - {id: spmv_coo_f16_int_non, operator: spmv_coo, format: coo, dtype: f16, capi: false}
+  - {id: spmv_csc_c32_int_non, operator: spmv_csc, format: csc, dtype: c32, capi: true}
+  - {id: spmv_csc_f16_int_non, operator: spmv_csc, format: csc, dtype: f16, capi: false}
+  - {id: sddmm_csr_f32_int_non_non_col, operator: sddmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: sddmm_csr_f32_int_non_trans_row, operator: sddmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: sddmm_csr_f32_int_trans_non_row, operator: sddmm_csr, format: csr, dtype: f32, capi: true}
+  - {id: spmm_coo_c32_int_non_non_row, operator: spmm_coo, format: coo, dtype: c32, capi: true}
+  - {id: spmm_coo_f16_int_non_non_row, operator: spmm_coo, format: coo, dtype: f16, capi: false}
+  - {id: spmm_csr_f32_int_trans_non_row, operator: spmm_csr, format: csr, dtype: f32, capi: false}
+  - {id: spmv_coo_c32_int_conj, operator: spmv_coo, format: coo, dtype: c32, capi: false}
+  - {id: spmv_coo_i8i32_int_non, operator: spmv_coo, format: coo, dtype: i8i32, capi: false}
+  - {id: spmv_csr_c32_int_conj, operator: spmv_csr, format: csr, dtype: c32, capi: false}
+  - {id: spmm_coo_i8i32_int_non_non_row, operator: spmm_coo, format: coo, dtype: i8i32, capi: false}
+  - {id: spmm_csc_c32_int_non_non_row, operator: spmm_csc, format: csc, dtype: c32, capi: false}
+  - {id: sddmm_csr_c32_int_non_non_row, operator: sddmm_csr, format: csr, dtype: c32, capi: false}
+  - {id: sddmm_csr_f16_int_non_non_row, operator: sddmm_csr, format: csr, dtype: f16, capi: false}
+  - {id: spmm_csc_f16_int_non_non_row, operator: spmm_csc, format: csc, dtype: f16, capi: false}
+  - {id: spgemm_csr_f32_int_non_non, operator: spgemm_csr, format: csr, dtype: f32, capi: true}
 
 # The matrices a delivery run measures. `--delivery-only` keeps only these <name>.mtx
 # files from the --benchmark-input directory (run_flagsparse_pytest.py, and the C API

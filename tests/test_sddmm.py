@@ -1073,6 +1073,11 @@ def main():
             run_cusparse=run_cusparse_ref,
             acc_mode=args.acc_mode,
         )
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "sddmm_csr", paths, csv_path, args.warmup, args.iters
+        )
         return
 
     print("=" * 150)
