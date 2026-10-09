@@ -711,6 +711,11 @@ def main():
             run_cusparse=not args.no_cusparse,
             fail_fast=args.fail_fast,
         )
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmv_csc", paths, args.csv_csc, args.warmup, args.iters
+        )
         return
     if not paths:
         print("No .mtx files. Use --synthetic or --csv-csc with inputs.")

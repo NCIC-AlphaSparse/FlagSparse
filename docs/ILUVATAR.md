@@ -273,6 +273,29 @@ python3 tools/delivery_table.py pytest_results_iluvatar_delivery --markdown
 python tools/run_backend_tests.py --backend iluvatar --phase accuracy --mode quick
 ```
 
+## 2.5 现在是 65 个变体，一条 runner 命令（2026-10-08，**仅在 CUDA 上验证过，BI-V150 未实测**）
+
+`conf/operators.yaml` 的 `delivery_variants:` 从 20 项合并成了 65 项（原 20 个 + q4 的 45 个混合精度/
+int8/转置/布局变体），不再分"交付"和"q4"两部分；`--delivery-only` 现在会按这 65 项派生出全部 13 个
+父算子（原来 7 个之外新增 `axpby`/`spvv`/`spmv_sell`/`spmv_csc`/`spmm_csc`/`spgemm_csr`）。一条命令：
+
+```bash
+python3 run_flagsparse_pytest.py \
+  --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
+  --phase both --benchmark-input <矩阵目录>
+```
+
+**已验证**：CUDA（RTX 5090，10 个交付矩阵，20 次迭代）—— 65/65 accuracy Passed、65/65 performance
+Passed、0 missing（`tools/delivery_table.py` 的输出）。
+**未验证**：BI-V150 没有拿这条命令实机跑过，而且这张卡的已知限制比其他后端更多（fp64 H2D 静默置零、
+`torch.sparse` 结果是错的不能当参考、通用 `cusparseSpMV` 申请约 140TB 显存不可用，见第 3 节）——45 个
+新变体里不含 f64/c64，理论上不撞 fp64 那个坑，但 `torch.sparse` 这条限制对新变体同样适用：新增脚本的
+q4 变体测量（`tests/q4_variant_bench.py`）里 PyTorch 基线路径包了 try/except，理论上会跳过而不是报出
+静默错误的结果，但这只是代码审查的结论，没有实测过，**尤其不要在没有实测确认的情况下把这部分 PyTorch
+对照数字当真**。上机后按这条命令跑一遍，`tools/delivery_table.py <results-dir>` 的输出回传即可确认；
+如果要套用上面第 2 节那种"显式列出已知能跑的 dtype 子集"的收紧写法，`--op-benchmark-args` 对新增的
+`axpby`/`spvv`/`spmv_sell` 三个脚本同样适用（用法与 `gather`/`scatter` 一致）。
+
 ---
 
 ## 3. 性能基线

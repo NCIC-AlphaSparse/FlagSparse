@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <utility>
 #include <random>
@@ -29,6 +30,77 @@
 #include "baseline/baseline.hpp"
 
 namespace fstest {
+
+// IEEE binary16, from/to float. Moved here (not just in sweep.hpp, which
+// originally had the only copy) so ctest/accuracy/*.cpp can build the `Half`
+// host type below without pulling in sweep.hpp's benchmark-oriented machinery.
+inline uint16_t float_to_fp16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) {
+        // Subnormal, not zero. fp16's smallest normal is ~6.1e-5 and its
+        // smallest subnormal ~6e-8, so flushing this whole range to zero loses
+        // four orders of magnitude -- a unit test caught 1e-5 becoming 0.
+        if (exp < -10) return static_cast<uint16_t>(sign);   // truly below range
+        mant |= 0x800000u;                                   // restore implicit 1
+        const int32_t shift = 14 - exp;                      // 24-bit mant -> 10-bit
+        const uint32_t sub = mant >> shift;
+        // Round to nearest even on the discarded bits.
+        const uint32_t rem = mant & ((1u << shift) - 1u);
+        const uint32_t half = 1u << (shift - 1);
+        uint32_t rounded = sub + ((rem > half || (rem == half && (sub & 1u))) ? 1u : 0u);
+        return static_cast<uint16_t>(sign | rounded);
+    }
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);  // overflow to inf
+    // Round to nearest even on the 13 bits being discarded.
+    const uint32_t round = (mant & 0x1fffu) > 0x1000u ||
+                           ((mant & 0x1fffu) == 0x1000u && ((mant >> 13) & 1u));
+    uint16_t out = static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
+                                         (mant >> 13));
+    return static_cast<uint16_t>(out + round);
+}
+
+inline float fp16_to_float(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) { bits = sign; }
+        else {
+            // Subnormal: normalise it into an fp32 exponent.
+            int32_t e = -1;
+            uint32_t m = mant;
+            do { m <<= 1; ++e; } while ((m & 0x400u) == 0);
+            bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) |
+                   ((m & 0x3ffu) << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// A host-side fp16 value that behaves like a float for template purposes
+// (static_cast<Half>(double), implicit conversion back to double for error
+// checks) while being bit-exact fp16 storage -- the same representation
+// flagsparseCreateDnMat's FLAGSPARSE_R_16F expects on device. Needed because
+// plain `float`/`double` are 4/8 bytes and DeviceBuffer<T>::from/download are
+// sizeof(T)-based, so an accuracy test cannot use a native C++ type for fp16.
+struct Half {
+    uint16_t bits = 0;
+    Half() = default;
+    Half(double f) : bits(float_to_fp16(static_cast<float>(f))) {}  // NOLINT
+    operator double() const { return static_cast<double>(fp16_to_float(bits)); }  // NOLINT
+};
+static_assert(sizeof(Half) == 2, "Half must be bit-exact fp16 storage");
 
 // Device buffer with RAII, built on the C API's own backend so the tests need
 // no vendor headers of their own.

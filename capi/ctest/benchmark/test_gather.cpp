@@ -71,6 +71,7 @@ TEST(GatherBenchmark, SpVecOverCorpus) {
         }
 
         for (const registry::Variant* v : declared) {
+            if (!benchmark_variant_selected(*v)) continue;
             const auto dt = v->dt;
             BenchRow row;
             row.name = std::string("gather_spvec_") + v->dtype + "_" + entry.name;
@@ -83,6 +84,7 @@ TEST(GatherBenchmark, SpVecOverCorpus) {
                .num("nnz", static_cast<double>(nnz))
                .num("size", static_cast<double>(dense))
                .num("bytes_moved", bytes);
+            if (v->variant_id) row.tag("variant", v->variant_id);
             trace("gather", entry.name, v->dtype, A);
 
             DeviceBuffer d_idx = DeviceBuffer::from(idx);

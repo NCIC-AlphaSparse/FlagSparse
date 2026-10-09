@@ -72,6 +72,7 @@ TEST(SpsmBenchmark, CsrOverCorpus) {
             }
 
             for (const registry::Variant* v : declared) {
+                if (!benchmark_variant_selected(*v)) continue;
                 if (std::string(v->format) != "csr") {
                     if (n == kRhs[0]) {
                         const std::string why =

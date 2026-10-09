@@ -45,6 +45,7 @@ import platform
 import subprocess
 import sys
 
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.delivery_variants import load_delivery_variants  # noqa: E402
@@ -86,7 +87,17 @@ DELIVERY_BY_OPERATOR_DTYPE = {}
 
 
 def variant_name(row):
-    """The delivery-list name for a measured row, e.g. spmv_csr_f32_int_non."""
+    """The delivery-list name for a measured row, e.g. spmv_csr_f32_int_non.
+
+    A row the benchmark tagged with its delivery `variant` id is that variant:
+    the id is what configured it (opA, opB, layout, mixed types). An untagged
+    row -- the ordinary per-dtype sweep, or a JSON from before the tag existed --
+    falls back to (operator, dtype), which is only a name when exactly one
+    delivery variant has that pair.
+    """
+    tagged = row.get("variant")
+    if tagged:
+        return str(tagged)
     op = str(row.get("operator") or row.get("_op", ""))
     dtype = str(row.get("dtype", ""))
     matches = DELIVERY_BY_OPERATOR_DTYPE.get((op, dtype), [])
@@ -193,8 +204,8 @@ def main():
     ap.add_argument(
         "--all",
         action="store_true",
-        help="include retained variants; the default is the "
-        "registered delivery variants only (conf/operators.yaml)",
+        help="also read rows tagged `retained`; either way the summary has one "
+        "entry per registered delivery variant (conf/operators.yaml)",
     )
     args = ap.parse_args()
 
@@ -202,6 +213,10 @@ def main():
     if not files:
         sys.exit(f"no *_benchmark.json under {args.bench_dir}")
 
+    # Every registered delivery variant is expected, whether or not this C API
+    # implements it: one it cannot run reports NotFound (or not_supported, from
+    # the row the benchmark still emits for it) instead of dropping out of the
+    # report. `--all` only widens which ROWS are read (retained ones too).
     delivery_variants = load_delivery_variants()
     expected_variants = {variant["id"]: variant for variant in delivery_variants}
     DELIVERY_BY_OPERATOR_DTYPE.clear()
@@ -238,10 +253,17 @@ def main():
         if not rows:
             continue
 
-        # Group by variant: one summary entry per delivery-list name.
+        # Group by variant: one summary entry per delivery-list name. A variant
+        # measured by a tagged row ignores untagged rows that would fall back to
+        # the same name: those come from the ordinary sweep, whose configuration
+        # (layout, op) is the benchmark's default rather than the variant's.
+        tagged_here = {str(r["variant"]) for r in rows if r.get("variant")}
         by_variant = {}
         for r in rows:
-            by_variant.setdefault(variant_name(r), []).append(r)
+            name = variant_name(r)
+            if not r.get("variant") and name in tagged_here:
+                continue
+            by_variant.setdefault(name, []).append(r)
 
         # ---- accuracy artifact, indexed by variant so each entry cites the
         # rows that decided it. From the operator's own file when the
@@ -258,7 +280,10 @@ def main():
         # than from an operator-wide total that would hide which variant failed.
         acc_by_variant = {}
         for r in acc_rows:
-            acc_by_variant.setdefault(variant_name(r), []).append(r)
+            name = variant_name(r)
+            if not r.get("variant") and name in tagged_here:
+                continue
+            acc_by_variant.setdefault(name, []).append(r)
 
         for vname, vrows in by_variant.items():
             if vname not in expected_variants:

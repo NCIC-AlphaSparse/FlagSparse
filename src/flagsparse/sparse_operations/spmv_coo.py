@@ -19,10 +19,12 @@
   reduction + single ``tl.store`` per output row (no atomics on ``y``).
 - ``sort_by_row=False``: grid over NNZ with ``tl.atomic_add`` (slower / contentions).
 
-Storage: sorted ``data, row, col`` plus optional ``seg_starts`` vector — never ``indptr``.
+Storage: sorted ``data, row, col`` plus optional ``seg_starts`` vector. Prepared
+gather routes additionally store row pointers; callers still provide COO arrays.
 """
 
 from ._common import *
+from . import mixed_spmx as _mixed_spmx
 
 import time
 from functools import lru_cache
@@ -107,6 +109,8 @@ class PreparedCoo:
         "sort_by_row",
         "op",
         "transpose",
+        "transpose_csr_plan",
+        "non_csr_plan",
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
@@ -144,6 +148,17 @@ class PreparedCoo:
         self.sort_by_row = bool(sort_by_row)
         self.op = _normalize_spmv_coo_op(op, transpose=transpose)
         self.transpose = _spmv_coo_op_transposes(self.op)
+        self.transpose_csr_plan = None
+        self.non_csr_plan = None
+        if self.sort_by_row and self.data_trans.dtype in (torch.float32, torch.complex64):
+            from . import _spmv_csr_transpose
+            counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
+            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(self.row_trans.dtype)
+            self.transpose_csr_plan = _spmv_csr_transpose.make_plan(self.col_trans, ptr, None, self.n_cols)
+            if (_backend_name() == "cuda" or _is_maca_runtime() or _is_rocm_runtime()) and self.data_non.dtype == torch.complex64:
+                counts = torch.bincount(self.row_non.long(), minlength=self.n_rows)
+                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(self.row_non.dtype)
+                self.non_csr_plan = _spmv_csr_transpose.make_plan(self.col_non, ptr, None, self.n_rows)
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -168,6 +183,7 @@ class _PreparedCooLaunch:
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
+        "csr_plan",
     )
 
     def __init__(
@@ -181,6 +197,7 @@ class _PreparedCooLaunch:
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
+        csr_plan=None,
     ):
         self.data = data
         self.row = row
@@ -200,6 +217,7 @@ class _PreparedCooLaunch:
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
+        self.csr_plan = csr_plan
 
 
 @triton.jit
@@ -650,9 +668,19 @@ def _resolve_spmv_coo_launch(prepared, op):
             index_fallback_policy=prepared.index_fallback_policy,
             index_fallback_applied=prepared.index_fallback_applied,
             index_fallback_reason=prepared.index_fallback_reason,
+            csr_plan=prepared.non_csr_plan,
         )
     data = prepared.data_trans
-    if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype):
+    # The csr_plan path (built whenever dtype qualifies, independent of backend --
+    # see _PreparedCooLaunch.__init__) folds conj in internally, so the direct
+    # conjugation below is normally skipped when a plan exists. Ascend's
+    # _ascend_spmv_coo_index_add never touches csr_plan at all (plain index_add_
+    # over launch.data/.row/.col), so it always needs the direct conj here
+    # regardless of whether a plan was built -- same bug shape already fixed in
+    # spmv_csr/spmm_csr/sddmm_csr's Ascend fallbacks.
+    if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype) and (
+        prepared.transpose_csr_plan is None or _is_ascend_runtime()
+    ):
         data = data.conj()
         if hasattr(data, "resolve_conj"):
             data = data.resolve_conj()
@@ -666,6 +694,7 @@ def _resolve_spmv_coo_launch(prepared, op):
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=prepared.index_fallback_applied,
         index_fallback_reason=prepared.index_fallback_reason,
+        csr_plan=prepared.transpose_csr_plan,
     )
 
 
@@ -686,6 +715,12 @@ def _validate_x_coo(x, prepared):
 
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
+    if prepared.csr_plan is not None:
+        from . import _spmv_csr_transpose
+        return _spmv_csr_transpose.gather(
+            prepared.data, x, prepared.csr_plan, prepared.n_rows,
+            prepared.op == SPMV_COO_OP_CONJ_TRANS,
+        )
     dtype = prepared.data.dtype
     # A run-compressed launch stores exactly one value for every non-empty row.
     # When every row has a run, avoid a full output memset before the kernel;
@@ -707,7 +742,7 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     if _is_complex_dtype(dtype):
         data_ri = torch.view_as_real(prepared.data).reshape(-1)
         x_ri = torch.view_as_real(x).reshape(-1)
-        y_ri = torch.zeros(prepared.n_rows * 2, dtype=data_ri.dtype, device=y.device)
+        y_ri = torch.view_as_real(y).reshape(-1)
         acc_dtype = tl.float64 if dtype == torch.complex128 else tl.float32
         if prepared.use_seg_kernel:
             grid = (prepared.n_segs,)
@@ -745,7 +780,6 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
                 ACC_DTYPE=acc_dtype,
                 num_warps=num_warps,
             )
-        y.copy_(torch.view_as_complex(y_ri.reshape(prepared.n_rows, 2)))
         return y
     if prepared.use_seg_kernel:
         ker = _spmv_coo_seg_f64 if dtype == torch.float64 else _spmv_coo_seg_f32
@@ -878,7 +912,9 @@ def _ascend_spmv_coo_index_add(launch, x):
     if launch.nnz:
         row = launch.row.to(torch.int64)
         col = launch.col.to(torch.int64)
-        y.index_add_(0, row, launch.data * x[col])
+        # conj (for op=conj_trans) is already folded into launch.data by
+        # _resolve_spmv_coo_launch / _prepare_spmv_coo_launch.
+        _index_add_values(y, 0, row, launch.data * _gather_values(x, col))
     return y
 
 
@@ -939,12 +975,27 @@ def flagsparse_spmv_coo(
     transpose=None,
     op=None,
     index_fallback_policy="auto",
+    *,
+    out_dtype=None,
 ):
     """COO SpMV with no CSR indptr. See module docstring.
 
     ``block_inner``: tile for the row-run kernel (``sort_by_row=True``).
     ``block_size`` / ``num_warps``: grid over NNZ when ``sort_by_row=False`` (atomics).
+    float16 / bfloat16 / int8 matrices and widened outputs (``out_dtype`` or
+    ``out.dtype``: half -> float32, int8 -> int32 / float32) run in ``mixed_spmx``.
     """
+    if (
+        prepared is None
+        and torch.is_tensor(data)
+        and _mixed_spmx.spmv_needs_mixed(
+            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype, coo=True
+        )
+    ):
+        return _mixed_spmx.spmv_coo_mixed(
+            data, row, col, x, shape, op=op, transpose=transpose,
+            out=out, out_dtype=out_dtype, return_time=return_time,
+        )
     transpose_flag = False if transpose is None else bool(transpose)
     op_explicit = op is not None
     op_code = _normalize_spmv_coo_op(op, transpose=transpose_flag)

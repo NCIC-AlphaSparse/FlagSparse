@@ -82,6 +82,27 @@ python3 tools/delivery_table.py pytest_results_rocm_delivery              # 加 
 export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ```
 
+## 0.6 现在是 65 个变体，一条 runner 命令（2026-10-08，**仅在 CUDA 上验证过，BW1000 未实测**）
+
+`conf/operators.yaml` 的 `delivery_variants:` 从 20 项合并成了 65 项（原 20 个 + q4 的 45 个混合精度/
+int8/转置/布局变体），不再分"交付"和"q4"两部分；`--delivery-only` 现在会按这 65 项派生出全部 13 个
+父算子（原来 7 个之外新增 `axpby`/`spvv`/`spmv_sell`/`spmv_csc`/`spmm_csc`/`spgemm_csr`）。一条命令：
+
+```bash
+python3 run_flagsparse_pytest.py \
+  --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
+  --phase both --benchmark-input <矩阵目录>
+```
+
+**已验证**：CUDA（RTX 5090，10 个交付矩阵，20 次迭代）—— 65/65 accuracy Passed、65/65 performance
+Passed、0 missing（`tools/delivery_table.py` 的输出）。
+**未验证**：BW1000 没有拿这条命令实机跑过。机制上看应该通：新增的 7 个脚本的 q4 变体测量
+（`tests/q4_variant_bench.py`）会先查 `tests/cusparse_generic_baseline.py` 的 `skip_reason()`，
+hipSPARSE 不在其中（该文件只接 cuSPARSE/CuPy），所以这部分新增变体在 DCU 上大概率没有厂商基线、只有
+PyTorch 对照，跟原有变体在本机"厂商库仅覆盖 op=non"的既有限制是同一个性质，不是新问题。但这只是代码
+审查的结论，没有实测过。上机后按这条命令跑一遍，`tools/delivery_table.py <results-dir>` 的输出回传
+即可确认。
+
 ---
 
 ## 1. 环境准备

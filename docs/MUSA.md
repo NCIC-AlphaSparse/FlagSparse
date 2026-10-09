@@ -94,6 +94,28 @@ python3 tools/delivery_table.py pytest_results_mthreads_split              # 加
 export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ```
 
+## 0.6 现在是 65 个变体，一条 runner 命令（2026-10-08，**仅在 CUDA 上验证过，S5000 未实测**）
+
+`conf/operators.yaml` 的 `delivery_variants:` 从 20 项合并成了 65 项（原 20 个 + q4 的 45 个混合精度/
+int8/转置/布局变体），不再分"交付"和"q4"两部分；`--delivery-only` 现在会按这 65 项派生出全部 13 个
+父算子（原来 7 个之外新增 `axpby`/`spvv`/`spmv_sell`/`spmv_csc`/`spmm_csc`/`spgemm_csr`）。一条命令：
+
+```bash
+python3 run_flagsparse_pytest.py \
+  --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
+  --phase both --benchmark-input <矩阵目录>
+```
+
+**已验证**：CUDA（RTX 5090，10 个交付矩阵，20 次迭代）—— 65/65 accuracy Passed、65/65 performance
+Passed、0 missing（`tools/delivery_table.py` 的输出）。
+**未验证**：S5000 没有拿这条命令实机跑过，而且风险比其他后端更明确一点——`torch.sparse` 在 MUSA 上
+**完全没有矩阵乘实现**（见下面"实测能力矩阵"一节），这是已知会影响 PyTorch 回退基线的点，不是这次新
+引入的问题。新增的 7 个脚本的 q4 变体测量（`tests/q4_variant_bench.py`）会先查
+`tests/cusparse_generic_baseline.py` 的 `skip_reason()`，非 CUDA 后端会优雅跳过厂商基线；PyTorch 基线
+那部分也包了 try/except（专门注释了"e.g. MUSA registers no sparse matmul"），理论上不会让整条命令崩，
+但这只是代码审查的结论，没有实测过。上机后按这条命令跑一遍，`tools/delivery_table.py <results-dir>`
+的输出回传即可确认。
+
 ---
 
 ## 1. MUSA 与 CUDA 兼容后端的区别

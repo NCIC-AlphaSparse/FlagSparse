@@ -32,19 +32,25 @@ namespace flagsparse::jit {
 // the value is stored by the struct and its address handed over at launch --
 // taking the address of a temporary is the easy way to corrupt a launch.
 struct Arg {
-    enum class Kind { DevicePtr, I32, I64, F32, F64 } kind;
+    enum class Kind { DevicePtr, I32, I64, F32, F64, F16 } kind;
     union {
         adaptor::DevicePtr dev;
         std::int32_t i32;
         std::int64_t i64;
         float f32;
         double f64;
+        std::uint16_t f16;  // raw IEEE binary16 bits, for a scalar "fp16" param
     };
     static Arg ptr(adaptor::DevicePtr v) { Arg a{Kind::DevicePtr}; a.dev = v; return a; }
     static Arg i(std::int32_t v)         { Arg a{Kind::I32}; a.i32 = v; return a; }
     static Arg i64v(std::int64_t v)      { Arg a{Kind::I64}; a.i64 = v; return a; }
     static Arg f(float v)                { Arg a{Kind::F32}; a.f32 = v; return a; }
     static Arg d(double v)               { Arg a{Kind::F64}; a.f64 = v; return a; }
+    // v is already-encoded IEEE binary16 bits, not a float to convert: callers
+    // that need float->fp16 (e.g. a scalar matching a fp16 tensor param) do
+    // that conversion themselves, the same way they build the fp16 buffers
+    // this scalar accompanies.
+    static Arg h(std::uint16_t v)        { Arg a{Kind::F16}; a.f16 = v; return a; }
 };
 
 // Absolute path of a kernel module inside flagsparse_codegen/.

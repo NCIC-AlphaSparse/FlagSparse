@@ -115,6 +115,26 @@ python3 tools/delivery_table.py pytest_results_metax_delivery              # 加
 export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ```
 
+## 0.6 现在是 65 个变体，一条 runner 命令（2026-10-08，**仅在 CUDA 上验证过，C550 未实测**）
+
+`conf/operators.yaml` 的 `delivery_variants:` 从 20 项合并成了 65 项（原 20 个 + q4 的 45 个混合精度/
+int8/转置/布局变体），不再分"交付"和"q4"两部分；`--delivery-only` 现在会按这 65 项派生出全部 13 个
+父算子（原来 7 个之外新增 `axpby`/`spvv`/`spmv_sell`/`spmv_csc`/`spmm_csc`/`spgemm_csr`）。一条命令：
+
+```bash
+python3 run_flagsparse_pytest.py \
+  --ops gather,scatter,axpby,spvv,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,sddmm_csr \
+  --phase both --benchmark-input <矩阵目录>
+```
+
+**已验证**：CUDA（RTX 5090，10 个交付矩阵，20 次迭代）—— 65/65 accuracy Passed、65/65 performance
+Passed、0 missing（`tools/delivery_table.py` 的输出）。
+**未验证**：C550 没有拿这条命令实机跑过。机制上看应该通：新增的 7 个脚本（`test_spmv_csr.py` 等）的
+q4 变体测量（`tests/q4_variant_bench.py`）会先查 `tests/cusparse_generic_baseline.py` 的
+`skip_reason()`，C550 没有 CuPy/cuSPARSE 时会优雅跳过、报空基线而不是崩溃，跟原有 20 个变体在本机的
+行为模式（见上面 0.5 节"性能 baseline 探测而非假定"）一致——但这只是代码审查的结论，不是实测结论。
+上机后按这条命令跑一遍，`tools/delivery_table.py <results-dir>` 的输出回传即可确认。
+
 ---
 
 ## 1. 每次开工的环境

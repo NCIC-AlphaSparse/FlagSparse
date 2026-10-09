@@ -1,0 +1,97 @@
+﻿序号,父算子,变体,分类,难度,cuSPARSE_API,取名规则,备注
+1,scatter,scatter_i8_int,计算类,★ 1.3,cusparseScatter,scatter_数据类型_int（只搬数据，无格式/opA）,
+2,axpby,axpby_f16_int,计算类,★ 2.0,cusparseAxpby,axpby_数据类型_int（逐元素，无格式/opA）,12.8 起弃用
+3,spmv_sell,spmv_sell_f32_int_non,计算类,★★ 2.5,cusparseSpMV (SELL_ALG1),spmv_sell_数据类型_int_opA,
+4,spmv_csr,spmv_csr_f16f32_int_non,计算类,★★ 2.8,cusparseSpMV,spmv_csr_数据类型_int_opA,
+5,spvv,spvv_f16f32_int_non,计算类,★★ 2.8,cusparseSpVV,spvv_数据类型_int_opA（向量无格式，opA=non/conj）,12.8 起弃用
+6,spmv_csr,spmv_csr_f16_int_non,计算类,★★ 3.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+7,spmv_csr,spmv_csr_f32c32_int_non,计算类,★★ 3.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+8,spmv_sell,spmv_sell_f16_int_non,计算类,★★ 3.0,cusparseSpMV (SELL_ALG1),spmv_sell_数据类型_int_opA,
+9,spmm_csr,spmm_csr_f16f32_int_non_non_row,计算类,★★ 3.3,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+10,spmm_csr,spmm_csr_f16_int_non_non_row,计算类,★★ 3.5,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+11,spmm_csr,spmm_csr_f32_int_non_non_col,计算类,★★ 3.5,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+12,spmm_csr,spmm_csr_f32_int_non_trans_row,计算类,★★ 3.5,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+13,spmv_csc,spmv_csc_f32_int_non,计算类,★★ 3.5,cusparseSpMV,spmv_csc_数据类型_int_opA,
+14,spmv_csr,spmv_csr_c32_int_non,计算类,★★ 3.5,cusparseSpMV,spmv_csr_数据类型_int_opA,40 表
+15,spmv_sell,spmv_sell_c32_int_non,计算类,★★ 3.5,cusparseSpMV (SELL_ALG1),spmv_sell_数据类型_int_opA,
+16,spvv,spvv_c32_int_conj,计算类,★★ 3.5,cusparseSpVV,spvv_数据类型_int_opA（向量无格式，opA=non/conj）,12.8 起弃用
+17,spmv_coo,spmv_coo_f16f32_int_non,计算类,★★ 3.8,cusparseSpMV,spmv_coo_数据类型_int_opA,
+18,spmm_csr,spmm_csr_c32_int_non_non_row,计算类,★★★ 4.0,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),40 表
+19,spmv_coo,spmv_coo_f32_int_trans,计算类,★★★ 4.0,cusparseSpMV,spmv_coo_数据类型_int_opA,
+20,spmv_csr,spmv_csr_f32_int_trans,计算类,★★★ 4.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+21,spmv_csr,spmv_csr_i8f32_int_non,计算类,★★★ 4.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+22,spmv_csr,spmv_csr_i8i32_int_non,计算类,★★★ 4.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+23,spmv_sell,spmv_sell_i8i32_int_non,计算类,★★★ 4.0,cusparseSpMV (SELL_ALG1),spmv_sell_数据类型_int_opA,
+24,spvv,spvv_i8i32_int_non,计算类,★★★ 4.0,cusparseSpVV,spvv_数据类型_int_opA（向量无格式，opA=non/conj）,12.8 起弃用
+25,spmm_csc,spmm_csc_f32_int_non_non_row,计算类,★★★ 4.5,cusparseSpMM,spmm_csc_数据类型_int_opA_opB_denseLayout(row/col),
+26,spmm_csr,spmm_csr_i8i32_int_non_non_row,计算类,★★★ 4.5,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+27,spmv_coo,spmv_coo_c32_int_non,计算类,★★★ 4.5,cusparseSpMV,spmv_coo_数据类型_int_opA,40 表
+28,spmv_coo,spmv_coo_f16_int_non,计算类,★★★ 4.5,cusparseSpMV,spmv_coo_数据类型_int_opA,
+29,spmv_csc,spmv_csc_c32_int_non,计算类,★★★ 4.5,cusparseSpMV,spmv_csc_数据类型_int_opA,
+30,spmv_csc,spmv_csc_f16_int_non,计算类,★★★ 4.5,cusparseSpMV,spmv_csc_数据类型_int_opA,
+31,sddmm_csr,sddmm_csr_f32_int_non_non_col,计算类,★★★ 5.0,cusparseSDDMM,sddmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+32,sddmm_csr,sddmm_csr_f32_int_non_trans_row,计算类,★★★ 5.0,cusparseSDDMM,sddmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+33,sddmm_csr,sddmm_csr_f32_int_trans_non_row,计算类,★★★ 5.0,cusparseSDDMM,sddmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+34,spmm_bell,spmm_bell_f32_int_non_non_row,计算类,★★★ 5.0,cusparseSpMM (BLOCKED_ELL_ALG1),spmm_bell_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non，无i8/c32）,无 i8/c32、opA 仅 non
+35,spmm_bsr,spmm_bsr_f32_int_non_non_row,计算类,★★★ 5.0,cusparseSpMM (BSR_ALG1),spmm_bsr_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non）,仅 opA=non
+36,spmm_coo,spmm_coo_c32_int_non_non_row,计算类,★★★ 5.0,cusparseSpMM,spmm_coo_数据类型_int_opA_opB_denseLayout(row/col),40 表
+37,spmm_coo,spmm_coo_f16_int_non_non_row,计算类,★★★ 5.0,cusparseSpMM,spmm_coo_数据类型_int_opA_opB_denseLayout(row/col),
+38,spmm_csr,spmm_csr_f32_int_trans_non_row,计算类,★★★ 5.0,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+39,spmv_coo,spmv_coo_c32_int_conj,计算类,★★★ 5.0,cusparseSpMV,spmv_coo_数据类型_int_opA,
+40,spmv_coo,spmv_coo_i8i32_int_non,计算类,★★★ 5.0,cusparseSpMV,spmv_coo_数据类型_int_opA,
+41,spmv_csr,spmv_csr_c32_int_conj,计算类,★★★ 5.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+42,sddmm_bsr,sddmm_bsr_f32_int_non_non_row,计算类,★★★★ 5.5,cusparseSDDMM,sddmm_bsr_数据类型_int_opA_opB_denseLayout(row/col),
+43,sddmm_csr,sddmm_csr_c32_int_non_non_row,计算类,★★★★ 5.5,cusparseSDDMM,sddmm_csr_数据类型_int_opA_opB_denseLayout(row/col),原 42 表待补项
+44,sddmm_csr,sddmm_csr_f16_int_non_non_row,计算类,★★★★ 5.5,cusparseSDDMM,sddmm_csr_数据类型_int_opA_opB_denseLayout(row/col),CSR 不支持 bf16
+45,spmm_bsr,spmm_bsr_f32_int_non_trans_row,计算类,★★★★ 5.5,cusparseSpMM (BSR_ALG1),spmm_bsr_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non）,仅 opA=non
+46,spmm_coo,spmm_coo_i8i32_int_non_non_row,计算类,★★★★ 5.5,cusparseSpMM,spmm_coo_数据类型_int_opA_opB_denseLayout(row/col),
+47,spmm_csc,spmm_csc_c32_int_non_non_row,计算类,★★★★ 5.5,cusparseSpMM,spmm_csc_数据类型_int_opA_opB_denseLayout(row/col),
+48,spmm_csc,spmm_csc_f16_int_non_non_row,计算类,★★★★ 5.5,cusparseSpMM,spmm_csc_数据类型_int_opA_opB_denseLayout(row/col),
+49,spmm_bell,spmm_bell_f16f32_int_non_non_row,计算类,★★★★ 5.8,cusparseSpMM (BLOCKED_ELL_ALG1),spmm_bell_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non，无i8/c32）,无 i8/c32、opA 仅 non
+50,spmm_bell,spmm_bell_f16_int_non_non_row,计算类,★★★★ 6.0,cusparseSpMM (BLOCKED_ELL_ALG1),spmm_bell_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non，无i8/c32）,无 i8/c32、opA 仅 non
+51,spmm_bsr,spmm_bsr_f16_int_non_non_row,计算类,★★★★ 6.0,cusparseSpMM (BSR_ALG1),spmm_bsr_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non）,仅 opA=non
+52,spmm_coo,spmm_coo_f32_int_trans_non_row,计算类,★★★★ 6.0,cusparseSpMM,spmm_coo_数据类型_int_opA_opB_denseLayout(row/col),
+53,spmm_csr,spmm_csr_c32_int_conj_non_row,计算类,★★★★ 6.0,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+54,sddmm_bsr,sddmm_bsr_f16_int_non_non_row,计算类,★★★★ 6.5,cusparseSDDMM,sddmm_bsr_数据类型_int_opA_opB_denseLayout(row/col),
+55,spgemm_csr,spgemm_csr_f32_int_non_non,计算类,★★★★ 7.0,cusparseSpGEMM (ALG1),spgemm_csr_数据类型_int_opA_opB[_alg2|_alg3],40 表
+56,spmm_bsr,spmm_bsr_i8i32_int_non_non_row,计算类,★★★★ 7.0,cusparseSpMM (BSR_ALG1),spmm_bsr_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non）,仅 opA=non
+57,spsv_csr,spsv_csr_f32_int_non,计算类,★★★★ 7.0,cusparseSpSV,spsv_csr_数据类型_int_opA[_upper],40 表
+58,spsm_csr,spsm_csr_f32_int_non_non_row,计算类,★★★★★ 7.5,cusparseSpSM,spsm_csr_数据类型_int_opA_opB_denseLayout(row/col),40 表
+59,spsv_coo,spsv_coo_f32_int_non,计算类,★★★★★ 7.5,cusparseSpSV,spsv_coo_数据类型_int_opA,40 表
+60,spsv_csr,spsv_csr_f32_int_non_upper,计算类,★★★★★ 7.5,cusparseSpSV,spsv_csr_数据类型_int_opA[_upper],上三角
+61,spgemm_csr,spgemm_csr_c32_int_non_non,计算类,★★★★★ 8.0,cusparseSpGEMM (ALG1),spgemm_csr_数据类型_int_opA_opB[_alg2|_alg3],无 f16/bf16
+62,spgemm_csr,spgemm_csr_f32_int_non_non_alg2,计算类,★★★★★ 8.0,cusparseSpGEMM (ALG2),spgemm_csr_数据类型_int_opA_opB[_alg2|_alg3],内存受限算法
+63,spgemm_csr,spgemm_csr_f32_int_non_non_alg3,计算类,★★★★★ 8.0,cusparseSpGEMM (ALG3),spgemm_csr_数据类型_int_opA_opB[_alg2|_alg3],分块，更省内存
+64,spsm_coo,spsm_coo_f32_int_non_non_row,计算类,★★★★★ 8.0,cusparseSpSM,spsm_coo_数据类型_int_opA_opB_denseLayout(row/col),
+65,spsm_csr,spsm_csr_f32_int_non_non_col,计算类,★★★★★ 8.0,cusparseSpSM,spsm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+66,spsm_csr,spsm_csr_f32_int_non_trans_row,计算类,★★★★★ 8.0,cusparseSpSM,spsm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+67,spsv_csr,spsv_csr_c32_int_non,计算类,★★★★★ 8.0,cusparseSpSV,spsv_csr_数据类型_int_opA[_upper],40 表
+68,spsv_sell,spsv_sell_f32_int_non,计算类,★★★★★ 8.0,cusparseSpSV,spsv_sell_数据类型_int_opA,
+69,spsm_csr,spsm_csr_c32_int_non_non_row,计算类,★★★★★ 8.5,cusparseSpSM,spsm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+70,spsv_coo,spsv_coo_c32_int_non,计算类,★★★★★ 8.5,cusparseSpSV,spsv_coo_数据类型_int_opA,40 表
+71,spsv_csr,spsv_csr_f32_int_trans,计算类,★★★★★ 8.5,cusparseSpSV,spsv_csr_数据类型_int_opA[_upper],
+72,spsm_csr,spsm_csr_f32_int_trans_non_row,计算类,★★★★★ 9.0,cusparseSpSM,spsm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+73,spsv_coo,spsv_coo_f32_int_trans,计算类,★★★★★ 9.0,cusparseSpSV,spsv_coo_数据类型_int_opA,
+74,spsv_csr,spsv_csr_c32_int_conj,计算类,★★★★★ 9.5,cusparseSpSV,spsv_csr_数据类型_int_opA[_upper],
+75,spsm_coo,spsm_coo_c32_int_conj_non_row,计算类,★★★★★ 10.5,cusparseSpSM,spsm_coo_数据类型_int_opA_opB_denseLayout(row/col),
+76,spsv_sell,spsv_sell_c32_int_conj,计算类,★★★★★ 10.5,cusparseSpSV,spsv_sell_数据类型_int_opA,
+77,sparse2dense_csr,sparse2dense_csr_f32_int,格式转换,★ 1.5,cusparseSparseToDense,sparse2dense_csr_数据类型_int（无opA/opB）,
+78,sparse2dense_coo,sparse2dense_coo_f16_int,格式转换,★ 2.0,cusparseSparseToDense,sparse2dense_coo_数据类型_int（无opA/opB）,
+79,sparse2dense_csc,sparse2dense_csc_c32_int,格式转换,★★ 2.5,cusparseSparseToDense,sparse2dense_csc_数据类型_int（无opA/opB）,
+80,csr2csc,csr2csc_f32_int,格式转换,★★ 3.0,cusparseCsr2cscEx2,csr2csc_数据类型_int（无opA/opB）,
+81,dense2sparse_csr,dense2sparse_csr_f32_int,格式转换,★★ 3.0,cusparseDenseToSparse,dense2sparse_csr_数据类型_int（无opA/opB）,
+82,dense2sparse_csr,dense2sparse_csr_f16_int,格式转换,★★ 3.5,cusparseDenseToSparse,dense2sparse_csr_数据类型_int（无opA/opB）,
+83,csr2csc,csr2csc_c32_int,格式转换,★★★ 4.0,cusparseCsr2cscEx2,csr2csc_数据类型_int（无opA/opB）,
+84,dense2sparse_bell,dense2sparse_bell_f16_int,格式转换,★★★ 4.5,cusparseDenseToSparse,dense2sparse_bell_数据类型_int（无opA/opB）,
+85,gather,gather_bf16_int,bf16,★ 1.5,cusparseGather,gather_数据类型_int（只搬数据，无格式/opA）,
+86,scatter,scatter_bf16_int,bf16,★ 1.5,cusparseScatter,scatter_数据类型_int（只搬数据，无格式/opA）,
+87,spmv_csr,spmv_csr_bf16f32_int_non,bf16,★★ 2.8,cusparseSpMV,spmv_csr_数据类型_int_opA,
+88,spmv_sell,spmv_sell_bf16f32_int_non,bf16,★★ 2.8,cusparseSpMV (SELL_ALG1),spmv_sell_数据类型_int_opA,
+89,spmv_csr,spmv_csr_bf16_int_non,bf16,★★ 3.0,cusparseSpMV,spmv_csr_数据类型_int_opA,
+90,spmm_csr,spmm_csr_bf16_int_non_non_row,bf16,★★ 3.5,cusparseSpMM,spmm_csr_数据类型_int_opA_opB_denseLayout(row/col),
+91,spmv_coo,spmv_coo_bf16_int_non,bf16,★★★ 4.5,cusparseSpMV,spmv_coo_数据类型_int_opA,
+92,spmm_bsr,spmm_bsr_bf16f32_int_non_non_row,bf16,★★★★ 5.8,cusparseSpMM (BSR_ALG1),spmm_bsr_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non）,仅 opA=non
+93,spmm_bell,spmm_bell_bf16_int_non_non_row,bf16,★★★★ 6.0,cusparseSpMM (BLOCKED_ELL_ALG1),spmm_bell_数据类型_int_opA_opB_denseLayout(row/col)（仅opA=non，无i8/c32）,无 i8/c32、opA 仅 non
+94,sddmm_bsr,sddmm_bsr_bf16_int_non_non_row,bf16,★★★★ 6.5,cusparseSDDMM,sddmm_bsr_数据类型_int_opA_opB_denseLayout(row/col),
+95,csr2csc,csr2csc_bf16_int,bf16,★★ 3.5,cusparseCsr2cscEx2,csr2csc_数据类型_int（无opA/opB）,
+96,dense2sparse_coo,dense2sparse_coo_bf16_int,bf16,★★ 3.5,cusparseDenseToSparse,dense2sparse_coo_数据类型_int（无opA/opB）,

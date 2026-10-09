@@ -55,6 +55,21 @@ performance_baseline:
 # checks it.
 
 operators:
+  - id: axpby
+    zhiyuan_name: AXPBY
+    cusparse_api: cusparseAxpby
+    c_api: [flagsparseAxpby]
+    python_impl: [flagsparse_axpby]
+    formats: [sparse_vector]
+    dtypes: [f16]
+    index_types: [int]
+    kernel_module: flagsparse_codegen/axpby.py
+    kernel_name: [axpby_scale_f16, axpby_add_f16]
+    dispatch: src/ops/axpby.cpp
+    tests: [ctest/accuracy/test_axpby.cpp, ctest/benchmark/test_axpby.cpp]
+    status: implemented
+    reporting: retained
+
   - id: gather
     zhiyuan_name: Gather
     cusparse_api: cusparseGather
@@ -63,7 +78,11 @@ operators:
     formats: [sparse_vector]
     # f16 is in the delivery list; bf16 is supported by the kernel but is not
     # part of it, so it is left out here rather than measured and then filtered.
-    dtypes: [f16, f32, f64, c64, c128]
+    # i8 gather -- implemented (dispatch is dtype-generic, see
+    # src/ops/gather_scatter.cpp) but not in the 20-variant delivery list, hence
+    # delivery_dtypes below excludes it.
+    dtypes: [f16, f32, f64, c64, c128, i8]
+    delivery_dtypes: [f16, f32, f64, c64, c128]
     index_types: [int]
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [gather_real_kernel, gather_complex_kernel]
@@ -84,7 +103,9 @@ operators:
     formats: [sparse_vector]
     # f16 is in the delivery list; bf16 is supported by the kernel but is not
     # part of it, so it is left out here rather than measured and then filtered.
-    dtypes: [f16, f32, f64, c64, c128]
+    # i8 is scatter_i8_int -- see the matching note on `gather` above.
+    dtypes: [f16, f32, f64, c64, c128, i8]
+    delivery_dtypes: [f16, f32, f64, c64, c128]
     index_types: [int]
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [scatter_real_kernel, scatter_complex_kernel]
@@ -93,15 +114,42 @@ operators:
     status: implemented
     reporting: delivery
 
+  - id: spvv
+    zhiyuan_name: SpVV
+    cusparse_api: cusparseSpVV
+    c_api: [flagsparseSpVV, flagsparseSpVV_bufferSize]
+    python_impl: [flagsparse_spvv]
+    formats: [sparse_vector]
+    dtypes: [c32]
+    mixed_dtypes: [f16f32, i8i32]
+    index_types: [int]
+    ops: [non, conj]
+    kernel_module: flagsparse_codegen/spvv.py
+    kernel_name: [spvv_mixed_f32acc, spvv_mixed_i32acc, spvv_c32]
+    dispatch: src/ops/spvv.cpp
+    tests: [ctest/accuracy/test_spvv.cpp, ctest/benchmark/test_spvv.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      The current C API slice implements the widened-output f16->f32 and
+      i8->i32 variants. mixed_dtypes is intentionally separate from dtypes:
+      gen_variants.py cannot yet encode distinct input and output dtypes, so
+      emitting an ordinary benchmark row would mislabel the operands.
+
   - id: spmv_csr
     zhiyuan_name: SpMV_CSR
     cusparse_api: cusparseSpMV
     c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
     python_impl: [flagsparse_spmv_csr, prepare_spmv_csr]
     formats: [csr]
-    dtypes: [f32, f64, c64, c128]   # complex wired 2026-09; measured accurate vs host fp64
+    # f16 (spmv_csr_f16_int_non) is dtype-generic through the same
+    # dispatch as f32/f64/complex -- no separate kernel needed.
+    dtypes: [f32, f64, c64, c128, f16]   # complex wired 2026-09; measured accurate vs host fp64
     index_types: [int]
-    ops: [non]                  # trans/conj pending
+    # trans is f32 only and conj_trans c32 only (atomic scatter, spmv_transpose.py);
+    # mixed_dtypes are input->output pairs through mixed_spmx.py.
+    ops: [non, trans, conj_trans]
+    mixed_dtypes: [f16f32, f32c32, i8f32, i8i32]
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_CSR_ALG1, FLAGSPARSE_SPMV_CSR_ALG2]
     kernel_module: flagsparse_codegen/spmv_csr.py
     kernel_name: _spmv_csr_real_kernel
@@ -110,6 +158,14 @@ operators:
     status: implemented
     reporting: delivery
     delivery_dtypes: [f32, f64]   # complex is implemented, not delivered
+    notes: >
+      In addition to the same-dtype kernels listed above, mixed_spmx.py supplies
+      i8->i32/i8->f32, f16->f32, and real-f32 matrix by complex64 vector
+      dispatch; those mixed routes accept identity alpha/beta because their
+      kernels implement y=A@x directly.
+      The f32 transpose and complex32 conjugate-transpose use the separate
+      spmv_transpose.py atomic-scatter module; those two directions currently
+      support only f32/c32, while the ordinary row-parallel path remains broad.
 
   - id: spmv_coo
     zhiyuan_name: SpMV_COO
@@ -117,9 +173,12 @@ operators:
     c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
     python_impl: [flagsparse_spmv_coo, prepare_spmv_coo]
     formats: [coo]
-    dtypes: [f32, f64, c64, c128]
+    # f16 (spmv_coo_f16_int_non) is dtype-generic like spmv_csr's.
+    dtypes: [f32, f64, c64, c128, f16]
     index_types: [int]
-    ops: [non]                  # trans needs a column-offsets array; pending
+    # trans is f32 only and conj_trans c32 only (direct atomic scatter).
+    ops: [non, trans, conj_trans]
+    mixed_dtypes: [f16f32, i8i32]
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_COO_ALG1,
                  FLAGSPARSE_SPMV_COO_ALG2]
     kernel_module: flagsparse_codegen/spmv_coo.py
@@ -133,8 +192,9 @@ operators:
       The deterministic segment route, run with SEG_IS_ROW=True so seg_starts is
       a full row-offsets array and a row with no nonzeros still picks up beta*y.
       bufferSize reports rows+1 int32 for that array; preprocess builds it and
-      rejects a COO that is not sorted by row. The atomic route is not wired up:
-      it needs the beta prologue and is non-deterministic by construction.
+      rejects a COO that is not sorted by row. The f32 transpose and complex32
+      conjugate-transpose instead use direct atomic scatter after the beta
+      prologue; they do not need the row-offset scratch and are non-deterministic.
 
   - id: spmv_csc
     zhiyuan_name: SpMV_CSC
@@ -142,7 +202,7 @@ operators:
     c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
     python_impl: [flagsparse_spmv_csc, prepare_spmv_csc]
     formats: [csc]
-    dtypes: [f32, f64, c64, c128]
+    dtypes: [f32, f64, c64, c128, f16]
     index_types: [int]
     ops: [non, trans, conj_trans]
     kernel_module: flagsparse_codegen/spmv_csc.py
@@ -183,6 +243,28 @@ operators:
       with SEG_FROM_GRID=True -- as a constexpr the segment index made the host
       loop and compile one kernel per segment value.
 
+  - id: spmv_sell
+    zhiyuan_name: SpMV_SELL
+    cusparse_api: none
+    c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
+    python_impl: [flagsparse_spmv_sell]
+    formats: [sell]
+    dtypes: [f16, f32, c32]
+    mixed_dtypes: [i8i32]
+    index_types: [int]
+    ops: [non]
+    algorithms: [FLAGSPARSE_SPMV_SELL_ALG1]
+    kernel_module: flagsparse_codegen/spmv_sell.py
+    kernel_name: [spmv_sell_f32acc, _spmv_sell_complex_kernel, spmv_sell_i32acc]
+    dispatch: src/ops/spmv.cpp
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      The C API supports ordinary f16/f32/c32 non-transpose paths and the
+      int8 A/x to int32 y mixed path. The mixed path requires identity
+      alpha/beta; mixed_dtypes stays outside the ordinary benchmark registry.
+
   - id: spmv_coo_tocsr
     zhiyuan_name: SpMV_COO_toCSR
     cusparse_api: cusparseSpMV
@@ -205,20 +287,42 @@ operators:
       this just launches the CSR kernel over it. Verified to agree with the
       segment route to the same error ratio. Complex keeps the segment route.
 
+  - id: spmm_csc
+    zhiyuan_name: SpMM_CSC
+    cusparse_api: cusparseSpMM
+    c_api: [flagsparseSpMM, flagsparseSpMM_bufferSize, flagsparseSpMM_preprocess]
+    python_impl: [flagsparse_spmm_csc, flagsparse_spmm_csc_run, prepare_spmm_csc_route]
+    formats: [csc]
+    dtypes: [f16, f32, c32]
+    index_types: [int]
+    ops: [non]
+    orders: [row]
+    algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT]
+    kernel_module: flagsparse_codegen/spmm_csc.py
+    kernel_name: [_spmm_csc_non_real_kernel, _spmm_csc_non_complex_kernel]
+    dispatch: src/ops/spmm.cpp
+    tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      The CSC route is non/non with row-major dense operands and identity
+      alpha/beta. It clears C before the nnz-atomic kernel.
+
   - id: spmm_csr
     zhiyuan_name: SpMM_CSR
     cusparse_api: cusparseSpMM
     c_api: [flagsparseSpMM, flagsparseSpMM_bufferSize, flagsparseSpMM_preprocess]
     python_impl: [flagsparse_spmm_csr, flagsparse_spmm_csr_run, prepare_spmm_csr_route]
     formats: [csr]
-    dtypes: [f32, f64, c64, c128]
+    dtypes: [f32, f64, c64, c128, f16]
+    mixed_dtypes: [f16f32, i8i32]
     index_types: [int]
-    ops: [non]                  # opA trans/conj pending; opB non and trans both work
+    ops: [non, trans]           # f32 CSR transpose uses the atomic scatter route
     orders: [row, col]
     algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT, FLAGSPARSE_SPMM_CSR_ALG1,
                  FLAGSPARSE_SPMM_CSR_ALG2, FLAGSPARSE_SPMM_CSR_ALG3]
-    kernel_module: flagsparse_codegen/spmm_csr.py
-    kernel_name: [spmm_csr_real, spmm_csr_complex]
+    kernel_module: [flagsparse_codegen/spmm_csr.py, flagsparse_codegen/spmm_transpose.py]
+    kernel_name: [spmm_csr_real, spmm_csr_complex, spmm_csr_transpose_atomic_f32]
     dispatch: src/ops/spmm.cpp
     tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
     status: implemented
@@ -232,6 +336,11 @@ operators:
       signature parser cannot spell the tl.dtype accumulator constexpr, so they
       take a bool and delegate to the operator package's own kernels. The four
       algorithm ids all resolve to that one deterministic row-parallel route.
+      Mixed i8->i32/i8->f32 and f16->f32 A/B->C combinations use the wrappers
+      in mixed_spmx.py; they accept identity alpha/beta because those kernels
+      implement C=A@B rather than the scaled generic SpMM equation.
+      The f32 CSR opA=TRANSPOSE variant uses spmm_transpose.py: source rows
+      scatter into transposed output rows with atomics after beta*C prologue.
 
   - id: spmm_coo
     zhiyuan_name: SpMM_COO
@@ -239,7 +348,8 @@ operators:
     c_api: [flagsparseSpMM, flagsparseSpMM_bufferSize, flagsparseSpMM_preprocess]
     python_impl: [flagsparse_spmm_coo]
     formats: [coo]
-    dtypes: [f32, f64, c64, c128]
+    dtypes: [f32, f64, c64, c128, f16]
+    mixed_dtypes: [i8i32]
     index_types: [int]
     ops: [non]                  # opA trans/conj pending; opB non and trans both work
     orders: [row, col]
@@ -261,7 +371,9 @@ operators:
       beta * C; the Python path instead zeroes C and uses run-compressed segments.
       The atomic and alg1-bucket routes are not wired up: the first needs C
       pre-scaled by beta in a separate pass and is non-deterministic, the second
-      needs two prepare kernels.
+      needs two prepare kernels. Mixed i8->i32/i8->f32 and f16->f32 instead use
+      mixed_spmx.py's atomic kernel, clear C before launch, and need no scratch;
+      as on CSR, only identity alpha/beta is supported on that path.
 
   - id: spmm_csr_opt
     zhiyuan_name: SpMM_CSR_opt
@@ -331,23 +443,18 @@ operators:
     c_api: [flagsparseSDDMM, flagsparseSDDMM_bufferSize, flagsparseSDDMM_preprocess]
     python_impl: [flagsparse_sddmm_csr, prepare_sddmm_csr]
     formats: [csr]
-    # No complex SDDMM: the operator package has no complex kernel, and the
-    # delivery list (conf/operators.yaml) does not include sddmm c32/c64.
-    dtypes: [f32, f64]
+    # f16 is dtype-generic through sddmm_csr_real. c32 uses the interleaved
+    # sddmm_csr_complex wrapper and accepts real alpha/beta, matching the
+    # underlying Python kernel's scalar contract.
+    dtypes: [f32, f64, f16, c32]
+    delivery_dtypes: [f32, f64]
     index_types: [int]
     ops: [non, trans]           # for BOTH dense operands; conj pending
     orders: [row, col]
     algorithms: [FLAGSPARSE_SDDMM_ALG_DEFAULT]
     kernel_module: flagsparse_codegen/sddmm_csr.py
-    kernel_name: [sddmm_csr_real, _row_ids_kernel]
+    kernel_name: [sddmm_csr_real, sddmm_csr_complex, _row_ids_kernel]
     dispatch: src/ops/sddmm.cpp
-    # No complex SDDMM kernel: flagsparse_sddmm_csr rejects them with "x dtype
-    # must be torch.float32 or torch.float64" (measured 2026-09-15), so `dtypes`
-    # stays f32/f64. The delivery list no longer asks for sddmm c32/c64 (it did
-    # until 2026-09-21). If a delivery list asks for a dtype no kernel serves,
-    # record it as `delivery_gaps: [...]` rather than listing it in `dtypes`:
-    # check_manifest.py reports gaps, and listing them would generate variants that
-    # fail at runtime and read as a regression rather than as work not yet done.
     tests: [ctest/accuracy/test_sddmm.cpp, ctest/benchmark/test_sddmm.cpp]
     status: implemented
     reporting: delivery
@@ -358,7 +465,8 @@ operators:
       nnz int32 and _preprocess fills it with a binary-search kernel. Both dense
       operands are strided, so op(A)/op(B) and either order are stride choices.
       fp32 with a long k can need the spec 6.3.1 relaxed retry; that is reduction
-      order, not a defect.
+      order, not a defect. Complex32 is non/non only and has real alpha/
+      beta because _sddmm_csr_complex_kernel has no complex scalar cross terms.
 
   - id: spsv_csr
     zhiyuan_name: SpSV_CSR

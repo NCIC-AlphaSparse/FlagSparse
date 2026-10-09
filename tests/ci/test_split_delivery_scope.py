@@ -3,10 +3,13 @@
 """The C API half of a split delivery run only launches what is delivered.
 
 run_flagsparse_split_delivery.py used to call `ctest -R benchmark`, which launches
-every benchmark family. Once spsv, spsm and spgemm left the delivery list that
-would still have run them -- and on MUSA a SpSV case can take the whole GPU context
-down, costing every later case its result. It now selects the families that carry
-a `reporting: delivery` variant, and checks coverage in that scope only.
+every benchmark family -- and on MUSA a SpSV case can take the whole GPU context
+down, costing every later case its result. It now selects the families that own
+a delivery variant: the manifest's own `reporting: delivery` operators plus every
+operator the 65-variant registry (conf/operators.yaml) names, which brought
+spgemm back (spgemm_csr_f32_int_non_non) and added axpby and spvv. spsm and spsv
+are still never launched. Coverage is still checked in the manifest's own
+delivery scope, which did not grow.
 """
 
 import importlib.util
@@ -18,11 +21,27 @@ from pathlib import Path
 
 import yaml
 
+from tools.delivery_variants import load_delivery_variants
+
 ROOT = Path(__file__).resolve().parents[2]
 CAPI = ROOT / "capi"
 
-DELIVERY_FAMILIES = ["gather", "scatter", "sddmm", "spmm", "spmv"]
-NOT_DELIVERED_FAMILIES = ["spgemm", "spsm", "spsv"]
+# What the split runner launches: every family that owns a delivery variant.
+DELIVERY_FAMILIES = [
+    "axpby",
+    "gather",
+    "scatter",
+    "sddmm",
+    "spgemm",
+    "spmm",
+    "spmv",
+    "spvv",
+]
+NOT_DELIVERED_FAMILIES = ["spsm", "spsv"]
+# check_manifest.py's `--scope delivery`: the manifest's own `reporting:
+# delivery` entries, which the 65-variant registry did not change.
+MANIFEST_DELIVERY_FAMILIES = ["gather", "scatter", "sddmm", "spmm", "spmv"]
+TAG_OF_FORMAT = {"sparse_vector": "spvec"}
 
 
 def _load(name, path):
@@ -103,6 +122,21 @@ def _bench_dir(tmp_path, *, with_retained_rows):
         by_family.setdefault(family_of[op_id], []).append(
             {"format": fmt, "dtype": dtype, "status": "ok", "reporting": "delivery"}
         )
+    # Every registered variant the C API implements gets a row tagged with its
+    # id, in the family that owns its operator -- what gen_variants.py emits
+    # and FLAGSPARSE_BENCH_VARIANTS selects.
+    for variant in load_delivery_variants():
+        if not variant["capi"]:
+            continue
+        by_family.setdefault(family_of[variant["operator"]], []).append(
+            {
+                "format": TAG_OF_FORMAT.get(variant["format"], variant["format"]),
+                "dtype": variant["dtype"],
+                "status": "ok",
+                "reporting": "delivery",
+                "variant": variant["id"],
+            }
+        )
     if with_retained_rows:
         # A delivered family also sweeps variants that are not delivered.
         by_family["spmv"] += [
@@ -172,3 +206,35 @@ def test_declared_delivery_variants_are_the_registered_ones():
         "spmm_coo",
         "sddmm_csr",
     }
+
+
+def _drop_tagged(tmp_path, variant_id):
+    for path in tmp_path.glob("*_benchmark.json"):
+        doc = json.loads(path.read_text())
+        doc["result"] = [r for r in doc["result"] if r.get("variant") != variant_id]
+        path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_the_delivery_scope_flags_a_registered_variant_with_no_tagged_row(tmp_path):
+    _bench_dir(tmp_path, with_retained_rows=False)
+    _drop_tagged(tmp_path, "spmm_csr_f32_int_trans_non_row")
+    out = _check(tmp_path, "delivery")
+    assert "NOT MEASURED    spmm_csr_f32_int_trans_non_row" in out, out
+
+
+def test_a_tag_outside_the_registry_is_flagged(tmp_path):
+    _bench_dir(tmp_path, with_retained_rows=False)
+    path = tmp_path / "spmv_benchmark.json"
+    doc = json.loads(path.read_text())
+    doc["result"].append(
+        {
+            "format": "csr",
+            "dtype": "f32",
+            "status": "ok",
+            "reporting": "delivery",
+            "variant": "spmv_csr_f32_int_bogus",
+        }
+    )
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    out = _check(tmp_path, "delivery")
+    assert "UNKNOWN VARIANT spmv_csr_f32_int_bogus" in out, out

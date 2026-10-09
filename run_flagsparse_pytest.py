@@ -313,6 +313,31 @@ class OperatorTestConfig:
 
 
 PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
+    # Sparse-vector operators take synthetic (dense, nnz) cases, like gather/scatter.
+    **{
+        op: (
+            "tests/test_vector_ops.py",
+            "--op",
+            op,
+            "--csv-summary",
+            "{csv}",
+            "--warmup",
+            "{warmup}",
+            "--iters",
+            "{iters}",
+        )
+        for op in ("axpby", "spvv")
+    },
+    "spmv_sell": (
+        "tests/test_spmv_sell.py",
+        "{input}",
+        "--csv",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "gather": (
         "tests/test_gather.py",
         "--csv-summary",
@@ -331,13 +356,17 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         "--iters",
         "{iters}",
     ),
+    # `auto`, not `compare`: the delivery number is the path a caller actually
+    # gets (row_tile on ROCm, legacy_segbin on CUDA, ...). `compare` writes one
+    # row per registered algorithm, and _is_delivery_performance_row drops those
+    # -- pass `--op-benchmark-args 'spmv_csr=--alg compare'` to tune, not deliver.
     "spmv_csr": (
         "tests/test_spmv_csr.py",
         "{input}",
         "--csv-csr",
         "{csv}",
         "--alg",
-        "compare",
+        "auto",
         "--warmup",
         "{warmup}",
         "--iters",
@@ -810,10 +839,19 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         for op in ASCEND_PROBE_OPS
         if op not in ASCEND_PYTORCH_PERFORMANCE_OPS
     },
+    # These three scripts are backend-neutral (their PyTorch baseline runs on
+    # torch_npu; the cuSPARSE/cupy column comes back empty with a reason via
+    # tests/cusparse_generic_baseline.py's skip_reason(), same as every other
+    # non-CUDA backend), so Ascend reuses them as-is rather than needing its own
+    # benchmark_ascend.py routing.
+    **{op: PERFORMANCE_COMMANDS[op] for op in ("axpby", "spvv", "spmv_sell")},
 }
 
 
 OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
+    "spmv_sell": OperatorTestConfig("spmv_sell", PERFORMANCE_COMMANDS["spmv_sell"]),
+    "axpby": OperatorTestConfig("axpby", PERFORMANCE_COMMANDS["axpby"]),
+    "spvv": OperatorTestConfig("spvv", PERFORMANCE_COMMANDS["spvv"]),
     "gather": OperatorTestConfig("gather", PERFORMANCE_COMMANDS["gather"]),
     "scatter": OperatorTestConfig("scatter", PERFORMANCE_COMMANDS["scatter"]),
     "spmv_csr": OperatorTestConfig("spmv_csr", PERFORMANCE_COMMANDS["spmv_csr"]),
@@ -2884,6 +2922,11 @@ def run_performance(
         "stderr_log_path": str(stderr_path),
         "log_path": str(stdout_path),
         "data_path": str(csv_path) if csv_path.exists() else None,
+        # Read by _parent_failure_explained_by_other_rows: a FAIL the delivery
+        # projection may attribute to another variant's rows must be a plain
+        # `exit 1` after a complete run, not an exception or a short sweep.
+        "stderr_has_traceback": _PYTHON_TRACEBACK_MARKER in stderr,
+        "input_matrix_count": _input_matrix_count(benchmark_input),
     }
     if csv_path.exists():
         try:
@@ -3286,6 +3329,7 @@ _DELIVERY_PERF_DTYPES = {
     "f64": ("fp64", "float64", "double"),
     "c32": ("complex64", "c32"),
     "c64": ("complex128", "c64"),
+    "i8": ("int8", "torch.int8", "i8"),
 }
 
 
@@ -3333,10 +3377,31 @@ def _delivery_not_configured_phase(phase: str, reason: str) -> dict[str, object]
     }
 
 
+# The 45 non-original variants (mixed precision, int8, extra ops/layouts) have one
+# pytest case per (variant, shape) in tests/pytest/test_q4_variants_accuracy.py, with
+# the variant id as the first parametrize id: ``...[spmv_csr_f16f32_int_non-64x48x16]``.
+# Matching by id is exact -- no dtype-token ambiguity between e.g. `f16` and `f16f32`
+# (both would contain the word "float16"). The original 20 have no case there, so
+# this always falls through to the classic dtype-token search below for them.
+_Q4_ACCURACY_TEST = "test_q4_variants_accuracy.py"
+
+
+def _is_q4_variant_case(nodeid: object, variant_id: str) -> bool:
+    text = str(nodeid)
+    return _Q4_ACCURACY_TEST in text and (
+        f"[{variant_id}-" in text or text.endswith(f"[{variant_id}]")
+    )
+
+
 def _delivery_accuracy_phase(
-    phase_result: dict[str, object], dtype: str
+    phase_result: dict[str, object], dtype: str, variant_id: str | None = None
 ) -> dict[str, object]:
-    """Restrict recorded pytest cases to one delivery dtype when available."""
+    """Restrict recorded pytest cases to one delivery variant.
+
+    Tries an exact match on ``variant_id`` first (the only precise option for the
+    45 variants with a dtype tag the classic token search cannot disambiguate),
+    then falls back to the classic dtype-token search the original 20 still use.
+    """
     path_value = phase_result.get("result_path")
     if not path_value:
         return _delivery_not_configured_phase("accuracy", "no accuracy artifact")
@@ -3347,10 +3412,36 @@ def _delivery_accuracy_phase(
             "accuracy", f"cannot read accuracy artifact: {exc}"
         )
 
+    if variant_id is not None:
+        exact = {
+            nodeid: item
+            for nodeid, item in raw.items()
+            if isinstance(item, dict) and _is_q4_variant_case(nodeid, variant_id)
+        }
+        if exact:
+            projected = dict(phase_result)
+            for stale in ("errors", "xfailed", "xpassed", "failures", "tests"):
+                projected.pop(stale, None)
+            projected.update(summarize_accuracy_cases(exact))
+            projected["off_axis_excluded"] = 0
+            projected["phase"] = "accuracy"
+            projected["duration"] = phase_result.get("duration", 0.0)
+            projected["exit_code"] = phase_result.get("exit_code", 0)
+            projected["data_file"] = phase_result.get("data_file", "")
+            return projected
+
+    if dtype not in _DELIVERY_DTYPE_TOKENS:
+        return _delivery_not_configured_phase(
+            "accuracy",
+            f"no recorded {_Q4_ACCURACY_TEST} case for {variant_id!r} and {dtype!r} "
+            "has no classic dtype-token fallback",
+        )
     tokens = _DELIVERY_DTYPE_TOKENS[dtype]
     selected: dict[str, object] = {}
     for nodeid, item in raw.items():
         if not isinstance(item, dict):
+            continue
+        if _Q4_ACCURACY_TEST in str(nodeid):
             continue
         values = [str(nodeid).lower()]
         values.extend(
@@ -3422,20 +3513,221 @@ def _is_delivery_performance_row(row: dict[str, str]) -> bool:
         if op and op != "non":
             return False
     transpose = str(_row_value(row, "transpose") or "").strip().lower()
-    return transpose not in {"true", "1"}
+    if transpose in {"true", "1"}:
+        return False
+    # A script that sweeps several algorithms (spmv_csr --alg compare) records
+    # which one each row asked for; only the `auto` row is the path a caller
+    # gets. Averaging the others in made spmv_csr's delivery speedup the mean of
+    # seven algorithms, most of which no caller ever runs.
+    requested = str(_row_value(row, "alg_requested") or "").strip().lower()
+    return requested in ("", "auto")
+
+
+def _only_non_production_algorithm_rows(records: list[object]) -> str | None:
+    """Why a delivery projection found no rows, when the cause is that every
+    on-axis row asked for a specific algorithm rather than `auto`."""
+    requested = {
+        str(_row_value(row, "alg_requested") or "").strip().lower()
+        for row in records
+        if isinstance(row, dict) and not row.get("variant")
+    }
+    if not requested or requested & {"", "auto"}:
+        return None
+    return (
+        "the benchmark measured only specific algorithms "
+        f"({', '.join(sorted(requested))}), none with --alg auto, so none of "
+        "its rows is the path a caller gets; rerun it with --alg auto"
+    )
+
+
+# A variant shaped like the original 20 -- one plain dtype, int32 indices, `non`
+# op, row-major -- is measured by its script's ordinary rows (gather/scatter,
+# spgemm_csr, spmm_csc without the extra q4 axes), which carry no ``variant`` tag.
+_Q4_DELIVERY_SHAPED_SUFFIXES = (
+    "_int",
+    "_int_non",
+    "_int_non_non",
+    "_int_non_non_row",
+)
+
+
+_PYTHON_TRACEBACK_MARKER = "Traceback (most recent call last)"
+
+
+def _input_matrix_count(benchmark_input: Path | None) -> int | None:
+    """How many .mtx files a script was handed, counted the way q4_variant_bench does."""
+    if benchmark_input is None:
+        return None
+    path = Path(benchmark_input)
+    if path.is_dir():
+        return len(list(path.rglob("*.mtx")))
+    return 1 if path.suffix == ".mtx" else None
+
+
+def _row_failed(row: dict[str, object]) -> bool:
+    return str(row.get("status") or "").strip().upper() in {"FAIL", "ERROR"}
+
+
+def _parent_stderr_has_traceback(phase_result: dict[str, object]) -> bool | None:
+    flag = phase_result.get("stderr_has_traceback")
+    if isinstance(flag, bool):
+        return flag
+    log_path = phase_result.get("stderr_log_path")
+    if not log_path:
+        return None
+    try:
+        return _PYTHON_TRACEBACK_MARKER in Path(str(log_path)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+
+def _parent_failure_explained_by_other_rows(
+    phase_result: dict[str, object],
+    own_rows: list[dict[str, object]],
+    expected_row_count: int | None = None,
+) -> list[dict[str, object]] | None:
+    """Rows of OTHER variants that fully account for a failed parent process.
+
+    One benchmark script measures several delivery variants, and it exits 1 when
+    any row it wrote failed -- on MetaX C550 a single legacy spmm_csc_base trans
+    row marked all three spmm_csc q4 variants Failed while each had 10 PASS rows.
+    The parent's FAIL may only be set aside when nothing else can have caused it:
+
+    * the status is FAIL, never TIMEOUT -- a timeout stays a timeout;
+    * the exit code is exactly 1 (``SystemExit(1)``); a negative code is a signal
+      (segfault, kill) and anything else is not the scripts' failure exit;
+    * stderr carries no Python traceback (an exception also exits 1);
+    * this variant has all its rows, when the expected count is known;
+    * some row outside ``own_rows`` failed, so the exit 1 has a recorded cause.
+
+    Returns those other failing rows, or None when the parent status must stand.
+    """
+    if str(phase_result.get("status") or "").strip().upper() != "FAIL":
+        return None
+    returncode = phase_result.get("returncode", phase_result.get("exit_code"))
+    if returncode != 1:
+        return None
+    if _parent_stderr_has_traceback(phase_result) is not False:
+        return None
+    if expected_row_count is not None and len(own_rows) != expected_row_count:
+        return None
+    records = phase_result.get("records")
+    own = {id(row) for row in own_rows}
+    others = [
+        row
+        for row in (records if isinstance(records, list) else [])
+        if isinstance(row, dict) and id(row) not in own and _row_failed(row)
+    ]
+    return others or None
+
+
+def _set_aside_parent_failure(
+    result: dict[str, object], explained_by: list[dict[str, object]]
+) -> None:
+    """Record why a variant no longer carries its parent's FAIL, then clear it."""
+    result["parent_status"] = result.get("status")
+    result["parent_returncode"] = result.get("returncode", result.get("exit_code"))
+    result["parent_failure_rows"] = [
+        "/".join(
+            str(_row_value(row, key) or "")
+            for key in ("matrix", "dtype", "op", "alg")
+            if _row_value(row, key)
+        )
+        or "?"
+        for row in explained_by
+    ]
+    result["status"] = "PASS"
+
+
+def _q4_expected_row_count(
+    phase_result: dict[str, object], records: list[dict[str, object]]
+) -> int:
+    """Rows a complete q4 variant has: one per input matrix.
+
+    Falls back to the largest per-variant matrix count in the CSV for a result
+    produced before ``input_matrix_count`` was recorded.
+    """
+    count = phase_result.get("input_matrix_count")
+    if isinstance(count, int) and count > 0:
+        return count
+    matrices: dict[str, set[str]] = {}
+    for row in records:
+        variant = str(row.get("variant") or "")
+        if variant:
+            matrices.setdefault(variant, set()).add(str(row.get("matrix") or ""))
+    return max((len(names) for names in matrices.values()), default=0)
+
+
+def _q4_performance_phase(
+    phase_result: dict[str, object], variant_id: str, dtype: str | None = None
+) -> dict[str, object]:
+    """Benchmark rows whose ``variant`` column is ``variant_id``, all dtypes kept.
+
+    Falls back to the classic untagged-row dtype slice for a variant that is
+    delivery-shaped (plain dtype, non op, row layout) and whose script never tags
+    its rows with a ``variant`` column at all (gather/scatter, spgemm_csr).
+    """
+    records = phase_result.get("records")
+    rows = [
+        row
+        for row in (records if isinstance(records, list) else [])
+        if isinstance(row, dict) and str(row.get("variant") or "") == variant_id
+    ]
+    if (
+        not rows
+        and dtype in _DELIVERY_PERF_DTYPES
+        and variant_id.endswith(_Q4_DELIVERY_SHAPED_SUFFIXES)
+    ):
+        result = _delivery_performance_phase(phase_result, dtype)
+        if result.get("status") != "NOT_CONFIGURED":
+            result["matched_by"] = "dtype on the delivery axes (untagged rows)"
+        return result
+    if not rows:
+        if str(phase_result.get("status") or "").upper() == "TIMEOUT":
+            result = dict(phase_result)
+            result["data"] = {}
+            return result
+        return _delivery_not_configured_phase(
+            "performance", f"the benchmark recorded no {variant_id} rows"
+        )
+    result = dict(phase_result)
+    explained_by = _parent_failure_explained_by_other_rows(
+        phase_result, rows, _q4_expected_row_count(phase_result, records or [])
+    )
+    if explained_by:
+        _set_aside_parent_failure(result, explained_by)
+    result["data"] = _strict_flag_gems_perf_data(_flaggems_perf_data(rows))
+    result["records"] = rows
+    result["delivery_row_count"] = len(rows)
+    result["non_delivery_row_count"] = len(records or []) - len(rows)
+    if any(_row_failed(row) for row in rows):
+        result["status"] = "FAIL"
+    return result
 
 
 def _delivery_performance_phase(
     phase_result: dict[str, object], dtype: str
 ) -> dict[str, object]:
-    """Restrict CSV-derived performance data to one delivery variant."""
+    """Restrict CSV-derived performance data to one delivery variant.
+
+    Rows tagged with a q4 ``variant`` column belong to that variant only (see
+    ``_q4_performance_phase``) and are excluded here.
+    """
+    if dtype not in _DELIVERY_PERF_DTYPES:
+        return _delivery_not_configured_phase(
+            "performance", f"{dtype!r} has no classic dtype-token fallback"
+        )
     records = phase_result.get("records")
     delivery_rows = None
     if isinstance(records, list) and records:
         delivery_rows = [
             row
             for row in records
-            if isinstance(row, dict) and _is_delivery_performance_row(row)
+            if isinstance(row, dict)
+            and not row.get("variant")
+            and _is_delivery_performance_row(row)
         ]
         data = _strict_flag_gems_perf_data(_flaggems_perf_data(delivery_rows))
     else:
@@ -3452,15 +3744,48 @@ def _delivery_performance_phase(
             result = dict(phase_result)
             result["data"] = {}
             return result
+        why = (
+            _only_non_production_algorithm_rows(records)
+            if isinstance(records, list)
+            else None
+        )
         return _delivery_not_configured_phase(
-            "performance", f"the benchmark recorded no {dtype} rows"
+            "performance", why or f"the benchmark recorded no {dtype} rows"
         )
     result = dict(phase_result)
     result["data"] = selected
     if delivery_rows is not None:
+        # Classic rows are streamed as each case finishes, so there is no fixed
+        # row count to check -- only the exit-code / traceback / other-rows rule.
+        own_rows = [
+            row
+            for row in delivery_rows
+            if _row_value(row, "dtype")
+            and str(_row_value(row, "dtype")).lower() in _DELIVERY_PERF_DTYPES[dtype]
+        ]
+        explained_by = _parent_failure_explained_by_other_rows(
+            phase_result, own_rows
+        )
+        if explained_by:
+            _set_aside_parent_failure(result, explained_by)
         result["records"] = delivery_rows
         result["delivery_row_count"] = len(delivery_rows)
         result["non_delivery_row_count"] = len(records) - len(delivery_rows)
+        # Same rule as _q4_performance_phase: a failed row of this variant fails
+        # the variant, instead of disappearing into a mean over the passing ones.
+        failed = [
+            row
+            for row in delivery_rows
+            if _row_value(row, "dtype")
+            and str(_row_value(row, "dtype")).lower() in _DELIVERY_PERF_DTYPES[dtype]
+            and str(row.get("status") or "").strip().upper() in {"FAIL", "ERROR"}
+        ]
+        if failed:
+            result["status"] = "FAIL"
+            result["failed_rows"] = [
+                _row_value(row, "matrix") or _row_value(row, "name") or "?"
+                for row in failed
+            ]
         if dtype in ("c32", "c64"):
             dtype_rows = [
                 row
@@ -3510,14 +3835,14 @@ def _delivery_results(results: list[dict[str, object]]) -> list[dict[str, object
             accuracy = parent.get("accuracy")
             performance = parent.get("performance")
             result["accuracy"] = (
-                _delivery_accuracy_phase(accuracy, variant["dtype"])
+                _delivery_accuracy_phase(accuracy, variant["dtype"], variant["id"])
                 if isinstance(accuracy, dict)
                 else _delivery_not_configured_phase(
                     "accuracy", "accuracy phase was not run"
                 )
             )
             result["performance"] = (
-                _delivery_performance_phase(performance, variant["dtype"])
+                _q4_performance_phase(performance, variant["id"], variant["dtype"])
                 if isinstance(performance, dict)
                 else _delivery_not_configured_phase(
                     "performance", "performance phase was not run"

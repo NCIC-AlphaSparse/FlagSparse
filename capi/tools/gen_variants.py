@@ -17,6 +17,9 @@ import argparse
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+from tools.delivery_variants import load_delivery_variants  # noqa: E402
+
 try:
     import yaml
 except ImportError:
@@ -34,6 +37,25 @@ DTYPES = {
     "c128": ("FLAGSPARSE_C_64F", "c64"),
     "f16": ("FLAGSPARSE_R_16F", "f16"),
     "bf16": ("FLAGSPARSE_R_16BF", "bf16"),
+    "i8": ("FLAGSPARSE_R_8I", "i8"),
+}
+
+# Repo-root conf/operators.yaml (the delivery registry) spells dtypes the way the
+# benchmark rows already tag them -- by COMPONENT width, so its `c64` is a complex
+# of two fp64, unlike this manifest's `c64` above. Mixed-precision ids keep the
+# narrow input type as `dt`; the benchmark derives the widened output from the
+# variant id (sweep.hpp's variant_output_dtype).
+REGISTRY_DTYPES = {
+    "f16": ("FLAGSPARSE_R_16F", "f16"),
+    "f32": ("FLAGSPARSE_R_32F", "f32"),
+    "f64": ("FLAGSPARSE_R_64F", "f64"),
+    "i8": ("FLAGSPARSE_R_8I", "i8"),
+    "c32": ("FLAGSPARSE_C_32F", "c32"),
+    "c64": ("FLAGSPARSE_C_64F", "c64"),
+    "f16f32": ("FLAGSPARSE_R_16F", "f16f32"),
+    "i8f32": ("FLAGSPARSE_R_8I", "i8f32"),
+    "i8i32": ("FLAGSPARSE_R_8I", "i8i32"),
+    "f32c32": ("FLAGSPARSE_R_32F", "f32c32"),
 }
 
 FORMATS = {
@@ -66,15 +88,24 @@ def family_of_operator(op):
 def benchmark_families(doc, reporting="delivery"):
     """The benchmark binaries with at least one implemented variant of this
     reporting scope, sorted. `delivery_dtypes` only narrows which dtypes count, so
-    an operator with it set still puts its family in."""
-    return sorted(
-        {
+    an operator with it set still puts its family in. For the delivery scope that
+    includes every implemented operator a registered delivery variant names --
+    main() gives each of those a tagged `delivery` entry, whatever the operator's
+    own `reporting` says about its ordinary sweep rows."""
+    families = {
+        family_of_operator(op)
+        for op in doc["operators"]
+        if op.get("status") == "implemented"
+        and op.get("reporting", "retained") == reporting
+    }
+    if reporting == "delivery":
+        delivered = {v["operator"] for v in load_delivery_variants()}
+        families |= {
             family_of_operator(op)
             for op in doc["operators"]
-            if op.get("status") == "implemented"
-            and op.get("reporting", "retained") == reporting
+            if op.get("status") == "implemented" and op["id"] in delivered
         }
-    )
+    return sorted(families)
 
 
 def main():
@@ -85,6 +116,7 @@ def main():
 
     doc = yaml.safe_load(args.manifest.read_text())
     rows = []
+    by_id = {op["id"]: op for op in doc["operators"]}
     for op in doc["operators"]:
         if op.get("status") != "implemented":
             continue
@@ -107,7 +139,30 @@ def main():
                 scope = reporting
                 if reporting == "delivery" and narrow and d not in narrow:
                     scope = "retained"
-                rows.append((op["id"], fam, ftag, dtag, enum, scope))
+                rows.append((op["id"], fam, ftag, dtag, enum, scope, None))
+
+    # The delivery variants carry axes this manifest does not encode (opA, opB,
+    # dense layout, mixed input/output types), so each gets its own entry, tagged
+    # with its id: the benchmark reads the configuration from the id and stamps
+    # the id on the row, and write_summary.py attributes rows by that tag instead
+    # of guessing from (operator, dtype), which is ambiguous for e.g. the four
+    # spmm_csr f32 variants. A variant this C API cannot run still gets an entry,
+    # so it reports as not_supported rather than silently missing.
+    for v in load_delivery_variants():
+        op = by_id.get(v["operator"])
+        ent = REGISTRY_DTYPES.get(v["dtype"])
+        ftag = FORMATS.get(v["format"])
+        if (
+            op is None
+            or op.get("status") != "implemented"
+            or ent is None
+            or ftag is None
+        ):
+            continue
+        enum, dtag = ent
+        rows.append(
+            (op["id"], family_of_operator(op), ftag, dtag, enum, "delivery", v["id"])
+        )
 
     lines = [
         "// GENERATED from conf/operators.yaml by tools/gen_variants.py -- DO NOT EDIT.",
@@ -129,12 +184,16 @@ def main():
         '    const char* dtype;    // row tag, e.g. "c32"',
         "    flagsparseDataType_t dt;",
         '    const char* reporting;  // "delivery" or "retained"',
+        "    const char* variant_id; // delivery variant id (conf/operators.yaml), or nullptr for ordinary sweep rows",
         "};",
         "",
         "inline constexpr Variant kVariants[] = {",
     ]
-    for op, fam, ftag, dtag, enum, scope in rows:
-        lines.append(f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}"}},')
+    for op, fam, ftag, dtag, enum, scope, vid in rows:
+        vid_text = f'"{vid}"' if vid else "nullptr"
+        lines.append(
+            f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}", {vid_text}}},'
+        )
     lines += [
         "};",
         "",
@@ -148,7 +207,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines))
     fams, scopes = {}, {}
-    for _, fam, _, _, _, scope in rows:
+    for _, fam, _, _, _, scope, _ in rows:
         fams[fam] = fams.get(fam, 0) + 1
         scopes[scope] = scopes.get(scope, 0) + 1
     print(f"variants: {len(rows)} from {args.manifest.name} -> {args.out.name}")

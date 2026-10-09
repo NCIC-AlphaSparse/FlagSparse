@@ -1648,6 +1648,11 @@ def main():
             index_dtypes=csv_index_dtypes,
             ops=selected_ops,
         )
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append(
+            "spmm_csr", paths, csv_path, args.warmup, args.iters
+        )
         return
 
     for op in selected_ops:

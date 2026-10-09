@@ -1,6 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Keep the Python and C API delivery reports on one variant registry."""
+"""Keep the Python registry and the C API manifest on one source of truth."""
 
 from pathlib import Path
 
@@ -10,95 +10,161 @@ from tools.delivery_variants import load_delivery_variants
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# The delivery list, as handed over in fork/list.xlsx (2026-09-21). Pinned here on
-# purpose: the registry is what every summary, table and doc count follows, so a
-# variant appearing or disappearing must be a deliberate edit to this test too.
-DELIVERY_VARIANT_IDS = [
-    "gather_f16_int",
-    "gather_f32_int",
-    "gather_f64_int",
-    "gather_c32_int",
-    "gather_c64_int",
-    "scatter_f16_int",
-    "scatter_f32_int",
-    "scatter_f64_int",
-    "scatter_c32_int",
-    "scatter_c64_int",
-    "spmv_csr_f32_int_non",
-    "spmv_csr_f64_int_non",
-    "spmv_coo_f32_int_non",
-    "spmv_coo_f64_int_non",
-    "spmm_csr_f32_int_non_non_row",
-    "spmm_csr_f64_int_non_non_row",
-    "spmm_coo_f32_int_non_non_row",
-    "spmm_coo_f64_int_non_non_row",
-    "sddmm_csr_f32_int_non_non_row",
-    "sddmm_csr_f64_int_non_non_row",
-]
+# `delivery_variants:` in conf/operators.yaml holds 65 variants: the 20 originally
+# delivered to the C API plus 45 more from docs/NEW_OPERATORS_CUSPARSE_12_5.md that
+# are implemented and accuracy-tested in Python but not all wrapped by the C API /
+# c_fs layer yet. There is no separate "q4" list any more -- a variant's pytest
+# cases and benchmark rows are found by its `id`
+# (tests/pytest/test_q4_variants_accuracy.py, the `variant` CSV column).
+#
+# Each variant also carries `capi`: whether the C API has actually implemented that
+# exact (operator, dtype, opA) combination -- see `_capi_derived_true` below for the
+# precise rule, derived from capi/conf/operators.yaml's `status`/`dtypes`/
+# `mixed_dtypes`/`ops` fields. This is independent of that manifest's
+# `reporting: delivery` tag, which is the C API's own narrower "what's in its
+# default report" scope (checked separately by
+# test_the_capi_manifests_own_delivery_scope_has_not_grown below).
+#
+# All 65 since 2026-10-08: the origin/q4 C API work was ported and every variant
+# produced benchmark rows on CUDA (RTX 5090, the 10 delivery matrices). Pinned so
+# a regression -- a manifest entry narrowed, an op dropped -- fails here by name.
+CAPI_TRUE_COUNT = 65
 
 # The C API manifest names dtypes by the width of the whole value (c64 = complex of
 # two fp32); the registry names the component (c32 = complex64).
+# A few entries (spvv, spmv_sell, spmm_csc, sddmm_csr's complex) already spell
+# complex64 the registry's way, `c32`; the manifest's own convention never uses
+# that token, so it can only mean complex64 and passes through unchanged.
 CAPI_DTYPE_TO_REGISTRY_TAG = {
     "f16": "f16",
     "bf16": "bf16",
     "f32": "f32",
     "f64": "f64",
+    "i8": "i8",
     "c64": "c32",
     "c128": "c64",
 }
 
+# The manifest spells the conjugate transpose like cuSPARSE does; variant ids
+# shorten it to `conj`.
+OPA_MANIFEST_TO_REGISTRY = {"conj_trans": "conj"}
 
-def test_delivery_registry_is_exactly_the_20_listed_variants():
-    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
-    ids = [variant["id"] for variant in variants]
-    assert len(ids) == 20 and len(set(ids)) == 20
-    assert ids == DELIVERY_VARIANT_IDS
-
-
-def test_no_undelivered_operator_is_registered():
-    """spgemm/spsv/spsm and the complex spmv/spmm variants left the list."""
-    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
-    assert {v["operator"] for v in variants} == {
-        "gather",
-        "scatter",
-        "spmv_csr",
-        "spmv_coo",
-        "spmm_csr",
-        "spmm_coo",
-        "sddmm_csr",
-    }
-    for operator in ("spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr"):
-        assert {v["dtype"] for v in variants if v["operator"] == operator} == {
-            "f32",
-            "f64",
-        }
+# The C API's own "what ships in the default report" tag -- unrelated to `capi` in
+# the Python registry, see the module docstring.
+CAPI_DELIVERY_OPERATORS = {
+    "gather",
+    "scatter",
+    "spmv_csr",
+    "spmv_coo",
+    "spmm_csr",
+    "spmm_coo",
+    "sddmm_csr",
+}
 
 
-def test_capi_manifest_delivers_exactly_the_registered_variants():
-    """One registry, two front ends -- down to the dtype, not just the operator.
-
-    capi/conf/operators.yaml says what is delivered with `reporting: delivery`
-    (narrowed per dtype by `delivery_dtypes`). The parent-operator check below is
-    too coarse to catch a complex spmv variant that is registered on one side and
-    not the other, so compare (operator, dtype) pairs.
-    """
-    registered = {
-        (v["operator"], v["dtype"])
-        for v in load_delivery_variants(ROOT / "conf" / "operators.yaml")
-    }
-    manifest = yaml.safe_load(
+def _load_capi_manifest() -> dict:
+    return yaml.safe_load(
         (ROOT / "capi" / "conf" / "operators.yaml").read_text(encoding="utf-8")
     )
-    delivered = set()
-    for op in manifest["operators"]:
-        if op.get("status") != "implemented" or op.get("reporting") != "delivery":
-            continue
-        for dtype in op.get("delivery_dtypes") or op.get("dtypes") or []:
-            delivered.add((op["id"], CAPI_DTYPE_TO_REGISTRY_TAG[dtype]))
-    assert delivered == registered, {
-        "only in the C API manifest": sorted(delivered - registered),
-        "only in the registry": sorted(registered - delivered),
+
+
+def _split_variant_id(variant_id: str, operator: str) -> tuple[str, str]:
+    """``(dtype, opA)`` from a variant id, per the naming rule in
+    docs/NEW_OPERATORS_CUSPARSE_12_5.md: ``operator_dtype_int_opA[_opB][_row|_col]``.
+
+    opA defaults to ``"non"`` for operators with no transpose axis at all (gather,
+    scatter): nothing follows `_int`, which this also handles for any operator
+    whose id happens to end right after `_int`.
+    """
+    rest = variant_id[len(operator) + 1 :]
+    parts = rest.split("_")
+    i = parts.index("int")
+    dtype = "_".join(parts[:i])
+    tail = parts[i + 1 :]
+    opA = tail[0] if tail else "non"
+    return dtype, opA
+
+
+def _capi_derived_true(variant: dict, capi_ops: dict) -> tuple[bool, str]:
+    """Whether the C API manifest says this (operator, dtype, opA) is implemented.
+
+    Mechanical, not a guess: `status: implemented` plus the variant's dtype (mapped
+    through CAPI_DTYPE_TO_REGISTRY_TAG) in that operator's `dtypes:`, plus the
+    variant's opA (the sparse-side transpose; everything else -- opB, dense layout
+    -- is a stride choice the C API handles uniformly once opA and dtype clear,
+    per capi/conf/operators.yaml's own notes on spmm_csr/spmm_coo/sddmm_csr) in that
+    operator's `ops:` (default `["non"]` when the operator has no `ops:` field at
+    all, i.e. no transpose axis -- gather/scatter).
+    """
+    entry = capi_ops.get(variant["operator"])
+    if entry is None or entry.get("status") != "implemented":
+        return False, "no C API entry, or not implemented"
+    dtype, opA = _split_variant_id(variant["id"], variant["operator"])
+    declared = {CAPI_DTYPE_TO_REGISTRY_TAG.get(d, d) for d in entry.get("dtypes") or []}
+    # `mixed_dtypes` names input->output pairs the ordinary per-dtype sweep cannot
+    # express (f16f32, i8i32, ...) in the registry's own spelling.
+    declared |= set(entry.get("mixed_dtypes") or [])
+    if dtype not in declared:
+        return False, f"dtype {dtype!r} not in {sorted(declared)}"
+    allowed_ops = {
+        OPA_MANIFEST_TO_REGISTRY.get(o, o) for o in entry.get("ops") or ["non"]
     }
+    if opA not in allowed_ops:
+        return False, f"opA={opA!r} not in {sorted(allowed_ops)}"
+    return True, "ok"
+
+
+def test_delivery_registry_has_65_unique_variants():
+    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    ids = [variant["id"] for variant in variants]
+    assert len(ids) == 65 and len(set(ids)) == 65
+
+
+def test_the_capi_true_subset_is_pinned():
+    """`capi: true` disappearing must be a deliberate edit here too."""
+    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    not_capi = sorted(v["id"] for v in variants if not v["capi"])
+    assert not_capi == [], not_capi
+    assert sum(v["capi"] for v in variants) == CAPI_TRUE_COUNT
+
+
+def test_the_capi_field_matches_the_capi_manifests_own_capability_claims():
+    """`capi: true`/`false` in the Python registry must agree with what
+    capi/conf/operators.yaml itself says is implemented -- both directions: no
+    variant claims C API support the manifest does not back, and no variant the
+    manifest already supports is left marked `false` (the bug this test replaces
+    a looser version of: several variants whose dtype and opA the C API already
+    covers had been left `capi: false`).
+    """
+    capi_ops = {op["id"]: op for op in _load_capi_manifest()["operators"]}
+    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    mismatches = []
+    for variant in variants:
+        derived, reason = _capi_derived_true(variant, capi_ops)
+        if derived != variant["capi"]:
+            mismatches.append((variant["id"], variant["capi"], derived, reason))
+    assert not mismatches, mismatches
+
+
+def test_the_capi_manifests_own_delivery_scope_has_not_grown():
+    """spgemm/spsv/spsm and the complex spmv/spmm variants stay out of the C API's
+    own default report.
+
+    This checks capi/conf/operators.yaml alone, not the Python registry: `capi:
+    true` (above) now also covers operators and dtypes the C API has implemented but
+    does not headline (spmv_csc, spgemm_csr's f32/f64, complex spmv/spmm) -- that is
+    a wider, different thing from `reporting: delivery`, which is this test's
+    concern.
+    """
+    manifest = _load_capi_manifest()
+    delivered = {
+        op["id"]: set(op.get("delivery_dtypes") or op.get("dtypes") or [])
+        for op in manifest["operators"]
+        if op.get("status") == "implemented" and op.get("reporting") == "delivery"
+    }
+    assert set(delivered) == CAPI_DELIVERY_OPERATORS
+    for operator in ("spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr"):
+        assert delivered[operator] == {"f32", "f64"}, (operator, delivered[operator])
 
 
 def test_both_summary_writers_consume_the_shared_delivery_registry():
@@ -130,10 +196,8 @@ def test_delivery_only_selects_exactly_the_operators_behind_the_variants():
     sys.modules["_runner_under_test"] = runner
     spec.loader.exec_module(runner)
 
-    parents = {
-        variant["operator"]
-        for variant in load_delivery_variants(ROOT / "conf" / "operators.yaml")
-    }
+    variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    parents = {variant["operator"] for variant in variants}
 
     def select(manifest, delivery_only):
         return runner.read_ops(
@@ -153,6 +217,8 @@ def test_delivery_only_selects_exactly_the_operators_behind_the_variants():
     # The default is a superset: no variant goes unreported without the flag.
     assert parents <= set(select("conf/operators.yaml", False))
 
-    # The C API manifest spells the same intent with `reporting: delivery`, and
-    # the two have to agree -- one registry, two front ends.
-    assert set(select("capi/conf/operators.yaml", True)) == parents
+    # The C API manifest spells the same `--delivery-only` intent with its own
+    # `reporting: delivery` tag, and the two mechanisms have to agree on what that
+    # resolves to -- the same CAPI_DELIVERY_OPERATORS this file already pins above,
+    # not the (now broader) `capi: true` operator set.
+    assert set(select("capi/conf/operators.yaml", True)) == CAPI_DELIVERY_OPERATORS

@@ -82,11 +82,13 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
             // has to guess which variants it stands for -- and a summary that
             // defaults the guess to "delivery" quietly inflates its own totals.
             for (const registry::Variant* v : declared) {
+                if (!benchmark_variant_selected(*v)) continue;
                 BenchRow row;
                 row.name = std::string("spgemm_csr_") + v->dtype + "_" + entry.name;
                 row.tag("operator", v->op).tag("matrix", entry.name)
                    .tag("format", v->format).tag("dtype", v->dtype)
                    .tag("corpus", corpus_tag()).tag("reporting", v->reporting);
+                if (v->variant_id) row.tag("variant", v->variant_id);
                 g_report.skip(std::move(row), "skipped_shape",
                               "A*A needs a square A");
             }
@@ -96,6 +98,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
         const std::vector<double> ref = host_spmv(A, host_spmv(A, x));  // A*(A*x)
 
         for (const registry::Variant* v : declared) {
+            if (!benchmark_variant_selected(*v)) continue;
             if (std::string(v->format) != "csr") {
                 const std::string why =
                     std::string("benchmark/test_spgemm.cpp has no ") + v->format +
@@ -111,6 +114,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                .tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                .num("rows", static_cast<double>(A.rows))
                .num("nnz", static_cast<double>(A.nnz));
+            if (v->variant_id) row.tag("variant", v->variant_id);
             trace("spgemm", entry.name, v->dtype, A);
 
             DeviceBuffer indptr = DeviceBuffer::from(A.indptr);

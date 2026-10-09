@@ -1636,6 +1636,40 @@ def flagsparse_spmm_csc(
     index_fallback_policy="auto",
 ):
     """CSC SpMM using native Triton CSC kernels."""
+    # float16 is not in SUPPORTED_SPMM_CSC_VALUE_DTYPES: the `non` route scatters
+    # into C with tl.atomic_add (see _spmm_csc_non_real_kernel), and fp16
+    # atomic_add is not reliably available on every backend -- mixed_spmx.py's
+    # "fp16 and complex atomics are never needed" note is exactly this class of
+    # gap. Rather than add an fp32-accumulating kernel variant to every one of
+    # this file's non/trans/folded/nnzpar/multicol paths, compute the whole
+    # thing in float32 (the same "atomic_add on a float32 buffer, cast at the
+    # end" shape COO already uses) and cast back once at this public boundary.
+    if prepared is None and data is not None and data.dtype == torch.float16:
+        result = flagsparse_spmm_csc(
+            data.to(torch.float32),
+            indices,
+            indptr,
+            B.to(torch.float32) if B is not None else B,
+            shape,
+            block_n=block_n,
+            block_nnz=block_nnz,
+            max_segments=max_segments,
+            out=None,
+            return_time=return_time,
+            return_meta=return_meta,
+            prepared=None,
+            transpose=transpose,
+            op=op,
+            alg=alg,
+            timing=timing,
+            index_fallback_policy=index_fallback_policy,
+        )
+        pieces = list(result) if isinstance(result, tuple) else [result]
+        pieces[0] = pieces[0].to(torch.float16)
+        if out is not None:
+            out.copy_(pieces[0])
+            pieces[0] = out
+        return tuple(pieces) if isinstance(result, tuple) else pieces[0]
     op_explicit = op is not None
     op_code = _normalize_spmm_csc_op(
         op,

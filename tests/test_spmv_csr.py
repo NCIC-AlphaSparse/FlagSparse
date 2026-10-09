@@ -464,6 +464,11 @@ def main(argv=None):
     finally:
         if csv_file:
             csv_file.close()
+    import q4_variant_bench
+
+    q4_variant_bench.run_and_append(
+        "spmv_csr", [str(path) for path in paths], args.csv_csr, args.warmup, args.iters
+    )
     # Row-level results live in the `status` column, as in every other benchmark
     # script. The exit code stays 0: the runner treats a non-zero exit as a failed
     # phase and the delivery rows inherit that, so one FAIL matrix in one dtype

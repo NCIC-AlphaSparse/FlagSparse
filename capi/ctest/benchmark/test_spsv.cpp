@@ -63,6 +63,7 @@ TEST(SpsvBenchmark, CsrOverCorpus) {
         const std::vector<int32_t> coo_rows = coo_row_indices_of(L);
 
         for (const registry::Variant* v : declared) {
+            if (!benchmark_variant_selected(*v)) continue;
             const bool is_coo = std::string(v->format) == "coo";
             const bool is_csr = std::string(v->format) == "csr";
             // SELL has its own accuracy test and no operand builder here.

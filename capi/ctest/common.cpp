@@ -226,6 +226,12 @@ Tolerance default_tolerance(flagsparseDataType_t dtype) {
         case FLAGSPARSE_C_32F:  return {1e-5, 1e-6};
         case FLAGSPARSE_R_64F:
         case FLAGSPARSE_C_64F:  return {1e-12, 1e-13};
+        // The sweep's fp64 dense pattern (0.5 .. 2.0, see dense_pattern()) is
+        // rounded to the nearest int8 by upload_as() rather than rescaled, so
+        // the oracle (computed from the unrounded pattern) and the read-back
+        // int8 value can legitimately differ by up to 0.5 -- that is rounding,
+        // not a defect. atol must cover it; rtol is irrelevant at this scale.
+        case FLAGSPARSE_R_8I:   return {0.0, 0.500001};
         default:                return {1e-5, 1e-6};
     }
 }
@@ -237,6 +243,7 @@ Tolerance relaxed_tolerance(flagsparseDataType_t dtype) {
     switch (dtype) {
         case FLAGSPARSE_R_64F:
         case FLAGSPARSE_C_64F: return {1e-10, 1e-11};
+        case FLAGSPARSE_R_8I:  return {0.0, 0.500001};
         default:               return {1e-3, 1e-4};
     }
 }
@@ -478,14 +485,15 @@ void write_accuracy_json(const std::string& op, const std::vector<BenchRow>& row
             out << ", \"" << kv.first << "\": \"" << kv.second << "\"";
         }
         out << ", \"accuracy\": \"" << r.accuracy << "\"";
-        if (r.accuracy != "unchecked") {
+        if (r.accuracy != "unchecked" && std::isfinite(r.error_ratio) &&
+            std::isfinite(r.relaxed_error_ratio)) {
             out << ", \"error_ratio\": " << std::setprecision(6) << r.error_ratio
                 << ", \"relaxed_error_ratio\": " << r.relaxed_error_ratio;
         } else {
             out << ", \"error_ratio\": null, \"relaxed_error_ratio\": null";
         }
         out << ", \"baseline_accuracy\": \"" << r.baseline_accuracy << "\"";
-        if (r.baseline_accuracy != "unchecked") {
+        if (r.baseline_accuracy != "unchecked" && std::isfinite(r.baseline_error_ratio)) {
             out << ", \"baseline_error_ratio\": " << std::setprecision(6)
                 << r.baseline_error_ratio;
         }
@@ -551,7 +559,8 @@ void BenchReport::write() const {
         // value: a fabricated baseline is worse than none, and a speedup over an
         // answer we did not check is worse still.
         out << ", \"accuracy\": \"" << r.accuracy << "\"";
-        if (r.accuracy != "unchecked") {
+        if (r.accuracy != "unchecked" && std::isfinite(r.error_ratio) &&
+            std::isfinite(r.relaxed_error_ratio)) {
             out << ", \"error_ratio\": " << std::setprecision(6) << r.error_ratio
                 << ", \"relaxed_error_ratio\": " << r.relaxed_error_ratio;
         } else {
@@ -559,7 +568,7 @@ void BenchReport::write() const {
         }
         out << ", \"baseline\": \"" << baseline::name() << "\"";
         out << ", \"baseline_accuracy\": \"" << r.baseline_accuracy << "\"";
-        if (r.baseline_accuracy != "unchecked") {
+        if (r.baseline_accuracy != "unchecked" && std::isfinite(r.baseline_error_ratio)) {
             out << ", \"baseline_error_ratio\": " << std::setprecision(6)
                 << r.baseline_error_ratio;
         } else {
@@ -574,7 +583,7 @@ void BenchReport::write() const {
         } else {
             out << ", \"baseline_ms\": null";
         }
-        if (r.speedup > 0) {
+        if (r.speedup > 0 && std::isfinite(r.speedup)) {
             out << ", \"speedup\": " << std::setprecision(6) << r.speedup;
         } else {
             out << ", \"speedup\": null";

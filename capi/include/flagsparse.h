@@ -270,6 +270,22 @@ FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseCreateSpVec(flagsparseSpVecDescr_
                                                            flagsparseDataType_t valueType);
 FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseDestroySpVec(flagsparseConstSpVecDescr_t descr);
 
+/* ------------------------------------------------------------------ AXPBY */
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseAxpby(
+    flagsparseHandle_t handle, const void* alpha, flagsparseConstSpVecDescr_t vecX,
+    const void* beta, flagsparseDnVecDescr_t vecY);
+
+/* ------------------------------------------------------------------- SpVV */
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseSpVV_bufferSize(
+    flagsparseHandle_t handle, flagsparseOperation_t opX,
+    flagsparseConstSpVecDescr_t vecX, flagsparseConstDnVecDescr_t vecY,
+    const void* result, flagsparseDataType_t computeType, size_t* bufferSize);
+
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseSpVV(
+    flagsparseHandle_t handle, flagsparseOperation_t opX,
+    flagsparseConstSpVecDescr_t vecX, flagsparseConstDnVecDescr_t vecY,
+    void* result, flagsparseDataType_t computeType, void* externalBuffer);
+
 /* ------------------------------------------------------------------- SpMV */
 typedef enum {
     FLAGSPARSE_SPMV_ALG_DEFAULT = 0,

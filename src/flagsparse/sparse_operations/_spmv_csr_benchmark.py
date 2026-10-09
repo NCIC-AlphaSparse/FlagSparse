@@ -18,7 +18,11 @@ def _prepared_row_tile_op(prepared, x, out):
 
     config = prepared.config["row_tile"]
     grid = (triton.cdiv(prepared.n_rows, config["rows_per_program"]),)
-    acc = tl.float32 if prepared.data.dtype == torch.float32 else tl.float64
+    acc = (
+        tl.float32
+        if kernels.uses_native_rocm_fp32_accumulation(prepared)
+        else tl.float64
+    )
     avg_nnz = prepared.data.numel() / prepared.n_rows
     fixed_steps = 0
     # Match the production row-tile loop policy in kernels.compute: short
@@ -59,7 +63,7 @@ def _prepared_row_tile_op(prepared, x, out):
             ),
             FIXED_STEPS=fixed_steps,
             num_warps=config["num_warps"],
-            enable_fp_fusion=(prepared.data.dtype == torch.float32),
+            enable_fp_fusion=(acc == tl.float32),
         )
         return out
 

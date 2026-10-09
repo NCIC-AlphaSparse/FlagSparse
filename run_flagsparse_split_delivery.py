@@ -32,11 +32,14 @@ narrowing one side without the other would produce a report where the two halves
 cover different variants, and prompt.md's rule against trimming the delivery list
 to dodge a failing operator applies here too. "The full delivery set" is the
 registry's, on both sides: the pytest half runs the registry's parent operators
-(--delivery-only), and the C API half runs only the benchmark binaries whose
-family carries a `reporting: delivery` variant in capi/conf/operators.yaml. An
-operator that is not delivered (spsv, spsm, spgemm since 2026-09-21) is therefore
-never launched -- on MUSA a SpSV benchmark can take the whole GPU context down
-with it, which would cost every later case its result.
+(--delivery-only), and the C API half runs only the benchmark binaries that own a
+delivery variant (capi/tools/gen_variants.py's benchmark_families), restricted by
+FLAGSPARSE_BENCH_VARIANTS to the entries tagged with a delivery variant id, each
+measured once in the configuration its id names. An operator that is not
+delivered (spsv, spsm) is therefore never launched -- on MUSA a SpSV benchmark can
+take the whole GPU context down with it, which would cost every later case its
+result. A delivery variant this C API does not implement still gets a row, saying
+not_supported, instead of being silently absent.
 
 Run from the repository root:
 
@@ -62,7 +65,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tools.delivery_variants import cleanup_delivery_matrices, select_delivery_matrices
+from tools.delivery_variants import (
+    cleanup_delivery_matrices,
+    load_delivery_variants,
+    select_delivery_matrices,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CAPI_SRC_DIR = PROJECT_ROOT / "capi"
@@ -195,6 +202,12 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     )
     env["FLAGSPARSE_MATRIX_DIR"] = str(matrix_dir)
     env["FLAGSPARSE_BENCH_OUT"] = str(bench_out.resolve())
+    # Only the entries tagged with a delivery variant id run, each in the exact
+    # configuration its id names; the ordinary per-dtype sweep rows would measure
+    # the same kernels a second time under the benchmark's default layout/op.
+    env["FLAGSPARSE_BENCH_VARIANTS"] = ",".join(
+        variant["id"] for variant in load_delivery_variants()
+    )
     pattern, families = delivery_ctest_regex()
     print(f"ctest: running the delivery benchmark families {families}", flush=True)
     rc = run(

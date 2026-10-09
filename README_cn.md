@@ -19,7 +19,8 @@
 GPU 稀疏运算库（SpMV、SpMM、SpGEMM、SDDMM、gather、scatter、多种稀疏格式）。
 
 > **要在非 NVIDIA 加速卡上做 bring-up？** 从 [`prompt.md`](prompt.md) 开始，再读
-> `docs/<后端>.md`（那台机器怎么跑）和 `modified/<后端>.md`（前人改了什么、为什么）。
+> `docs/<后端>.md`（那台机器怎么跑）和 `docs/debug/<后端>.md`（还要验证什么，以及前人在那台机器上
+> 改了什么、为什么）。
 > 本文记录的是 CUDA 参照路径。
 
 ## 安装
@@ -280,7 +281,7 @@ BSR 脚本会保留已完成的 `PASS`/`FAIL` case、重试此前的 `ERROR` cas
 | `benchmark/` | 后端能力探测与厂商基线脚本 |
 | `capi/` | 兼容 cuSPARSE 的 C API 封装、它的 CTest 套件与各后端基线 |
 | `docs/` | 一个后端一份：那台机器怎么跑。索引是 `docs/README.md` |
-| `modified/` | 一个后端一份改动台账：在那台机器上改了哪个文件的哪个函数、为什么 —— 各后端之间传描述，不传文件 |
+| `docs/debug/` | 一个后端一份：那台机器上还要验证什么，以及改动台账（改了哪个文件的哪个函数、为什么 —— 各后端之间传描述，不传文件） |
 | `prompt.md` | 新后端上手从这里开始 |
 
 ## 测试用法

@@ -348,8 +348,69 @@ def test_every_delivery_operator_has_a_usable_library_time_column(bundled):
         assert usable, f"{op}: no row carries a vendor-library time ({fields})"
 
 
-def test_the_bundled_variants_are_the_20_delivery_variants(bundled):
-    assert set(bundled["variants"]) == {v["id"] for v in load_delivery_variants()}
+def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
+    """45 of the 65 delivery variants have no H800 run yet -- that is expected.
+
+    `conf/h800_reference.json` only has real H800 wall times for variants someone
+    has actually run there; fabricating numbers for the rest is not an option. Once
+    a variant gets measured on H800, its id lands in the bundle and this still
+    holds.
+    """
+    delivery_ids = {v["id"] for v in load_delivery_variants()}
+    assert set(bundled["variants"]) <= delivery_ids
+
+
+# The bundle was built from the 2026-09-22 H800 run (conf/h800_reference.json's own
+# "reference" block), which predates both the 45 q4 variants and the `capi` field --
+# it is NOT the same set as `capi: true` (all 65 since 2026-10-08, including
+# spgemm_csr, column-major and complex variants the 2026-09-22 run never touched).
+# Pinned here on purpose: a real H800 run adding or dropping an id must be a
+# deliberate edit to this test too, not something a count or subset check would
+# silently absorb.
+H800_MEASURED_VARIANT_IDS = {
+    "gather_c32_int",
+    "gather_c64_int",
+    "gather_f16_int",
+    "gather_f32_int",
+    "gather_f64_int",
+    "scatter_c32_int",
+    "scatter_c64_int",
+    "scatter_f16_int",
+    "scatter_f32_int",
+    "scatter_f64_int",
+    "sddmm_csr_f32_int_non_non_row",
+    "sddmm_csr_f64_int_non_non_row",
+    "spmm_coo_f32_int_non_non_row",
+    "spmm_coo_f64_int_non_non_row",
+    "spmm_csr_f32_int_non_non_row",
+    "spmm_csr_f64_int_non_non_row",
+    "spmv_coo_f32_int_non",
+    "spmv_coo_f64_int_non",
+    "spmv_csr_f32_int_non",
+    "spmv_csr_f64_int_non",
+}
+
+
+def test_the_bundled_variants_are_exactly_the_2026_09_22_h800_run(bundled):
+    """As measured: the bundle is the fixed set `H800_MEASURED_VARIANT_IDS` above,
+    which is a strict subset of `capi: true` (not all of it -- `capi: true` also
+    covers variants the C API has implemented but no one has yet run on H800) and
+    unrelated to it structurally (a `capi: false` variant could be H800-measured
+    before it ever gets a C wrapper). An H800 run of one of the other 45 variants
+    should make this fail while leaving the subset test above green -- that is the
+    correct, expected way for it to fail; update the pinned set deliberately when
+    it does, same as DELIVERY_VARIANT_IDS-style registries elsewhere in tests/ci.
+    """
+    assert set(bundled["variants"]) == H800_MEASURED_VARIANT_IDS
+    capi_ids = {v["id"] for v in load_delivery_variants() if v["capi"]}
+    assert H800_MEASURED_VARIANT_IDS <= capi_ids, (
+        "every H800-measured variant should also be capi: true today -- if this "
+        "ever fails it means a variant was H800-measured before being C-wrapped, "
+        "which is fine, just update this comment and drop the assertion"
+    )
+
+
+def test_every_bundled_variant_has_passing_accuracy(bundled):
     assert all(v["accuracy"] == "Passed" for v in bundled["variants"].values())
 
 

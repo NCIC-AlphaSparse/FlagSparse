@@ -65,6 +65,9 @@ _SUPPORTED_VALUE_DTYPES = [
     torch.complex128,
 ]
 SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
+# Gather/scatter only move values, so they also take int8 (cusparseGather/Scatter
+# accept CUDA_R_8I). Kept separate: the arithmetic operators share the tuple above.
+GATHER_SCATTER_VALUE_DTYPES = SUPPORTED_VALUE_DTYPES + (torch.int8,)
 SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 _INDEX_LIMIT_INT32 = 2**31 - 1
 # ---------------------------------------------------------------------------
@@ -398,10 +401,12 @@ _CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
 # Star-import exposes only non-underscore names unless listed here.
 __all__ = (
     "SUPPORTED_VALUE_DTYPES",
+    "GATHER_SCATTER_VALUE_DTYPES",
     "SUPPORTED_INDEX_DTYPES",
     "_INDEX_LIMIT_INT32",
     "_is_complex_dtype",
     "_gather_values",
+    "_index_add_values",
     "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
     "_tolerance_for_dtype",
@@ -550,11 +555,12 @@ def _gather_values(values, order):
     """Gather ``values`` along dim 0 by ``order``; complex-safe on every backend.
 
     Moore Threads has no complex kernel for advanced indexing -- ``values[order]``
-    raises ``RuntimeError: "IndexMusa" not implemented for 'ComplexFloat'`` -- which
-    breaks every reorder a transposed or COO-sorted operator has to do, while the
-    real dtypes go through fine.  Complex values are therefore gathered through
-    ``view_as_real``: the same bytes in the same order, and the real-dtype index
-    kernel exists everywhere.
+    raises ``RuntimeError: "IndexMusa" not implemented for 'ComplexFloat'`` -- and
+    Ascend's aclnnIndex rejects it the same way (``Tensor self not implemented for
+    DT_COMPLEX64``). Both break every reorder a transposed or COO-sorted operator has
+    to do, while the real dtypes go through fine. Complex values are therefore
+    gathered through ``view_as_real``: the same bytes in the same order, and the
+    real-dtype index kernel exists everywhere.
 
     The branch is on **dtype, not backend**, so CUDA/ROCm/MACA keep the exact path
     they always took for real data and get an equivalent one for complex.  The same
@@ -565,6 +571,30 @@ def _gather_values(values, order):
         return values[order]
     real_view = torch.view_as_real(values if values.is_contiguous() else values.contiguous())
     return torch.view_as_complex(real_view[order].contiguous())
+
+
+def _index_add_values(acc, dim, index, source):
+    """``acc.index_add_(dim, index, source)`` in place; complex-safe on every backend.
+
+    The scatter-add counterpart to ``_gather_values``: ``index_add_`` on a complex
+    tensor hits the exact same "no complex index kernel" gap (MUSA's ``IndexMusa``,
+    Ascend's ``aclnnIndex``) that plain advanced indexing does -- it is the same
+    underlying index primitive, just writing instead of reading. Every torch_npu /
+    Ascend fallback in this package that reduces nonzeros with ``index_add_`` (CSR and
+    COO SpMV/SpMM) needs this, not only the ones that also call ``_gather_values``.
+
+    ``torch.view_as_real`` of a complex tensor is a VIEW over the same interleaved
+    storage (contiguous, since a complex64 element already IS two adjacent float32
+    values), so ``index_add_`` on the real view mutates ``acc`` in place exactly like
+    the direct complex call would -- this returns ``acc`` for convenience, not a copy.
+    """
+    if not _is_complex_dtype(acc.dtype):
+        acc.index_add_(dim, index, source)
+        return acc
+    acc_real = torch.view_as_real(acc)
+    src_real = torch.view_as_real(source if source.is_contiguous() else source.contiguous())
+    acc_real.index_add_(dim, index, src_real)
+    return acc
 
 
 def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
@@ -580,6 +610,7 @@ def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
             "float64": torch.float64,
             "complex64": torch.complex64,
             "complex128": torch.complex128,
+            "int8": torch.int8,
         }
         if token not in mapping:
             raise TypeError(f"Unsupported dtype token: {value_dtype}")
@@ -604,6 +635,8 @@ def _tolerance_for_dtype(value_dtype):
         return 1e-6, 1e-5
     if value_dtype in (torch.float64, torch.complex128):
         return 1e-10, 1e-8
+    if value_dtype == torch.int8:
+        return 0.0, 0.0  # moved bytes must match exactly
     return 1e-6, 1e-5
 
 
@@ -3343,6 +3376,9 @@ def _build_random_dense(dense_size, value_dtype, device):
         real = torch.randn(dense_size, dtype=component_dtype, device=device)
         imag = torch.randn(dense_size, dtype=component_dtype, device=device)
         return torch.complex(real, imag)
+    if value_dtype == torch.int8:
+        # gather/scatter move int8 (GATHER_SCATTER_VALUE_DTYPES); values are bytes.
+        return torch.randint(-128, 128, (dense_size,), dtype=torch.int8, device=device)
     raise TypeError(f"Unsupported value dtype: {value_dtype}")
 
 
@@ -3377,9 +3413,9 @@ def _validate_common_inputs(dense_vector, indices):
         raise ValueError("indices must be a 1D tensor")
     if not _is_accel_tensor(dense_vector) or not _is_accel_tensor(indices):
         raise ValueError("dense_vector and indices must both be CUDA tensors")
-    if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
+    if dense_vector.dtype not in GATHER_SCATTER_VALUE_DTYPES:
         raise TypeError(
-            f"dense_vector dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
+            f"dense_vector dtype must be one of: {', '.join(str(dt) for dt in GATHER_SCATTER_VALUE_DTYPES)}"
         )
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -3430,9 +3466,9 @@ def _prepare_scatter_inputs(
         )
     if not _is_accel_tensor(sparse_values) or not _is_accel_tensor(indices):
         raise ValueError("sparse_values and indices must both be CUDA tensors")
-    if sparse_values.dtype not in SUPPORTED_VALUE_DTYPES:
+    if sparse_values.dtype not in GATHER_SCATTER_VALUE_DTYPES:
         raise TypeError(
-            f"sparse_values dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
+            f"sparse_values dtype must be one of: {', '.join(str(dt) for dt in GATHER_SCATTER_VALUE_DTYPES)}"
         )
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")

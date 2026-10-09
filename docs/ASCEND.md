@@ -91,6 +91,63 @@ runner 在 Ascend 上自动做三件事，不需要手动处理：
 **`86a09cd`（2026-09-18）之前跑出的性能结果作废**，原因见 `prompt.md` 第 2 节；2026-09-17 那一轮的
 Ascend benchmark 实际用的是合成矩阵（`modified/ASCEND.md` 第 3 节），也不能当作 30 矩阵结果。
 
+## 现在是 65 个变体（2026-10-08）：哪些接上了、哪些没有
+
+`conf/operators.yaml` 的 `delivery_variants:` 从 20 项合并成了 65 项（原 20 个 + q4 的 45 个混合精度/
+int8/转置/布局变体），不再分"交付"和"q4"两部分。**跟 MACA/MUSA/DCU/Iluvatar 不同，昇腾这边不是简单
+"理论可行、未实测"——分三块看，状态不一样：**
+
+**1. `axpby`/`spvv`/`spmv_sell` 三个算子——今天接上了路由，未上机验证。**
+这三个脚本（`tests/test_vector_ops.py`、`tests/test_spmv_sell.py`）本身是 backend-neutral 的，PyTorch
+基线跑在 torch_npu 上，cuSPARSE 列由 `tests/cusparse_generic_baseline.py` 的 `skip_reason()` 在非 CUDA
+后端自动判空，所以直接复用了 CUDA 那套脚本（`ASCEND_PERFORMANCE_COMMANDS`/`OP_TEST_CONFIGS` 各加了
+一行），不需要走 `benchmark_ascend.py`。精度本来就不在 `ASCEND_ACCURACY_OPS`（只有 gather/scatter/
+spmv_csr/spmm_csr/sddmm_csr 五个）里，走的是和 CUDA 一样的 `tests/pytest -m axpby` 这条通用路径，
+理论上不需要额外适配。**但这三行改动没有在真实 NPU 上跑过**，只验证了语法和在 CUDA 上能正常工作。
+
+**2. 其余 42 个新变体（`spmv_csr`/`spmv_coo`/`spmv_csc`/`spmm_csr`/`spmm_coo`/`spmm_csc`/`sddmm_csr`
+族下面）——内核派发正确性已模拟验证，但 runner 的性能测量路径没有接。**
+用 `tools/q4_ascend_dispatch_check.py`（CUDA 上强制 `_is_ascend_runtime()->True`、Triton 启动直接报错，
+逐个跑 45 个变体对 CPU golden）验证：
+
+```bash
+PYTHONPATH=src python3 tools/q4_ascend_dispatch_check.py
+```
+
+**当前结果 38/45 OK**（退出码仍非 0，还有 7 个要修）。过程中发现并修了一个真实 bug：
+`spmv_coo_c32_int_conj` 在模拟昇腾派发下算出的结果是错的（`_resolve_spmv_coo_launch` 里跳过直接共轭
+的条件 `prepared.transpose_csr_plan is None` 没有考虑昇腾——`_ascend_spmv_coo_index_add` 根本不用
+`csr_plan`，所以永远需要直接共轭），已在 `spmv_coo.py` 里按 `spmv_csr`/`spmm_csr`/`sddmm_csr` 同样的
+模式修了（`or _is_ascend_runtime()`），并把 `tests/ci/test_spmv_coo_ascend_fallback.py`（此前已经存在
+但从未真正跑出失败过——它的测试数据虚部全是 0，共轭了等于没共轭，根本测不出共轭 bug）的数据改成有真实
+虚部，CUDA 上验证过"撤销修复会让它真的失败、恢复修复会通过"。这个修复**同样只在 CUDA 模拟下验证过**，
+没有真实 NPU。
+
+**还剩 7 个 TRITON（没有昇腾分支，是老问题，不是这次 q4 合并引入的）**：
+
+| 变体 | 卡在哪 |
+|---|---|
+| `spmv_csc_f32_int_non` | `_spmv_csc_non_real_kernel` |
+| `spmv_csc_c32_int_non` | `_gather` |
+| `spmv_csc_f16_int_non` | `_csc_spmv_mixed_kernel` |
+| `spmm_csc_f32_int_non_non_row` | `_spmm_csc_non_real_kernel` |
+| `spmm_csc_c32_int_non_non_row` | `_spmm_csc_non_complex_kernel` |
+| `spmm_csc_f16_int_non_non_row` | `_spmm_csc_non_real_kernel` |
+| `spgemm_csr_f32_int_non_non` | `_spgemm_hash_count_kernel` |
+
+`spmv_csc`/`spmm_csc`/`spgemm_csr` 这三个算子**压根没有昇腾分支**（不只是 q4 新增的变体，老变体一样
+没有），需要给这三个算子写 torch_npu 回退路径才能解决，工作量和"修一个条件判断"不是一个量级，这次没动。
+
+**3. 性能测量：`benchmark_ascend.py`/`benchmark_ascend_probe.py`/`benchmark_ascend_accuracy.py`
+这三个昇腾专用脚本完全没碰过，q4 分支自己也没碰过。** 上面第 2 点验证的是"内核派发会不会走错路、算
+不算得对"，不是"runner 能不能测出这些变体的性能"——`spmv_csr`/`spmm_csr`/`sddmm_csr`/`spmv_coo`/
+`spmm_coo` 这 5 族在昇腾上走的是 `benchmark_ascend.py`（原生 PyTorch-NPU baseline）或
+`benchmark_ascend_probe.py`（只探测能不能跑，没有加速比），两者都**不知道 `tests/q4_variant_bench.py`
+和 45 个新变体这回事**。也就是说：即使上面 38 个变体的内核派发是对的，它们的性能目前也测不出来（精度
+应该没问题，走的是通用 pytest 路径）。要测这部分性能，需要给 `benchmark_ascend.py` 接一条类似
+CUDA 那 7 个脚本的 `--q4-variants` 式路由，这次没做——没有 NPU 没法验证测出来的数字对不对，贸然接上
+比不接风险更大。
+
 ## Ascend fallback 分发表
 
 有两个内核在 CANN 上编不出来，各自有一条 torch-only 的退路，并且都暴露成公共符号：

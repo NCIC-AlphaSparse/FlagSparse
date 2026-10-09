@@ -16,26 +16,40 @@ DEFAULT_MANIFEST = ROOT / "conf" / "operators.yaml"
 REQUIRED_KEYS = frozenset({"id", "operator", "format", "dtype"})
 
 
-def load_delivery_variants(path: Path | None = None) -> list[dict[str, str]]:
-    """Return ordered, validated delivery variants from the canonical manifest."""
+def load_delivery_variants(path: Path | None = None) -> list[dict[str, object]]:
+    """Return ordered, validated delivery variants from the canonical manifest.
+
+    One registry of 65: the 20 originally delivered to the C API plus 45 more that
+    are implemented and accuracy-tested but not yet wrapped by the C API / c_fs
+    layer. Each variant carries a ``capi`` bool (default ``False``) marking which
+    side of that line it is on -- see the comment above ``delivery_variants:`` in
+    conf/operators.yaml and tests/ci/test_delivery_variant_registry.py.
+    """
+    return _load_variant_list(path, "delivery_variants", required=True)
+
+
+def _load_variant_list(
+    path: Path | None, key: str, *, required: bool
+) -> list[dict[str, object]]:
     manifest = path or DEFAULT_MANIFEST
     raw = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-    variants = raw.get("delivery_variants")
+    variants = raw.get(key)
+    if variants is None and not required:
+        return []
     if not isinstance(variants, list) or not variants:
-        raise ValueError(f"{manifest}: delivery_variants must be a non-empty list")
-    result: list[dict[str, str]] = []
+        raise ValueError(f"{manifest}: {key} must be a non-empty list")
+    result: list[dict[str, object]] = []
     seen: set[str] = set()
     for index, item in enumerate(variants):
         if not isinstance(item, dict):
-            raise ValueError(
-                f"{manifest}: delivery_variants[{index}] must be a mapping"
-            )
+            raise ValueError(f"{manifest}: {key}[{index}] must be a mapping")
         missing = REQUIRED_KEYS.difference(item)
         if missing:
-            raise ValueError(
-                f"{manifest}: delivery_variants[{index}] lacks {sorted(missing)}"
-            )
-        variant = {key: str(item[key]) for key in REQUIRED_KEYS}
+            raise ValueError(f"{manifest}: {key}[{index}] lacks {sorted(missing)}")
+        variant: dict[str, object] = {
+            field: str(item[field]) for field in REQUIRED_KEYS
+        }
+        variant["capi"] = bool(item.get("capi", False))
         if variant["id"] in seen:
             raise ValueError(f"{manifest}: duplicate variant id {variant['id']!r}")
         seen.add(variant["id"])

@@ -173,6 +173,7 @@ def runtime_namespace():
         "_execute_spmv_route",
         "_execute_spmv_route_with_fallback",
         "_spmv_execution_matrix",
+        "_spmv_transpose_scatter_enabled",
     }
     tree = ast.parse((SOURCE / "spmv_csr.py").read_text(encoding="utf-8"))
     nodes = [
@@ -185,6 +186,7 @@ def runtime_namespace():
         def __init__(self):
             self.alg = self.alg_requested = "row_adaptive_split"
             self.op, self.transpose, self.n_rows = 0, False, 3
+            self.non_gather_plan = None
             self.shape = (3, 4)
             self.backend_caps = policy.BackendCaps(
                 "cuda", "80", "cuda", 32, 1024, True, True, True
@@ -312,6 +314,73 @@ class RuntimePolicy(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "out of memory"):
             env["flagsparse_spmv_csr_run"](p, object())
         self.assertEqual(kernels.compute.call_count, 1)
+
+
+def native_fp32_predicate():
+    """The production ROCm FP32-accumulation predicate, without GPU imports."""
+    tree = ast.parse((SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8"))
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "uses_native_rocm_fp32_accumulation"
+    ]
+    torch = types.SimpleNamespace(float32="float32", float64="float64")
+    env = {"torch": torch}
+    exec(
+        compile(
+            ast.Module(body=nodes, type_ignores=[]),
+            str(SOURCE / "_spmv_csr_kernels.py"),
+            "exec",
+        ),
+        env,
+    )
+    return env["uses_native_rocm_fp32_accumulation"]
+
+
+class RocmFp32AccumulationPolicy(unittest.TestCase):
+    """auto.mtx's 37-nnz rows broke FP32 on DCU while the limit was 8192.
+
+    Native FP32 accumulation is only accurate enough for rows of at most 32
+    non-zeros; nothing pinned the old 8192 limit, so it went unnoticed.
+    """
+
+    def setUp(self):
+        self.allowed = native_fp32_predicate()
+
+    def prepared(self, max_row_nnz, dtype="float32", backend="rocm"):
+        caps = types.SimpleNamespace(backend=backend)
+        return types.SimpleNamespace(
+            data=types.SimpleNamespace(dtype=dtype),
+            backend_caps=caps,
+            max_row_nnz=max_row_nnz,
+        )
+
+    def test_row_length_boundary(self):
+        self.assertTrue(self.allowed(self.prepared(0)))
+        self.assertTrue(self.allowed(self.prepared(32)))
+        self.assertFalse(self.allowed(self.prepared(33)))
+        self.assertFalse(self.allowed(self.prepared(37)))  # auto.mtx
+        self.assertFalse(self.allowed(self.prepared(8192)))
+
+    def test_only_rocm_fp32_accumulates_natively(self):
+        for backend in ("cuda", "metax", "mthreads", "ascend", None):
+            self.assertFalse(self.allowed(self.prepared(1, backend=backend)))
+        self.assertFalse(self.allowed(self.prepared(1, dtype="float64")))
+        caps_less = self.prepared(1)
+        caps_less.backend_caps = None
+        self.assertFalse(self.allowed(caps_less))
+
+    def test_production_and_benchmark_share_the_predicate(self):
+        kernels = (SOURCE / "_spmv_csr_kernels.py").read_text(encoding="utf-8")
+        bench = (SOURCE / "_spmv_csr_benchmark.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "native_rocm_fp32 = uses_native_rocm_fp32_accumulation(prepared)",
+            kernels,
+        )
+        self.assertIn("kernels.uses_native_rocm_fp32_accumulation(prepared)", bench)
+        self.assertNotIn("max_row_nnz <= 8192", kernels)
+        self.assertNotIn("tl.float32 if prepared.data.dtype == torch.float32", bench)
 
 
 class IntegrationPolicy(unittest.TestCase):

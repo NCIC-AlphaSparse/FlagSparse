@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from . import _common as _common_mod
 from . import _spmv_csr_config as _csr_config
+from . import mixed_spmx as _mixed_spmx
 
 _csr_config.set_known_backends(spec.name for spec in _common_mod.backend_specs())
 
@@ -122,6 +123,8 @@ class PreparedCsrSpmv:
         "opt_buckets",
         "supports_opt",
         "transpose",
+        "transpose_plan",
+        "non_gather_plan",
         "op",
         "index_fallback_policy",
         "index_fallback_applied",
@@ -173,6 +176,8 @@ class PreparedCsrSpmv:
         self.supports_opt = kernel_indices.dtype == torch.int32
         self.op = _normalize_spmv_op(op, transpose=transpose)
         self.transpose = _spmv_op_transposes(self.op)
+        self.transpose_plan = None
+        self.non_gather_plan = None
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -1050,7 +1055,18 @@ def prepare_spmv_csr(
         op=op_code,
         index_fallback_policy=index_fallback_policy,
     )
-    return _configure_spmv_route(prepared, requested_alg, config)
+    prepared = _configure_spmv_route(prepared, requested_alg, config)
+    if _spmv_transpose_scatter_enabled(prepared):
+        from . import _spmv_csr_transpose
+        prepared.transpose_plan = _spmv_csr_transpose.prepare(
+            kernel_indices, kernel_indptr, shape
+        )
+    elif (not transpose and requested_alg == "auto" and config is None
+          and _backend_name() == "cuda" and data.dtype in (torch.float16, torch.complex64)):
+        from . import _spmv_csr_transpose
+        prepared.non_gather_plan = _spmv_csr_transpose.make_plan(
+            kernel_indices, kernel_indptr, None, n_rows)
+    return prepared
 
 
 def _get_spmv_baseline_data(prepared):
@@ -1401,6 +1417,12 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
     result.config_source = prepared.config_source
     result.backend_caps = prepared.backend_caps
     result.config_rejections = deepcopy(prepared.config_rejections)
+    if prepared.transpose_plan is not None:
+        from . import _spmv_csr_transpose
+        result.transpose_plan = _spmv_csr_transpose.prepare(kernel_indices, kernel_indptr, prepared.shape)
+    if prepared.non_gather_plan is not None:
+        from . import _spmv_csr_transpose
+        result.non_gather_plan = _spmv_csr_transpose.make_plan(kernel_indices, kernel_indptr, None, prepared.n_rows)
     if _is_rocm_runtime():
         result.rocm_nnz_plan = prepared.rocm_nnz_plan
     return result
@@ -1471,6 +1493,9 @@ def get_spmv_csr_algorithm_spec(alg):
 
 
 def _configure_spmv_route(prepared, alg, config=None):
+    if config is not None:
+        # An explicit tuning request must not be bypassed by the default gather.
+        prepared.non_gather_plan = None
     requested = _csr_config.normalize_alg(alg)
     resolved = requested
     if resolved == "auto":
@@ -1692,6 +1717,30 @@ def _spmv_execution_matrix(prepared):
 
 
 def _execute_spmv_route(prepared, x, out=None, timing=False):
+    if prepared.non_gather_plan is not None and prepared.alg_requested == "auto":
+        from . import _spmv_csr_transpose
+        y, compute_ms = _spmv_phase(
+            lambda: _spmv_csr_transpose.gather(prepared.data, x, prepared.non_gather_plan,
+                                              prepared.n_rows, out=out), timing)
+        return y, {
+            "process_cpu_ms": 0.0, "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": compute_ms,
+            "execution_indices_dtype": str(prepared.kernel_indices.dtype).removeprefix("torch."),
+            "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+        }
+    if _spmv_transpose_scatter_enabled(prepared):
+        from . import _spmv_csr_transpose
+
+        y, compute_ms = _spmv_phase(
+            lambda: _spmv_csr_transpose.compute(prepared, x, out), timing
+        )
+        return y, {
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": compute_ms,
+            "execution_indices_dtype": str(prepared.kernel_indices.dtype).removeprefix("torch."),
+            "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+        }
     alg = prepared.alg
     needs_process = prepared.transpose or alg in (
         "row_split_reduce",
@@ -1760,6 +1809,12 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
     }
 
 
+def _spmv_transpose_scatter_enabled(prepared):
+    # Explicit algorithm requests retain their reduction and tuning contracts.
+    return (prepared.transpose and prepared.alg_requested == "auto"
+            and prepared.data.dtype in (torch.float32, torch.complex64))
+
+
 def _execute_spmv_route_with_fallback(prepared, x, out=None, timing=False):
     try:
         y, meta = _execute_spmv_route(prepared, x, out, timing)
@@ -1820,6 +1875,12 @@ def flagsparse_spmv_csr_run(
             )
         spec = get_spmv_csr_algorithm_spec(actual.alg)
         compute_dtype = _csr_config.compute_dtype(actual.alg, actual.data.dtype)
+        scatter = _spmv_transpose_scatter_enabled(actual)
+        non_gather = actual.non_gather_plan is not None and actual.alg_requested == "auto"
+        if scatter:
+            compute_dtype = str(actual.data.dtype).removeprefix("torch.")
+        if non_gather:
+            compute_dtype = "complex64" if actual.data.is_complex() else "float32"
         if _is_rocm_runtime() and actual.rocm_nnz_plan is not None:
             compute_dtype = str(actual.data.dtype).removeprefix("torch.")
         ms = phases["process_cpu_ms"] + gpu_ms
@@ -1827,8 +1888,8 @@ def flagsparse_spmv_csr_run(
             "alg_requested": prepared.alg_requested,
             "alg_resolved": actual.alg,
             "alg": actual.alg,
-            "implementation": actual.alg,
-            "implementation_version": spec["implementation_version"],
+            "implementation": "transpose_gather" if scatter else "batched_gather" if non_gather else actual.alg,
+            "implementation_version": "1" if scatter or non_gather else spec["implementation_version"],
             "config": deepcopy(actual.config),
             "config_source": actual.config_source,
             "config_rejections": deepcopy(actual.config_rejections),
@@ -1846,7 +1907,8 @@ def flagsparse_spmv_csr_run(
                 compute_dtype, compute_dtype
             ),
             "transpose_strategy": (
-                "per_run_csr_rebuild" if prepared.transpose else "none"
+                "prepared_structure_gather" if _spmv_transpose_scatter_enabled(actual)
+                else "per_run_csr_rebuild" if prepared.transpose else "none"
             ),
             "output_dtype": str(actual.data.dtype).removeprefix("torch."),
             "index_fallback_applied": actual.index_fallback_applied,
@@ -1892,8 +1954,34 @@ def flagsparse_spmv_csr(
     alg=None,
     config=None,
     timing=False,
+    out_dtype=None,
 ):
-    """Native CSR SpMV; auto preserves the existing backend default algorithm."""
+    """Native CSR SpMV; auto preserves the existing backend default algorithm.
+
+    ``out_dtype`` (or ``out.dtype``) selects the cuSPARSE mixed outputs: float16 /
+    bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
+    ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
+    """
+    if (
+        prepared is None
+        and torch.is_tensor(data)
+        and _mixed_spmx.spmv_needs_mixed(
+            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype
+        )
+    ):
+        if alg is not None or config is not None or use_opt is not None:
+            raise ValueError("alg/config/use_opt do not apply to mixed-precision SpMV")
+        y = _mixed_spmx.spmv_csr_mixed(
+            data, indices, indptr, x, shape, op=op, transpose=transpose,
+            out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return y
+        y, elapsed = y
+        if return_meta:
+            meta = {"route": "mixed", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     requested = _csr_config.normalize_alg(alg)
     if use_opt is not None:
         compatibility_alg = (
@@ -1939,10 +2027,13 @@ def flagsparse_spmv_csr(
         t0 = time.perf_counter()
         if _spmv_op_transposes(op_code):
             y = torch.zeros((n_cols,), device=data.device, dtype=data.dtype)
-            y.index_add_(0, cols, data * x[row_ids])
+            # op(A) = A^H (conjugate transpose) needs the values conjugated too, not
+            # just the row/col roles swapped -- op(A) = A^T (plain transpose) does not.
+            vals = data.conj() if op_code == SPMV_OP_CONJ_TRANS else data
+            _index_add_values(y, 0, cols, vals * _gather_values(x, row_ids))
         else:
             y = torch.zeros((n_rows,), device=data.device, dtype=data.dtype)
-            y.index_add_(0, row_ids, data * x[cols])
+            _index_add_values(y, 0, row_ids, data * _gather_values(x, cols))
         if out is not None:
             out.copy_(y)
             y = out

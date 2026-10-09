@@ -37,12 +37,12 @@ C API 的失败只是它的回声。
 Python/Triton 与 C API 的测试策略现在按后端拆在同树中：
 
 ```
-tests/backends/<cuda|rocm|maca|musa|ascend|xpu>/suite.json
-capi/ctest/backends/<cuda|rocm|maca|musa|ascend|xpu>.cmake
+tests/backends/<cuda|rocm|maca|musa|ascend|xpu|iluvatar>/suite.json
+capi/ctest/backends/<cuda|rocm|maca|musa|ascend|xpu|iluvatar>.cmake
 ```
 
 每个目录或文件拥有该后端的运行时 selector、C API 状态和测试入口；算子断言仍在共享的
-`tests/pytest` 与 `ctest/{accuracy,benchmark}` 中，避免六份 oracle 漂移。Python 测试用：
+`tests/pytest` 与 `ctest/{accuracy,benchmark}` 中，避免多份 oracle 漂移。Python 测试用：
 
 ```bash
 python3 tools/run_backend_tests.py --backend cuda --phase accuracy --mode quick
@@ -53,11 +53,16 @@ python3 tools/run_backend_tests.py --backend maca --phase both --ops spmv_csr,sp
 后端 label，例如 CUDA：
 
 ```bash
-ctest --test-dir build -L cuda --output-on-failure
+ctest --test-dir build -L capi --output-on-failure
 ```
 
-当前只有 `cuda`、`musa` profile 允许注册 C API cases；`rocm`、`maca`、`ascend`、`xpu`
-明确记录为 Python-only，直到对应 C API adaptor 可构建并完成 profile 状态更新。
+若需要连同该 profile 下的 Python/Triton 套件一起跑，再使用
+`ctest --test-dir build -L cuda --output-on-failure`；`-L capi` 仅筛选 C API cases。
+
+当前只有 `cuda`、`musa` profile 允许注册 C API cases。调试约定是 MUSA 使用
+C API CTest；`rocm`、`maca`、`ascend`、`xpu`、`iluvatar` 明确使用
+`tools/run_backend_tests.py` 的 Python-only 入口，直到对应 C API adaptor 可构建并完成
+profile 状态更新。
 
 ## 交付变体清单
 

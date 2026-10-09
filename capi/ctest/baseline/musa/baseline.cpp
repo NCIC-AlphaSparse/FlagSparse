@@ -91,14 +91,36 @@ bool map_op(flagsparseOperation_t in, musparseOperation_t* out) {
 Status make_matrix(const DeviceCsr& A, musparseSpMatDescr_t* out) {
     musaDataType_t type;
     if (!map_dtype(A.dtype, &type)) return Status::no("muSPARSE: dtype unsupported");
-    const musparseStatus_t s = A.is_coo()
-        ? musparseCreateCoo(out, A.rows, A.cols, A.nnz, A.coo_rows, A.indices,
-                            A.values, MUSPARSE_INDEX_32I, MUSPARSE_INDEX_BASE_ZERO,
-                            type)
-        : musparseCreateCsr(out, A.rows, A.cols, A.nnz, A.indptr, A.indices,
-                            A.values, MUSPARSE_INDEX_32I, MUSPARSE_INDEX_32I,
-                            MUSPARSE_INDEX_BASE_ZERO, type);
+    musparseStatus_t s;
+    if (A.is_coo()) {
+        s = musparseCreateCoo(out, A.rows, A.cols, A.nnz, A.coo_rows, A.indices,
+                              A.values, MUSPARSE_INDEX_32I, MUSPARSE_INDEX_BASE_ZERO,
+                              type);
+    } else if (A.is_csc()) {
+        // SDK 4.3.5 rejects CSC descriptors in the generic SpMV/SpMM paths.
+        // A CSC(A) buffer is bit-for-bit CSR(A^T), so represent it that way and
+        // flip the requested operation below. No conversion or allocation is
+        // introduced into either side's timed region.
+        s = musparseCreateCsr(out, A.cols, A.rows, A.nnz, A.indptr, A.indices,
+                              A.values, MUSPARSE_INDEX_32I, MUSPARSE_INDEX_32I,
+                              MUSPARSE_INDEX_BASE_ZERO, type);
+    } else {
+        s = musparseCreateCsr(out, A.rows, A.cols, A.nnz, A.indptr, A.indices,
+                              A.values, MUSPARSE_INDEX_32I, MUSPARSE_INDEX_32I,
+                              MUSPARSE_INDEX_BASE_ZERO, type);
+    }
     return s == MUSPARSE_STATUS_SUCCESS ? Status::good() : Status::no(fail("CreateSpMat", s));
+}
+
+musparseOrder_t map_order(flagsparseOrder_t order) {
+    return order == FLAGSPARSE_ORDER_ROW ? MUSPARSE_ORDER_ROW : MUSPARSE_ORDER_COLUMN;
+}
+
+musparseOperation_t csc_as_csr_operation(const DeviceCsr& A, musparseOperation_t op) {
+    if (!A.is_csc()) return op;
+    if (op == MUSPARSE_OPERATION_NON_TRANSPOSE) return MUSPARSE_OPERATION_TRANSPOSE;
+    if (op == MUSPARSE_OPERATION_TRANSPOSE) return MUSPARSE_OPERATION_NON_TRANSPOSE;
+    return op;
 }
 
 Status set_triangle(musparseSpMatDescr_t A, flagsparseFillMode_t fill,
@@ -152,6 +174,7 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
     musaDataType_t type; musparseOperation_t mop;
     if (!map_dtype(A.dtype, &type) || !map_op(op, &mop))
         return Status::no("muSPARSE: unsupported SpMV type or operation");
+    mop = csc_as_csr_operation(A, mop);
     musparseSpMatDescr_t mat = nullptr; musparseDnVecDescr_t vx = nullptr, vy = nullptr;
     if (Status s = make_matrix(A, &mat); !s.ok) return s;
     const int64_t xlen = op == FLAGSPARSE_OPERATION_NON_TRANSPOSE ? A.cols : A.rows;
@@ -175,18 +198,20 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
-                int iters, Timing* out) {
+                int iters, Timing* out, flagsparseOrder_t orderB,
+                flagsparseOrder_t orderC) {
     musaDataType_t type; musparseOperation_t ma, mb;
     if (!map_dtype(A.dtype, &type) || !map_op(opA, &ma) || !map_op(opB, &mb))
         return Status::no("muSPARSE: unsupported SpMM type or operation");
+    ma = csc_as_csr_operation(A, ma);
     musparseSpMatDescr_t mat = nullptr; musparseDnMatDescr_t b = nullptr, c = nullptr;
     if (Status s = make_matrix(A, &mat); !s.ok) return s;
     const int64_t k = opA == FLAGSPARSE_OPERATION_NON_TRANSPOSE ? A.cols : A.rows;
     const int64_t m = opA == FLAGSPARSE_OPERATION_NON_TRANSPOSE ? A.rows : A.cols;
     musparseStatus_t st = musparseCreateDnMat(&b, k, n, ldb, const_cast<void*>(B), type,
-                                               MUSPARSE_ORDER_COLUMN);
+                                               map_order(orderB));
     if (st == MUSPARSE_STATUS_SUCCESS) st = musparseCreateDnMat(&c, m, n, ldc, C, type,
-                                                                  MUSPARSE_ORDER_COLUMN);
+                                                                  map_order(orderC));
     std::size_t bytes = 0;
     if (st == MUSPARSE_STATUS_SUCCESS) st = musparseSpMM(
         vendor(), ma, mb, alpha, mat, b, beta, c, type, MUSPARSE_SPMM_ALG_DEFAULT,
@@ -207,33 +232,66 @@ Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void*
 
 Status sddmm_csr(const DeviceCsr& A, const void* B, int64_t k, int64_t ldb,
                  const void* D, int64_t ldd, const void* alpha, const void* beta,
+                 flagsparseOperation_t opA, flagsparseOperation_t opB,
+                 flagsparseOrder_t orderB, flagsparseOrder_t orderD,
                  int warmup, int iters, Timing* out) {
-    musaDataType_t type;
-    if (!map_dtype(A.dtype, &type)) return Status::no("muSPARSE: unsupported SDDMM dtype");
+    musaDataType_t type; musparseOperation_t ma, mb;
+    if (!map_dtype(A.dtype, &type) || !map_op(opA, &ma) || !map_op(opB, &mb))
+        return Status::no("muSPARSE: unsupported SDDMM dtype or operation");
     musparseSpMatDescr_t mat = nullptr; musparseDnMatDescr_t b = nullptr, d = nullptr;
     if (Status s = make_matrix(A, &mat); !s.ok) return s;
-    musparseStatus_t st = musparseCreateDnMat(&b, A.rows, k, ldb, const_cast<void*>(B),
-                                               type, MUSPARSE_ORDER_ROW);
+    const int64_t b_rows = opA == FLAGSPARSE_OPERATION_TRANSPOSE ? k : A.rows;
+    const int64_t b_cols = opA == FLAGSPARSE_OPERATION_TRANSPOSE ? A.rows : k;
+    const int64_t d_rows = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? A.cols : k;
+    const int64_t d_cols = opB == FLAGSPARSE_OPERATION_TRANSPOSE ? k : A.cols;
+    musparseStatus_t st = musparseCreateDnMat(&b, b_rows, b_cols, ldb, const_cast<void*>(B),
+                                               type, map_order(orderB));
     if (st == MUSPARSE_STATUS_SUCCESS) st = musparseCreateDnMat(
-        &d, k, A.cols, ldd, const_cast<void*>(D), type, MUSPARSE_ORDER_ROW);
+        &d, d_rows, d_cols, ldd, const_cast<void*>(D), type, map_order(orderD));
     std::size_t bytes = 0;
     if (st == MUSPARSE_STATUS_SUCCESS) st = musparseSDDMM_bufferSize(
-        vendor(), MUSPARSE_OPERATION_NON_TRANSPOSE, MUSPARSE_OPERATION_NON_TRANSPOSE,
+        vendor(), ma, mb,
         alpha, b, d, beta, mat, type, MUSPARSE_SDDMM_ALG_DEFAULT, &bytes);
     Scratch scratch;
     Status result = native(st, "SDDMM buffer size");
     if (result.ok && !scratch.grab(bytes)) result = Status::no("muSPARSE: SDDMM scratch allocation failed");
     if (result.ok) result = native(musparseSDDMM_preprocess(
-        vendor(), MUSPARSE_OPERATION_NON_TRANSPOSE, MUSPARSE_OPERATION_NON_TRANSPOSE,
+        vendor(), ma, mb,
         alpha, b, d, beta, mat, type, MUSPARSE_SDDMM_ALG_DEFAULT, scratch.p),
         "SDDMM preprocess");
     if (result.ok) result = timed([&] { return native(musparseSDDMM(
-        vendor(), MUSPARSE_OPERATION_NON_TRANSPOSE, MUSPARSE_OPERATION_NON_TRANSPOSE,
+        vendor(), ma, mb,
         alpha, b, d, beta, mat, type, MUSPARSE_SDDMM_ALG_DEFAULT, scratch.p), "SDDMM");
     }, warmup, iters, out);
     if (b) musparseDestroyDnMat(b); if (d) musparseDestroyDnMat(d);
     musparseDestroySpMat(mat);
     return result;
+}
+
+Status spvv(const void* sparse_val, const void* sparse_idx, const void* dense,
+            int64_t nnz, int64_t size, void* result, flagsparseDataType_t dtype,
+            flagsparseDataType_t compute_dtype, flagsparseOperation_t op,
+            int warmup, int iters, Timing* out) {
+    musaDataType_t type, compute; musparseOperation_t mop;
+    if (!map_dtype(dtype, &type) || !map_dtype(compute_dtype, &compute) || !map_op(op, &mop))
+        return Status::no("muSPARSE: unsupported SpVV dtype or operation");
+    musparseSpVecDescr_t x = nullptr; musparseDnVecDescr_t y = nullptr;
+    musparseStatus_t st = musparseCreateSpVec(&x, size, nnz, const_cast<void*>(sparse_idx),
+                                               const_cast<void*>(sparse_val), MUSPARSE_INDEX_32I,
+                                               MUSPARSE_INDEX_BASE_ZERO, type);
+    if (st == MUSPARSE_STATUS_SUCCESS)
+        st = musparseCreateDnVec(&y, size, const_cast<void*>(dense), type);
+    std::size_t bytes = 0;
+    if (st == MUSPARSE_STATUS_SUCCESS)
+        st = musparseSpVV(vendor(), mop, x, y, result, compute, &bytes, nullptr);
+    Scratch scratch;
+    Status status = native(st, "SpVV setup");
+    if (status.ok && !scratch.grab(bytes)) status = Status::no("muSPARSE: SpVV scratch allocation failed");
+    if (status.ok) status = timed([&] { return native(musparseSpVV(
+        vendor(), mop, x, y, result, compute, &bytes, scratch.p), "SpVV"); }, warmup, iters, out);
+    if (x) musparseDestroySpVec(x);
+    if (y) musparseDestroyDnVec(y);
+    return status;
 }
 
 void free_csr(BaselineCsrOut* c) {

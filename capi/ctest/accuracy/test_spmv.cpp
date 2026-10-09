@@ -154,6 +154,428 @@ TEST_F(SpMVAccuracy, Float32MatchesHostReference) {
     }
 }
 
+// spmv_csr_i8i32_int_non / spmv_csr_i8f32_int_non: int8 matrix and x,
+// widened int32 or float32 y -- capi/src/ops/spmv.cpp's run_csr_mixed, a
+// separate path from the rest of this file (Operands/launch_csr_rowpar
+// assume A/X/Y share one dtype, which this deliberately does not). Hand-built
+// small integer data, not random_csr's continuous doubles: int8 has no
+// fractional part, so a rounding-derived reference would just be testing the
+// rounding, not the kernel.
+TEST_F(SpMVAccuracy, Int8ToInt32MixedPrecision) {
+    // A (3x4), CSR: row0=[2,0,-3,0] row1=[0,0,1,4] row2=[-1,2,0,0]
+    const std::vector<int8_t> data = {2, -3, 1, 4, -1, 2};
+    const std::vector<int32_t> indices = {0, 2, 2, 3, 0, 1};
+    const std::vector<int32_t> indptr = {0, 2, 4, 6};
+    const std::vector<int8_t> x = {3, -2, 5, -1};
+    // expected: row0=2*3-3*5=-9, row1=1*5+4*-1=1, row2=-1*3+2*-2=-7
+    const std::vector<int32_t> expect = {-9, 1, -7};
+
+    DeviceBuffer d_data = DeviceBuffer::from(data);
+    DeviceBuffer d_idx = DeviceBuffer::from(indices);
+    DeviceBuffer d_ptr = DeviceBuffer::from(indptr);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y(3 * sizeof(int32_t));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateCsr(&matA, 3, 4, 6, d_ptr.get(), d_idx.get(), d_data.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 4, d_x.get(), FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32I),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const int32_t one = 1, zero = 0;
+    size_t bufsz = 12345;  // must come back 0 for this path -- catches a stale value.
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &one, matA, vecX, &zero, vecY,
+                                        FLAGSPARSE_R_32I, FLAGSPARSE_SPMV_ALG_DEFAULT,
+                                        &bufsz),
+              FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(bufsz, 0u);
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA,
+                             vecX, &zero, vecY, FLAGSPARSE_R_32I,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const std::vector<int32_t> got = d_y.download<int32_t>(3);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(got[i], expect[i]) << "row " << i;
+
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, Int8ToFloat32MixedPrecision) {
+    const std::vector<int8_t> data = {2, -3, 1, 4, -1, 2};
+    const std::vector<int32_t> indices = {0, 2, 2, 3, 0, 1};
+    const std::vector<int32_t> indptr = {0, 2, 4, 6};
+    const std::vector<int8_t> x = {3, -2, 5, -1};
+    const std::vector<float> expect = {-9.0f, 1.0f, -7.0f};
+
+    DeviceBuffer d_data = DeviceBuffer::from(data);
+    DeviceBuffer d_idx = DeviceBuffer::from(indices);
+    DeviceBuffer d_ptr = DeviceBuffer::from(indptr);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y(3 * sizeof(float));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateCsr(&matA, 3, 4, 6, d_ptr.get(), d_idx.get(), d_data.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 4, d_x.get(), FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const float one = 1.0f, zero = 0.0f;
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA,
+                             vecX, &zero, vecY, FLAGSPARSE_R_32F,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const std::vector<float> got = d_y.download<float>(3);
+    for (int i = 0; i < 3; ++i) EXPECT_FLOAT_EQ(got[i], expect[i]) << "row " << i;
+
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroySpMat(matA);
+}
+
+// spmv_csr_f16f32_int_non: fp16 matrix/x, widened float32 y. Same
+// run_csr_mixed path as the int8 tests above (ACC=float32 either way); values
+// kept exactly fp16-representable (halves) so there is no rounding to reason
+// about, isolating this test to "does the mixed dispatch route correctly."
+TEST_F(SpMVAccuracy, Float16ToFloat32MixedPrecision) {
+    const std::vector<Half> data = {Half(2.5), Half(-1.5), Half(0.5), Half(4.0)};
+    const std::vector<int32_t> indices = {0, 1, 1, 2};
+    const std::vector<int32_t> indptr = {0, 2, 3, 4};
+    const std::vector<Half> x = {Half(2.0), Half(-2.0), Half(1.0)};
+    // row0=2.5*2 + -1.5*-2 = 8; row1=0.5*-2=-1; row2=4*1=4
+    const std::vector<float> expect = {8.0f, -1.0f, 4.0f};
+
+    DeviceBuffer d_data = DeviceBuffer::from(data);
+    DeviceBuffer d_idx = DeviceBuffer::from(indices);
+    DeviceBuffer d_ptr = DeviceBuffer::from(indptr);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y(3 * sizeof(float));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateCsr(&matA, 3, 3, 4, d_ptr.get(), d_idx.get(), d_data.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_16F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_R_16F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const float one = 1.0f, zero = 0.0f;
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA,
+                             vecX, &zero, vecY, FLAGSPARSE_R_32F,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const std::vector<float> got = d_y.download<float>(3);
+    for (int i = 0; i < 3; ++i) EXPECT_FLOAT_EQ(got[i], expect[i]) << "row " << i;
+
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, RealFloat32ByComplex64MixedPrecision) {
+    // A = [[2, 0, -1], [0, 3, 4]], x = [1+2i, -2+i, 0.5-3i].
+    const std::vector<float> data{2.0f, -1.0f, 3.0f, 4.0f};
+    const std::vector<int32_t> indices{0, 2, 1, 2};
+    const std::vector<int32_t> indptr{0, 2, 4};
+    const std::vector<float> x_ri{1.0f, 2.0f, -2.0f, 1.0f, 0.5f, -3.0f};
+    const std::vector<float> expect_ri{1.5f, 7.0f, -4.0f, -9.0f};
+
+    DeviceBuffer d_data = DeviceBuffer::from(data);
+    DeviceBuffer d_idx = DeviceBuffer::from(indices);
+    DeviceBuffer d_ptr = DeviceBuffer::from(indptr);
+    DeviceBuffer d_x = DeviceBuffer::from(x_ri);
+    DeviceBuffer d_y = DeviceBuffer::from(std::vector<float>(4, 99.0f));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateCsr(&matA, 2, 3, 4, d_ptr.get(), d_idx.get(), d_data.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_C_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 2, d_y.get(), FLAGSPARSE_C_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const float one[2] = {1.0f, 0.0f};
+    const float zero[2] = {0.0f, 0.0f};
+    size_t bufsz = 12345;
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        one, matA, vecX, zero, vecY,
+                                        FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT,
+                                        &bufsz),
+              FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(bufsz, 0u);
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, one, matA,
+                             vecX, zero, vecY, FLAGSPARSE_C_32F,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    EXPECT_EQ(d_y.download<float>(4), expect_ri);
+
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, SellInt8ToInt32MixedPrecision) {
+    // Slice size 2. A = [[2,0,-1], [0,3,4], [-2,0,0]]; the final entry pads
+    // the incomplete second slice and must be ignored through col=-1.
+    const std::vector<int32_t> offsets{0, 4, 6};
+    const std::vector<int32_t> cols{0, 1, 2, 2, 0, -1};
+    const std::vector<int8_t> values{2, 3, -1, 4, -2, 0};
+    const std::vector<int8_t> x{3, -2, 5};
+    const std::vector<int32_t> expected{1, 14, -6};
+
+    DeviceBuffer d_offsets = DeviceBuffer::from(offsets);
+    DeviceBuffer d_cols = DeviceBuffer::from(cols);
+    DeviceBuffer d_values = DeviceBuffer::from(values);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y = DeviceBuffer::from(std::vector<int32_t>(3, 99));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateSlicedEll(
+                  &matA, 3, 3, 2, d_offsets.get(), d_cols.get(), d_values.get(),
+                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32I),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const int32_t one = 1, zero = 0;
+    size_t buffer_size = 12345;
+    ASSERT_EQ(flagsparseSpMV_bufferSize(
+                  handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, vecX,
+                  &zero, vecY, FLAGSPARSE_R_32I, FLAGSPARSE_SPMV_SELL_ALG1,
+                  &buffer_size),
+              FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(buffer_size, 0u);
+    ASSERT_EQ(flagsparseSpMV(
+                  handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, vecX,
+                  &zero, vecY, FLAGSPARSE_R_32I, FLAGSPARSE_SPMV_SELL_ALG1, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    EXPECT_EQ(d_y.download<int32_t>(3), expected);
+
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, SellFloat32MatchesHostReference) {
+    const std::vector<int32_t> offsets{0, 4, 6};
+    const std::vector<int32_t> cols{0, 1, 2, 2, 0, -1};
+    const std::vector<float> values{2.0f, 3.0f, -1.0f, 4.0f, -2.0f, 0.0f};
+    const std::vector<float> x{3.0f, -2.0f, 5.0f};
+    const std::vector<float> expected{1.0f, 14.0f, -6.0f};
+    DeviceBuffer d_offsets = DeviceBuffer::from(offsets);
+    DeviceBuffer d_cols = DeviceBuffer::from(cols);
+    DeviceBuffer d_values = DeviceBuffer::from(values);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y = DeviceBuffer::from(std::vector<float>(3, 99.0f));
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateSlicedEll(&matA, 3, 3, 2, d_offsets.get(), d_cols.get(),
+                                        d_values.get(), FLAGSPARSE_INDEX_32I,
+                                        FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+    const float one = 1.0f, zero = 0.0f;
+    size_t buffer = 0;
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &one, matA, vecX, &zero, vecY, FLAGSPARSE_R_32F,
+                                        FLAGSPARSE_SPMV_SELL_ALG1, &buffer), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                             &one, matA, vecX, &zero, vecY, FLAGSPARSE_R_32F,
+                             FLAGSPARSE_SPMV_SELL_ALG1, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    EXPECT_EQ(d_y.download<float>(3), expected);
+    flagsparseDestroyDnVec(vecY); flagsparseDestroyDnVec(vecX); flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, SellComplex64MatchesHostReference) {
+    using C = std::complex<float>;
+    const std::vector<int32_t> offsets{0, 4, 6};
+    const std::vector<int32_t> cols{0, 1, 2, 2, 0, -1};
+    const std::vector<C> values{C(2, 1), C(3, -1), C(-1, 2), C(4, 0), C(-2, 1), C(0, 0)};
+    const std::vector<C> x{C(3, 1), C(-2, 0), C(5, -1)};
+    const std::vector<C> expected{C(2, 16), C(14, -2), C(-7, 1)};
+    DeviceBuffer d_offsets = DeviceBuffer::from(offsets);
+    DeviceBuffer d_cols = DeviceBuffer::from(cols);
+    DeviceBuffer d_values = DeviceBuffer::from(values);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y = DeviceBuffer::from(std::vector<C>(3, C(99, 99)));
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateSlicedEll(&matA, 3, 3, 2, d_offsets.get(), d_cols.get(),
+                                        d_values.get(), FLAGSPARSE_INDEX_32I,
+                                        FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    const C one(1, 0), zero(0, 0);
+    size_t buffer = 0;
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &one, matA, vecX, &zero, vecY, FLAGSPARSE_C_32F,
+                                        FLAGSPARSE_SPMV_SELL_ALG1, &buffer), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                             &one, matA, vecX, &zero, vecY, FLAGSPARSE_C_32F,
+                             FLAGSPARSE_SPMV_SELL_ALG1, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    EXPECT_EQ(d_y.download<C>(3), expected);
+    flagsparseDestroyDnVec(vecY); flagsparseDestroyDnVec(vecX); flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, SellFloat16MatchesHostReference) {
+    const std::vector<int32_t> offsets{0, 4, 6};
+    const std::vector<int32_t> cols{0, 1, 2, 2, 0, -1};
+    const std::vector<Half> values{2.0, 3.0, -1.0, 4.0, -2.0, 0.0};
+    const std::vector<Half> x{3.0, -2.0, 5.0};
+    const std::vector<Half> expected{1.0, 14.0, -6.0};
+    DeviceBuffer d_offsets = DeviceBuffer::from(offsets);
+    DeviceBuffer d_cols = DeviceBuffer::from(cols);
+    DeviceBuffer d_values = DeviceBuffer::from(values);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y = DeviceBuffer::from(std::vector<Half>(3, Half(99.0)));
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateSlicedEll(&matA, 3, 3, 2, d_offsets.get(), d_cols.get(),
+                                        d_values.get(), FLAGSPARSE_INDEX_32I,
+                                        FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_16F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_R_16F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_16F), FLAGSPARSE_STATUS_SUCCESS);
+    const Half one(1.0), zero(0.0);
+    size_t buffer = 0;
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &one, matA, vecX, &zero, vecY, FLAGSPARSE_R_16F,
+                                        FLAGSPARSE_SPMV_SELL_ALG1, &buffer), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                             &one, matA, vecX, &zero, vecY, FLAGSPARSE_R_16F,
+                             FLAGSPARSE_SPMV_SELL_ALG1, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    EXPECT_EQ(d_y.download<Half>(3), expected);
+    flagsparseDestroyDnVec(vecY); flagsparseDestroyDnVec(vecX); flagsparseDestroySpMat(matA);
+}
+
+// spmv_coo_i8i32_int_non / spmv_coo_i8f32_int_non: same dtype-pair table
+// as the CSR mixed tests above (mixed_narrow_wide_pair is shared), but routed
+// through run_coo_mixed's nnz-parallel atomic_add kernel instead of a
+// row-tiled one -- same (row,col) pairs as the CSR tests' (indptr,indices),
+// just spelled as COO coordinates, so the expected sums are identical.
+TEST_F(SpMVAccuracy, CooInt8ToInt32MixedPrecision) {
+    const std::vector<int8_t> data = {2, -3, 1, 4, -1, 2};
+    const std::vector<int32_t> rows = {0, 0, 1, 1, 2, 2};
+    const std::vector<int32_t> cols = {0, 2, 2, 3, 0, 1};
+    const std::vector<int8_t> x = {3, -2, 5, -1};
+    const std::vector<int32_t> expect = {-9, 1, -7};
+
+    DeviceBuffer d_data = DeviceBuffer::from(data);
+    DeviceBuffer d_rows = DeviceBuffer::from(rows);
+    DeviceBuffer d_cols = DeviceBuffer::from(cols);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y(3 * sizeof(int32_t));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateCoo(&matA, 3, 4, 6, d_rows.get(), d_cols.get(), d_data.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                                  FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 4, d_x.get(), FLAGSPARSE_R_8I),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32I),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const int32_t one = 1, zero = 0;
+    size_t bufsz = 12345;  // must come back 0 -- the atomic route needs no scratch.
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &one, matA, vecX, &zero, vecY,
+                                        FLAGSPARSE_R_32I, FLAGSPARSE_SPMV_ALG_DEFAULT,
+                                        &bufsz),
+              FLAGSPARSE_STATUS_SUCCESS);
+    EXPECT_EQ(bufsz, 0u);
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA,
+                             vecX, &zero, vecY, FLAGSPARSE_R_32I,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const std::vector<int32_t> got = d_y.download<int32_t>(3);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(got[i], expect[i]) << "row " << i;
+
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroySpMat(matA);
+}
+
+TEST_F(SpMVAccuracy, CooFloat16ToFloat32MixedPrecision) {
+    const std::vector<Half> data = {Half(2.5), Half(-1.5), Half(0.5), Half(4.0)};
+    const std::vector<int32_t> rows = {0, 0, 1, 2};
+    const std::vector<int32_t> cols = {0, 1, 1, 2};
+    const std::vector<Half> x = {Half(2.0), Half(-2.0), Half(1.0)};
+    // row0=2.5*2 + -1.5*-2 = 8; row1=0.5*-2=-1; row2=4*1=4
+    const std::vector<float> expect = {8.0f, -1.0f, 4.0f};
+
+    DeviceBuffer d_data = DeviceBuffer::from(data);
+    DeviceBuffer d_rows = DeviceBuffer::from(rows);
+    DeviceBuffer d_cols = DeviceBuffer::from(cols);
+    DeviceBuffer d_x = DeviceBuffer::from(x);
+    DeviceBuffer d_y(3 * sizeof(float));
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    ASSERT_EQ(flagsparseCreateCoo(&matA, 3, 3, 4, d_rows.get(), d_cols.get(), d_data.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                                  FLAGSPARSE_R_16F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecX, 3, d_x.get(), FLAGSPARSE_R_16F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vecY, 3, d_y.get(), FLAGSPARSE_R_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+
+    const float one = 1.0f, zero = 0.0f;
+    ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &one, matA,
+                             vecX, &zero, vecY, FLAGSPARSE_R_32F,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const std::vector<float> got = d_y.download<float>(3);
+    for (int i = 0; i < 3; ++i) EXPECT_FLOAT_EQ(got[i], expect[i]) << "row " << i;
+
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroySpMat(matA);
+}
+
+// spmv_csr_f16_int_non: same dispatch as fp32/fp64, just fp16 storage.
+// Row density kept modest (mean nnz/row ~5, matching the smaller of the
+// fp32 shapes above): fp16 error is input-quantization noise that grows with
+// how many nonzeros a row sums, same reason sddmm's fp16 ctest picked a
+// modest k (see ctest/accuracy/test_sddmm.cpp's Float16 test).
+TEST_F(SpMVAccuracy, Float16MatchesHostReference) {
+    const CsrMatrix A = random_csr(64, 96, 0.03, 1234);
+    const RunResult r = run_spmv<Half>(handle.h, A, FLAGSPARSE_R_16F, 1.0, 0.0, 7);
+    expect_close(r, "fp16", handle.h);
+}
+
 TEST_F(SpMVAccuracy, Float64MatchesHostReference) {
     const CsrMatrix A = random_csr(256, 320, 0.05, 99);
     const RunResult r = run_spmv<double>(handle.h, A, FLAGSPARSE_R_64F, 1.0, 0.0, 11);
@@ -205,8 +627,9 @@ TEST_F(SpMVAccuracy, RejectsMismatchedVectorLength) {
     flagsparseDestroySpMat(matA);
 }
 
-// Unported paths must say NOT_SUPPORTED, never crash (spec §4.4).
-TEST_F(SpMVAccuracy, TransposeReportsNotSupported) {
+// Types outside the fp32/c32 transpose kernels must still report the
+// capability boundary instead of launching an incompatible atomic kernel.
+TEST_F(SpMVAccuracy, Float64TransposeReportsNotSupported) {
     const CsrMatrix A = random_csr(32, 32, 0.1, 8);
     DeviceBuffer d_val = DeviceBuffer::from(std::vector<float>(A.values.begin(), A.values.end()));
     DeviceBuffer d_col = DeviceBuffer::from(A.indices);
@@ -223,7 +646,7 @@ TEST_F(SpMVAccuracy, TransposeReportsNotSupported) {
     flagsparseCreateDnVec(&vecY, A.cols, d_y.get(), FLAGSPARSE_R_32F);
     const float one = 1.0f, zero = 0.0f;
     EXPECT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, &one, matA, vecX,
-                             &zero, vecY, FLAGSPARSE_R_32F,
+                             &zero, vecY, FLAGSPARSE_R_64F,
                              FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
               FLAGSPARSE_STATUS_NOT_SUPPORTED);
     flagsparseDestroyDnVec(vecY);
@@ -401,11 +824,15 @@ RunResult run_spmv_complex(flagsparseHandle_t handle, const CsrMatrix& A,
                            flagsparseFormat_t format, flagsparseDataType_t dtype,
                            std::complex<double> alpha, std::complex<double> beta,
                            uint32_t seed,
-                           flagsparseSpMVAlg_t alg = FLAGSPARSE_SPMV_ALG_DEFAULT) {
+                           flagsparseSpMVAlg_t alg = FLAGSPARSE_SPMV_ALG_DEFAULT,
+                           flagsparseOperation_t opA = FLAGSPARSE_OPERATION_NON_TRANSPOSE) {
     using C64 = std::complex<double>;
     RunResult out;
+    const bool trans = opA != FLAGSPARSE_OPERATION_NON_TRANSPOSE;
     const auto m = static_cast<std::size_t>(A.rows);
     const auto n = static_cast<std::size_t>(A.cols);
+    const auto x_size = trans ? m : n;
+    const auto y_size = trans ? n : m;
 
     std::mt19937 rng(seed);
     std::normal_distribution<double> dist(0.0, 1.0);
@@ -413,20 +840,20 @@ RunResult run_spmv_complex(flagsparseHandle_t handle, const CsrMatrix& A,
     for (std::size_t i = 0; i < a_vals.size(); ++i) {
         a_vals[i] = C64(A.values[i], dist(rng));
     }
-    std::vector<C64> x64(n), y64(m);
+    std::vector<C64> x64(x_size), y64(y_size);
     for (auto& v : x64) v = C64(dist(rng), dist(rng));
     for (auto& v : y64) v = C64(dist(rng), dist(rng));
 
-    std::vector<R> a_dev(a_vals.size() * 2), x_dev(n * 2), y_dev(m * 2);
+    std::vector<R> a_dev(a_vals.size() * 2), x_dev(x_size * 2), y_dev(y_size * 2);
     for (std::size_t i = 0; i < a_vals.size(); ++i) {
         a_dev[i * 2]     = static_cast<R>(a_vals[i].real());
         a_dev[i * 2 + 1] = static_cast<R>(a_vals[i].imag());
     }
-    for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t i = 0; i < x_size; ++i) {
         x_dev[i * 2] = static_cast<R>(x64[i].real());
         x_dev[i * 2 + 1] = static_cast<R>(x64[i].imag());
     }
-    for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t i = 0; i < y_size; ++i) {
         y_dev[i * 2] = static_cast<R>(y64[i].real());
         y_dev[i * 2 + 1] = static_cast<R>(y64[i].imag());
     }
@@ -450,47 +877,52 @@ RunResult run_spmv_complex(flagsparseHandle_t handle, const CsrMatrix& A,
                                   FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
                                   dtype);
     if (out.status != FLAGSPARSE_STATUS_SUCCESS) return out;
-    flagsparseCreateDnVec(&vecX, A.cols, d_x.get(), dtype);
-    flagsparseCreateDnVec(&vecY, A.rows, d_y.get(), dtype);
+    flagsparseCreateDnVec(&vecX, static_cast<int64_t>(x_size), d_x.get(), dtype);
+    flagsparseCreateDnVec(&vecY, static_cast<int64_t>(y_size), d_y.get(), dtype);
 
     const R alpha_t[2] = {static_cast<R>(alpha.real()), static_cast<R>(alpha.imag())};
     const R beta_t[2]  = {static_cast<R>(beta.real()),  static_cast<R>(beta.imag())};
     size_t buffer_size = 0;
-    out.status = flagsparseSpMV_bufferSize(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+    out.status = flagsparseSpMV_bufferSize(handle, opA,
                                            alpha_t, matA, vecX, beta_t, vecY, dtype, alg,
                                            &buffer_size);
     DeviceBuffer scratch(buffer_size);
     if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
-        out.status = flagsparseSpMV_preprocess(handle,
-                                               FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+        out.status = flagsparseSpMV_preprocess(handle, opA,
                                                alpha_t, matA, vecX, beta_t, vecY, dtype,
                                                alg, scratch.get());
     }
     if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
-        out.status = flagsparseSpMV(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE, alpha_t,
+        out.status = flagsparseSpMV(handle, opA, alpha_t,
                                     matA, vecX, beta_t, vecY, dtype, alg, scratch.get());
     }
     dev_sync();
 
     if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
-        const std::vector<R> got = d_y.download<R>(m * 2);
+        const std::vector<R> got = d_y.download<R>(y_size * 2);
         // Real and imaginary parts compared as one flat vector: the result is
         // wrong if either component is.
         std::vector<double> actual, ref;
-        actual.reserve(m * 2); ref.reserve(m * 2);
+        actual.reserve(y_size * 2); ref.reserve(y_size * 2);
+        std::vector<C64> want = y64;
+        for (auto& v : want) v = beta * v;
         for (int64_t r = 0; r < A.rows; ++r) {
-            C64 acc(0.0, 0.0);
             for (int32_t p = A.indptr[static_cast<std::size_t>(r)];
                  p < A.indptr[static_cast<std::size_t>(r) + 1]; ++p) {
-                acc += a_vals[static_cast<std::size_t>(p)] *
-                       x64[static_cast<std::size_t>(A.indices[static_cast<std::size_t>(p)])];
+                C64 value = a_vals[static_cast<std::size_t>(p)];
+                if (opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) value = std::conj(value);
+                const std::size_t in = static_cast<std::size_t>(
+                    trans ? r : A.indices[static_cast<std::size_t>(p)]);
+                const std::size_t out_index = static_cast<std::size_t>(
+                    trans ? A.indices[static_cast<std::size_t>(p)] : r);
+                want[out_index] += alpha * value * x64[in];
             }
-            C64 want = alpha * acc;
-            if (beta != C64(0.0, 0.0)) want += beta * y64[static_cast<std::size_t>(r)];
-            actual.push_back(static_cast<double>(got[static_cast<std::size_t>(r) * 2]));
-            actual.push_back(static_cast<double>(got[static_cast<std::size_t>(r) * 2 + 1]));
-            ref.push_back(want.real());
-            ref.push_back(want.imag());
+        }
+        for (std::size_t i = 0; i < y_size; ++i) {
+            actual.push_back(static_cast<double>(got[i * 2]));
+            actual.push_back(static_cast<double>(got[i * 2 + 1]));
+            ref.push_back(want[i].real());
+            ref.push_back(want[i].imag());
         }
         out.strict_ratio = max_error_ratio(actual, ref, default_tolerance(dtype));
         if (out.strict_ratio > 1.0) {
@@ -538,6 +970,30 @@ TEST_F(SpMVAccuracy, ComplexCooRoutesAgree) {
     }
 }
 
+TEST_F(SpMVAccuracy, CsrAndCooFloat32TransposeMatchHostReference) {
+    const CsrMatrix A = random_csr(73, 91, 0.07, 71);
+    for (auto format : {FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_FORMAT_COO}) {
+        expect_close(run_spmv_fmt<float>(handle.h, A, format,
+                                         FLAGSPARSE_OPERATION_TRANSPOSE,
+                                         FLAGSPARSE_R_32F, 1.25, -0.5, 19),
+                     format == FLAGSPARSE_FORMAT_CSR ? "csr_f32_trans" : "coo_f32_trans",
+                     handle.h);
+    }
+}
+
+TEST_F(SpMVAccuracy, CsrAndCooComplex64ConjugateTransposeMatchHostReference) {
+    const CsrMatrix A = random_csr(67, 89, 0.08, 73);
+    for (auto format : {FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_FORMAT_COO}) {
+        expect_close(run_spmv_complex<float>(handle.h, A, format, FLAGSPARSE_C_32F,
+                                              std::complex<double>(1.25, -0.75),
+                                              std::complex<double>(-0.5, 0.25), 23,
+                                              FLAGSPARSE_SPMV_ALG_DEFAULT,
+                                              FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE),
+                     format == FLAGSPARSE_FORMAT_CSR ? "csr_c32_conj" : "coo_c32_conj",
+                     handle.h);
+    }
+}
+
 TEST_F(SpMVAccuracy, CooMatchesHostReference) {
     for (auto shape : {std::pair<int64_t, int64_t>{64, 96}, {257, 129}, {1, 32}}) {
         const CsrMatrix A = random_csr(shape.first, shape.second, 0.05, 1234);
@@ -550,6 +1006,16 @@ TEST_F(SpMVAccuracy, CooMatchesHostReference) {
                                           FLAGSPARSE_R_64F, -2.5, 0.75, 11),
                      "coo_fp64_alpha_beta", handle.h);
     }
+}
+
+// spmv_coo_f16_int_non. Same modest-density reasoning as the CSR fp16
+// test above (mean nnz/row ~5).
+TEST_F(SpMVAccuracy, CooFloat16MatchesHostReference) {
+    const CsrMatrix A = random_csr(64, 96, 0.03, 1234);
+    expect_close(run_spmv_fmt<Half>(handle.h, A, FLAGSPARSE_FORMAT_COO,
+                                    FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                    FLAGSPARSE_R_16F, 1.0, 0.0, 7),
+                 "coo_fp16", handle.h);
 }
 
 // Interior rows with no nonzeros must still pick up beta * y -- the COO segment
@@ -572,6 +1038,74 @@ TEST_F(SpMVAccuracy, CooEmptyRowsStillApplyBeta) {
 // per column); the non-transposed one scatters with atomics and takes its beta
 // from the dense prologue, so it is the one that would break first if that
 // prologue were wrong.
+TEST_F(SpMVAccuracy, GatherComplexDuplicatesEmptyRowsAndLiveTopology) {
+    using C = std::complex<float>;
+    // Same compressed structure denotes CSR(4x5)^H or CSC(5x4).
+    const std::vector<int32_t> ptr{0, 2, 2, 3, 4}, indices{0, 0, 2, 1};
+    const std::vector<C> values{C(1, 2), C(-2, 1), C(3, -1), C(2, 4)};
+    const std::vector<C> x{C(2, 1), C(-1, 3), C(1, -2), C(4, 1)};
+    const std::vector<C> initial(5, C(1, -1));
+    const C alpha(1.25f, -0.75f), beta(-0.5f, 0.25f);
+    for (auto format : {FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_FORMAT_CSC}) {
+        const bool csr = format == FLAGSPARSE_FORMAT_CSR;
+        const auto op = csr ? FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE
+                            : FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+        auto dp = DeviceBuffer::from(ptr), di = DeviceBuffer::from(indices);
+        auto dv = DeviceBuffer::from(values), dx = DeviceBuffer::from(x);
+        auto dy = DeviceBuffer::from(initial);
+        flagsparseSpMatDescr_t a = nullptr;
+        flagsparseDnVecDescr_t xd = nullptr, yd = nullptr;
+        if (csr) {
+            ASSERT_EQ(flagsparseCreateCsr(&a, 4, 5, 4, dp.get(), di.get(), dv.get(),
+                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        } else {
+            ASSERT_EQ(flagsparseCreateCsc(&a, 5, 4, 4, dp.get(), di.get(), dv.get(),
+                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        }
+        ASSERT_EQ(flagsparseCreateDnVec(&xd, 4, dx.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnVec(&yd, 5, dy.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, op, &alpha, a, xd, &beta, yd,
+            FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+        DeviceBuffer scratch(bytes), second(bytes);
+        ASSERT_EQ(flagsparseSpMV_preprocess(handle.h, op, &alpha, a, xd, &beta, yd,
+            FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+        auto current_ptr = ptr;
+        auto current_values = values;
+        for (int step = 0; step < 3; ++step) {
+            // New scratch must prepare lazily; replacing CSR pointers invalidates topology.
+            if (step == 1) {
+                for (auto& v : current_values) v *= C(0.5f, 0.25f);
+                ASSERT_EQ(to_device(dv.get(), current_values.data(), current_values.size() * sizeof(C)),
+                    FLAGSPARSE_STATUS_SUCCESS);
+            }
+            if (step == 2 && csr) {
+                current_ptr = {0, 1, 1, 2, 4};
+                ASSERT_EQ(to_device(dp.get(), current_ptr.data(), current_ptr.size() * sizeof(int32_t)),
+                    FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(flagsparseCsrSetPointers(a, dp.get(), di.get(), dv.get()), FLAGSPARSE_STATUS_SUCCESS);
+            }
+            ASSERT_EQ(to_device(dy.get(), initial.data(), initial.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(flagsparseSpMV(handle.h, op, &alpha, a, xd, &beta, yd,
+                FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT,
+                step == 0 ? scratch.get() : second.get()), FLAGSPARSE_STATUS_SUCCESS);
+            dev_sync();
+            std::vector<C> expected(5, beta * initial[0]);
+            for (int r = 0; r < 4; ++r)
+                for (int p = current_ptr[r]; p < current_ptr[r + 1]; ++p)
+                    expected[indices[p]] += alpha * (csr ? std::conj(current_values[p]) : current_values[p]) * x[r];
+            const auto got = dy.download<C>(5);
+            for (size_t i = 0; i < got.size(); ++i) {
+                EXPECT_NEAR(got[i].real(), expected[i].real(), 1e-5f);
+                EXPECT_NEAR(got[i].imag(), expected[i].imag(), 1e-5f);
+            }
+        }
+        flagsparseDestroyDnVec(yd); flagsparseDestroyDnVec(xd); flagsparseDestroySpMat(a);
+    }
+}
+
 TEST_F(SpMVAccuracy, CscBothDirections) {
     for (auto shape : {std::pair<int64_t, int64_t>{64, 96}, {129, 257}}) {
         const CsrMatrix A = random_csr(shape.first, shape.second, 0.05, 55);

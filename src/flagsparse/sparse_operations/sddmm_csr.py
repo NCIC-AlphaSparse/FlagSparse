@@ -19,7 +19,7 @@ import math
 
 from ._common import *
 
-SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64)
+SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64, torch.float16, torch.complex64)
 _ASCEND_ROW_IDS_CACHE = {}
 
 
@@ -742,6 +742,70 @@ def _sddmm_csr_real_kernel_altreduce(
     tl.store(out_ptr + offs_p, out_vals, mask=mask_p)
 
 
+@triton.jit
+def _sddmm_csr_complex_kernel(
+    indices_ptr,
+    row_ids_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    in_ri_ptr,
+    out_ri_ptr,
+    nnz,
+    k_dim,
+    stride_xm,
+    stride_xk,
+    stride_ym,
+    stride_yk,
+    alpha,
+    beta,
+    HAS_IN: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    """Complex counterpart of _sddmm_csr_real_kernel.
+
+    Triton has no complex type, so x/y/data/out arrive as the real view of the
+    interleaved storage (torch.view_as_real), and every index into them is scaled
+    by 2 for the (real, imag) pair -- the same convention spmv_csr.py's
+    _spmv_csr_complex_kernel uses. alpha/beta stay real here: nothing in this
+    package multiplies an SDDMM result by a complex scalar, so a complex alpha/
+    beta split is not implemented (would need alpha_re/alpha_im like spv_csr's
+    kernel, and cross terms in `out_vals` below).
+    """
+    pid = tl.program_id(0)
+    offs_p = pid * BLOCK_P + tl.arange(0, BLOCK_P)
+    mask_p = offs_p < nnz
+
+    rows = tl.load(row_ids_ptr + offs_p, mask=mask_p, other=0)
+    cols = tl.load(indices_ptr + offs_p, mask=mask_p, other=0)
+    acc_re = tl.zeros([BLOCK_P], dtype=ACC_DTYPE)
+    acc_im = tl.zeros([BLOCK_P], dtype=ACC_DTYPE)
+
+    for k0 in tl.range(0, k_dim, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < k_dim
+        xy_mask = mask_p[:, None] & mask_k[None, :]
+        x_base = (rows[:, None] * stride_xm + offs_k[None, :] * stride_xk) * 2
+        y_base = (cols[:, None] * stride_ym + offs_k[None, :] * stride_yk) * 2
+        x_re = tl.load(x_ri_ptr + x_base, mask=xy_mask, other=0.0).to(ACC_DTYPE)
+        x_im = tl.load(x_ri_ptr + x_base + 1, mask=xy_mask, other=0.0).to(ACC_DTYPE)
+        y_re = tl.load(y_ri_ptr + y_base, mask=xy_mask, other=0.0).to(ACC_DTYPE)
+        y_im = tl.load(y_ri_ptr + y_base + 1, mask=xy_mask, other=0.0).to(ACC_DTYPE)
+        acc_re += tl.sum(x_re * y_re - x_im * y_im, axis=1)
+        acc_im += tl.sum(x_re * y_im + x_im * y_re, axis=1)
+
+    out_re = acc_re * alpha
+    out_im = acc_im * alpha
+    if HAS_IN:
+        in_re = tl.load(in_ri_ptr + offs_p * 2, mask=mask_p, other=0.0).to(ACC_DTYPE)
+        in_im = tl.load(in_ri_ptr + offs_p * 2 + 1, mask=mask_p, other=0.0).to(ACC_DTYPE)
+        out_re += in_re * beta
+        out_im += in_im * beta
+    tl.store(out_ri_ptr + offs_p * 2, out_re, mask=mask_p)
+    tl.store(out_ri_ptr + offs_p * 2 + 1, out_im, mask=mask_p)
+
+
 def _validate_sddmm_dense_inputs(data, prepared, x, y):
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError("x and y must be 2D dense tensors")
@@ -750,7 +814,9 @@ def _validate_sddmm_dense_inputs(data, prepared, x, y):
     if x.device != y.device or x.device != prepared.indices.device:
         raise ValueError("x, y, and sparse pattern must be on the same CUDA device")
     if x.dtype not in SUPPORTED_SDDMM_VALUE_DTYPES:
-        raise TypeError("x dtype must be torch.float32 or torch.float64")
+        raise TypeError(
+            "x dtype must be torch.float16, torch.float32, torch.float64, or torch.complex64"
+        )
     if y.dtype != x.dtype:
         raise TypeError("y dtype must match x dtype")
     if data is not None and data.dtype != x.dtype:
@@ -799,6 +865,8 @@ def _normalize_sddmm_diagnostic_variant(variant):
 def _resolve_sddmm_diagnostic_kernel(variant, value_dtype):
     variant = _normalize_sddmm_diagnostic_variant(variant)
     if variant == "baseline":
+        if _is_complex_dtype(value_dtype):
+            return _sddmm_csr_complex_kernel, tl.float32
         acc_dtype = tl.float64 if value_dtype == torch.float64 else tl.float32
         return _sddmm_csr_real_kernel, acc_dtype
     if variant in ("acc64", "acc64_out64"):
@@ -873,21 +941,34 @@ def _run_sddmm_prepared(
     kernel, acc_dtype = _resolve_sddmm_diagnostic_kernel(variant, x.dtype)
     grid = (triton.cdiv(nnz, block_p),)
     fallback_used = False
+    # Strides captured in COMPLEX-element units before view_as_real (which adds
+    # a trailing size-2 axis); the complex kernel scales indices by 2 itself, the
+    # same convention _spmv_csr_complex_kernel uses.
+    stride_xm, stride_xk = x.stride(0), x.stride(1)
+    stride_ym, stride_yk = y.stride(0), y.stride(1)
+    in_arg = data if data is not None else out
+    if _is_complex_dtype(x.dtype):
+        x_arg, y_arg, in_arg, out_arg = (
+            torch.view_as_real(x), torch.view_as_real(y),
+            torch.view_as_real(in_arg), torch.view_as_real(out),
+        )
+    else:
+        x_arg, y_arg, out_arg = x, y, out
     if allow_fallback:
         try:
             kernel[grid](
                 prepared.indices,
                 prepared.row_ids,
-                x,
-                y,
-                data if data is not None else out,
-                out,
+                x_arg,
+                y_arg,
+                in_arg,
+                out_arg,
                 nnz,
                 k_dim,
-                x.stride(0),
-                x.stride(1),
-                y.stride(0),
-                y.stride(1),
+                stride_xm,
+                stride_xk,
+                stride_ym,
+                stride_yk,
                 float(alpha),
                 float(beta),
                 HAS_IN=data is not None,
@@ -907,16 +988,16 @@ def _run_sddmm_prepared(
         kernel[grid](
             prepared.indices,
             prepared.row_ids,
-            x,
-            y,
-            data if data is not None else out,
-            out,
+            x_arg,
+            y_arg,
+            in_arg,
+            out_arg,
             nnz,
             k_dim,
-            x.stride(0),
-            x.stride(1),
-            y.stride(0),
-            y.stride(1),
+            stride_xm,
+            stride_xk,
+            stride_ym,
+            stride_yk,
             float(alpha),
             float(beta),
             HAS_IN=data is not None,
@@ -936,6 +1017,37 @@ def _run_sddmm_prepared(
     }
 
 
+def _normalize_sddmm_dense_op(op, default):
+    token = default if op is None else str(op).strip().lower()
+    token = {"0": "non", "n": "non", "non_trans": "non", "1": "trans", "t": "trans",
+             "2": "conj", "c": "conj", "conj_trans": "conj"}.get(token, token)
+    if token not in ("non", "trans", "conj"):
+        raise ValueError("op_a/op_b must be one of: non, trans, conj")
+    # SDDMM values are real (float32/float64), so conj(B^T) is B^T.
+    return "trans" if token == "conj" else token
+
+
+def _apply_sddmm_dense_ops(x, y, op_a, op_b, dense_layout):
+    """Map cuSPARSE (op_a, op_b, layout) onto the kernel's x: M x K, y: N x K views."""
+    if op_a is None and op_b is None and dense_layout is None:
+        return x, y
+    if not (torch.is_tensor(x) and torch.is_tensor(y) and x.ndim == 2 and y.ndim == 2):
+        raise ValueError("x and y must be 2D tensors")
+    if dense_layout is not None:
+        layout = str(dense_layout).strip().lower()
+        if layout not in ("row", "col"):
+            raise ValueError("dense_layout must be 'row' or 'col'")
+        for t, name in ((x, "x"), (y, "y")):
+            unit = t.stride(1) == 1 if layout == "row" else t.stride(0) == 1
+            if not unit and t.numel() > 1:
+                raise ValueError(f"{name} is not stored {layout}-major")
+    if _normalize_sddmm_dense_op(op_a, "non") == "trans":
+        x = x.transpose(0, 1)
+    if _normalize_sddmm_dense_op(op_b, "trans") == "non":
+        y = y.transpose(0, 1)
+    return x, y
+
+
 def flagsparse_sddmm_csr(
     data=None,
     indices=None,
@@ -951,12 +1063,24 @@ def flagsparse_sddmm_csr(
     return_meta=False,
     allow_fallback=False,
     validate=True,
+    *,
+    op_a=None,
+    op_b=None,
+    dense_layout=None,
 ):
     """CSR SDDMM: out[p] = alpha * dot(x[row(p)], y[col(p)]) + beta * data[p].
 
     ``validate=False`` is forwarded to :func:`prepare_sddmm_csr` and only applies
     when this call builds the prepared pattern itself.
+
+    ``op_a`` / ``op_b`` follow ``cusparseSDDMM``: C = op(A) @ op(B) sampled on the
+    pattern, with ``x`` holding A and ``y`` holding B. ``op_a='non'``: x is M x K;
+    ``'trans'``: x is K x M. ``op_b='non'``: y is K x N; ``'trans'``: y is N x K.
+    ``op_b=None`` keeps this function's historical layout, y is N x K -- which is
+    cuSPARSE opB=TRANS (the hipSPARSE baseline calls it that way). ``dense_layout``
+    ('row' / 'col') checks how x and y are stored; any strides are read in place.
     """
+    x, y = _apply_sddmm_dense_ops(x, y, op_a, op_b, dense_layout)
     # Ascend 910B currently fails lowering the generic Triton SDDMM kernel.  Compute the
     # sampled dense products with torch_npu indexing instead; CUDA/ROCm/MetaX/MUSA fall
     # through to the Triton path unchanged.
@@ -1066,10 +1190,13 @@ def flagsparse_sddmm_csr(
     if timed:
         _ACCEL.synchronize()
     t0 = time.perf_counter()
+    # x / y go in as views: the kernel reads them through their strides, so a
+    # transposed op_a/op_b or a column-major operand needs no copy (``contiguous``
+    # here used to copy both inside the timed window; row-major input is unchanged).
     out_tensor, launch_meta = _run_sddmm_prepared(
         prepared,
-        x.contiguous(),
-        y.contiguous(),
+        x,
+        y,
         data.contiguous() if data is not None else None,
         alpha,
         beta,
