@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._common import _gather_values
+
 
 def prepare(indices, indptr, shape):
     """Prepare transpose topology; values are refreshed lazily during compute."""
@@ -86,7 +88,11 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
             version = None
         if version is not None:
             if cache.get("version") != version or cache.get("source") is not values:
-                cache.update(source=values, version=version, values=values[order].contiguous())
+                cache.update(
+                    source=values,
+                    version=version,
+                    values=_gather_values(values, order).contiguous(),
+                )
             values = cache["values"]
             order = None
     if complex_values:
