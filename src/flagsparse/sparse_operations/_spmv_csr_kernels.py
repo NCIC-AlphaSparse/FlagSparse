@@ -7,6 +7,21 @@ import triton.language as tl
 from . import _common
 
 
+def uses_native_rocm_fp32_accumulation(prepared):
+    """Return whether a real ROCm FP32 route can safely accumulate in FP32.
+
+    A row_tile lane accumulates consecutive products before the lane reduction.
+    On gfx936, rows crossing two 16-wide chunks can exceed the public FP32
+    tolerance for cancellation-heavy inputs.  Keep those rows in FP64 while
+    retaining the native FP32 fast path for the short-row delivery routes.
+    """
+    return (
+        prepared.data.dtype == torch.float32
+        and getattr(prepared.backend_caps, "backend", None) == "rocm"
+        and prepared.max_row_nnz <= 32
+    )
+
+
 @triton.jit
 def _product(A, X, pos, col, mask, COMPLEX: tl.constexpr, ACC: tl.constexpr):
     if COMPLEX:
@@ -422,17 +437,10 @@ def compute(prepared, x, y, alg, config, plan=None):
 
         return _spmv_csr_nnz.bind(prepared, x, y)()
     complex_input = prepared.data.is_complex()
-    # gfx936's FP64 accumulation doubles value traffic and register pressure for
-    # FP32 SpMV. The native FP32 reduction remains within the operator's FP32
-    # tolerance, so keep the high-precision path for other backends only.
-    native_rocm_fp32 = (
-        prepared.data.dtype == torch.float32
-        and getattr(prepared.backend_caps, "backend", None) == "rocm"
-        # A long serial reduction accumulates enough FP32 rounding error to
-        # exceed the public SpMV tolerance. Delivery matrices stay on the
-        # faster FP32 path; exceptional long rows retain FP64 accumulation.
-        and prepared.max_row_nnz <= 8192
-    )
+    # gfx936's FP64 accumulation doubles value traffic and register pressure,
+    # but a row spanning more than two 16-wide chunks can exceed the public
+    # FP32 tolerance.  The predicate is shared with the direct benchmark path.
+    native_rocm_fp32 = uses_native_rocm_fp32_accumulation(prepared)
     acc_dtype = (
         torch.float32
         if native_rocm_fp32
