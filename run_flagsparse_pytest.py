@@ -2922,6 +2922,11 @@ def run_performance(
         "stderr_log_path": str(stderr_path),
         "log_path": str(stdout_path),
         "data_path": str(csv_path) if csv_path.exists() else None,
+        # Read by _parent_failure_explained_by_other_rows: a FAIL the delivery
+        # projection may attribute to another variant's rows must be a plain
+        # `exit 1` after a complete run, not an exception or a short sweep.
+        "stderr_has_traceback": _PYTHON_TRACEBACK_MARKER in stderr,
+        "input_matrix_count": _input_matrix_count(benchmark_input),
     }
     if csv_path.exists():
         try:
@@ -3546,6 +3551,115 @@ _Q4_DELIVERY_SHAPED_SUFFIXES = (
 )
 
 
+_PYTHON_TRACEBACK_MARKER = "Traceback (most recent call last)"
+
+
+def _input_matrix_count(benchmark_input: Path | None) -> int | None:
+    """How many .mtx files a script was handed, counted the way q4_variant_bench does."""
+    if benchmark_input is None:
+        return None
+    path = Path(benchmark_input)
+    if path.is_dir():
+        return len(list(path.rglob("*.mtx")))
+    return 1 if path.suffix == ".mtx" else None
+
+
+def _row_failed(row: dict[str, object]) -> bool:
+    return str(row.get("status") or "").strip().upper() in {"FAIL", "ERROR"}
+
+
+def _parent_stderr_has_traceback(phase_result: dict[str, object]) -> bool | None:
+    flag = phase_result.get("stderr_has_traceback")
+    if isinstance(flag, bool):
+        return flag
+    log_path = phase_result.get("stderr_log_path")
+    if not log_path:
+        return None
+    try:
+        return _PYTHON_TRACEBACK_MARKER in Path(str(log_path)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+
+def _parent_failure_explained_by_other_rows(
+    phase_result: dict[str, object],
+    own_rows: list[dict[str, object]],
+    expected_row_count: int | None = None,
+) -> list[dict[str, object]] | None:
+    """Rows of OTHER variants that fully account for a failed parent process.
+
+    One benchmark script measures several delivery variants, and it exits 1 when
+    any row it wrote failed -- on MetaX C550 a single legacy spmm_csc_base trans
+    row marked all three spmm_csc q4 variants Failed while each had 10 PASS rows.
+    The parent's FAIL may only be set aside when nothing else can have caused it:
+
+    * the status is FAIL, never TIMEOUT -- a timeout stays a timeout;
+    * the exit code is exactly 1 (``SystemExit(1)``); a negative code is a signal
+      (segfault, kill) and anything else is not the scripts' failure exit;
+    * stderr carries no Python traceback (an exception also exits 1);
+    * this variant has all its rows, when the expected count is known;
+    * some row outside ``own_rows`` failed, so the exit 1 has a recorded cause.
+
+    Returns those other failing rows, or None when the parent status must stand.
+    """
+    if str(phase_result.get("status") or "").strip().upper() != "FAIL":
+        return None
+    returncode = phase_result.get("returncode", phase_result.get("exit_code"))
+    if returncode != 1:
+        return None
+    if _parent_stderr_has_traceback(phase_result) is not False:
+        return None
+    if expected_row_count is not None and len(own_rows) != expected_row_count:
+        return None
+    records = phase_result.get("records")
+    own = {id(row) for row in own_rows}
+    others = [
+        row
+        for row in (records if isinstance(records, list) else [])
+        if isinstance(row, dict) and id(row) not in own and _row_failed(row)
+    ]
+    return others or None
+
+
+def _set_aside_parent_failure(
+    result: dict[str, object], explained_by: list[dict[str, object]]
+) -> None:
+    """Record why a variant no longer carries its parent's FAIL, then clear it."""
+    result["parent_status"] = result.get("status")
+    result["parent_returncode"] = result.get("returncode", result.get("exit_code"))
+    result["parent_failure_rows"] = [
+        "/".join(
+            str(_row_value(row, key) or "")
+            for key in ("matrix", "dtype", "op", "alg")
+            if _row_value(row, key)
+        )
+        or "?"
+        for row in explained_by
+    ]
+    result["status"] = "PASS"
+
+
+def _q4_expected_row_count(
+    phase_result: dict[str, object], records: list[dict[str, object]]
+) -> int:
+    """Rows a complete q4 variant has: one per input matrix.
+
+    Falls back to the largest per-variant matrix count in the CSV for a result
+    produced before ``input_matrix_count`` was recorded.
+    """
+    count = phase_result.get("input_matrix_count")
+    if isinstance(count, int) and count > 0:
+        return count
+    matrices: dict[str, set[str]] = {}
+    for row in records:
+        variant = str(row.get("variant") or "")
+        if variant:
+            matrices.setdefault(variant, set()).add(str(row.get("matrix") or ""))
+    return max((len(names) for names in matrices.values()), default=0)
+
+
 def _q4_performance_phase(
     phase_result: dict[str, object], variant_id: str, dtype: str | None = None
 ) -> dict[str, object]:
@@ -3579,12 +3693,16 @@ def _q4_performance_phase(
             "performance", f"the benchmark recorded no {variant_id} rows"
         )
     result = dict(phase_result)
+    explained_by = _parent_failure_explained_by_other_rows(
+        phase_result, rows, _q4_expected_row_count(phase_result, records or [])
+    )
+    if explained_by:
+        _set_aside_parent_failure(result, explained_by)
     result["data"] = _strict_flag_gems_perf_data(_flaggems_perf_data(rows))
     result["records"] = rows
     result["delivery_row_count"] = len(rows)
     result["non_delivery_row_count"] = len(records or []) - len(rows)
-    states = {str(row.get("status") or "").strip().upper() for row in rows}
-    if states & {"FAIL", "ERROR"}:
+    if any(_row_failed(row) for row in rows):
         result["status"] = "FAIL"
     return result
 
@@ -3637,6 +3755,19 @@ def _delivery_performance_phase(
     result = dict(phase_result)
     result["data"] = selected
     if delivery_rows is not None:
+        # Classic rows are streamed as each case finishes, so there is no fixed
+        # row count to check -- only the exit-code / traceback / other-rows rule.
+        own_rows = [
+            row
+            for row in delivery_rows
+            if _row_value(row, "dtype")
+            and str(_row_value(row, "dtype")).lower() in _DELIVERY_PERF_DTYPES[dtype]
+        ]
+        explained_by = _parent_failure_explained_by_other_rows(
+            phase_result, own_rows
+        )
+        if explained_by:
+            _set_aside_parent_failure(result, explained_by)
         result["records"] = delivery_rows
         result["delivery_row_count"] = len(delivery_rows)
         result["non_delivery_row_count"] = len(records) - len(delivery_rows)
