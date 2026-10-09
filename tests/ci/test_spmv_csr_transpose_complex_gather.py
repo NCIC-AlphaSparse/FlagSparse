@@ -13,6 +13,7 @@ complex tensor-indexing the way MUSA does, and a no-op launch in place of the
 Triton kernel -- only the host-side value cache is under test.
 """
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -25,7 +26,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from flagsparse.sparse_operations import _spmv_csr_transpose as transpose  # noqa: E402
+# Imported by name rather than with a from-import: that line would pass 79
+# columns, which isort and black wrap in opposite directions forever.
+transpose = importlib.import_module("flagsparse.sparse_operations._spmv_csr_transpose")
 
 
 class MusaLikeTensor(torch.Tensor):
