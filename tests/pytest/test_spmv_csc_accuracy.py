@@ -206,6 +206,8 @@ def test_spmv_csc_prepared_op_mismatch_rejected():
 
 @pytest.mark.spmv_csc
 def test_spmv_csc_int64_auto_fallback_to_int32(monkeypatch):
+    if spmv_csc_mod._is_ascend_runtime():
+        pytest.skip("Ascend uses the index_add path instead of the Triton fallback")
     device = accelerator_device()
     data, indices, indptr, dense = _random_csc_mn(
         12, 9, torch.float32, torch.int64, device
@@ -237,6 +239,8 @@ def test_spmv_csc_int64_auto_fallback_to_int32(monkeypatch):
 
 @pytest.mark.spmv_csc
 def test_spmv_csc_int64_strict_no_fallback(monkeypatch):
+    if spmv_csc_mod._is_ascend_runtime():
+        pytest.skip("Ascend uses the index_add path instead of the Triton fallback")
     device = accelerator_device()
     data, indices, indptr, _dense = _random_csc_mn(
         12, 9, torch.float32, torch.int64, device

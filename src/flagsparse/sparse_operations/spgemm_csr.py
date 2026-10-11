@@ -1159,6 +1159,11 @@ def _spgemm_compute(prepared):
     return _spgemm_esc_compute_safe(prepared)
 
 
+def _ascend_spgemm_compute(prepared):
+    """Ascend-safe SpGEMM path; ESC uses ordinary torch tensor primitives."""
+    return _spgemm_esc_compute_safe(prepared)
+
+
 _SPGEMM_EMPTY_STAGE_META = {
     "count_ms": None,
     "fill_ms": None,
@@ -1204,7 +1209,11 @@ def _run_spgemm_prepared(prepared, out=None, profile=False, measure_stage=False)
     if measure_stage:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    c_data, c_indices, c_indptr = _spgemm_compute(prepared)
+    c_data, c_indices, c_indptr = (
+        _ascend_spgemm_compute(prepared)
+        if _is_ascend_runtime()
+        else _spgemm_compute(prepared)
+    )
     if measure_stage:
         _ACCEL.synchronize()
         total_ms = (time.perf_counter() - t0) * 1000.0

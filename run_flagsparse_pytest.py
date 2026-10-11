@@ -707,11 +707,19 @@ ASCEND_PYTORCH_PERFORMANCE_OPS: tuple[str, ...] = (
     *ASCEND_BASELINE_OPS,
     "spmv_coo",
     "spmm_coo",
+    "spmv_csc",
+    "spmm_csc",
 )
 ASCEND_PERFORMANCE_DTYPES: dict[str, str] = {
     **ASCEND_BASELINE_DTYPES,
+    # scatter_i8_int is a delivery variant.  benchmark_ascend.py handles the
+    # int8 value path directly; keep it in the Ascend-only dtype sweep so the
+    # untagged row can be projected onto that delivery variant.
+    "scatter": "float16,float32,float64,complex64,complex128,int8",
     "spmv_coo": "float32,float64",
     "spmm_coo": "float32,float64",
+    "spmv_csc": "float32",
+    "spmm_csc": "float32",
 }
 
 # The operators whose accuracy runs through benchmark_ascend_accuracy.py instead
@@ -741,6 +749,59 @@ ASCEND_PROBE_OPS: tuple[str, ...] = (
     "spsm_csr",
     "spsm_coo",
 )
+
+ASCEND_Q4_VARIANTS: dict[str, tuple[str, ...]] = {
+    # Keep the measured rollout explicit; expand only after real-NPU validation.
+    "spmv_csr": (
+        "spmv_csr_f16_int_non",
+        "spmv_csr_f16f32_int_non",
+        "spmv_csr_f32c32_int_non",
+        "spmv_csr_c32_int_non",
+        "spmv_csr_f32_int_trans",
+        "spmv_csr_i8f32_int_non",
+        "spmv_csr_i8i32_int_non",
+        "spmv_csr_c32_int_conj",
+    ),
+    "spmv_coo": (
+        "spmv_coo_f16_int_non",
+        "spmv_coo_f16f32_int_non",
+        "spmv_coo_f32_int_trans",
+        "spmv_coo_c32_int_non",
+        "spmv_coo_c32_int_conj",
+        "spmv_coo_i8i32_int_non",
+    ),
+    "spmm_csr": (
+        "spmm_csr_f16f32_int_non_non_row",
+        "spmm_csr_f16_int_non_non_row",
+        "spmm_csr_f32_int_non_non_col",
+        "spmm_csr_f32_int_non_trans_row",
+        "spmm_csr_c32_int_non_non_row",
+        "spmm_csr_i8i32_int_non_non_row",
+        "spmm_csr_f32_int_trans_non_row",
+    ),
+    "spmm_coo": (
+        "spmm_coo_c32_int_non_non_row",
+        "spmm_coo_f16_int_non_non_row",
+        "spmm_coo_i8i32_int_non_non_row",
+    ),
+    "sddmm_csr": (
+        "sddmm_csr_f32_int_non_non_col",
+        "sddmm_csr_f32_int_non_trans_row",
+        "sddmm_csr_f32_int_trans_non_row",
+        "sddmm_csr_c32_int_non_non_row",
+        "sddmm_csr_f16_int_non_non_row",
+    ),
+    "spmv_csc": (
+        "spmv_csc_f32_int_non",
+        "spmv_csc_c32_int_non",
+        "spmv_csc_f16_int_non",
+    ),
+    "spmm_csc": (
+        "spmm_csc_f32_int_non_non_row",
+        "spmm_csc_c32_int_non_non_row",
+        "spmm_csc_f16_int_non_non_row",
+    ),
+}
 
 # Every operator, routed to the capability probe. Used by any backend that has
 # no per-operator benchmark of its own; the probe itself is backend-neutral and
@@ -818,6 +879,11 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "{warmup}",
             "--iters",
             "{iters}",
+            *(
+                ("--q4-variants", ",".join(ASCEND_Q4_VARIANTS[op]))
+                if op in ASCEND_Q4_VARIANTS
+                else ()
+            ),
         )
         for op in ASCEND_PYTORCH_PERFORMANCE_OPS
     },
@@ -1835,6 +1901,10 @@ def run_accuracy(
             "--output",
             str(result_path),
         ]
+        if op in ASCEND_Q4_VARIANTS:
+            cmd.extend(
+                ["--q4-variants", ",".join(ASCEND_Q4_VARIANTS[op])]
+            )
         returncode, stdout, stderr, duration, timed_out = run_subprocess(
             cmd,
             project_root=project_root,
@@ -2291,6 +2361,11 @@ def _row_value(row: dict[str, str], key: str | None):
         if name.lower() == lowered:
             return value
     return None
+
+
+def _row_dtype_value(row: dict[str, str]):
+    """Read either dtype spelling used by the benchmark CSVs."""
+    return _row_value(row, "dtype") or _row_value(row, "value_dtype")
 
 
 def _is_metric_column(key: str) -> bool:
@@ -3322,6 +3397,7 @@ _DELIVERY_DTYPE_TOKENS = {
     "f64": ("torch.float64", "float64", "double", "fp64"),
     "c32": ("torch.complex64", "complex64", "c32"),
     "c64": ("torch.complex128", "complex128", "c64"),
+    "i8": ("torch.int8", "int8", "i8"),
 }
 _DELIVERY_PERF_DTYPES = {
     "f16": ("fp16", "float16", "half"),
@@ -3760,8 +3836,8 @@ def _delivery_performance_phase(
         own_rows = [
             row
             for row in delivery_rows
-            if _row_value(row, "dtype")
-            and str(_row_value(row, "dtype")).lower() in _DELIVERY_PERF_DTYPES[dtype]
+            if _row_dtype_value(row)
+            and str(_row_dtype_value(row)).lower() in _DELIVERY_PERF_DTYPES[dtype]
         ]
         explained_by = _parent_failure_explained_by_other_rows(
             phase_result, own_rows
@@ -3776,8 +3852,8 @@ def _delivery_performance_phase(
         failed = [
             row
             for row in delivery_rows
-            if _row_value(row, "dtype")
-            and str(_row_value(row, "dtype")).lower() in _DELIVERY_PERF_DTYPES[dtype]
+            if _row_dtype_value(row)
+            and str(_row_dtype_value(row)).lower() in _DELIVERY_PERF_DTYPES[dtype]
             and str(row.get("status") or "").strip().upper() in {"FAIL", "ERROR"}
         ]
         if failed:
@@ -3790,8 +3866,8 @@ def _delivery_performance_phase(
             dtype_rows = [
                 row
                 for row in delivery_rows
-                if _row_value(row, "dtype")
-                and str(_row_value(row, "dtype")).lower()
+                if _row_dtype_value(row)
+                and str(_row_dtype_value(row)).lower()
                 in _DELIVERY_PERF_DTYPES[dtype]
             ]
             if dtype_rows and not any(

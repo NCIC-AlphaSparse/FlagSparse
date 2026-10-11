@@ -369,7 +369,19 @@ def csr_to_sell(data, indices, indptr, n_rows, slice_size, index_dtype=None):
         )
         slot = torch.arange(nnz, device=device, dtype=torch.int64) - ptr[rows]
         pos = offsets[rows // slice_size] + slot * slice_size + rows % slice_size
-        values[pos] = data
+        if _is_ascend_runtime() and data.is_complex():
+            # torch_npu's IndexPut implementation rejects complex tensors.  Store
+            # the two real planes instead; IndexCopy supports the corresponding
+            # floating dtype and view_as_complex restores the SELL value layout.
+            parts = torch.zeros(
+                (total, 2),
+                dtype=torch.view_as_real(data).dtype,
+                device=device,
+            )
+            parts.index_copy_(0, pos, torch.view_as_real(data))
+            values = torch.view_as_complex(parts)
+        else:
+            values[pos] = data
         cols[pos] = indices.to(index_dtype)
     return values, cols, offsets.to(index_dtype)
 

@@ -100,6 +100,15 @@ def _name(dtype):
     return str(dtype).replace("torch.", "")
 
 
+def _variant_name(value_dtype, out_dtype):
+    tag = (
+        _TAGS[value_dtype]
+        if out_dtype == value_dtype
+        else _TAGS[value_dtype] + _TAGS[out_dtype]
+    )
+    return f"spmv_sell_{tag}_int_non"
+
+
 def _parse_dtypes(raw):
     out = []
     for token in (t.strip() for t in str(raw).split(",") if t.strip()):
@@ -158,9 +167,8 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
     m, k = csr.shape
     # Variant naming: one token when the output keeps the value type, two when it
     # widens (f16f32, i8i32); int8's default int32 output is still "i8i32".
-    tag = _TAGS[vdt] if odt == vdt else _TAGS[vdt] + _TAGS[odt]
     row = {
-        "variant": f"spmv_sell_{tag}_int_non",
+        "variant": _variant_name(vdt, odt),
         "matrix": os.path.basename(path),
         "value_dtype": _name(vdt),
         "out_dtype": _name(odt),
@@ -261,6 +269,7 @@ def main(argv=None):
                 row = _run(path, csr, vdt, odt, args.slice_size, args.warmup, args.iters, gen)
             except Exception as exc:
                 row = {
+                    "variant": _variant_name(vdt, odt),
                     "matrix": os.path.basename(path),
                     "value_dtype": _name(vdt),
                     "out_dtype": _name(odt),

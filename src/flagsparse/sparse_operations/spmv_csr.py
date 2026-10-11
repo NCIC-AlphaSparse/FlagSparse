@@ -53,19 +53,10 @@ SUPPORTED_SPMV_VALUE_DTYPES = (
     torch.complex64,
     torch.complex128,
 )
-_ASCEND_ROW_IDS_CACHE = {}
 
 
 def _ascend_csr_row_ids(indptr, n_rows):
-    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
-    cached = _ASCEND_ROW_IDS_CACHE.get(key)
-    if cached is None:
-        cached = torch.repeat_interleave(
-            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
-            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
-        )
-        _ASCEND_ROW_IDS_CACHE[key] = cached
-    return cached
+    return _csr_row_ids_torch(indptr, n_rows)
 
 
 SPMV_OP_NON = 0

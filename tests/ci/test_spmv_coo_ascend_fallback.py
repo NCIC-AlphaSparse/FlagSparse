@@ -20,7 +20,10 @@ import pytest
 
 torch = pytest.importorskip("torch", reason="requires torch to exercise dispatch")
 
+from flagsparse.sparse_operations import spmm_csr as spmm_csr_ops  # noqa: E402
 from flagsparse.sparse_operations import spmv_coo as spmv_coo_ops  # noqa: E402
+from flagsparse.sparse_operations import spmv_csr as spmv_csr_ops  # noqa: E402
+from tests.pytest import test_spmv_coo_accuracy  # noqa: E402
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.complex64])
@@ -64,3 +67,47 @@ def test_ascend_index_add_fallback_preserves_coo_operations(monkeypatch, dtype, 
     out = spmv_coo_ops.flagsparse_spmv_coo(values, row, col, x, shape=(3, 3), op=op)
 
     torch.testing.assert_close(out, expected)
+
+
+def test_ascend_skips_the_triton_int64_retry_test(monkeypatch):
+    monkeypatch.setattr(spmv_coo_ops, "_is_ascend_runtime", lambda: True)
+
+    with pytest.raises(pytest.skip.Exception, match="index_add path"):
+        test_spmv_coo_accuracy.test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch)
+
+
+def test_ascend_csr_row_ids_follow_each_current_structure():
+    first = torch.tensor([0, 2, 5], dtype=torch.int32)
+    second = torch.tensor([0, 1, 1], dtype=torch.int32)
+    assert spmv_csr_ops._ascend_csr_row_ids(first, 2).tolist() == [0, 0, 1, 1, 1]
+    assert spmv_csr_ops._ascend_csr_row_ids(second, 2).tolist() == [0]
+    assert spmm_csr_ops._ascend_csr_row_ids(first, 2).tolist() == [0, 0, 1, 1, 1]
+    assert spmm_csr_ops._ascend_csr_row_ids(second, 2).tolist() == [0]
+
+
+def test_csr_row_ids_cache_reuses_only_the_same_unmodified_tensor():
+    """Row ids are cached per tensor object and version, never per address.
+
+    Dropping the cache entirely (the stale-address fix) re-ran repeat_interleave
+    on every call -- the same size of work as the SpMV it feeds.
+    """
+    import gc
+
+    from flagsparse.sparse_operations import _common
+
+    indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
+    first = _common._csr_row_ids_torch(indptr, 2)
+    assert _common._csr_row_ids_torch(indptr, 2) is first
+
+    indptr[1] = 1  # in place: same object and address, new structure
+    assert _common._csr_row_ids_torch(indptr, 2).tolist() == [0, 1, 1, 1, 1]
+
+    key = id(indptr)
+    del indptr
+    gc.collect()
+    assert key not in _common._CSR_ROW_IDS_CACHE
+
+    with torch.inference_mode():
+        frozen = torch.tensor([0, 1, 1], dtype=torch.int32)
+    assert _common._csr_row_ids_torch(frozen, 2).tolist() == [0]
+    assert id(frozen) not in _common._CSR_ROW_IDS_CACHE

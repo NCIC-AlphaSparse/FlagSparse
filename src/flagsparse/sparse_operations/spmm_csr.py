@@ -23,28 +23,11 @@ from . import mixed_spmx as _mixed_spmx
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
-_ASCEND_ROW_IDS_CACHE = {}
-
 
 def _ascend_csr_row_ids(indptr, n_rows):
-    """Per-nonzero row index for the Ascend fallbacks (repeat_interleave, not Triton)."""
-    # XPU's caching allocator can recycle a just-freed indptr storage address for
-    # a different CSR pattern.  The legacy cache is address-keyed, so use a fresh
-    # device-side expansion there rather than risking stale row IDs.
-    if _is_xpu_runtime():
-        return torch.repeat_interleave(
-            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
-            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
-        )
-    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
-    cached = _ASCEND_ROW_IDS_CACHE.get(key)
-    if cached is None:
-        cached = torch.repeat_interleave(
-            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
-            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
-        )
-        _ASCEND_ROW_IDS_CACHE[key] = cached
-    return cached
+    """Per-nonzero row index for the Ascend/XPU fallbacks (repeat_interleave, not Triton)."""
+    return _csr_row_ids_torch(indptr, n_rows)
+
 
 HipPointer = _common_mod.HipPointer
 

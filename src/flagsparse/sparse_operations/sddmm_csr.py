@@ -20,7 +20,6 @@ import math
 from ._common import *
 
 SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64, torch.float16, torch.complex64)
-_ASCEND_ROW_IDS_CACHE = {}
 
 
 # Stored entries per chunk in the Ascend SDDMM fallback (see flagsparse_sddmm_csr).
@@ -33,15 +32,9 @@ def _ascend_csr_row_ids(indptr, n_rows):
     Deliberately not ``_build_row_ids``: that is a Triton kernel, and Ascend 910B cannot
     lower it -- which is why these fallbacks exist at all.
     """
-    key = (str(indptr.device), int(indptr.data_ptr()), int(indptr.numel()), int(n_rows))
-    cached = _ASCEND_ROW_IDS_CACHE.get(key)
-    if cached is None:
-        cached = torch.repeat_interleave(
-            torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
-            indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
-        )
-        _ASCEND_ROW_IDS_CACHE[key] = cached
-    return cached
+    return _csr_row_ids_torch(indptr, n_rows)
+
+
 SUPPORTED_SDDMM_DIAGNOSTIC_VARIANTS = ("baseline", "acc64", "acc64_out64", "altreduce")
 
 
@@ -1115,7 +1108,9 @@ def flagsparse_sddmm_csr(
         for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
             end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
             vals[begin:end] = torch.sum(
-                x[row_ids[begin:end]] * y[cols[begin:end]], dim=1
+                _gather_values(x, row_ids[begin:end])
+                * _gather_values(y, cols[begin:end]),
+                dim=1,
             )
         vals = vals * float(alpha)
         if beta != 0.0:

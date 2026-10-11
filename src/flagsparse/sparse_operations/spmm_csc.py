@@ -14,6 +14,7 @@
 
 """Native CSC SpMM kernels and route helpers."""
 
+import time
 from dataclasses import dataclass
 
 from ._common import *
@@ -55,6 +56,32 @@ class SpmmCscAlgorithm:
     supported_ops: tuple[str, ...]
     supported_dtypes: tuple
     run: object
+
+
+def _ascend_spmm_csc_torch(prepared, B):
+    """CSC SpMM fallback for Ascend, implemented with torch index_add."""
+    n_rows, n_cols = prepared.n_rows, prepared.n_cols
+    nnz = int(prepared.nnz)
+    dense_cols = int(B.shape[1])
+    out_rows = n_cols if _spmm_csc_op_transposes(prepared.op) else n_rows
+    C = torch.zeros((out_rows, dense_cols), dtype=prepared.data.dtype, device=B.device)
+    if nnz == 0:
+        return C
+    col_ids = getattr(prepared, "col_ids", None)
+    if col_ids is None:
+        col_ids = _csr_row_ids_torch(prepared.kernel_indptr, n_cols)
+    rows = prepared.kernel_indices.to(torch.int64)
+    cols = col_ids.to(torch.int64)
+    values = prepared.data
+    if prepared.op == "conj":
+        values = values.conj()
+    if _spmm_csc_op_transposes(prepared.op):
+        products = values[:, None] * _gather_values(B, rows)
+        _index_add_values(C, 0, cols, products)
+    else:
+        products = values[:, None] * _gather_values(B, cols)
+        _index_add_values(C, 0, rows, products)
+    return C
 
 
 def _normalize_spmm_csc_op(op=None, transpose=False):
@@ -539,9 +566,13 @@ def prepare_spmm_csc_route(
     col_ids = None
     if int(data.numel()) > 0:
         try:
-            from .sddmm_csr import _build_row_ids
+            if _is_ascend_runtime():
+                # A CSC indptr runs over columns, so its "row ids" are column ids.
+                col_ids = _csr_row_ids_torch(indptr, n_cols)
+            else:
+                from .sddmm_csr import _build_row_ids
 
-            col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
+                col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
         except Exception:
             col_ids = None
     return PreparedCscSpmm(
@@ -1521,6 +1552,29 @@ def _spmm_csc_prepared_with_int32_indices(prepared, reason):
 
 
 def _run_spmm_csc_prepared_with_fallback(prepared, B, algorithm, collect_timing=False):
+    if _is_ascend_runtime():
+        # No Triton launch happens here, so the int64->int32 index retry never
+        # applies: torch_npu's index_add_ takes int64 indices as they are.
+        del algorithm
+        compute_ms = None
+        if collect_timing:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        C = _ascend_spmm_csc_torch(prepared, B)
+        if collect_timing:
+            _ACCEL.synchronize()
+            compute_ms = (time.perf_counter() - t0) * 1000.0
+        return C, {
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0,
+            "compute_ms": compute_ms,
+            "block_n": prepared.block_n,
+            "block_nnz": prepared.block_nnz,
+            "launch_backend": "torch_npu",
+            "device_warp_size": None,
+            "index_fallback_applied": False,
+            "index_fallback_reason": None,
+        }
     try:
         return algorithm.run(prepared, B, timing=bool(collect_timing))
     except RuntimeError as exc:

@@ -156,6 +156,8 @@ def test_the_ascend_pytorch_baselines_use_declared_dtypes_and_measured_commands(
         "sddmm_csr",
         "spmv_coo",
         "spmm_coo",
+        "spmv_csc",
+        "spmm_csc",
     )
     for op in runner.ASCEND_PYTORCH_PERFORMANCE_OPS:
         template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
@@ -163,6 +165,94 @@ def test_the_ascend_pytorch_baselines_use_declared_dtypes_and_measured_commands(
         index = template.index("--dtypes")
         expected = runner.ASCEND_PERFORMANCE_DTYPES[op]
         assert template[index + 1] == expected, op
+
+
+def test_ascend_csr_bringup_routes_measured_q4_variants_to_both_phases():
+    runner = _runner()
+    assert runner.ASCEND_Q4_VARIANTS == {
+        "spmv_csr": (
+            "spmv_csr_f16_int_non",
+            "spmv_csr_f16f32_int_non",
+            "spmv_csr_f32c32_int_non",
+            "spmv_csr_c32_int_non",
+            "spmv_csr_f32_int_trans",
+            "spmv_csr_i8f32_int_non",
+            "spmv_csr_i8i32_int_non",
+            "spmv_csr_c32_int_conj",
+        ),
+        "spmv_coo": (
+            "spmv_coo_f16_int_non",
+            "spmv_coo_f16f32_int_non",
+            "spmv_coo_f32_int_trans",
+            "spmv_coo_c32_int_non",
+            "spmv_coo_c32_int_conj",
+            "spmv_coo_i8i32_int_non",
+        ),
+        "spmm_csr": (
+            "spmm_csr_f16f32_int_non_non_row",
+            "spmm_csr_f16_int_non_non_row",
+            "spmm_csr_f32_int_non_non_col",
+            "spmm_csr_f32_int_non_trans_row",
+            "spmm_csr_c32_int_non_non_row",
+            "spmm_csr_i8i32_int_non_non_row",
+            "spmm_csr_f32_int_trans_non_row",
+        ),
+        "spmm_coo": (
+            "spmm_coo_c32_int_non_non_row",
+            "spmm_coo_f16_int_non_non_row",
+            "spmm_coo_i8i32_int_non_non_row",
+        ),
+        "sddmm_csr": (
+            "sddmm_csr_f32_int_non_non_col",
+            "sddmm_csr_f32_int_non_trans_row",
+            "sddmm_csr_f32_int_trans_non_row",
+            "sddmm_csr_c32_int_non_non_row",
+            "sddmm_csr_f16_int_non_non_row",
+        ),
+        "spmv_csc": (
+            "spmv_csc_f32_int_non",
+            "spmv_csc_c32_int_non",
+            "spmv_csc_f16_int_non",
+        ),
+        "spmm_csc": (
+            "spmm_csc_f32_int_non_non_row",
+            "spmm_csc_c32_int_non_non_row",
+            "spmm_csc_f16_int_non_non_row",
+        ),
+    }
+    command = runner.ASCEND_PERFORMANCE_COMMANDS["spmv_csr"]
+    assert command[command.index("--q4-variants") + 1] == (
+        "spmv_csr_f16_int_non,spmv_csr_f16f32_int_non,"
+        "spmv_csr_f32c32_int_non,spmv_csr_c32_int_non,"
+        "spmv_csr_f32_int_trans,spmv_csr_i8f32_int_non,"
+        "spmv_csr_i8i32_int_non,spmv_csr_c32_int_conj"
+    )
+    accuracy_source = (ROOT / "benchmark" / "benchmark_ascend_accuracy.py").read_text(
+        encoding="utf-8"
+    )
+    assert "--q4-variants" in accuracy_source
+
+
+def test_ascend_coo_bringup_routes_measured_q4_variants_to_performance():
+    runner = _runner()
+    command = runner.ASCEND_PERFORMANCE_COMMANDS["spmv_coo"]
+    assert command[command.index("--q4-variants") + 1] == (
+        "spmv_coo_f16_int_non,spmv_coo_f16f32_int_non,"
+        "spmv_coo_f32_int_trans,spmv_coo_c32_int_non,"
+        "spmv_coo_c32_int_conj,spmv_coo_i8i32_int_non"
+    )
+    assert "spmv_coo" not in runner.ASCEND_ACCURACY_OPS
+
+
+def test_ascend_spmm_sddmm_bringup_routes_measured_q4_variants():
+    runner = _runner()
+    for op, expected in {
+        "spmm_csr": ",".join(runner.ASCEND_Q4_VARIANTS["spmm_csr"]),
+        "spmm_coo": ",".join(runner.ASCEND_Q4_VARIANTS["spmm_coo"]),
+        "sddmm_csr": ",".join(runner.ASCEND_Q4_VARIANTS["sddmm_csr"]),
+    }.items():
+        command = runner.ASCEND_PERFORMANCE_COMMANDS[op]
+        assert command[command.index("--q4-variants") + 1] == expected
 
 
 def test_coo_delivery_performance_uses_pytorch_baselines_not_probe_rows():
@@ -219,7 +309,10 @@ def test_complex_delivery_rows_are_capability_skips_not_missing():
     )
     for op in ("gather", "scatter"):
         command = runner.ASCEND_PERFORMANCE_COMMANDS[op]
-        assert command[command.index("--dtypes") + 1].endswith("complex64,complex128")
+        dtypes = command[command.index("--dtypes") + 1]
+        assert "complex64,complex128" in dtypes
+    scatter_command = runner.ASCEND_PERFORMANCE_COMMANDS["scatter"]
+    assert scatter_command[scatter_command.index("--dtypes") + 1].endswith(",int8")
     reason = "Ascend complex gather/scatter capability unavailable: Index unsupported"
     rows = [
         {
