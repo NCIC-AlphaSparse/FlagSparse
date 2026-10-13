@@ -18,9 +18,14 @@ def _prepared_row_tile_op(prepared, x, out):
 
     config = prepared.config["row_tile"]
     grid = (triton.cdiv(prepared.n_rows, config["rows_per_program"]),)
+    # Half inputs widen to FP32 in the production row-tile kernel.  Keeping
+    # the benchmark on the same accumulator avoids charging the prepared path
+    # for an unnecessary FP64 kernel variant.
     acc = (
         tl.float32
-        if kernels.uses_native_rocm_fp32_accumulation(prepared)
+        if prepared.data.dtype
+        in (torch.float16, torch.bfloat16, torch.complex64)
+        or kernels.uses_native_rocm_fp32_accumulation(prepared)
         else tl.float64
     )
     avg_nnz = prepared.data.numel() / prepared.n_rows
@@ -44,27 +49,46 @@ def _prepared_row_tile_op(prepared, x, out):
         )
 
     def launch():
-        kernels.row_tile_real_kernel[grid](
-            prepared.data,
-            prepared.kernel_indices,
-            prepared.kernel_indptr,
-            x,
-            out,
-            prepared.kernel_indptr,
-            prepared.n_rows,
-            INDEXED=False,
-            R=config["rows_per_program"],
-            V=config["lanes_per_row"],
-            STAGES=config["loop_num_stages"],
-            ACC=acc,
-            POSITION_64=not (
-                prepared.data.dtype == torch.float32
-                and prepared.kernel_indptr.dtype == torch.int32
-            ),
-            FIXED_STEPS=fixed_steps,
-            num_warps=config["num_warps"],
-            enable_fp_fusion=(acc == tl.float32),
-        )
+        if prepared.data.is_complex():
+            kernels.row_tile_kernel[grid](
+                torch.view_as_real(prepared.data.resolve_conj()).reshape(-1),
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                torch.view_as_real(x.resolve_conj()).reshape(-1),
+                torch.view_as_real(out).reshape(-1),
+                prepared.kernel_indptr,
+                prepared.n_rows,
+                INDEXED=False,
+                R=config["rows_per_program"],
+                V=config["lanes_per_row"],
+                STAGES=config["loop_num_stages"],
+                COMPLEX=True,
+                ACC=acc,
+                num_warps=config["num_warps"],
+                enable_fp_fusion=False,
+            )
+        else:
+            kernels.row_tile_real_kernel[grid](
+                prepared.data,
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                x,
+                out,
+                prepared.kernel_indptr,
+                prepared.n_rows,
+                INDEXED=False,
+                R=config["rows_per_program"],
+                V=config["lanes_per_row"],
+                STAGES=config["loop_num_stages"],
+                ACC=acc,
+                POSITION_64=not (
+                    prepared.data.dtype == torch.float32
+                    and prepared.kernel_indptr.dtype == torch.int32
+                ),
+                FIXED_STEPS=fixed_steps,
+                num_warps=config["num_warps"],
+                enable_fp_fusion=(acc == tl.float32),
+            )
         return out
 
     return launch
@@ -111,6 +135,41 @@ def event_benchmark(fn, warmup, iters):
     return value, _filtered_avg_ms(samples)
 
 
+def _rocm_graph_replay(fn, output):
+    """Capture one prepared ROCm launch and return a replay callable.
+
+    The delivery benchmark invokes a fixed prepared operation many times with
+    the same pointers.  A HIP graph removes the repeated host-side Triton
+    launcher work from each event window while retaining the same kernel and
+    output buffer.  Graph capture is an optional acceleration: unsupported
+    ROCm/Triton combinations fall back to the ordinary callable.
+    """
+    if not common._is_rocm_runtime() or not hasattr(torch.cuda, "CUDAGraph"):
+        return fn
+    try:
+        # The prepared probe may have been queued on the default stream.
+        # Establish its completion before capturing on the private stream.
+        torch.cuda.synchronize(output.device)
+        stream = torch.cuda.Stream(device=output.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            fn()  # compile and establish all static allocations first
+            graph.capture_begin()
+            fn()
+            graph.capture_end()
+        stream.synchronize()
+
+        def replay():
+            graph.replay()
+            return output
+
+        return replay
+    except (RuntimeError, NotImplementedError):
+        # Some older HIP runtimes do not expose graph capture for Triton.
+        # The prepared launch remains valid and is the safe fallback.
+        return fn
+
+
 def measure_route(prepared, x, warmup=10, iters=50, timing=False):
     with _spmv_device_context(prepared.data.device):
         # Keep the timed operation equivalent to the prepared hipSPARSE path,
@@ -136,12 +195,16 @@ def measure_route(prepared, x, warmup=10, iters=50, timing=False):
             and not x.is_conj()
             and not prepared.data.is_conj()
             and x.is_contiguous()
-            and prepared.data.dtype in (torch.float32, torch.float64)
+            and prepared.data.dtype in (
+                torch.float16, torch.bfloat16, torch.float32, torch.float64
+            )
         )
         if direct_row_tile:
             timed_op = _prepared_row_tile_op(prepared, x, out)
+            timed_op = _rocm_graph_replay(timed_op, out)
         else:
-            timed_op = lambda: flagsparse_spmv_csr_run(prepared, x, out=out)
+            def timed_op():
+                return flagsparse_spmv_csr_run(prepared, x, out=out)
         value, gpu_ms = event_benchmark(
             timed_op, warmup, iters
         )

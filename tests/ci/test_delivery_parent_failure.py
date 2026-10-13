@@ -160,6 +160,16 @@ def test_classic_other_dtype_failure_does_not_fail_this_dtype():
     assert f64["status"] == "FAIL"
 
 
+def test_classic_value_dtype_error_fails_the_matching_variant():
+    row = _classic_row("complex64", status="ERROR")
+    row["value_dtype"] = row.pop("dtype")
+
+    result = runner._delivery_performance_phase(_phase([row]), "c32")
+
+    assert result["status"] == "FAIL"
+    assert result["failed_rows"] == ["a.mtx"]
+
+
 def test_classic_counterexamples_keep_parent_status():
     rows = [_classic_row("float32"), _classic_row("float64", status="FAIL")]
 

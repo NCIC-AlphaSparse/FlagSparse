@@ -254,6 +254,8 @@ def test_spmm_csc_transpose_family_high_level(op):
 @pytest.mark.spmm_csc
 @pytest.mark.parametrize("op", ["non", "trans"], ids=["non", "trans"])
 def test_spmm_csc_int64_auto_fallback_to_int32(monkeypatch, op):
+    if spmm_csc_mod._is_ascend_runtime():
+        pytest.skip("Ascend uses the index_add path instead of the Triton fallback")
     device = accelerator_device()
     M, K, N = 7, 5, 4
     dtype = torch.float32
@@ -288,6 +290,8 @@ def test_spmm_csc_int64_auto_fallback_to_int32(monkeypatch, op):
 
 @pytest.mark.spmm_csc
 def test_spmm_csc_int64_strict_no_fallback(monkeypatch):
+    if spmm_csc_mod._is_ascend_runtime():
+        pytest.skip("Ascend uses the index_add path instead of the Triton fallback")
     device = accelerator_device()
     M, K, N = 7, 5, 4
     data, indices, indptr, _dense = _random_csc_mk(

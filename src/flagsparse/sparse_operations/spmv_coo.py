@@ -150,15 +150,38 @@ class PreparedCoo:
         self.transpose = _spmv_coo_op_transposes(self.op)
         self.transpose_csr_plan = None
         self.non_csr_plan = None
-        if self.sort_by_row and self.data_trans.dtype in (torch.float32, torch.complex64):
+        if self.sort_by_row and self.data_trans.dtype in (
+            torch.float32,
+            torch.complex64,
+        ):
             from . import _spmv_csr_transpose
+
             counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
-            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(self.row_trans.dtype)
-            self.transpose_csr_plan = _spmv_csr_transpose.make_plan(self.col_trans, ptr, None, self.n_cols)
-            if (_backend_name() == "cuda" or _is_maca_runtime() or _is_rocm_runtime()) and self.data_non.dtype == torch.complex64:
+            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
+                self.row_trans.dtype
+            )
+            self.transpose_csr_plan = _spmv_csr_transpose.make_plan(
+                self.col_trans, ptr, None, self.n_cols
+            )
+            if (
+                _backend_name() == "cuda" or _is_maca_runtime() or _is_rocm_runtime()
+            ) and self.data_non.dtype == torch.complex64:
                 counts = torch.bincount(self.row_non.long(), minlength=self.n_rows)
-                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(self.row_non.dtype)
-                self.non_csr_plan = _spmv_csr_transpose.make_plan(self.col_non, ptr, None, self.n_rows)
+                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
+                    self.row_non.dtype
+                )
+                self.non_csr_plan = _spmv_csr_transpose.make_plan(
+                    self.col_non, ptr, None, self.n_rows
+                )
+                if _is_rocm_runtime():
+                    # gfx936's wave64 complex gather is register-pressure
+                    # bound at the default 8-lane row tile. Four lanes and a
+                    # 128-row batch improve the C32 COO delivery corpus;
+                    # keep this override local to ROCm and this route.
+                    cols, plan_ptr, order, rows, _lanes, _batch, cache = (
+                        self.non_csr_plan
+                    )
+                    self.non_csr_plan = (cols, plan_ptr, order, rows, 4, 128, cache)
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -459,8 +482,14 @@ def _spmv_coo_run_add(row_a, val_a, row_b, val_b):
 
 @triton.jit
 def _spmv_coo_atomic_runs_real(
-    data_ptr, row_ptr, col_ptr, x_ptr, y_ptr, nnz,
-    BLOCK: tl.constexpr, ACC: tl.constexpr,
+    data_ptr,
+    row_ptr,
+    col_ptr,
+    x_ptr,
+    y_ptr,
+    nnz,
+    BLOCK: tl.constexpr,
+    ACC: tl.constexpr,
 ):
     """Reduce adjacent COO entries before the global atomic update.
 
@@ -678,8 +707,10 @@ def _resolve_spmv_coo_launch(prepared, op):
     # over launch.data/.row/.col), so it always needs the direct conj here
     # regardless of whether a plan was built -- same bug shape already fixed in
     # spmv_csr/spmm_csr/sddmm_csr's Ascend fallbacks.
-    if op_code == SPMV_COO_OP_CONJ_TRANS and _is_complex_dtype(data.dtype) and (
-        prepared.transpose_csr_plan is None or _is_ascend_runtime()
+    if (
+        op_code == SPMV_COO_OP_CONJ_TRANS
+        and _is_complex_dtype(data.dtype)
+        and (prepared.transpose_csr_plan is None or _is_ascend_runtime())
     ):
         data = data.conj()
         if hasattr(data, "resolve_conj"):
@@ -717,8 +748,12 @@ def _validate_x_coo(x, prepared):
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     if prepared.csr_plan is not None:
         from . import _spmv_csr_transpose
+
         return _spmv_csr_transpose.gather(
-            prepared.data, x, prepared.csr_plan, prepared.n_rows,
+            prepared.data,
+            x,
+            prepared.csr_plan,
+            prepared.n_rows,
             prepared.op == SPMV_COO_OP_CONJ_TRANS,
         )
     dtype = prepared.data.dtype
@@ -807,7 +842,12 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     grid = (triton.cdiv(nnz, block_size),)
     if _is_rocm_runtime():
         _spmv_coo_atomic_runs_real[grid](
-            prepared.data, prepared.row, prepared.col, x, y, nnz,
+            prepared.data,
+            prepared.row,
+            prepared.col,
+            x,
+            y,
+            nnz,
             BLOCK=block_size,
             ACC=tl.float64 if dtype == torch.float64 else tl.float32,
             num_warps=num_warps,
@@ -891,9 +931,8 @@ def _run_spmv_coo_prepared_with_fallback(
             block_inner=block_inner,
         )
     except Exception as exc:
-        if (
-            prepared.index_fallback_policy != "auto"
-            or not _spmv_coo_uses_int64_indices(prepared)
+        if prepared.index_fallback_policy != "auto" or not _spmv_coo_uses_int64_indices(
+            prepared
         ):
             raise
         fallback_prepared = _spmv_coo_prepared_with_int32_indices(prepared, exc)
@@ -919,12 +958,12 @@ def _ascend_spmv_coo_index_add(launch, x):
 
 
 @lru_cache(maxsize=128)
-def _cached_rocm_fp32_coo_launch(device, nnz, block_size, num_warps):
+def _cached_rocm_coo_launch(device, dtype, nnz, block_size, num_warps):
     # Device properties and launch clipping do not change between executions.
     # Cache only immutable launch values, never tensors or output buffers.
     launch = _spmv_rocm_launch_overrides(
         fmt="coo",
-        dtype=torch.float32,
+        dtype=dtype,
         nnz=nnz,
         block_size=block_size,
         num_warps=num_warps,
@@ -942,9 +981,13 @@ def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
         block_size = 256 if _is_rocm_runtime() else 256
     if num_warps is None:
         num_warps = 2 if _is_rocm_runtime() else 4
-    if _is_rocm_runtime() and prepared.data.dtype == torch.float32:
-        return _cached_rocm_fp32_coo_launch(
-            prepared.data.device, prepared.nnz, int(block_size), int(num_warps)
+    if _is_rocm_runtime():
+        return _cached_rocm_coo_launch(
+            prepared.data.device,
+            prepared.data.dtype,
+            prepared.nnz,
+            int(block_size),
+            int(num_warps),
         )
     launch = _spmv_rocm_launch_overrides(
         fmt="coo",
@@ -989,12 +1032,24 @@ def flagsparse_spmv_coo(
         prepared is None
         and torch.is_tensor(data)
         and _mixed_spmx.spmv_needs_mixed(
-            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype, coo=True
+            data.dtype,
+            x.dtype if torch.is_tensor(x) else None,
+            out,
+            out_dtype,
+            coo=True,
         )
     ):
         return _mixed_spmx.spmv_coo_mixed(
-            data, row, col, x, shape, op=op, transpose=transpose,
-            out=out, out_dtype=out_dtype, return_time=return_time,
+            data,
+            row,
+            col,
+            x,
+            shape,
+            op=op,
+            transpose=transpose,
+            out=out,
+            out_dtype=out_dtype,
+            return_time=return_time,
         )
     transpose_flag = False if transpose is None else bool(transpose)
     op_explicit = op is not None
@@ -1045,9 +1100,15 @@ def flagsparse_spmv_coo(
     if _is_ascend_runtime():
         y = _ascend_spmv_coo_index_add(launch, x)
     else:
-        block_size, num_warps = _resolve_spmv_coo_kernel_launch(
-            launch, block_size, num_warps
-        )
+        # The gather kernel owns its R/K/warp geometry. COO atomic launch
+        # overrides are unused on this route, so avoid resolving them per call.
+        if _is_rocm_runtime() and launch.csr_plan is not None:
+            block_size = 256 if block_size is None else block_size
+            num_warps = 2 if num_warps is None else num_warps
+        else:
+            block_size, num_warps = _resolve_spmv_coo_kernel_launch(
+                launch, block_size, num_warps
+            )
         y = _run_spmv_coo_prepared_with_fallback(
             launch,
             x,

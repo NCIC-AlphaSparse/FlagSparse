@@ -225,6 +225,8 @@ def test_spmv_coo_prepared_explicit_transpose_conflict_rejected():
 
 @pytest.mark.spmv_coo
 def test_spmv_coo_int64_auto_fallback_to_int32(monkeypatch):
+    if spmv_coo_mod._is_ascend_runtime():
+        pytest.skip("Ascend uses the index_add path instead of the Triton fallback")
     device = accelerator_device()
     data, indices, dense = _random_coo_mn(12, 9, torch.float32, device)
     row = indices[0].to(torch.int64).contiguous()

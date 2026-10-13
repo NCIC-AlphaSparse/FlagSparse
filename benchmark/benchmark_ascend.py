@@ -26,6 +26,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+_TESTS = _ROOT / "tests"
 
 
 @dataclass
@@ -156,6 +157,8 @@ ASCEND_OPERATOR_IMPLEMENTATION = {
     "spmm_csr": "torch_npu",
     "spmm_coo": "torch_npu",
     "sddmm_csr": "torch_npu",
+    "spmv_csc": "torch_npu",
+    "spmm_csc": "torch_npu",
 }
 
 
@@ -185,6 +188,12 @@ def _ascend_complex_index_capability_reason(exc):
 
 
 def _randn(torch, shape, device, dtype):
+    if dtype == torch.int8:
+        # torch.randn has no integer implementation.  Keep the values small so
+        # the scatter reference remains exact while exercising the real int8
+        # dispatch path on Ascend.
+        size = (shape,) if isinstance(shape, int) else shape
+        return torch.randint(-3, 4, size, device=device, dtype=dtype)
     if dtype == torch.complex64:
         real = torch.randn(shape, device="cpu", dtype=torch.float32)
         imag = torch.randn(shape, device="cpu", dtype=torch.float32)
@@ -566,19 +575,29 @@ def main():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--device", type=int, default=0, help="Ascend NPU device ordinal")
-    p.add_argument("--op", choices=("spmv_csr", "spmv_coo", "spmm_csr", "spmm_coo", "sddmm_csr", "gather", "scatter"), default=None)
+    p.add_argument("--op", choices=("spmv_csr", "spmv_coo", "spmv_csc", "spmm_csr", "spmm_coo", "spmm_csc", "sddmm_csr", "gather", "scatter"), default=None)
     p.add_argument("--dtypes", default="float32", help="Comma-separated value dtypes")
     p.add_argument("--input", type=Path, default=None,
                    help="MatrixMarket .mtx file or directory; every .mtx is benchmarked")
     p.add_argument("--csv-summary", default=None, help="Write a runner-compatible one-row CSV summary")
+    p.add_argument(
+        "--q4-variants",
+        default="",
+        help="Comma-separated q4 variant ids to append to --csv-summary",
+    )
     args = p.parse_args()
     dtype_names = [item.strip() for item in args.dtypes.split(",") if item.strip()]
-    allowed_dtypes = {"float16", "bfloat16", "float32", "float64", "complex64", "complex128"}
+    allowed_dtypes = {"float16", "bfloat16", "float32", "float64", "complex64", "complex128", "int8"}
     unknown = sorted(set(dtype_names) - allowed_dtypes)
     if not dtype_names or unknown:
         p.error("--dtypes must contain names from: " + ", ".join(sorted(allowed_dtypes)))
     if set(dtype_names) & {"complex64", "complex128"} and args.op not in ("gather", "scatter"):
         p.error("complex dtypes are supported only for --op gather or --op scatter")
+    q4_variants = [
+        item.strip() for item in args.q4_variants.split(",") if item.strip()
+    ]
+    if q4_variants and (not args.op or not args.csv_summary or args.input is None):
+        p.error("--q4-variants requires --op, --input and --csv-summary")
     import json
     if args.input is None:
         matrix_paths: list[Path | None] = [None]
@@ -639,6 +658,24 @@ def main():
             )
             writer.writeheader()
             writer.writerows(rows)
+        if q4_variants:
+            tests_path_added = str(_TESTS) not in sys.path
+            if tests_path_added:
+                sys.path.insert(0, str(_TESTS))
+            try:
+                import q4_variant_bench
+            finally:
+                if tests_path_added:
+                    sys.path.remove(str(_TESTS))
+
+            q4_variant_bench.run_and_append(
+                args.op,
+                [str(path) for path in matrix_paths if path is not None],
+                args.csv_summary,
+                args.warmup,
+                args.iters,
+                variant_names=q4_variants,
+            )
     print(json.dumps(payload, indent=2))
 
 

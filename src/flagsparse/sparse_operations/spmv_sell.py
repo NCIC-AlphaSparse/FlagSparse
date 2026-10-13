@@ -37,6 +37,8 @@ import time
 import triton
 import triton.language as tl
 
+from ._rocm_sparse_cache import TensorPlanCache
+
 SPMV_SELL_VALUE_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -71,6 +73,62 @@ _TL = {
     torch.float64: tl.float64,
     torch.int32: tl.int32,
 }
+_ROCM_SELL_CSR_CACHE = TensorPlanCache(maxsize=16)
+
+
+def _rocm_sell_csr_plan(values, cols, offsets, n_rows, slice_size):
+    """Materialize a row-major view once for the ROCm real fast path."""
+    sources = (values, cols, offsets)
+    options = (int(n_rows), int(slice_size))
+    cached = _ROCM_SELL_CSR_CACHE.get(sources, options)
+    if cached is not None:
+        return cached
+    rows = _sell_entry_rows(cols, offsets, slice_size)
+    valid = (cols >= 0) & (rows < n_rows)
+    row_ids = rows[valid].to(torch.int64)
+    order = torch.argsort(row_ids, stable=True)
+    row_ids = row_ids.index_select(0, order)
+    data = values[valid].index_select(0, order).contiguous()
+    indices = cols[valid].index_select(0, order).contiguous()
+    counts = torch.bincount(row_ids, minlength=n_rows)
+    indptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(cols.dtype)
+    plan = (data, indices, indptr, int(counts.max().item()) if n_rows else 0)
+    _ROCM_SELL_CSR_CACHE.put(sources, options, plan)
+    return plan
+
+
+def _rocm_sell_real_kernel(values, cols, offsets, x, y, n_rows, slice_size):
+    """Launch the tuned row-tile kernel over a cached row-major SELL view."""
+    from . import _spmv_csr_kernels as kernels
+
+    data, indices, indptr, max_row = _rocm_sell_csr_plan(
+        values, cols, offsets, n_rows, slice_size
+    )
+    mean = data.numel() / max(n_rows, 1)
+    if mean <= 4:
+        rows_per, lanes, warps = 128, 4, 2
+    elif mean <= 24:
+        # The delivery matrices are dominated by rows shorter than one
+        # wave.  A compact 8-lane row keeps masked work low; the third stage
+        # hides the indirect x loads on gfx936.
+        rows_per, lanes, warps = 32, 8, 1
+    else:
+        rows_per, lanes, warps = 16, 8, 1
+    # Same accumulator as the generic SELL kernel: FP64 values keep FP64.
+    acc = _TL[_sell_acc_dtype(values.dtype, y.dtype)]
+    kernels.row_tile_real_kernel[(triton.cdiv(n_rows, rows_per),)](
+        data, indices, indptr, x, y, indptr, n_rows,
+        INDEXED=False,
+        R=rows_per,
+        V=lanes,
+        STAGES=3,
+        ACC=acc,
+        POSITION_64=indices.dtype == torch.int64,
+        FIXED_STEPS=0,
+        num_warps=warps,
+        enable_fp_fusion=(acc == tl.float32),
+    )
+    return y
 
 @triton.jit
 def _spmv_sell_real_kernel(
@@ -280,7 +338,14 @@ def flagsparse_spmv_sell(
         y = _torch_spmv_sell(values, cols, offsets, x, n_rows, slice_size, acc_dtype)
         y = y if y.dtype == out_dtype else y.to(out_dtype)
     else:
-        y = torch.empty(n_rows, dtype=out_dtype, device=x.device)
+        # Reuse a caller-provided output directly.  This keeps prepared
+        # benchmark calls symmetric with cuSPARSE's preallocated DnVec and
+        # avoids a full-device copy after every launch.
+        # A strided ``out`` cannot be handed to the kernels, which index it
+        # densely; it is filled by the copy below instead.
+        y = out if out is not None and out.is_contiguous() else torch.empty(
+            n_rows, dtype=out_dtype, device=x.device
+        )
         block_r = triton.next_power_of_2(slice_size)
         # Group existing slices; changing SLICE would reinterpret the storage.
         group = max(1, min(8, (256 if _is_rocm_runtime() else 128) // block_r))
@@ -299,7 +364,7 @@ def flagsparse_spmv_sell(
         # program owns.  Keep an opt-in override for backend tuning.
         override = os.environ.get("FLAGSPARSE_SELL_ROCM_GROUP")
         if _is_rocm_runtime() and override:
-            group = max(1, min(8, int(override)))
+            group = max(1, min(16, int(override)))
         warp_override = os.environ.get("FLAGSPARSE_SELL_ROCM_WARPS")
         if _is_rocm_runtime() and warp_override:
             num_warps = max(1, min(8, int(warp_override)))
@@ -322,6 +387,10 @@ def flagsparse_spmv_sell(
                         *complex_args, SLICE=slice_size, BLOCK_R=block_r,
                         SLOTS=(8 if _is_rocm_runtime() else 4),
                     )
+            elif _is_rocm_runtime() and not _is_complex_dtype(values.dtype):
+                _rocm_sell_real_kernel(
+                    values, cols, offsets, x, y, n_rows, slice_size
+                )
             else:
                 _spmv_sell_real_kernel[grid](
                     y, values, cols, offsets, x, n_rows,
@@ -329,7 +398,8 @@ def flagsparse_spmv_sell(
                     num_warps=num_warps,
                 )
     if out is not None:
-        out.copy_(y)
+        if y is not out:
+            out.copy_(y)
         y = out
     if return_time:
         _ACCEL.synchronize()
@@ -369,7 +439,19 @@ def csr_to_sell(data, indices, indptr, n_rows, slice_size, index_dtype=None):
         )
         slot = torch.arange(nnz, device=device, dtype=torch.int64) - ptr[rows]
         pos = offsets[rows // slice_size] + slot * slice_size + rows % slice_size
-        values[pos] = data
+        if _is_ascend_runtime() and data.is_complex():
+            # torch_npu's IndexPut implementation rejects complex tensors.  Store
+            # the two real planes instead; IndexCopy supports the corresponding
+            # floating dtype and view_as_complex restores the SELL value layout.
+            parts = torch.zeros(
+                (total, 2),
+                dtype=torch.view_as_real(data).dtype,
+                device=device,
+            )
+            parts.index_copy_(0, pos, torch.view_as_real(data))
+            values = torch.view_as_complex(parts)
+        else:
+            values[pos] = data
         cols[pos] = indices.to(index_dtype)
     return values, cols, offsets.to(index_dtype)
 

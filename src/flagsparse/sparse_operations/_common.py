@@ -19,6 +19,7 @@ import importlib
 import os
 import statistics
 import time
+import weakref
 
 try:
     import torch
@@ -406,6 +407,7 @@ __all__ = (
     "_INDEX_LIMIT_INT32",
     "_is_complex_dtype",
     "_gather_values",
+    "_csr_row_ids_torch",
     "_index_add_values",
     "_resolve_scatter_value_dtype",
     "_component_dtype_for_complex",
@@ -549,6 +551,52 @@ __all__ = (
 
 def _is_complex_dtype(value_dtype):
     return value_dtype in (torch.complex64, torch.complex128)
+
+
+_CSR_ROW_IDS_CACHE = {}
+
+
+def _csr_row_ids_torch(indptr, n_rows):
+    """Per-nonzero row index of a CSR ``indptr``, via ``repeat_interleave``.
+
+    For the torch fallbacks (Ascend, XPU) that cannot lower ``_build_row_ids``.
+    The expansion costs as much as the SpMV it feeds, so it is cached -- but per
+    tensor OBJECT and version, never per address: the old ``data_ptr()``-keyed
+    cache handed a recycled allocation the row ids of the previous CSR pattern
+    (``index_add_(): Number of indices ... should be equal to source.size``).
+    A hit requires the very same live tensor, unmodified (``_version``), and the
+    same row count; the entry is dropped when the tensor is freed, so ``id()``
+    reuse cannot match. Inference tensors have no version and are not cached.
+    """
+    n_rows = int(n_rows)
+    key = id(indptr)
+    try:
+        version = indptr._version
+    except RuntimeError:
+        version = None
+    entry = _CSR_ROW_IDS_CACHE.get(key)
+    if entry is not None and version is not None:
+        ref, cached_version, cached_rows, row_ids = entry
+        if ref() is indptr and cached_version == version and cached_rows == n_rows:
+            return row_ids
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
+        indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
+    )
+    if version is None:
+        return row_ids
+
+    def _evict(dead_ref, key=key):
+        current = _CSR_ROW_IDS_CACHE.get(key)
+        if current is not None and current[0] is dead_ref:
+            del _CSR_ROW_IDS_CACHE[key]
+
+    try:
+        ref = weakref.ref(indptr, _evict)
+    except TypeError:
+        return row_ids
+    _CSR_ROW_IDS_CACHE[key] = (ref, version, n_rows, row_ids)
+    return row_ids
 
 
 def _gather_values(values, order):

@@ -16,6 +16,7 @@
 
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
+from ._rocm_sparse_cache import TensorPlanCache
 
 import triton
 import triton.language as tl
@@ -145,8 +146,10 @@ class PreparedCscSpmv:
         self.col_ids = col_ids
         self.csr_delegate = csr_delegate
         self.non_gather_plan = None
-        if (_SPMV_CSC_CUDA and _normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_NON
-                and data.dtype == torch.complex64):
+        if (_normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_NON
+                and ((_SPMV_CSC_CUDA and data.dtype == torch.complex64)
+                     or (_is_rocm_runtime() and not _is_ascend_runtime()
+                         and data.dtype in (torch.complex64, torch.float32, torch.float16)))):
             from . import _spmv_csr_transpose
             # CSC(A) is CSR(A.T); transposing this topology gives row owners of A.
             self.non_gather_plan = _spmv_csr_transpose.prepare(
@@ -430,11 +433,15 @@ def prepare_spmv_csc(
     col_ids = None
     if int(data.numel()) > 0 and not _spmv_csc_op_transposes(op_code):
         try:
-            # Deferred import: sddmm_csr only depends on _common, so there is no cycle,
-            # but keeping it local avoids adding a load-time edge between operators.
-            from .sddmm_csr import _build_row_ids
+            if _is_ascend_runtime():
+                # A CSC indptr runs over columns, so its "row ids" are column ids.
+                col_ids = _csr_row_ids_torch(indptr, n_cols)
+            else:
+                # Deferred import: sddmm_csr only depends on _common, so there is no cycle,
+                # but keeping it local avoids adding a load-time edge between operators.
+                from .sddmm_csr import _build_row_ids
 
-            col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
+                col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
         except Exception:
             col_ids = None
     # op="trans"/"conj": CSC(A) and CSR(A.T) are the same three arrays, so the
@@ -574,6 +581,34 @@ def _spmv_csc_non_complex_nnzpar_kernel(
 
 
 SPMV_CSC_NNZPAR_BLOCK = 256
+
+
+def _ascend_spmv_csc_torch(prepared, x, op_code):
+    """CSC SpMV fallback using torch_npu indexing primitives.
+
+    CANN currently cannot lower the native CSC Triton kernels.  Keep this route
+    local to Ascend; all other backends continue to use the kernels above.
+    """
+    n_rows, n_cols = prepared.n_rows, prepared.n_cols
+    nnz = int(prepared.nnz)
+    if nnz == 0:
+        out_len = n_cols if _spmv_csc_op_transposes(op_code) else n_rows
+        return torch.zeros(out_len, dtype=prepared.data.dtype, device=prepared.data.device)
+    col_ids = getattr(prepared, "col_ids", None)
+    if col_ids is None:
+        col_ids = _csr_row_ids_torch(prepared.kernel_indptr, n_cols)
+    rows = prepared.kernel_indices.to(torch.int64)
+    cols = col_ids.to(torch.int64)
+    values = prepared.data
+    if op_code == SPMV_CSC_OP_CONJ_TRANS:
+        values = values.conj()
+    if _spmv_csc_op_transposes(op_code):
+        result = torch.zeros(n_cols, dtype=values.dtype, device=values.device)
+        _index_add_values(result, 0, cols, values * _gather_values(x, rows))
+    else:
+        result = torch.zeros(n_rows, dtype=values.dtype, device=values.device)
+        _index_add_values(result, 0, rows, values * _gather_values(x, cols))
+    return result
 
 
 def _triton_spmv_csc_kernel(prepared, x, op_code):
@@ -743,6 +778,8 @@ def _spmv_csc_prepared_with_int32_indices(prepared, reason):
 
 
 def _run_spmv_csc_prepared_with_fallback(prepared, x, op_code):
+    if _is_ascend_runtime():
+        return _ascend_spmv_csc_torch(prepared, x, op_code)
     try:
         return _triton_spmv_csc_kernel(prepared, x, op_code)
     except RuntimeError as exc:
@@ -756,6 +793,7 @@ def _run_spmv_csc_prepared_with_fallback(prepared, x, op_code):
 
 
 _SPMV_CSC_VIA_MIXED_DTYPES = (torch.float16, torch.bfloat16, torch.int8)
+_ROCM_CSC_GATHER_CACHE = TensorPlanCache()
 
 
 def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype,
@@ -772,6 +810,40 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
     if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
         raise ValueError("invalid CSC dimensions")
     timed = bool(return_time or return_meta)
+    if (_is_rocm_runtime() and not _is_ascend_runtime()
+            and data.dtype == torch.float16 and not _spmv_csc_op_transposes(op_code)):
+        # CSC(A) is CSR(A.T).  A prepared gather plan computes A @ x by
+        # grouping entries by output row, avoiding the per-nnz FP32 atomic
+        # path used by the generic mixed COO fallback.
+        from . import _spmv_csr_transpose
+        _mixed_spmx._check_1d((data, "data"), (x, "x"))
+        if x.numel() != n_cols:
+            raise ValueError("x shape does not match CSC operation")
+        if x.device != data.device:
+            raise ValueError("CSC inputs must be on the same device")
+        result_dtype, _ = _mixed_spmx._resolve_types(data.dtype, x.dtype, out, out_dtype, False)
+        if out is not None and (out.shape != (n_rows,) or out.device != data.device):
+            raise ValueError("out shape/device must match the CSC SpMV result")
+        t0 = _mixed_spmx._start(timed)
+        sources, options = (indices, indptr), (n_rows, n_cols, data.device)
+        plan = _ROCM_CSC_GATHER_CACHE.get(sources, options)
+        if plan is None:
+            _mixed_spmx._check_1d((indices, "indices"), (indptr, "indptr"))
+            if indices.device != data.device or indptr.device != data.device:
+                raise ValueError("CSC inputs must be on the same device")
+            plan = _spmv_csr_transpose.prepare(indices, indptr, (n_cols, n_rows))
+            _ROCM_CSC_GATHER_CACHE.put(sources, options, plan)
+        target = (None if result_dtype == data.dtype
+                  else torch.empty(n_rows, dtype=result_dtype, device=data.device))
+        y = _spmv_csr_transpose.gather(data.contiguous(), x, plan, n_rows, out=target)
+        y = _mixed_spmx._finish(y, out, t0, timed)
+        if not timed:
+            return y
+        y, elapsed = y
+        if return_meta:
+            meta = {"route": "rocm_csc_gather", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     if _spmv_csc_op_transposes(op_code):
         y = _mixed_spmx.spmv_csr_mixed(
             data, indices, indptr, x, (n_cols, n_rows),

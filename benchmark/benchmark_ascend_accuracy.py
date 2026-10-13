@@ -1,10 +1,55 @@
 """Ascend accuracy probe using SciPy/NumPy references."""
 from __future__ import annotations
-import argparse, json
+import argparse, json, sys, zlib
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from benchmark_ascend import Case, run
 
 DEFAULT_ACCURACY_DTYPES = 'float16,float32,float64'
-GATHER_SCATTER_ACCURACY_DTYPES = 'float16,float32,float64,complex64,complex128'
+GATHER_SCATTER_ACCURACY_DTYPES = 'float16,float32,float64,complex64,complex128,int8'
+
+
+def _run_q4_variants(names):
+    import torch
+    from tests.pytest import test_q4_variants_accuracy as cases
+
+    selected = {
+        name: (builder, dtype)
+        for name, _marker, builder, dtype in cases.VARIANTS
+        if name in names
+    }
+    unknown = sorted(set(names) - set(selected))
+    if unknown:
+        raise ValueError(f"unknown q4 variant(s): {', '.join(unknown)}")
+
+    payload = {}
+    for name in names:
+        builder, dtype = selected[name]
+        for shape in cases.SHAPES:
+            shape_id = "x".join(map(str, shape))
+            nodeid = (
+                "tests/pytest/test_q4_variants_accuracy.py::"
+                f"test_q4_variant_matches_cpu_golden[{name}-{shape_id}]"
+            )
+            try:
+                gen = torch.Generator().manual_seed(zlib.crc32(name.encode()))
+                result, reference, expected = builder(dtype, shape, gen)
+                cases._check(result, reference, expected)
+                test_result, reason = "passed", None
+            except Exception as exc:
+                test_result = "failed"
+                reason = f"{type(exc).__name__}: {exc}"
+            payload[nodeid] = {
+                "params": {"variant": name, "shape": shape_id},
+                "result": test_result,
+                "reason": reason,
+                "opname": [name],
+            }
+    return payload
 
 
 def main():
@@ -15,6 +60,7 @@ def main():
     # Complex variants are probed only for gather/scatter; unsupported index
     # kernels become explicit capability skips rather than missing rows.
     p.add_argument('--dtypes', default=None)
+    p.add_argument('--q4-variants', default='')
     args = p.parse_args()
     default_dtypes = (
         GATHER_SCATTER_ACCURACY_DTYPES
@@ -62,6 +108,11 @@ def main():
             ),
             'opname': [args.op],
         }
+    q4_variants = [
+        item.strip() for item in args.q4_variants.split(',') if item.strip()
+    ]
+    if q4_variants:
+        payload.update(_run_q4_variants(q4_variants))
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
     print(json.dumps(payload, indent=2), flush=True)

@@ -37,6 +37,8 @@ OPERATOR_MODULE = {
     "spmv_coo": "spmv_coo.py",
     "spmm_csr": "spmm_csr.py",
     "spmm_coo": "spmm_coo.py",
+    "spmv_csc": "spmv_csc.py",
+    "spmm_csc": "spmm_csc.py",
     "sddmm_csr": "sddmm_csr.py",
 }
 

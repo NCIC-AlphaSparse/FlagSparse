@@ -45,7 +45,13 @@ import cusparse_generic_baseline as cusparse_baseline
 import flagsparse as fs
 from benchmark_utils import accelerator_device
 from flagsparse.sparse_operations import mixed_spmx
-from flagsparse.sparse_operations._common import _benchmark_cuda_op
+from flagsparse.sparse_operations._common import (
+    _benchmark_cuda_op,
+    _gather_values,
+    _is_ascend_runtime,
+    _is_rocm_runtime,
+)
+from flagsparse.sparse_operations._spmv_csr_benchmark import _prepared_row_tile_op
 from mtx_fast import read_scipy_csr
 
 DENSE_COLS = 32  # N for SpMM, K for SDDMM
@@ -323,7 +329,9 @@ class _Matrix:
             return values, self.cols, self.ptr
         if fmt == "coo":
             return values, self.rows, self.cols
-        return values[self.csc_order.to(values.device)].contiguous(), self.csc_rows, self.csc_ptr
+        order = self.csc_order.to(values.device)
+        csc_values = _gather_values(values, order).contiguous()
+        return csc_values, self.csc_rows, self.csc_ptr
 
     def scipy(self, values_cpu):
         return sp.csr_matrix((_wide_np(values_cpu), self.csr.indices, self.csr.indptr), self.shape)
@@ -424,7 +432,7 @@ def _spmv(v, mat, gen, warmup, iters, row):
         v.value, x.dtype, None, kw.get("out_dtype"), coo=v.fmt == "coo"
     ) or (v.fmt == "csc" and v.value in (torch.float16, torch.bfloat16, torch.int8))
     csc_vals = mat.arrays("csc", vals)[0] if v.fmt == "csc" else None
-    if mixed:
+    if mixed or _is_ascend_runtime():
         row["timed"] = "call"
         if v.fmt == "csr":
             ours = lambda: fs.flagsparse_spmv_csr(vals, mat.cols, mat.ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
@@ -436,7 +444,25 @@ def _spmv(v, mat, gen, warmup, iters, row):
         row["timed"] = "prepared"
         if v.fmt == "csr":
             prepared = fs.prepare_spmv_csr(vals, mat.cols, mat.ptr, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
+            if (
+                _is_rocm_runtime()
+                and prepared.alg == "row_tile"
+                and v.op_a == "non"
+                and v.value in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                    torch.complex64,
+                )
+            ):
+                # The vendor plan owns its output buffer. Bind the same
+                # prepared Triton launch so allocation and wrapper dispatch do
+                # not dominate short-row delivery timings.
+                target = torch.empty(m, dtype=v.out, device=mat.dev)
+                ours = _prepared_row_tile_op(prepared, x, target)
+            else:
+                ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
         elif v.fmt == "coo":
             prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
             ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x)  # noqa: E731
@@ -459,6 +485,32 @@ def _spmv(v, mat, gen, warmup, iters, row):
     def build_torch():
         c = _compute_dtype(v) if v.value in (torch.int8, torch.float16, torch.bfloat16) else (v.x or v.value)
         c = torch.float32 if c == torch.int32 else c
+        if _is_ascend_runtime():
+            values = vals.to(c)
+            dense = x.to(c)
+            if v.op_a == "non":
+                target = mat.rows.to(torch.int64)
+                source_index = mat.cols.to(torch.int64)
+                out_size = m
+            else:
+                target = mat.cols.to(torch.int64)
+                source_index = mat.rows.to(torch.int64)
+                values = values.conj() if v.op_a == "conj" else values
+                out_size = n
+
+            def index_add_spmv():
+                product = values * dense.index_select(0, source_index)
+                if product.is_complex():
+                    out = torch.zeros(out_size, dtype=c, device=mat.dev)
+                    torch.view_as_real(out).index_add_(
+                        0, target, torch.view_as_real(product)
+                    )
+                    return out
+                out = torch.zeros(out_size, dtype=c, device=mat.dev)
+                out.index_add_(0, target, product)
+                return out
+
+            return index_add_spmv
         a = _sparse_torch(mat.ptr, mat.cols, vals.to(c), mat.shape, v.op_a)
         xc = x.to(c)
         return lambda: a @ xc
@@ -489,8 +541,12 @@ def _spmm(v, mat, gen, warmup, iters, row):
         ours = lambda: fs.flagsparse_spmm_csc(
             csc_vals, csc_rows, csc_ptr, _op_t(B, v.op_b), mat.shape, op=v.op_a, **kw
         )
-    elif v.fmt in ("csr", "coo") and mixed_spmx.spmm_needs_mixed(
-        v.value, None, kw.get("out_dtype")
+    elif (
+        v.fmt in ("csr", "coo")
+        and (
+            mixed_spmx.spmm_needs_mixed(v.value, None, kw.get("out_dtype"))
+            or (_is_ascend_runtime() and v.fmt == "csr")
+        )
     ):
         row["timed"] = "call"
         if v.fmt == "csr":
@@ -628,13 +684,31 @@ def _sddmm(v, mat, gen, warmup, iters, row):
     if v.layout == "col":
         A, B = _col_major(A), _col_major(B)
 
-    row["timed"] = "prepared"
-    prepared = fs.prepare_sddmm_csr(mat.cols, mat.ptr, mat.shape, k_hint=kd)
+    if _is_ascend_runtime():
+        # The public Ascend SDDMM fallback is intentionally raw-input based;
+        # preparing here would compile its Triton row-id helper first.
+        row["timed"] = "call"
 
-    def ours():
-        return fs.flagsparse_sddmm_csr(
-            x=A, y=B, prepared=prepared, op_a=v.op_a, op_b=v.op_b, dense_layout=v.layout
-        )
+        def ours():
+            return fs.flagsparse_sddmm_csr(
+                None,
+                mat.cols,
+                mat.ptr,
+                x=A,
+                y=B,
+                shape=mat.shape,
+                op_a=v.op_a,
+                op_b=v.op_b,
+                dense_layout=v.layout,
+            )
+    else:
+        row["timed"] = "prepared"
+        prepared = fs.prepare_sddmm_csr(mat.cols, mat.ptr, mat.shape, k_hint=kd)
+
+        def ours():
+            return fs.flagsparse_sddmm_csr(
+                x=A, y=B, prepared=prepared, op_a=v.op_a, op_b=v.op_b, dense_layout=v.layout
+            )
 
     first = ours()
     row["max_error"] = _error(first, ref)
@@ -714,10 +788,20 @@ def matrix_paths(inputs):
     return list(dict.fromkeys(paths))
 
 
-def run_variants(op, inputs, warmup, iters, seed=2026, log=print):
+def run_variants(
+    op, inputs, warmup, iters, seed=2026, log=print, variant_names=None
+):
     """Generic rows for every q4 variant of ``op`` on every .mtx in ``inputs``."""
     dev = accelerator_device()
     gen = torch.Generator().manual_seed(seed)
+    variants = VARIANTS[op]
+    if variant_names is not None:
+        requested = set(variant_names)
+        known = {variant.name for variant in variants}
+        unknown = sorted(requested - known)
+        if unknown:
+            raise ValueError(f"unknown {op} q4 variant(s): {', '.join(unknown)}")
+        variants = [variant for variant in variants if variant.name in requested]
     rows = []
     for path in matrix_paths(inputs):
         try:
@@ -725,7 +809,7 @@ def run_variants(op, inputs, warmup, iters, seed=2026, log=print):
         except Exception as exc:
             log(f"[q4] {os.path.basename(path)}: cannot load: {exc}")
             continue
-        for v in VARIANTS[op]:
+        for v in variants:
             row = {
                 "variant": v.name,
                 "matrix": os.path.basename(path),
@@ -782,12 +866,14 @@ def append_to_csv(op, csv_path, rows):
     return len(translated)
 
 
-def run_and_append(op, inputs, csv_path, warmup, iters):
+def run_and_append(op, inputs, csv_path, warmup, iters, variant_names=None):
     """Entry point for the scripts: measure ``op``'s q4 variants, append to ``csv_path``."""
     if not csv_path:
         print("[q4] --q4-variants needs the script's CSV output option; skipped")
         return 0
-    rows = run_variants(op, inputs, warmup, iters)
+    rows = run_variants(
+        op, inputs, warmup, iters, variant_names=variant_names
+    )
     count = append_to_csv(op, csv_path, rows)
     failed = sum(1 for r in rows if r.get("status") != "PASS")
     print(f"[q4] appended {count} {op} q4-variant row(s) to {csv_path}; {failed} not PASS")
