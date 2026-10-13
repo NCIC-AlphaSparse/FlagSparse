@@ -996,11 +996,9 @@ def _spgemm_hash_hybrid_compute(prepared):
         keep[pend] = False
         hashed = hashed & keep
     if bool(hashed.any()):
-        # Launch-shape selection for the fill pass.  The CUDA branch sizes tables from the
-        # exact per-row nnz using the finer _SPGEMM_HASH_FILL_BUCKETS and decides
-        # uniform-vs-partitioned by cost; every other backend keeps upstream's
-        # max-based gate over the original bucket table, unchanged.
-        if _backend_name() == "cuda":
+        # Size tables by exact output occupancy on CUDA/ROCm. Other backends
+        # retain the max-based gate over the original bucket table.
+        if _backend_name() == "cuda" or _is_rocm_runtime():
             fill_ncaps = len(_SPGEMM_HASH_FILL_BUCKETS)
             while (
                 fill_ncaps > 1
@@ -1028,7 +1026,8 @@ def _spgemm_hash_hybrid_compute(prepared):
             # Per-row fill cost tracks table size, but only down to the program's thread
             # count: init/emit is a vector op over num_warps*32 lanes, which is why cap 32
             # with 2 warps measured *slower* than cap 64 on ecology1 (rows all 13 nnz).
-            eff = [max(cap, warps * 32) for _mr, cap, _b, warps in fill_buckets]
+            wave_size = 64 if _is_rocm_runtime() else 32
+            eff = [max(cap, warps * wave_size) for _mr, cap, _b, warps in fill_buckets]
             nonempty = [i for i, c in enumerate(counts) if c > 0]
             single = None
             if nonempty:

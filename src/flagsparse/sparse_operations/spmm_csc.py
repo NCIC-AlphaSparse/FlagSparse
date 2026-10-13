@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 
 from ._common import *
+from ._rocm_sparse_cache import TensorPlanCache
 
 import triton
 import triton.language as tl
@@ -43,6 +44,7 @@ _SPMM_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMM_CSC_OP_NAMES.item
 
 SPMM_CSC_ALG_BASE = "spmm_csc_base"
 _SPMM_CSC_RESERVED_OP_MESSAGE = "spmm_csc_base supports op='non', 'trans', and 'conj'"
+_ROCM_CSC_PREPARED_CACHE = TensorPlanCache()
 
 
 class SpmmCscAlgorithmUnavailable(RuntimeError):
@@ -155,6 +157,7 @@ class PreparedCscSpmm:
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
+        "rocm_non_gather_plan",
     )
 
     def __init__(
@@ -199,6 +202,16 @@ class PreparedCscSpmm:
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
+        self.rocm_non_gather_plan = None
+        if (_is_rocm_runtime() and not _is_ascend_runtime()
+                and data.dtype == torch.complex64 and self.op == "non"):
+            from . import _spmv_csr_transpose
+            cols, ptr, order, rows, _, _, _ = _spmv_csr_transpose.prepare(
+                kernel_indices, kernel_indptr, (n_cols, n_rows)
+            )
+            self.rocm_non_gather_plan = (
+                cols, ptr, rows, order, {}
+            )
 
 
 @triton.jit
@@ -1117,12 +1130,70 @@ def _spmm_csc_trans_complex_nnzpar_kernel(
     )
 
 
+@triton.jit
+def _spmm_csc_rocm_complex_gather_kernel(
+    A, I, P, ROW_ORDER, ORDER, B, C, M: tl.constexpr, N: tl.constexpr,
+    BK: tl.constexpr, BN: tl.constexpr,
+    R: tl.constexpr, K: tl.constexpr, TILE_N: tl.constexpr,
+    INDIRECT: tl.constexpr,
+):
+    ids = tl.program_id(0) * R + tl.arange(0, R)
+    valid_rows = ids < M
+    rows = tl.load(ROW_ORDER + ids, valid_rows, other=0)
+    starts = tl.load(P + rows, valid_rows, other=0)
+    ends = tl.load(P + rows + 1, valid_rows, other=0)
+    lanes = tl.arange(0, K)
+    dense = tl.program_id(1) * TILE_N + tl.arange(0, TILE_N)
+    re = tl.zeros((R, K, TILE_N), tl.float32)
+    im = tl.zeros((R, K, TILE_N), tl.float32)
+    for base in range(0, tl.max(ends - starts, 0), K):
+        pos = starts[:, None] + base + lanes[None, :]
+        mask = valid_rows[:, None] & (pos < ends[:, None])
+        cols = tl.load(I + pos, mask, other=0)
+        source = tl.load(ORDER + pos, mask, other=0) if INDIRECT else pos
+        ar = tl.load(A + 2 * source, mask, other=0.)
+        ai = tl.load(A + 2 * source + 1, mask, other=0.)
+        bpos = cols[:, :, None] * BK + dense[None, None, :] * BN
+        bmask = mask[:, :, None] & (dense[None, None, :] < N)
+        br = tl.load(B + bpos, bmask, other=0.)
+        bi = tl.load(B + bpos + 1, bmask, other=0.)
+        re += ar[:, :, None] * br - ai[:, :, None] * bi
+        im += ar[:, :, None] * bi + ai[:, :, None] * br
+    target = 2 * (rows[:, None] * N + dense[None, :])
+    output_mask = valid_rows[:, None] & (dense[None, :] < N)
+    tl.store(C + target, tl.sum(re, 1), output_mask)
+    tl.store(C + target + 1, tl.sum(im, 1), output_mask)
+
+
 def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
     op_code = _normalize_spmm_csc_op(prepared.op if op_code is None else op_code)
     transposes = _spmm_csc_op_transposes(op_code)
     dtype = prepared.data.dtype
     n_dense_cols = int(B.shape[1])
     out_rows = prepared.n_cols if transposes else prepared.n_rows
+    plan = prepared.rocm_non_gather_plan
+    if plan is not None and not transposes:
+        C = torch.empty((out_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
+        if out_rows and n_dense_cols:
+            cols, ptr, rows, order, cache = plan
+            values = prepared.data.resolve_conj()
+            try:
+                version = values._version
+            except RuntimeError:
+                version = None
+            if version is not None:
+                if cache.get("source") is not values or cache.get("version") != version:
+                    cache.update(source=values, version=version,
+                                 values=_gather_values(values, order).contiguous())
+                values = cache["values"]
+            B_ri = torch.view_as_real(B)
+            tile_n = prepared.block_n if prepared.block_n_override else 32
+            _spmm_csc_rocm_complex_gather_kernel[(triton.cdiv(out_rows, 4), triton.cdiv(n_dense_cols, tile_n))](
+                torch.view_as_real(values), cols, ptr, rows, order, B_ri, torch.view_as_real(C),
+                out_rows, n_dense_cols, B_ri.stride(0), B_ri.stride(1),
+                R=4, K=8, TILE_N=tile_n, INDIRECT=version is None, num_warps=4,
+            )
+        return C
     C = torch.zeros((out_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
     if prepared.nnz == 0 or n_dense_cols == 0:
         return C
@@ -1440,9 +1511,10 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
 def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
     del diagnostics
     compute_ms = None
-    block_n = (
-        prepared.block_n
-        if prepared.block_n_override
+    gather_route = (prepared.rocm_non_gather_plan is not None
+                    and not _spmm_csc_op_transposes(prepared.op))
+    block_n = (prepared.block_n if prepared.block_n_override else 32) if gather_route else (
+        prepared.block_n if prepared.block_n_override
         else _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device)
     )
     backend_info = _get_device_backend_info(prepared.data.device)
@@ -1461,7 +1533,7 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": compute_ms,
         "block_n": int(block_n),
-        "block_nnz": int(prepared.block_nnz),
+        "block_nnz": 8 if gather_route else int(prepared.block_nnz),
         "launch_backend": backend_info["backend"],
         "device_warp_size": int(backend_info["device_warp_size"]),
     }
@@ -1741,18 +1813,29 @@ def flagsparse_spmm_csc(
             raise ValueError(
                 "data, indices, indptr, and shape are required when prepared is not provided"
             )
-        prepared = prepare_spmm_csc_route(
-            data,
-            indices,
-            indptr,
-            shape,
-            block_n=block_n,
-            block_nnz=block_nnz,
-            max_segments=max_segments,
-            op=_spmm_csc_op_to_name(op_code),
-            alg=alg,
-            index_fallback_policy=index_fallback_policy,
-        )
+        cacheable = (_is_rocm_runtime() and not _is_ascend_runtime()
+                     and data.dtype == torch.complex64
+                     and op_code == SPMM_CSC_OP_NON)
+        if cacheable:
+            sources = (data, indices, indptr)
+            options = (tuple(shape), block_n, block_nnz, max_segments,
+                       op_code, alg, index_fallback_policy)
+            prepared = _ROCM_CSC_PREPARED_CACHE.get(sources, options)
+        if prepared is None:
+            prepared = prepare_spmm_csc_route(
+                data,
+                indices,
+                indptr,
+                shape,
+                block_n=block_n,
+                block_nnz=block_nnz,
+                max_segments=max_segments,
+                op=_spmm_csc_op_to_name(op_code),
+                alg=alg,
+                index_fallback_policy=index_fallback_policy,
+            )
+            if cacheable:
+                _ROCM_CSC_PREPARED_CACHE.put(sources, options, prepared)
     else:
         if op_explicit and _spmm_csc_op_to_name(op_code) != prepared.op:
             raise ValueError(f"op={_spmm_csc_op_to_name(op_code)} does not match prepared.op={prepared.op}")

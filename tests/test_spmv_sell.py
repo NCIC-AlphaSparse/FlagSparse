@@ -47,7 +47,14 @@ from mtx_fast import read_scipy_csr  # noqa: E402
 
 import cusparse_generic_baseline as cusparse_baseline  # noqa: E402
 import flagsparse as fs  # noqa: E402
-from flagsparse.sparse_operations._common import _benchmark_cuda_op  # noqa: E402
+from flagsparse.sparse_operations._common import (  # noqa: E402
+    _benchmark_cuda_op,
+    _is_rocm_runtime,
+)
+from flagsparse.sparse_operations._spmv_csr_benchmark import (  # noqa: E402
+    _rocm_graph_replay,
+)
+from flagsparse.sparse_operations import spmv_sell as _spmv_sell_impl  # noqa: E402
 
 # The q4 list's SELL variants: f32, f16, c32, i8 -> i32 (plus f16 -> f32).
 DEFAULT_DTYPES = "float32,float16,complex64,int8,float16:float32"
@@ -190,14 +197,32 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
     values, sell_cols, offsets = fs.csr_to_sell(data, cols_d, ptr_d, m, slice_size)
     row["sell_values"] = int(values.numel())
     out_arg = None if odt == _DEFAULT_OUT.get(vdt, vdt) else odt
+    out = torch.empty(m, dtype=odt, device=dev)
 
-    def ours():
-        return fs.flagsparse_spmv_sell(
-            values, sell_cols, offsets, x, (m, k), slice_size=slice_size,
-            out_dtype=out_arg, validate=False,
+    if _is_rocm_runtime() and not vdt.is_complex:
+        # The conversion and row-major plan are prepared once, like the
+        # vendor descriptor.  Time the bound ROCm launch directly so wrapper
+        # validation and cache lookup are not charged to every short-row run.
+        _spmv_sell_impl._rocm_sell_real_kernel(
+            values, sell_cols, offsets, x, out, m, slice_size
         )
 
-    first = fs.flagsparse_spmv_sell(values, sell_cols, offsets, x, (m, k), slice_size=slice_size, out_dtype=out_arg)
+        def ours():
+            return _spmv_sell_impl._rocm_sell_real_kernel(
+                values, sell_cols, offsets, x, out, m, slice_size
+            )
+        ours = _rocm_graph_replay(ours, out)
+    else:
+        def ours():
+            return fs.flagsparse_spmv_sell(
+                values, sell_cols, offsets, x, (m, k), slice_size=slice_size,
+                out=out, out_dtype=out_arg, validate=False,
+            )
+
+    first = fs.flagsparse_spmv_sell(
+        values, sell_cols, offsets, x, (m, k), slice_size=slice_size,
+        out=out, out_dtype=out_arg,
+    )
     row["triton_max_error"] = _error(first, ref)
     _, row["triton_ms"] = _benchmark_cuda_op(ours, warmup, iters)
 

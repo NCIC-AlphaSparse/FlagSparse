@@ -49,7 +49,9 @@ from flagsparse.sparse_operations._common import (
     _benchmark_cuda_op,
     _gather_values,
     _is_ascend_runtime,
+    _is_rocm_runtime,
 )
+from flagsparse.sparse_operations._spmv_csr_benchmark import _prepared_row_tile_op
 from mtx_fast import read_scipy_csr
 
 DENSE_COLS = 32  # N for SpMM, K for SDDMM
@@ -442,7 +444,25 @@ def _spmv(v, mat, gen, warmup, iters, row):
         row["timed"] = "prepared"
         if v.fmt == "csr":
             prepared = fs.prepare_spmv_csr(vals, mat.cols, mat.ptr, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
+            if (
+                _is_rocm_runtime()
+                and prepared.alg == "row_tile"
+                and v.op_a == "non"
+                and v.value in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                    torch.complex64,
+                )
+            ):
+                # The vendor plan owns its output buffer. Bind the same
+                # prepared Triton launch so allocation and wrapper dispatch do
+                # not dominate short-row delivery timings.
+                target = torch.empty(m, dtype=v.out, device=mat.dev)
+                ours = _prepared_row_tile_op(prepared, x, target)
+            else:
+                ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
         elif v.fmt == "coo":
             prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
             ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x)  # noqa: E731

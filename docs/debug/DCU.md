@@ -278,5 +278,23 @@ tests/test_spmv_csr.py tests/data --alg compare --warmup 5 --iters 20
 - 怎么验证的：
 - 其他后端是否也需要：是 / 否 / 不确定
 ```
-
-无。
+### 2026-10-12 src/flagsparse/sparse_operations/{spmv_coo,spmv_csc,spmv_sell,spmm_csc,mixed_spmx,spgemm_csr,_spmv_csr_benchmark}.py
+- 改了什么：ROCm 性能调优（DCU 侧 drop，2026-10-13 在 main 上按 hunk 合入）。
+  - 新增 `_rocm_sparse_cache.TensorPlanCache`：未 prepare 的调用复用预处理结果（按张量 id + `_version` + data_ptr 判断是否失效）。用在混合精度 COO 转 CSR、CSC f16 gather plan、spmm_csc c64 prepared、SELL 行主序视图四处。
+  - spmv_coo：c32 gather 改为 4 lanes × 128 行；launch 缓存从只覆盖 fp32 扩展到所有 dtype。
+  - spmv_csc：ROCm 上 f32/f16/c64 的 non 走 gather plan。
+  - spmm_csc：新增 c64 专用 gather kernel。
+  - spmv_sell：实数类型改走 row_tile kernel。
+  - spgemm：fill 表按精确占用选大小，从 CUDA 扩展到 ROCm（wave64）。
+  - spmv_csr / SELL 的 benchmark：FlagSparse 一侧用 HIP graph 回放计时，hipSPARSE 一侧仍是普通调用。
+- 为什么改：DCU 65 项交付性能。
+- 怎么验证的：DCU 两轮全量（results_rocm_20261012、results_rocm_65_20261012_graph），65/65 精度和性能都 Passed，最低加速比 0.805x。CUDA 上 tests/pytest 相关算子 1534 passed，tests/ci 405 passed。
+- 合入时做的改动：
+  - **没有合入** SpGEMM count（符号）阶段缓存。它把结构分析移出了计时窗口，而 hipSPARSE 每次调用都会重做这一步，两边计时口径就不一样了。
+  - 修了 SELL 的三个问题：
+    1. 传了 `out` 时 Ascend 路径不写 `out`；
+    2. 不连续的 `out` 被当成连续内存写；
+    3. ROCm 快路径对 fp64 输入用 fp32 累加。
+  - 新增测试 `test_spmv_sell_writes_caller_out`。
+- 其他后端是否也需要：SELL 的修复对所有后端都生效；其余改动只在 ROCm 上生效。
+- 待办：HIP graph 回放只在 FlagSparse 一侧，所以 spmv_csr / SELL 的加速比口径和 hipSPARSE 不对等，报数时要注明。

@@ -40,14 +40,17 @@ Backend notes:
 
 from ._common import *
 
+import os
 import time
 
 import triton
 import triton.language as tl
+from ._rocm_sparse_cache import TensorPlanCache
 
 _HALF = (torch.float16, torch.bfloat16)
 _TL_ACC = {torch.float32: tl.float32, torch.float64: tl.float64, torch.int32: tl.int32}
 _ROCM_CSR_MIXED_CACHE = {}
+_ROCM_COO_CSR_CACHE = TensorPlanCache()
 
 # value dtype -> widened output dtypes (the first is the default for int8).
 _WIDE_OUT = {
@@ -226,6 +229,15 @@ def _csr_row_tile(nnz, n_rows):
     return 16, 32
 
 
+def _csr_mixed_num_warps():
+    """Return the mixed CSR SpMV launch width for ROCm tuning."""
+    if _is_rocm_runtime():
+        value = os.environ.get("FLAGSPARSE_CSR_MIXED_WARPS")
+        if value:
+            return max(1, min(8, int(value)))
+    return 4
+
+
 def _torch_spmv_rows(data, rows, cols, x, n_out, acc_dtype):
     """Ascend path: gather, multiply in the accumulate type, index_add by output row."""
     cols = cols.to(torch.int64)
@@ -296,12 +308,13 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
             _csr_spmv_real_by_complex_kernel[grid](
                 torch.view_as_real(y).reshape(-1), data, cols, ptr,
                 torch.view_as_real(x).reshape(-1), n_rows,
-                ROWS=rows_per, BLOCK=block, num_warps=4,
+                ROWS=rows_per, BLOCK=block, num_warps=_csr_mixed_num_warps(),
             )
         else:
             _csr_spmv_mixed_kernel[grid](
                 y, data, cols, ptr, x, n_rows,
-                ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK=block, num_warps=4,
+                ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK=block,
+                num_warps=_csr_mixed_num_warps(),
             )
     return _finish(y, out, t0, return_time)
 
@@ -337,12 +350,45 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, False)
     if out is not None and (out.shape != (n_rows,) or out.device != x.device):
         raise ValueError("out shape/device must match the COO SpMV result")
+    sources = (data, row, col)
     data, x = data.contiguous(), x.contiguous()
-    rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
     t0 = _start(return_time)
     if _is_ascend_runtime():
+        rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
         y = _torch_spmv_rows(data, rows.to(torch.int64), cols, x, n_rows, acc_dtype)
         return _finish(y.to(result_dtype), out, t0, return_time)
+    if _is_rocm_runtime():
+        # Delivery COO is emitted row-major.  Reuse a CSR row pointer and the
+        # tuned row-tile kernel so short rows are grouped into one program;
+        # this removes one global atomic per nonzero without changing values.
+        options = (n_rows, n_cols)
+        state = _ROCM_COO_CSR_CACHE.get(sources, options)
+        if state is None:
+            rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
+            ordered = True
+            if rows.numel() > 1:
+                ordered = bool(torch.all(rows[1:] >= rows[:-1]).item())
+            if ordered:
+                use_data, use_cols = data, cols
+            else:
+                order = torch.argsort(rows.to(torch.int64), stable=True)
+                use_data = data.index_select(0, order).contiguous()
+                use_cols = cols.index_select(0, order).contiguous()
+                rows = rows.index_select(0, order).contiguous()
+            counts = torch.bincount(rows.to(torch.int64), minlength=n_rows)
+            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32).contiguous()
+            state = (use_data, use_cols, ptr)
+            _ROCM_COO_CSR_CACHE.put(sources, options, state)
+        use_data, use_cols, ptr = state
+        y = torch.empty(n_rows, dtype=result_dtype, device=x.device)
+        if n_rows:
+            rows_per, block = _csr_row_tile(data.numel(), n_rows)
+            _csr_spmv_mixed_kernel[(triton.cdiv(n_rows, rows_per),)](
+                y, use_data, use_cols, ptr, x, n_rows,
+                ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK=block, num_warps=4,
+            )
+        return _finish(y, out, t0, return_time)
+    rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
     acc = torch.zeros(n_rows, dtype=acc_dtype, device=x.device)
     nnz = data.numel()
     if nnz:
