@@ -90,6 +90,9 @@ python3 tools/delivery_table.py results_ascend_65_<日期>
   3. 折算补上的变体预演出来大多是 0.001x–0.06x：这些 q4 路径每次调用 0.3–2.4 秒（`timed=call`）。这是真实性能，
      回传时照实报，并附上 `delivery_table.py` 全表。
 
+> **下面的优先级 1–3 和"带回来的东西"是 2026-10-08 的历史任务清单**，到 10-11 已基本完成（45/45 派发、
+> 10-11 全量 64/65）。这一轮复测只做上面的"先做：65 变体全量重测"，按"跑完要确认"一节回报。
+
 ### 优先级 1：验证今天接上路由的 8 个变体（预计几分钟）
 
 ```bash
@@ -141,33 +144,55 @@ sweep、单次 `index_add`）。涉及对 CSC 格式和 SpGEMM 哈希表算法�
    报错，或者判 TRITON 但其实某个新版本 CANN 能编过），这个工具本身需要更新——它是 CUDA 模拟，不是
    NPU 本身的真值。
 
+## 跑完要确认（2026-10-14 之后这一轮）
+
+1. `missing` 是不是 0；`scatter_i8_int` 这次应在全量里出现（10-11 那轮 NotFound）。
+2. `spgemm_csr` 的性能这次第一次走 `tests/test_spgemm.py`（交付矩阵、float32/float64 分进程）：
+   应有 `spgemm_csr/performance_float32.csv`、`performance_float64.csv`，`spgemm_csr_f32_int_non_non` 应有加速比。
+   失败就贴 `spgemm_csr/performance_stderr.log` 最后 50 行原文。
+3. 有加速比的变体个数（预演 64–65）。带 `(H800折算)` / `(H800 PyTorch折算)` 的变体原样列出；日志里卡型应是 `ascend-910b`。
+4. 折算补上的变体预演大多是 0.001x–0.06x（q4 call 路径每次 0.3–2.4 秒）。如实带回，并挑 3 个最慢的变体贴
+   `performance.csv` 原始行（含 `timed`、`triton_ms` 列）。
+
+把这些结果写回来，不用额外分析，原始数据最有用。
+
 ## 交给 Codex 的 prompt
 
 上机时把下面整段原样贴给 Codex（或其他代理），不用改任何内容。
 
 ````text
-你在昇腾 910B 实机上做 FlagSparse 65 变体的剩余工作。仓库在当前目录，main 分支。
-git pull --ff-only origin main 之后，完整读一遍 docs/debug/ASCEND.md，按里面的优先级做：
+你在 昇腾 910B（Ascend） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
-1. 先跑 PYTHONPATH=src python3 tools/q4_ascend_dispatch_check.py。它的结论是在 CUDA 上模拟出来的
-   （38/45 OK），本机结果如果不一样（判 OK 但真机报错，或者判 TRITON 但真机能编过），本身就是重要发现。
-2. 做优先级 1（8 个变体，命令在文档里），带回 delivery_table.py 的输出。
-3. 优先级 2 只挑 spmv_csr_f16_int_non 一个变体试着接通，接通后先停下来汇报，不要一次接完 30 个。
-4. 优先级 3 不做。
+背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里会标
+  (H800折算) 或 (H800 PyTorch折算)。有本机基线的变体不受影响。
+- 本后端相关的修复，见 docs/debug/ASCEND.md "跑完要确认"一节逐条列出的内容。
+主要目的是收集数据，不是修代码。
+
+步骤：
+1. git pull --ff-only origin main；git log -1 --oneline 的提交应不早于 d7d1919（"ci again"）。
+2. 按 docs/ASCEND.md 配好环境，做完它的环境自检。
+3. 确认导入的是仓库源码：python3 -c "import flagsparse; print(flagsparse.__file__)"
+   输出必须在当前目录的 src/ 下。如果指向 site-packages / dist-packages，先停下来汇报，不要继续。
+4. 完整读一遍 docs/debug/ASCEND.md，照"上机要做的事"里"先做：65 变体全量重测"一节的命令原样跑（已带 --h800-reference，不要去掉）。
+   - --results-dir 用新目录（<日期> 填今天），不要复用旧目录，也不要往旧目录里补跑。
+   - 命令本身已经用 setsid 放到后台，定期看日志进度，不要中途打断。
+   - 不要用 pytest --forked，它在 GPU 上会让所有用例失败。
+5. 跑完执行 python3 tools/delivery_table.py <结果目录>。
 
 规矩：
-- 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实要改（优先级 2 本身就要改 benchmark_ascend.py）
-  时，每改一个文件，都按 docs/debug/ASCEND.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动
-  放在同一个 commit 里。没改就在那一节写"无"。
-- 不要猜根因。遇到报错就给出完整报错原文。
-- --results-dir 用新目录，不要复用旧目录。不要用 pytest --forked。
+- 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实非改不可（比如环境适配）时，每改一个文件，
+  都按 docs/debug/ASCEND.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动放在同一个 commit 里。
+- 不要猜根因。遇到报错就给出完整报错原文，以及出错变体在结果目录里那一行的 reason/error 字段。
+- 折算出来的加速比是估算，低也照实报，不要为了数字好看换基线或改参数。
+- 结果目录整个打包带回（至少 summary.json、summary.csv、各算子的 performance.csv 和 *_stderr.log）。
 
 汇报包含：
-1. q4_ascend_dispatch_check.py 的完整输出。
-2. 优先级 1 的 delivery_table.py 输出（8 行），以及非 Passed 变体的 reason/error 原文。
-3. 如果做了优先级 2：那个变体第一次在真机上跑出的 performance.csv 原始行。
-4. 环境指纹：torch、torch_npu、CANN 版本，设备名。
-5. docs/debug/ASCEND.md "实机改动记录"一节的内容。
+1. delivery_table.py 的完整输出，尤其是第一行 "N registered variants, M missing"。
+2. 所有非 Passed 的变体、以及加速比为 "-" 的变体：变体名、阶段（精度/性能）、reason 或 error 原文。
+3. 逐条回答 docs/debug/ASCEND.md "跑完要确认"一节。
+4. 环境指纹：torch、triton 版本，设备名，驱动/SDK 版本，git log -1 --oneline，整轮总耗时。
+5. docs/debug/ASCEND.md "实机改动记录"一节的内容（没改写"无"）。
 ````
 
 ## 实机改动记录

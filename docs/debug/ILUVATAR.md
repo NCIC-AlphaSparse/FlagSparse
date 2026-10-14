@@ -73,53 +73,53 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
   `cusparseScsrmv`/`cusparseScsrmm`，且只覆盖 fp32 + int32 + 不转置。45 个新变体里的转置/共轭/
   混合精度/int8 变体大概率没有厂商基线，这是预期行为。
 
-## 跑完要确认
+## 跑完要确认（2026-10-14 之后这一轮）
 
-1. `missing` 是不是 0。
-2. 任何一行的 PyTorch 列数字是不是"看起来正常但可疑"（极快、或者跟其他后端差异巨大）——按上面第二条
-   风险点，这张卡的 PyTorch 列历史上出过静默错误的先例，数字本身不能直接当证据，需要交叉核对。
-3. int8/混合精度变体的精度是不是真的通过了。
+1. `missing` 是不是 0。9 个 f64/c64 变体 `NotFound` 是预期的，其余 56 个精度应 Passed。
+2. `spgemm_csr_f32_int_non_non`：精度 Passed、有加速比；日志/CSV 里不应再出现
+   `iluvatar TLE alloc does not support nv_mma_shared_layout=True`（出现就说明没拉到新代码）。
+3. 有加速比的变体个数（预演 56 = 10-09 预演的 55 + spgemm）。带 `(H800折算)` / `(H800 PyTorch折算)` 的原样列出。
+4. 任何一行的 PyTorch 列"看起来正常但可疑"（这张卡的 torch.sparse 有静默算错的先例）；int8/混合精度变体精度是否真的通过。
 
-把这三条的结果写回来，不用额外分析，原始数据最有用。
+把这些结果写回来，不用额外分析，原始数据最有用。
 
 ## 交给 Codex 的 prompt
 
-上机时把下面整段原样贴给 Codex（或其他代理）。不用改任何内容。
+上机时把下面整段原样贴给 Codex（或其他代理），不用改任何内容。
 
 ````text
-你在 天数智芯 BI-V150（Iluvatar） 实机上复测 FlagSparse 的 65 个交付变体。仓库在当前目录，main 分支。
+你在 天数智芯 BI-V150（Iluvatar） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
-背景：65 个变体（原 20 个 + 新合并的 45 个）只在 CUDA 上实测过，本机从没跑过。
-任务是在本机跑一遍，把原始结果带回来。主要目的是收集数据，不是修代码。
+背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里会标
+  (H800折算) 或 (H800 PyTorch折算)。有本机基线的变体不受影响。
+- 本后端相关的修复，见 docs/debug/ILUVATAR.md "跑完要确认"一节逐条列出的内容。
+主要目的是收集数据，不是修代码。
 
 步骤：
-1. git pull --ff-only origin main。
+1. git pull --ff-only origin main；git log -1 --oneline 的提交应不早于 d7d1919（"ci again"）。
 2. 按 docs/ILUVATAR.md 配好环境，做完它的环境自检。
 3. 确认导入的是仓库源码：python3 -c "import flagsparse; print(flagsparse.__file__)"
    输出必须在当前目录的 src/ 下。如果指向 site-packages / dist-packages，先停下来汇报，不要继续。
-   旧安装包会让基线列全部变成 N/A，看起来像正常结果。
-4. 完整读一遍 docs/debug/ILUVATAR.md，照"要做的事"一节的命令原样跑。
-   不要自己删减或改写参数，每个参数的来由那一节都写了。
-   - --results-dir 用新目录（<日期> 填今天），不要复用旧目录。
+4. 完整读一遍 docs/debug/ILUVATAR.md，照"要做的事"一节的命令原样跑（已带 --h800-reference，不要去掉）。
+   - --results-dir 用新目录（<日期> 填今天），不要复用旧目录，也不要往旧目录里补跑。
    - 命令本身已经用 setsid 放到后台，定期看日志进度，不要中途打断。
    - 不要用 pytest --forked，它在 GPU 上会让所有用例失败。
 5. 跑完执行 python3 tools/delivery_table.py <结果目录>。
 
 规矩：
 - 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实非改不可（比如环境适配）时，每改一个文件，
-  都按 docs/debug/ILUVATAR.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动放在同一个
-  commit 里。没改就在那一节写"无"。
+  都按 docs/debug/ILUVATAR.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动放在同一个 commit 里。
 - 不要猜根因。遇到报错就给出完整报错原文，以及出错变体在结果目录里那一行的 reason/error 字段。
-- 9 个 f64/c64 变体显示 NotFound 是预期的（本卡 fp64 不可用，命令已经挡掉了）。
-- 新变体的 PyTorch 列出现 PyTorch result off by ... 也是预期的，统计有多少行即可。
-  原 20 个变体的 PyTorch 数字不要当真。
+- 折算出来的加速比是估算，低也照实报，不要为了数字好看换基线或改参数。
+- 结果目录整个打包带回（至少 summary.json、summary.csv、各算子的 performance.csv 和 *_stderr.log）。
 
 汇报包含：
 1. delivery_table.py 的完整输出，尤其是第一行 "N registered variants, M missing"。
-2. 所有非 Passed 的变体：变体名、阶段（精度/性能）、reason 或 error 原文。
+2. 所有非 Passed 的变体、以及加速比为 "-" 的变体：变体名、阶段（精度/性能）、reason 或 error 原文。
 3. 逐条回答 docs/debug/ILUVATAR.md "跑完要确认"一节。
-4. 环境指纹：torch、triton 版本，设备名，warp size，驱动/SDK 版本，整轮总耗时。
-5. docs/debug/ILUVATAR.md "实机改动记录"一节的内容。
+4. 环境指纹：torch、triton 版本，设备名，驱动/SDK 版本，git log -1 --oneline，整轮总耗时。
+5. docs/debug/ILUVATAR.md "实机改动记录"一节的内容（没改写"无"）。
 ````
 
 ## 实机改动记录
