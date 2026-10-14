@@ -70,7 +70,7 @@ source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 export PYTHONPATH="$PWD/src:$PWD" FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 6,7 --timeout 3600 \
-  --benchmark-input /home/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
   --h800-reference \
   --results-dir results_ascend_65_<日期> \
   > results_ascend_65_<日期>.log 2>&1 < /dev/null &
@@ -78,7 +78,9 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
 python3 tools/delivery_table.py results_ascend_65_<日期>
 ```
 
-- 和 `pytest_results_ascend_full_20261011` 那轮是同一条命令，只多了 `--h800-reference`；`--results-dir` 用新目录。
+- 和 `pytest_results_ascend_full_20261011` 那轮相比：多了 `--h800-reference`；矩阵目录从本机的 `/home/matrix`
+  （30 个，靠 `--delivery-only` 挑出 10 个）改成仓库自带的 `tests/data`（正好这 10 个，和其他后端一致）。
+  `--results-dir` 用新目录。
 - `--h800-reference`（不带值）：没有 PyTorch-NPU 基线的行（10-11 那轮 25 个）用仓库自带的 H800 结果折算，交付表里标
   `(H800折算)` / `(H800 PyTorch折算)`，有 PyTorch-NPU 基线的行不受影响。卡型自动识别为 `ascend-910b`，日志里应出现
   `ascend-910b`；没有就加 `--vendor-card ascend-910b`。口径见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
@@ -174,11 +176,24 @@ sweep、单次 `index_add`）。涉及对 CSC 格式和 SpGEMM 哈希表算法�
 2. 按 docs/ASCEND.md 配好环境，做完它的环境自检。
 3. 确认导入的是仓库源码：python3 -c "import flagsparse; print(flagsparse.__file__)"
    输出必须在当前目录的 src/ 下。如果指向 site-packages / dist-packages，先停下来汇报，不要继续。
-4. 完整读一遍 docs/debug/ASCEND.md，照"上机要做的事"里"先做：65 变体全量重测"一节的命令原样跑（已带 --h800-reference，不要去掉）。
+4. 核对测试矩阵：这轮只用仓库自带的 10 个交付矩阵（conf/operators.yaml 的 delivery_matrices），路径和大小：
+   tests/data/ASIC_680ks.mtx  69268748 字节
+   tests/data/GL7d14.mtx  26726293 字节
+   tests/data/NACA0015.mtx  43158387 字节
+   tests/data/amazon0601.mtx  44469712 字节
+   tests/data/auto.mtx  44768883 字节
+   tests/data/cage12.mtx  61548649 字节
+   tests/data/cfd2.mtx  41954205 字节
+   tests/data/filter3D.mtx  47472525 字节
+   tests/data/roadNet-TX.mtx  27699282 字节
+   tests/data/wave.mtx  13325709 字节
+   用 ls -l tests/data/*.mtx 核对：恰好这 10 个文件、大小一致。缺文件或大小不对（例如 git lfs 指针、下载不全）
+   先停下来汇报，不要换别的矩阵目录。命令里的 --benchmark-input tests/data 指的就是它们。
+5. 完整读一遍 docs/debug/ASCEND.md，照"上机要做的事"里"先做：65 变体全量重测"一节的命令原样跑（已带 --h800-reference，不要去掉）。
    - --results-dir 用新目录（<日期> 填今天），不要复用旧目录，也不要往旧目录里补跑。
    - 命令本身已经用 setsid 放到后台，定期看日志进度，不要中途打断。
    - 不要用 pytest --forked，它在 GPU 上会让所有用例失败。
-5. 跑完执行 python3 tools/delivery_table.py <结果目录>。
+6. 跑完执行 python3 tools/delivery_table.py <结果目录>。
 
 规矩：
 - 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实非改不可（比如环境适配）时，每改一个文件，
