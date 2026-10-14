@@ -56,6 +56,7 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --op-benchmark-args='sddmm_csr=--no-cusparse' \
+  --h800-reference \
   --results-dir pytest_results_metax_delivery \
   > pytest_results_metax_delivery.log 2>&1 < /dev/null &
 ```
@@ -63,6 +64,12 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
 - `--op-benchmark-args='sddmm_csr=--no-cusparse'`：C550 上没有可用的厂商稀疏库，且 SDDMM 的
   `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
   `--benchmark-args` 会广播给所有性能脚本，而其他脚本不一定接受 `--no-cusparse`，所以用逐算子的形式；
+- `--h800-reference`（不带值）：没有任何基线的行（目前是 legacy `spmv_csr` f32/f64、SDDMM 的 q4 变体、`spgemm_csr`），
+  用仓库自带的 H800 结果按带宽折算出加速比（`h800_scaled_ms = T_cuSPARSE@H800 × 3050/1440`），`delivery_table.py`
+  里这些行后面会标 `(H800折算)`。**有 PyTorch 基线的行不受影响。** 这是估算，不是厂商实测，汇报时要注明；
+  `sddmm_csr_f16_int_non_non_row` 在 H800 上没有 cuSPARSE 时间（cuSPARSE SDDMM 不支持 fp16），改用 H800 上
+  PyTorch 的时间折算，标 `(H800 PyTorch折算)`（C550 自己的 `sampled_addmm` 结果是错的，7.3 节）。
+  口径和覆盖见 [`H800_REFERENCE.md`](H800_REFERENCE.md)。
 - `--timeout 4500`：`--delivery-only` 已把 spmv/spmm 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
   不收窄**（交付名里没有 K），按 30 个矩阵实测推算全量至少 3660 秒（7.4 节；现在交付只用 10 个矩阵，这个数会小一截，没有重新实测）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等

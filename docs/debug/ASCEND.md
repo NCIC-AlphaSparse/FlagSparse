@@ -63,6 +63,33 @@
 
 ## 上机要做的事，按优先级（工作量从小到大）
 
+### 先做：65 变体全量重测（带 `--h800-reference`）
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH="$PWD/src:$PWD" FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus 6,7 --timeout 3600 \
+  --benchmark-input /home/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --h800-reference \
+  --results-dir results_ascend_65_<日期> \
+  > results_ascend_65_<日期>.log 2>&1 < /dev/null &
+# 跑完后
+python3 tools/delivery_table.py results_ascend_65_<日期>
+```
+
+- 和 `pytest_results_ascend_full_20261011` 那轮是同一条命令，只多了 `--h800-reference`；`--results-dir` 用新目录。
+- `--h800-reference`（不带值）：没有 PyTorch-NPU 基线的行（10-11 那轮 25 个）用仓库自带的 H800 结果折算，交付表里标
+  `(H800折算)` / `(H800 PyTorch折算)`，有 PyTorch-NPU 基线的行不受影响。卡型自动识别为 `ascend-910b`，日志里应出现
+  `ascend-910b`；没有就加 `--vendor-card ascend-910b`。口径见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
+- 这轮要确认的三件事：
+  1. `spgemm_csr` 的性能现在走 `tests/test_spgemm.py`（交付矩阵、按 dtype 分进程），**第一次在 NPU 上跑**。日志里
+     应有 `performance_float32.csv` / `performance_float64.csv`，`spgemm_csr_f32_int_non_non` 应有加速比；
+     报错就贴 `spgemm_csr/performance_stderr.log` 原文。
+  2. `scatter_i8_int` 应在全量里出现（10-11 那轮是 NotFound，当时 dtype 列表还没 int8；v2 单跑是 0.999x）。
+  3. 折算补上的变体预演出来大多是 0.001x–0.06x：这些 q4 路径每次调用 0.3–2.4 秒（`timed=call`）。这是真实性能，
+     回传时照实报，并附上 `delivery_table.py` 全表。
+
 ### 优先级 1：验证今天接上路由的 8 个变体（预计几分钟）
 
 ```bash
@@ -343,3 +370,13 @@ git pull --ff-only origin main 之后，完整读一遍 docs/debug/ASCEND.md，�
 - 为什么改（附报错原文）：在有 CUDA 的机器上，CPU 张量会触发 `ValueError: Expected a cuda device, but got: cpu`，9 个用例失败；CI 的 pre-commit 也会修改这个文件。
 - 怎么验证的：有 GPU 和 `CUDA_VISIBLE_DEVICES=` 两种环境下都是 11 passed；连续两遍 `make pre-commit-check` 都通过。
 - 其他后端是否也需要：否
+
+### 2026-10-14 run_flagsparse_pytest.py::ASCEND_PERFORMANCE_COMMANDS["spgemm_csr"]
+- 改了什么：昇腾 `spgemm_csr` 的性能从 `benchmark/benchmark_ascend_probe.py` 改为 `tests/test_spgemm.py`（与其他后端同一脚本），
+  并走按 dtype 分进程的 `_run_spgemm_split_dtypes`。
+- 为什么改：探测脚本测的是合成规模（`tiny_square`、`square_1k` 等 20 个），`pytest_results_ascend_full_20261011` 里
+  `spgemm_csr_f32_int_non_non` 因此没有加速比，也无法和 H800 参照（交付矩阵）对上做折算。
+- 怎么验证的：只在 CUDA 机器上确认路由（`tests/ci/test_runner_result_format.py::test_ascend_spgemm_is_measured_on_the_delivery_matrices`）；
+  `tests/test_spgemm.py` 在 NPU 上能否跑通**未验证**，昇腾 spgemm 的精度用例是通过的（同一 `flagsparse_spgemm_csr`）。
+- 其他后端是否也需要：否。
+

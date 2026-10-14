@@ -1146,7 +1146,12 @@ def _spgemm_compute(prepared):
     # CUDA and other backends retain the optimized TLE route.  XPU's Triton
     # lowering cannot legalize TLE's shared-memory local_ptr/make_range path;
     # ESC uses ordinary device tensor operations and remains fully on-device.
-    tle_hash_safe = not (_is_mthreads_runtime() or _is_xpu_runtime())
+    # Iluvatar's FlagTree imports TLE but cannot compile its shared-memory
+    # tables ("iluvatar TLE alloc does not support nv_mma_shared_layout=True",
+    # BI-V150, 2026-10-09), which failed every SpGEMM row there.
+    tle_hash_safe = not (
+        _is_mthreads_runtime() or _is_xpu_runtime() or _is_iluvatar_runtime()
+    )
     if tle_hash_safe and _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
         try:
             result = _spgemm_hash_hybrid_compute(prepared)

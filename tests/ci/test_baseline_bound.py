@@ -587,11 +587,103 @@ def test_a_reference_row_without_a_usable_library_time_gets_nothing(tmp_path):
     out, info = _scaled(tmp_path, ref, rows)
     assert info["filled"] == 1 and out[2]["speedup_vs_h800_scaled"] != ""
     assert info["skipped"] == {
-        "the reference row has no vendor-library (cuSPARSE) time": 1,
+        "the reference row has no vendor-library (cuSPARSE) time nor a PyTorch time": 1,
         "the reference's vendor-library result did not match FlagSparse": 1,
     }
-    # FlagSparse's own H800 time is NOT a fallback: there is no baseline to stand in for.
+    # FlagSparse's own H800 time is NOT a fallback (only H800 PyTorch's is, see
+    # test_pytorch_is_the_fallback_only_when_the_reference_has_no_library_time).
     assert (
         out[0]["speedup_vs_h800_scaled"] == ""
         and out[1]["speedup_vs_h800_scaled"] == ""
     )
+
+
+def test_q4_variants_of_one_case_are_matched_to_their_own_reference_row(tmp_path):
+    # f16 and f16->f32 SpMV share matrix, dtype and op; only `variant`/`out_dtype`
+    # tell them apart. Each must take ITS H800 time, not be dropped as ambiguous.
+    ref = [
+        _ref("a.mtx", "float16", t=1.0, variant="v_f16", out_dtype="float16"),
+        _ref("a.mtx", "float16", t=3.0, variant="v_f16f32", out_dtype="float32"),
+    ]
+    rows = [
+        _ven("a.mtx", "float16", t=1.0, variant="v_f16", out_dtype="float16"),
+        _ven("a.mtx", "float16", t=1.0, variant="v_f16f32", out_dtype="float32"),
+    ]
+    out, info = _scaled(tmp_path, ref, rows)
+    assert info["filled"] == 2, info
+    assert [float(r["h800_vendor_ms"]) for r in out] == [1.0, 3.0]
+
+
+def _capi_entry(details, result="NoBaseline"):
+    return {
+        "status": result,
+        "data": {
+            "fp16": {
+                "result": result,
+                "details": details,
+                "speedup": 0.0,
+                "reason": ["muSPARSE: unsupported"],
+            }
+        },
+    }
+
+
+def test_capi_nobaseline_entry_gets_the_rescaled_h800_time(tmp_path):
+    from tools.baseline_bound import scaled_capi_performance
+
+    root = tmp_path / "h800"
+    _write_csv(
+        root / "spmv_csr" / "performance.csv",
+        [
+            _ref("/x/A.mtx", "float16", t=1.0, variant="v1"),
+            _ref("/x/B.mtx", "float16", t=2.0, variant="v1"),
+            _ref("/x/A.mtx", "float16", t=9.0, variant="other"),
+        ],
+    )
+    perf = _capi_entry(
+        {
+            "A": {"base": 0.0, "gems": 2.0, "speedup": 0.0},
+            "B": {"base": 0.0, "gems": 1.0, "speedup": 0.0},
+            "C_n=8": {"base": 0.0, "gems": 1.0, "speedup": 0.0},  # no H800 case
+        }
+    )
+    info = scaled_capi_performance("v1", perf, str(root), "iluvatar-biv150")
+    assert info["filled"] == 2
+    assert info["skipped"] == {"no such case in the reference run": 1}
+    dt = perf["data"]["fp16"]
+    assert dt["details"]["A"]["base"] == pytest.approx(1.0 * CARD_RATIO)
+    assert dt["details"]["A"]["speedup"] == pytest.approx(CARD_RATIO / 2.0)
+    assert dt["speedup"] == pytest.approx((CARD_RATIO / 2.0 + 2.0 * CARD_RATIO) / 2)
+    assert dt["result"] == "Passed" and dt["baseline"] == "h800_scaled"
+    assert dt["no_baseline_reason"] == ["muSPARSE: unsupported"]
+    assert perf["status"] == "Passed"
+
+
+def test_capi_entry_with_a_vendor_baseline_is_left_alone(tmp_path):
+    from tools.baseline_bound import scaled_capi_performance
+
+    root = tmp_path / "h800"
+    _write_csv(root / "spmv_csr" / "performance.csv", [_ref("A.mtx", variant="v1")])
+    perf = _capi_entry({"A": {"base": 0.5, "gems": 1.0, "speedup": 0.5}}, "Passed")
+    before = json.loads(json.dumps(perf))
+    assert scaled_capi_performance("v1", perf, str(root), "musa-s5000") is None
+    assert perf == before
+
+
+def test_pytorch_is_the_fallback_only_when_the_reference_has_no_library_time(tmp_path):
+    ref = [
+        # cuSPARSE has a time -> it is the baseline, PyTorch ignored
+        _ref("a.mtx", t=1.0, pytorch_ms=5.0, pytorch_max_error=1e-7),
+        # no cuSPARSE time (fp16 SDDMM) -> PyTorch's, checked and close
+        _ref("b.mtx", t=1.0, cusparse_ms="", pytorch_ms=4.0, pytorch_max_error=1e-7),
+        # no cuSPARSE time and PyTorch's result was wrong -> nothing
+        _ref("c.mtx", t=1.0, cusparse_ms="", pytorch_ms=4.0, pytorch_max_error=1.2),
+        # cuSPARSE ran and disagreed -> nothing, not a PyTorch fallback
+        _ref("d.mtx", t=1.0, cusparse_ms="", cu_status="FAIL", pytorch_ms=4.0),
+    ]
+    rows = [_ven(m, t=1.0) for m in ("a.mtx", "b.mtx", "c.mtx", "d.mtx")]
+    out, info = _scaled(tmp_path, ref, rows)
+    assert [r["h800_baseline_kind"] for r in out] == ["cusparse", "pytorch", "", ""]
+    assert float(out[0]["h800_vendor_ms"]) == 1.0
+    assert float(out[1]["h800_vendor_ms"]) == 4.0
+    assert info["filled"] == 2 and info["pytorch_fallback"] == 1

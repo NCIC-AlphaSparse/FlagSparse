@@ -522,6 +522,10 @@ def _select_spmm_csc_block_nnz(max_col_nnz, dtype, transposes=False):
         return 8
     pow2 = 1 << max(0, int(max_col_nnz) - 1).bit_length()
     if transposes:
+        if _is_maca_runtime() and dtype == torch.complex64:
+            # C550 spills the CUDA-sized complex reduction tile. Stream eight
+            # entries per iteration instead of materializing 512 x BLOCK_N.
+            return 8
         return max(8, min(512, pow2))
     hi = 64 if _is_complex_dtype(dtype) else 128
     return max(8, min(hi, pow2))

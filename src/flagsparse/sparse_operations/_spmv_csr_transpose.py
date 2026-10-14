@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import _gather_values
+from ._common import _gather_values, _is_maca_runtime
 
 
 def prepare(indices, indptr, shape):
@@ -31,6 +31,10 @@ def make_plan(cols, ptr, order, n):
     row_order = (torch.argsort(counts, stable=True) if avg <= 4 and maximum > 128
                  else torch.arange(n, device=ptr.device)).to(ptr.dtype)
     lanes = 4 if avg <= 4 else 8 if avg <= 8 else 16 if avg <= 24 else 32
+    if _is_maca_runtime():
+        # C550 favors a small one-wave tile over the CUDA 512-element tile.
+        lanes = 32 if avg >= 32 else 16
+        return cols, ptr, order, row_order, lanes, 128 // lanes, {}
     return cols, ptr, order, row_order, lanes, 512 // lanes, {}
 
 
@@ -79,6 +83,9 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
     x = x.resolve_conj().contiguous()
     complex_values = values.is_complex()
     cols, ptr, order, rows, lanes, batch, cache = plan
+    maca = _is_maca_runtime()
+    if maca and not complex_values:
+        batch *= 2
     # Torch in-place updates invalidate the materialized value order. Inference
     # tensors have no version counter and use live indirect loads instead.
     if order is not None:
@@ -101,10 +108,18 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
         v, vector, target = cache["component_view"], torch.view_as_real(x), torch.view_as_real(y)
     else:
         v, vector, target = values, x, y
-    _gather[(triton.cdiv(n_rows, batch),)](
-        v, cols, ptr, order if order is not None else cols, rows, vector, target,
-        n_rows, complex_values, conjugate, order is not None, batch, lanes, num_warps=4,
-    )
+    if maca and values.dtype == torch.complex64:
+        from ._spmv_csr_maca import complex_gather
+        complex_gather[(triton.cdiv(n_rows, batch),)](
+            v, cols, ptr, order if order is not None else cols, rows, vector, target,
+            n_rows, conjugate, order is not None, batch, lanes, num_warps=1,
+        )
+    else:
+        _gather[(triton.cdiv(n_rows, batch),)](
+            v, cols, ptr, order if order is not None else cols, rows, vector, target,
+            n_rows, complex_values, conjugate, order is not None, batch, lanes,
+            num_warps=(1 if maca else 4),
+        )
     return y
 
 

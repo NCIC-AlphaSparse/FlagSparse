@@ -129,6 +129,9 @@ def _scatter_dtype_error_message():
 def _resolve_scatter_block_size(block_size, value_dtype=None, nnz=None):
     """Choose the backend default while preserving explicit launch overrides."""
     if block_size is None:
+        if _is_maca_runtime() and value_dtype in (torch.complex64, torch.complex128):
+            # C550 needs more programs to hide the complex indexed-store latency.
+            return 64
         if _is_rocm_runtime():
             # gfx936 needs different program counts for sparse puts: fp32's
             # 4K/64K cases favor 64 elements per program, while its 16K case

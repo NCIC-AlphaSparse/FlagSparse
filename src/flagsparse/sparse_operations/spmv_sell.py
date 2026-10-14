@@ -358,6 +358,10 @@ def flagsparse_spmv_sell(
                 group, num_warps = 4, 1
             else:
                 group, num_warps = 8, 2
+        elif _is_maca_runtime() and values.dtype in (torch.float16, torch.float32, torch.int8):
+            # One slice per wave avoids C550's long serial slot loops and
+            # improves occupancy for both real and integer SELL gathers.
+            group, num_warps = 1, 1
         else:
             num_warps = 4
         # gfx936 wavefront occupancy is sensitive to how many slices one
@@ -386,6 +390,7 @@ def flagsparse_spmv_sell(
                     _spmv_sell_complex_parallel_kernel[(n_slices,)](
                         *complex_args, SLICE=slice_size, BLOCK_R=block_r,
                         SLOTS=(8 if _is_rocm_runtime() else 4),
+                        num_warps=(1 if _is_maca_runtime() and values.dtype == torch.complex64 else 4),
                     )
             elif _is_rocm_runtime() and not _is_complex_dtype(values.dtype):
                 _rocm_sell_real_kernel(

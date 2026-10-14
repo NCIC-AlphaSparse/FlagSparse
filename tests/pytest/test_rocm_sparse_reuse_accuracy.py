@@ -1,16 +1,31 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""DCU-only sparse reuse: mutated inputs, inference tensors, and API outputs."""
+"""Sparse reuse: mutated inputs, inference tensors, and API outputs.
+
+Written for the DCU plan caches, but every case checks the public API against a
+CPU result, so it is backend-neutral. It used to skip everywhere except ROCm,
+which left MACA's spmv_coo (and the other operators here) without this coverage.
+"""
 
 import pytest
 import torch
 
 import flagsparse as fs
-from flagsparse.sparse_operations._common import _is_rocm_runtime
+from flagsparse.sparse_operations._common import (
+    _backend_name,
+    _is_maca_runtime,
+    _is_rocm_runtime,
+)
 from tests.pytest.accuracy_utils import accelerator_available, accelerator_device
 
+# Enabled where it has been run: ROCm (BW1000), MACA (C550, 18 passed) and CUDA.
+# The runner's accuracy phase collects these by operator marker, so opening it to
+# a backend that has never run it would change that backend's delivery result.
+_VERIFIED_BACKEND = _is_rocm_runtime() or _is_maca_runtime() or _backend_name() == "cuda"
+
 pytestmark = pytest.mark.skipif(
-    not accelerator_available() or not _is_rocm_runtime(), reason="requires ROCm"
+    not accelerator_available() or not _VERIFIED_BACKEND,
+    reason="reuse coverage not yet verified on this backend (ROCm, MACA, CUDA only)",
 )
 
 

@@ -303,8 +303,11 @@ def test_bound_only_cli_defaults_to_the_bundled_file(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert proc.returncode == 0, proc.stderr
+    # Exit 1 only flags rows it could not judge: sddmm_csr_f16 has no cuSPARSE time on
+    # H800 (cuSPARSE SDDMM has no fp16), so those 10 rows are N/A -- not a failure.
+    assert proc.returncode in (0, 1), proc.stderr
     assert "sddmm_csr" in proc.stdout
+    assert "BOUND=120, N/A=10" in proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -360,58 +363,22 @@ def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
     assert set(bundled["variants"]) <= delivery_ids
 
 
-# The bundle was built from the 2026-09-22 H800 run (conf/h800_reference.json's own
-# "reference" block), which predates both the 45 q4 variants and the `capi` field --
-# it is NOT the same set as `capi: true` (all 65 since 2026-10-08, including
-# spgemm_csr, column-major and complex variants the 2026-09-22 run never touched).
-# Pinned here on purpose: a real H800 run adding or dropping an id must be a
-# deliberate edit to this test too, not something a count or subset check would
-# silently absorb.
-H800_MEASURED_VARIANT_IDS = {
-    "gather_c32_int",
-    "gather_c64_int",
-    "gather_f16_int",
-    "gather_f32_int",
-    "gather_f64_int",
-    "scatter_c32_int",
-    "scatter_c64_int",
-    "scatter_f16_int",
-    "scatter_f32_int",
-    "scatter_f64_int",
-    "sddmm_csr_f32_int_non_non_row",
-    "sddmm_csr_f64_int_non_non_row",
-    "spmm_coo_f32_int_non_non_row",
-    "spmm_coo_f64_int_non_non_row",
-    "spmm_csr_f32_int_non_non_row",
-    "spmm_csr_f64_int_non_non_row",
-    "spmv_coo_f32_int_non",
-    "spmv_coo_f64_int_non",
-    "spmv_csr_f32_int_non",
-    "spmv_csr_f64_int_non",
-}
+# The bundle is built from the 2026-10-14 H800 run of the whole 65-variant registry
+# (conf/h800_reference.json's own "reference" block). Pinned to the registry on
+# purpose: a regenerated bundle that lost a variant must fail here, not shrink
+# silently.
+def test_the_bundled_variants_are_the_whole_delivery_registry(bundled):
+    delivery_ids = {v["id"] for v in load_delivery_variants()}
+    assert set(bundled["variants"]) == delivery_ids
 
 
-def test_the_bundled_variants_are_exactly_the_2026_09_22_h800_run(bundled):
-    """As measured: the bundle is the fixed set `H800_MEASURED_VARIANT_IDS` above,
-    which is a strict subset of `capi: true` (not all of it -- `capi: true` also
-    covers variants the C API has implemented but no one has yet run on H800) and
-    unrelated to it structurally (a `capi: false` variant could be H800-measured
-    before it ever gets a C wrapper). An H800 run of one of the other 45 variants
-    should make this fail while leaving the subset test above green -- that is the
-    correct, expected way for it to fail; update the pinned set deliberately when
-    it does, same as DELIVERY_VARIANT_IDS-style registries elsewhere in tests/ci.
-    """
-    assert set(bundled["variants"]) == H800_MEASURED_VARIANT_IDS
-    capi_ids = {v["id"] for v in load_delivery_variants() if v["capi"]}
-    assert H800_MEASURED_VARIANT_IDS <= capi_ids, (
-        "every H800-measured variant should also be capi: true today -- if this "
-        "ever fails it means a variant was H800-measured before being C-wrapped, "
-        "which is fine, just update this comment and drop the assertion"
+def test_no_bundled_variant_failed(bundled):
+    # "Skipped" is allowed: on H800, spmv_coo_f32_int_non's accuracy phase skipped 2
+    # of 5 cases (3 passed). A Failed variant must never become a baseline source.
+    assert all(
+        v["accuracy"] in ("Passed", "Skipped") and v["performance"] == "Passed"
+        for v in bundled["variants"].values()
     )
-
-
-def test_every_bundled_variant_has_passing_accuracy(bundled):
-    assert all(v["accuracy"] == "Passed" for v in bundled["variants"].values())
 
 
 def test_the_bundled_file_matches_its_source_directory_when_present(bundled):
@@ -425,3 +392,49 @@ def test_the_bundled_file_matches_its_source_directory_when_present(bundled):
 
 def test_the_bundled_file_stays_small(bundled):
     assert BUNDLED.stat().st_size < 2 * 1024 * 1024
+
+
+def test_operators_the_new_run_lacks_are_carried_over_with_their_source(tmp_path):
+    old_run = _synthetic_run(tmp_path / "old")
+    _write_csv(
+        old_run / "spsv_csr" / "performance.csv",
+        [
+            {
+                "matrix": "a.mtx",
+                "dtype": "float32",
+                "FlagSparse_ms": "1",
+                "cuSPARSE_ms": "2",
+            }
+        ],
+    )
+    old = h800_reference.build(old_run)
+    new = h800_reference.build(
+        _synthetic_run(tmp_path / "new", [_sddmm_row(cusparse="7.0")]), carry_over=old
+    )
+    # measured again -> the new run's table, untagged
+    assert "source" not in new["operators"]["sddmm_csr"]
+    assert (
+        new["operators"]["sddmm_csr"]["rows"] != old["operators"]["sddmm_csr"]["rows"]
+    )
+    # not measured again -> kept, tagged with the run it came from
+    carried = new["operators"]["spsv_csr"]
+    assert carried["rows"] == old["operators"]["spsv_csr"]["rows"]
+    assert carried["source"]["source_dir"] == "pytest_results_fake"
+    # and it survives a write/load round trip and reads like any other table
+    path = h800_reference.write(new, tmp_path / "ref.json")
+    assert h800_reference.load(path)["operators"]["spsv_csr"]["source"]
+    _, rows = h800_reference.tables(path)["spsv_csr"].read()
+    assert rows[0]["cuSPARSE_ms"] == "2.0"
+    assert "| `spsv_csr` |" in h800_reference.render_markdown(new)
+
+
+def test_cli_carries_over_from_the_file_it_replaces_unless_told_not_to(tmp_path):
+    out = tmp_path / "ref.json"
+    old = h800_reference.build(_synthetic_run(tmp_path / "old"))
+    old["operators"]["spsv_csr"] = {"fields": ["matrix"], "rows": [["a.mtx"]]}
+    h800_reference.write(old, out)
+    run = _synthetic_run(tmp_path / "new")
+    h800_reference.main([str(run), "--out", str(out), "--doc", ""])
+    assert "spsv_csr" in h800_reference.load(out)["operators"]
+    h800_reference.main([str(run), "--out", str(out), "--doc", "", "--carry-over", ""])
+    assert "spsv_csr" not in h800_reference.load(out)["operators"]

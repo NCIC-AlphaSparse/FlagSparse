@@ -41,11 +41,23 @@ def _summary_path(target: Path) -> Path:
 def _speedup(performance: dict) -> str:
     data = performance.get("data")
     values = []
+    labels = set()
     if isinstance(data, dict):
         for entry in data.values():
             if isinstance(entry, dict) and entry.get("speedup"):
                 values.append(float(entry["speedup"]))
-    return f"{sum(values) / len(values):.3f}x" if values else "-"
+                labels.add(str(entry.get("baseline") or ""))
+    if not values:
+        return "-"
+    # Against a rescaled H800 time (no baseline on this card): an estimate, never
+    # to be read as a measured vendor speedup. H800 PyTorch only where H800's
+    # cuSPARSE had no time for the case.
+    note = ""
+    if any("h800_pytorch_scaled" in label for label in labels):
+        note = " (H800 PyTorch折算)"
+    elif any("h800_scaled" in label for label in labels):
+        note = " (H800折算)"
+    return f"{sum(values) / len(values):.3f}x" + note
 
 
 def main() -> int:

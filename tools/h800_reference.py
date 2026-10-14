@@ -15,10 +15,15 @@ dropped, it is not needed to scale a baseline):
 * every ``*_ms`` wall-time column and every ``*speedup*`` column, as numbers;
 * the ``status`` columns (a row whose vendor call failed must not become a baseline).
 
+Operators the new run did not measure are carried over from the previous file
+(``--carry-over``, default: the file being replaced), each tagged with the run it came
+from, so a narrower re-run never silently drops a reference.
+
 Usage::
 
-    python3 tools/h800_reference.py pytest_results_sparse_202609221038      # regenerate
+    python3 tools/h800_reference.py <H800 results dir>                     # regenerate
     python3 tools/h800_reference.py DIR --out conf/h800_reference.json --doc docs/H800_REFERENCE.md
+    python3 tools/h800_reference.py DIR --carry-over ''                    # new run only
 """
 
 from __future__ import annotations
@@ -68,6 +73,10 @@ AXIS_COLUMNS = (
     "nnzb",
     "n_rhs",
     "format",
+    # q4 rows: the variant name and the axes that tell same-matrix variants apart
+    "variant",
+    "op_b",
+    "out_dtype",
 )
 # `*_ms` columns that are breakdowns / host-side / conversion cost, not the timed operator.
 _DROP_MS = re.compile(
@@ -146,8 +155,19 @@ def _variant_summary(summary):
     return variants
 
 
-def build(results_dir, when=None):
-    """Read a pytest results directory and return the reference document (a dict)."""
+def _source(reference):
+    return {
+        k: reference.get(k)
+        for k in ("source_dir", "flagsparse_commit", "run_timestamp", "device")
+    }
+
+
+def build(results_dir, when=None, carry_over=None):
+    """Read a pytest results directory and return the reference document (a dict).
+
+    ``carry_over`` is a previous reference document: its operators that this run did
+    not measure are kept, tagged with the run they came from (``source``).
+    """
     results_dir = Path(results_dir)
     summary_path = results_dir / "summary.json"
     if not summary_path.is_file():
@@ -176,9 +196,7 @@ def build(results_dir, when=None):
         if fields and rows:
             operators[op_dir.name] = {"fields": fields, "rows": rows}
 
-    return {
-        "schema": SCHEMA,
-        "reference": {
+    reference = {
             "device": device,
             "device_count": torch_env.get("device_count"),
             "peaks": "h800-sxm",
@@ -193,7 +211,20 @@ def build(results_dir, when=None):
                 "*sparse_ms) is the baseline the scaled speedup divides into; see "
                 "docs/H800_REFERENCE.md."
             ),
-        },
+        }
+    if carry_over:
+        old_source = _source(carry_over.get("reference") or {})
+        for op, table in (carry_over.get("operators") or {}).items():
+            if op not in operators:
+                operators[op] = {
+                    "fields": table["fields"],
+                    "rows": table["rows"],
+                    "source": table.get("source") or old_source,
+                }
+        operators = dict(sorted(operators.items()))
+    return {
+        "schema": SCHEMA,
+        "reference": reference,
         "variants": _variant_summary(summary),
         "operators": operators,
     }
@@ -220,8 +251,13 @@ def write(doc, path):
             json.dumps(r, ensure_ascii=False, separators=(",", ":"))
             for r in table["rows"]
         )
+        source = (
+            f'"source": {json.dumps(table["source"], ensure_ascii=False)},\n'
+            if table.get("source")
+            else ""
+        )
         op_chunks.append(
-            f'{json.dumps(name)}: {{"fields": {json.dumps(table["fields"])},\n"rows": [\n{body}\n]}}'
+            f'{json.dumps(name)}: {{{source}"fields": {json.dumps(table["fields"])},\n"rows": [\n{body}\n]}}'
         )
     lines.append(",\n".join(op_chunks))
     lines.append("}")
@@ -304,6 +340,30 @@ def _usable_rows(op, table):
     return sum(1 for row in rows if baseline_bound._baseline_ms(row))
 
 
+def _variant_coverage(doc):
+    """{variant: (rows with a vendor time, rows)} for the q4-tagged reference rows.
+
+    Legacy variants carry no ``variant`` column; they are reported under their
+    operator/dtype (``<op> <dtype> (legacy)``) instead.
+    """
+    from tools import baseline_bound
+
+    coverage = {}
+    for op, table in doc["operators"].items():
+        if table.get("source"):
+            continue
+        _, rows = ReferenceTable("", op, table["fields"], table["rows"]).read()
+        for row in rows:
+            name = (row.get("variant") or "").strip()
+            if not name:
+                dtype = baseline_bound._dtype(row)
+                name = f"{op} {dtype} (legacy)"
+            usable, total = coverage.get(name, (0, 0))
+            ok = bool(baseline_bound._baseline_ms(row)) and baseline_bound._baseline_ok(row)
+            coverage[name] = (usable + ok, total + 1)
+    return dict(sorted(coverage.items()))
+
+
 def _short_commit(commit):
     commit = commit or "?"
     sha, plus, tail = commit.partition("+")
@@ -330,7 +390,7 @@ def render_markdown(doc):
         "",
         "## 用途",
         "",
-        "没有厂商 / PyTorch 基线的后端，用这里的 **H800 上 cuSPARSE 的时间**做基线：",
+        "**只用于没有任何基线的行**：目标卡上有厂商库（hipSPARSE、muSPARSE……）或 PyTorch 时间的行一律用实测基线，不会被折算覆盖。没有厂商 / PyTorch 基线的行，用这里的 **H800 上 cuSPARSE 的时间**做基线：",
         "",
         "```",
         "h800_scaled_ms = T_cuSPARSE@H800 × P_H800 / P_目标卡      (P = 实测显存带宽)",
@@ -339,33 +399,62 @@ def render_markdown(doc):
         "",
         "```bash",
         "# 不用再找目录：不带值即用本仓库自带的文件",
-        "python3 run_flagsparse_pytest.py --h800-reference --vendor-card iluvatar-biv150 ...",
-        "python3 tools/baseline_bound.py --vendor <目标卡结果目录> --vendor-card iluvatar-biv150",
+        "python3 run_flagsparse_pytest.py --h800-reference ...        # 卡型按后端/设备名自动识别",
+        "python3 run_flagsparse_split_delivery.py --h800-reference ...  # C API 拆分交付（MUSA）：补 NoBaseline 变体",
+        "python3 tools/baseline_bound.py --vendor <目标卡结果目录>    # 已跑完的结果目录事后查看",
         "```",
         "",
-        "这是**估算**，不是厂商实测：H800 与目标卡的访存效率、缓存、launch 开销并不成比例。",
+        "这是**估算**，不是厂商实测：H800 与目标卡的访存效率、缓存、launch 开销并不成比例。"
+        "折算出的加速比在 summary 里带 `baseline: h800_scaled`，`tools/delivery_table.py` 显示为 `(H800折算)`。",
+        "",
+        "H800 上某个算例**没有** cuSPARSE 时间时（cuSPARSE SDDMM 不支持 fp16），退一步用同一行 H800 PyTorch 的时间"
+        "（PyTorch 结果须通过校验），标 `baseline: h800_pytorch_scaled` / `(H800 PyTorch折算)`；cuSPARSE 跑了但结果"
+        "不对的行不退。FlagSparse 自己在 H800 上的时间永远不当基线。",
+        "",
+        "C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑性能（与本参照同一 benchmark、同一规模），"
+        "NoBaseline 变体优先取它；取不到再用 C API 时间按**变体 + 矩阵名**匹配（C API 的 SpMM `n=8`、SDDMM `k=16/64`、"
+        "按矩阵测的向量类在这里没有对应规模，只有 SpMV 类能对上）。",
         "",
         "## 覆盖情况与限制",
         "",
         "- 只有带 cuSPARSE（或 vendor）时间的行才能做基线；下表“可作基线的行”就是这个数。",
         "  为 0 的算子（当时只有 CuPy 基线、没有对应格式的库）**没有折算基线**，行会保持 `N/A`。",
         "- FlagSparse commit 带 `+dirty` 表示那轮 H800 是在有未提交改动的工作树上跑的。",
+        "- “来源”一列不是本轮的算子，是从上一份参考文件带过来的（新一轮没测它们），数据来自那一轮。",
         "",
         "## 各算子收录情况",
         "",
-        "| 算子 | 行数 | 可作基线的行 | 保留的时间 / 加速比列 |",
-        "|---|---:|---:|---|",
+        "| 算子 | 行数 | 可作基线的行 | 来源 | 保留的时间 / 加速比列 |",
+        "|---|---:|---:|---|---|",
     ]
     for op, table in doc["operators"].items():
         fields = table["fields"]
         numeric = [f for f in fields if _is_number_column(f)]
         cols = ", ".join(f"`{c}`" for c in numeric)
+        src = table.get("source")
+        origin = (
+            f"`{src.get('source_dir')}` (`{_short_commit(src.get('flagsparse_commit'))}`)"
+            if src
+            else "本轮"
+        )
         out.append(
-            f"| `{op}` | {len(table['rows'])} | {_usable_rows(op, table)} | {cols} |"
+            f"| `{op}` | {len(table['rows'])} | {_usable_rows(op, table)} | {origin} | {cols} |"
         )
     out += [
         "",
-        "## H800 上 20 个交付变体的结果",
+        "## 各交付变体能否折算",
+        "",
+        "按变体统计本轮 H800 上带厂商库时间的矩阵数；为 0 的变体只能退到 H800 PyTorch 的时间（见上）。",
+        "",
+        "| 变体 | 可作基线的矩阵 / 总矩阵 |",
+        "|---|---|",
+    ]
+    for name, (usable, total) in _variant_coverage(doc).items():
+        mark = "" if usable else " **（无 cuSPARSE，用 H800 PyTorch）**"
+        out.append(f"| `{name}` | {usable} / {total}{mark} |")
+    out += [
+        "",
+        f"## H800 上 {len(doc['variants'])} 个交付变体的结果",
         "",
         "| 变体 | 精度 | 性能 | 加速比（H800 vs cuSPARSE/PyTorch，runner 口径） |",
         "|---|---|---|---|",
@@ -404,9 +493,19 @@ def main(argv=None):
     parser.add_argument(
         "--doc", default=str(DEFAULT_DOC), help="output markdown summary ('' to skip)"
     )
+    parser.add_argument(
+        "--carry-over",
+        default=None,
+        help=(
+            "previous reference JSON whose operators missing from this run are kept "
+            "(default: the --out file if it exists; '' to keep nothing)"
+        ),
+    )
     args = parser.parse_args(argv)
 
-    doc = build(args.results_dir)
+    carry_path = args.out if args.carry_over is None else args.carry_over
+    carry = load(carry_path) if carry_path and Path(carry_path).is_file() else None
+    doc = build(args.results_dir, carry_over=carry)
     out = write(doc, args.out)
     rows = sum(len(t["rows"]) for t in doc["operators"].values())
     print(

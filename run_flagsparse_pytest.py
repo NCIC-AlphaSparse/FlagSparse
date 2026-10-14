@@ -300,7 +300,7 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("FlagSparse_vs_PyTorch_all_speedup", "pytorch_ms", "flagsparse_ms"),
     ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
     # LAST, so any vendor or PyTorch speedup a row has wins. Rows with neither get
-    # theirs from _apply_scaled_baseline: the same case's H800 FlagSparse time,
+    # theirs from _apply_scaled_baseline: the same case's H800 cuSPARSE time,
     # rescaled to this card by the bottleneck-unit peak ratio, is the baseline (1.0).
     ("speedup_vs_h800_scaled", "h800_scaled_ms", "h800_scaled_fs_ms"),
 )
@@ -905,12 +905,17 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         for op in ASCEND_PROBE_OPS
         if op not in ASCEND_PYTORCH_PERFORMANCE_OPS
     },
-    # These three scripts are backend-neutral (their PyTorch baseline runs on
+    # These scripts are backend-neutral (their PyTorch baseline runs on
     # torch_npu; the cuSPARSE/cupy column comes back empty with a reason via
     # tests/cusparse_generic_baseline.py's skip_reason(), same as every other
     # non-CUDA backend), so Ascend reuses them as-is rather than needing its own
-    # benchmark_ascend.py routing.
-    **{op: PERFORMANCE_COMMANDS[op] for op in ("axpby", "spvv", "spmv_sell")},
+    # benchmark_ascend.py routing. spgemm_csr was on the probe, which times
+    # synthetic shapes (tiny_square, square_1k, ...) instead of the delivery
+    # matrices -- no speedup and nothing an H800 reference could be matched to.
+    **{
+        op: PERFORMANCE_COMMANDS[op]
+        for op in ("axpby", "spvv", "spmv_sell", "spgemm_csr")
+    },
 }
 
 
@@ -1584,6 +1589,10 @@ def _strict_flag_gems_perf_data(value: object) -> dict[str, object]:
             "details": details,
             "speedup": float(dtype_value.get("speedup") or 0.0),
         }
+        if dtype_value.get("baseline"):
+            normalized[_flag_gems_dtype(dtype)]["baseline"] = str(
+                dtype_value["baseline"]
+            )
     return normalized
 
 
@@ -2244,6 +2253,11 @@ def _run_spgemm_split_dtypes(
         "failed_dtypes": failed_dtypes,
     }
     if csv_path.exists():
+        # Same as the other performance paths: rows with no vendor or PyTorch
+        # baseline get the scaled H800 one (rewrites the merged CSV when it fills).
+        rows, scaled_info = _apply_scaled_baseline(op, csv_path, rows)
+        if scaled_info is not None:
+            result["scaled_baseline"] = scaled_info
         write_benchmark_json_from_csv(op, csv_path, result_path, rows=rows)
         result.update(
             summarize_performance_csv(
@@ -2399,10 +2413,16 @@ def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | Non
     # spmm_csc reports it over pytorch_ms/ms -- so prefer an entry whose measurement
     # columns the row actually carries.  Without this the first entry always wins and
     # the other operator's rows fail the completeness check and vanish from aggregates.
+    # The first pass wants NUMBERS: a backend with no vendor writes "N/A" into
+    # speedup_vs_vendor/vendor_ms, and taking that text as "carried" hid the
+    # scaled-H800 speedup further down the table (MACA spmv_csr f32/f64).
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
-        if not _row_value(row, speedup_key):
+        if _to_float(_row_value(row, speedup_key)) is None:
             continue
-        if all(key is None or _row_value(row, key) for key in (base_key, latency_key)):
+        if all(
+            key is None or _to_float(_row_value(row, key)) is not None
+            for key in (base_key, latency_key)
+        ):
             return speedup_key, base_key, latency_key
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
         if _row_value(row, speedup_key):
@@ -2612,6 +2632,8 @@ def write_benchmark_json_from_csv(
 def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
     grouped: dict[str, dict[str, object]] = {}
     totals: dict[str, list[float]] = {}
+    scaled: dict[str, int] = {}
+    scaled_pytorch: set[str] = set()
     seen_by_dtype: dict[str, set[str]] = {}
     for index, row in enumerate(rows):
         dtype = _row_dtype(row)
@@ -2637,10 +2659,27 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         dtype_entry["details"][shape] = detail  # type: ignore[index]
         if _performance_row_has_complete_speedup(row):
             totals.setdefault(dtype, []).append(speedup)
+            if speedup_key == _SCALED_SPEEDUP_KEY:
+                scaled[dtype] = scaled.get(dtype, 0) + 1
+                if row.get("h800_baseline_kind") == "pytorch":
+                    scaled_pytorch.add(dtype)
 
     for dtype, values in totals.items():
         if values:
             grouped[dtype]["speedup"] = statistics.mean(values)
+        # An estimate against the rescaled H800 cuSPARSE time, not a measured
+        # baseline: say so, so a report can never pass it off as one.
+        if scaled.get(dtype):
+            # h800_pytorch_scaled: H800 had no vendor time for these cases (cuSPARSE
+            # SDDMM has no fp16), so the rescaled baseline is H800 PyTorch's.
+            label = (
+                "h800_pytorch_scaled"
+                if dtype in scaled_pytorch
+                else _SCALED_BASELINE_LABEL
+            )
+            grouped[dtype]["baseline"] = (
+                label if scaled[dtype] == len(values) else f"partly_{label}"
+            )
     return grouped
 
 
@@ -2821,6 +2860,9 @@ def summarize_performance_csv(
     return summary
 
 
+_SCALED_SPEEDUP_KEY = "speedup_vs_h800_scaled"
+_SCALED_BASELINE_LABEL = "h800_scaled"
+
 # Set by main() from --h800-reference; None leaves every report exactly as before.
 _SCALED_BASELINE: dict[str, str] | None = None
 
@@ -2931,7 +2973,9 @@ def run_performance(
 
     # `not backend` covers an unexported FLAGSPARSE_BACKEND, which is how a CUDA
     # box usually runs -- it takes the generic per-operator script too.
-    if op == "spgemm_csr" and (not backend or backend in GENERIC_BENCHMARK_BACKENDS):
+    if op == "spgemm_csr" and (
+        not backend or backend in GENERIC_BENCHMARK_BACKENDS or backend == "ascend"
+    ):
         return _run_spgemm_split_dtypes(
             project_root=project_root,
             op=op,

@@ -1052,8 +1052,14 @@ def prepare_spmv_csr(
         prepared.transpose_plan = _spmv_csr_transpose.prepare(
             kernel_indices, kernel_indptr, shape
         )
+    # C550 uses row gathers for half values and for complex matrices with
+    # enough entries per row to amortize the reduction. Very sparse complex
+    # matrices retain segbin, which avoids long-row imbalance in this regime.
     elif (not transpose and requested_alg == "auto" and config is None
-          and _backend_name() == "cuda" and data.dtype in (torch.float16, torch.complex64)):
+          and data.dtype in (torch.float16, torch.complex64)
+          and (_backend_name() == "cuda" or
+               (_is_maca_runtime() and
+                (data.dtype == torch.float16 or data.numel() > 4 * n_rows)))):
         from . import _spmv_csr_transpose
         prepared.non_gather_plan = _spmv_csr_transpose.make_plan(
             kernel_indices, kernel_indptr, None, n_rows)

@@ -88,6 +88,16 @@ CAPI_BACKEND_BY_PYTEST_BACKEND = {
     "iluvatar": "IX",
 }
 
+# --h800-reference: the card each backend's C API run is rescaled to (the keys of
+# tools/baseline_bound.py's VENDOR_BANDWIDTH_GBS). --vendor-card overrides it.
+H800_CARD_BY_PYTEST_BACKEND = {
+    "mthreads": "musa-s5000",
+    "rocm": "dcu-bw1000",
+    "metax": "maca-c550",
+    "ascend": "ascend-910b",
+    "iluvatar": "iluvatar-biv150",
+}
+
 
 def log(message: str) -> None:
     print(f"[run_flagsparse_split_delivery] {message}", flush=True)
@@ -110,12 +120,24 @@ def run_pytest_accuracy(args: argparse.Namespace, results_dir: Path) -> int:
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "run_flagsparse_pytest.py"),
-        "--phase", "accuracy",
+        "--phase", "both" if args.h800_reference else "accuracy",
         "--mode", args.mode,
         "--delivery-only",
         "--gpus", args.gpus,
         "--results-dir", str(results_dir),
     ]
+    if args.h800_reference:
+        # The Python half also measures FlagSparse, in the SAME harness and sizes as
+        # the H800 reference (q4 bench N/K=32, the vector ops' synthetic sizes), so a
+        # variant the vendor library cannot measure gets a like-for-like scaled
+        # baseline -- the C API's own sizes (SpMM n=8 on MUSA, SDDMM k=16/64) have
+        # no H800 counterpart. See merge_summaries for which half wins.
+        cmd += [
+            "--benchmark-input", str(args.benchmark_input),
+            "--h800-reference", str(args.h800_reference),
+        ]
+        if args.h800_card:
+            cmd += ["--vendor-card", args.h800_card]
     if args.timeout:
         cmd += ["--timeout", str(args.timeout)]
     if args.strict:
@@ -244,7 +266,58 @@ _SUMMARY_CSV_HEADERS = (
     "stdout_log_path", "stderr_log_path", "data_path", "reason", "command",
 )
 
-def merge_summaries(py_summary_path: Path, capi_summary_path: Path, out_path: Path) -> None:
+def _has_speedup(performance: object) -> bool:
+    data = performance.get("data") if isinstance(performance, dict) else None
+    return isinstance(data, dict) and any(
+        isinstance(d, dict) and (d.get("speedup") or 0) > 0 for d in data.values()
+    )
+
+
+def apply_h800_scaled_baseline(
+    merged_result: dict, reference: str, card: str, py_result: dict | None = None
+) -> dict:
+    """Fill the C API ``NoBaseline`` variants; a vendor-measured variant is never touched.
+
+    In order of preference:
+    1. the C API's own vendor baseline (muSPARSE ...) -- untouched;
+    2. the Python half's performance for that variant, when it has a speedup (run
+       with --h800-reference it is against the H800 time of the SAME harness and
+       sizes) -- the C API entry is replaced and kept under ``capi_performance``;
+    3. the C API's time against the H800 time of the same variant + matrix
+       (baseline_bound.scaled_capi_performance; only SpMV-type sizes match).
+    Returns {"python": n, "capi": n, "missing": [ids]}.
+    """
+    from tools import baseline_bound
+
+    index = baseline_bound._reference_by_variant(reference)
+    counts = {"python": 0, "capi": 0, "missing": []}
+    for variant_id, entry in merged_result.items():
+        performance = entry.get("performance")
+        if not isinstance(performance, dict) or performance.get("status") != "NoBaseline":
+            continue
+        py_perf = ((py_result or {}).get(variant_id) or {}).get("performance")
+        if _has_speedup(py_perf) and str(py_perf.get("status")) == "Passed":
+            entry["capi_performance"] = performance
+            entry["performance"] = dict(py_perf, source="python")
+            counts["python"] += 1
+        elif baseline_bound.scaled_capi_performance(
+            variant_id, performance, reference, card, _index=index
+        ):
+            performance["source"] = "capi"
+            counts["capi"] += 1
+        else:
+            counts["missing"].append(variant_id)
+    return counts
+
+
+def merge_summaries(
+    py_summary_path: Path,
+    capi_summary_path: Path,
+    out_path: Path,
+    *,
+    h800_reference: str | None = None,
+    h800_card: str | None = None,
+) -> None:
     """One summary.json: accuracy from the pytest run, performance from the
     C API run.
 
@@ -283,6 +356,15 @@ def merge_summaries(py_summary_path: Path, capi_summary_path: Path, out_path: Pa
         entry.setdefault("customized", py_entry.get("customized", capi_entry.get("customized", True)))
         entry.setdefault("labels", py_entry.get("labels") or capi_entry.get("labels") or [])
         merged_result[variant_id] = entry
+
+    if h800_reference and h800_card:
+        counts = apply_h800_scaled_baseline(
+            merged_result, h800_reference, h800_card, py_result
+        )
+        log(f"--h800-reference ({h800_card}): NoBaseline variants filled from the "
+            f"Python half={counts['python']}, from the C API time={counts['capi']}, "
+            f"still without a baseline={len(counts['missing'])} {counts['missing']} "
+            "(estimates, marked baseline=h800_scaled)")
 
     merged = {
         "timestamp": capi_summary.get("timestamp") or py_summary.get("timestamp"),
@@ -397,11 +479,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-performance", action="store_true", help="Skip the C API performance phase.")
     parser.add_argument("--out", default=None,
                          help="Merged summary.json path (default: <results-dir>/summary_split.json).")
+    parser.add_argument(
+        "--h800-reference", nargs="?", default=None,
+        const=str(PROJECT_ROOT / "conf" / "h800_reference.json"),
+        help="For variants the vendor library cannot measure (NoBaseline), compare "
+             "against the same variant+matrix's H800 cuSPARSE time rescaled to this "
+             "card by memory bandwidth. With no value: the bundled "
+             "conf/h800_reference.json. Variants with a vendor baseline are untouched.",
+    )
+    parser.add_argument(
+        "--vendor-card", default=None,
+        help="Card for --h800-reference (default: from --backend, e.g. mthreads -> musa-s5000).",
+    )
     return parser
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    args.h800_card = args.vendor_card or H800_CARD_BY_PYTEST_BACKEND.get(args.backend)
+    if args.h800_reference and not args.h800_card:
+        log(f"--h800-reference: no card known for backend {args.backend!r}; "
+            "pass --vendor-card")
+        return 2
 
     results_dir = Path(args.results_dir) if args.results_dir else Path(
         f"pytest_results_{args.backend}_split_accuracy"
@@ -427,7 +526,14 @@ def main() -> int:
 
     if not args.skip_accuracy and not args.skip_performance:
         out_path = Path(args.out) if args.out else results_dir / "summary_split.json"
-        merge_summaries(results_dir / "summary.json", bench_out / "summary.json", out_path)
+        card = args.h800_card
+        merge_summaries(
+            results_dir / "summary.json",
+            bench_out / "summary.json",
+            out_path,
+            h800_reference=args.h800_reference,
+            h800_card=card,
+        )
 
     if accuracy_rc != 0:
         log(f"pytest accuracy phase exited {accuracy_rc}")

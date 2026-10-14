@@ -46,3 +46,34 @@ def test_missing_variant_is_printed_and_fails(tmp_path):
     proc = _run(tmp_path, result)
     assert proc.returncode == 1
     assert f"{ids[0]}" in proc.stdout and "MISSING" in proc.stdout
+
+
+def test_a_speedup_against_the_scaled_h800_time_is_labelled(tmp_path):
+    ids = [v["id"] for v in load_delivery_variants()]
+    result = {
+        vid: {
+            "accuracy": {"status": "Passed"},
+            "performance": {"status": "Passed", "data": {"fp32": {"speedup": 2.0}}},
+        }
+        for vid in ids
+    }
+    result[ids[0]]["performance"]["data"]["fp32"]["baseline"] = "h800_scaled"
+    proc = _run(tmp_path, result)
+    assert proc.returncode == 0, proc.stderr
+    labelled = [line for line in proc.stdout.splitlines() if "(H800折算)" in line]
+    assert len(labelled) == 1 and ids[0] in labelled[0]
+
+
+def test_a_pytorch_fallback_speedup_says_so(tmp_path):
+    ids = [v["id"] for v in load_delivery_variants()]
+    result = {
+        vid: {
+            "accuracy": {"status": "Passed"},
+            "performance": {"status": "Passed", "data": {"fp32": {"speedup": 2.0}}},
+        }
+        for vid in ids
+    }
+    result[ids[0]]["performance"]["data"]["fp32"]["baseline"] = "h800_pytorch_scaled"
+    proc = _run(tmp_path, result)
+    line = next(line for line in proc.stdout.splitlines() if ids[0] in line)
+    assert "(H800 PyTorch折算)" in line

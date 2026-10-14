@@ -19,6 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 from tools.delivery_variants import load_delivery_variants
@@ -238,3 +239,140 @@ def test_a_tag_outside_the_registry_is_flagged(tmp_path):
     path.write_text(json.dumps(doc), encoding="utf-8")
     out = _check(tmp_path, "delivery")
     assert "UNKNOWN VARIANT spmv_csr_f32_int_bogus" in out, out
+
+
+def test_merge_fills_nobaseline_variants_from_the_h800_reference(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "split_delivery", ROOT / "run_flagsparse_split_delivery.py"
+    )
+    split = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(split)
+
+    ref = tmp_path / "h800" / "spmv_csr"
+    ref.mkdir(parents=True)
+    (ref / "performance.csv").write_text(
+        "matrix,dtype,variant,ms,vendor_ms,status\n"
+        "/d/A.mtx,float16,spmv_csr_f16_int_non,0.5,1.0,PASS\n",
+        encoding="utf-8",
+    )
+    nobase = {
+        "result": "NoBaseline",
+        "speedup": 0.0,
+        "details": {"A": {"base": 0.0, "gems": 2.0, "speedup": 0.0}},
+    }
+    measured = {
+        "result": "Passed",
+        "speedup": 0.5,
+        "details": {"A": {"base": 1.0, "gems": 2.0, "speedup": 0.5}},
+    }
+    capi = {
+        "result": {
+            "spmv_csr_f16_int_non": {
+                "performance": {"status": "NoBaseline", "data": {"fp16": nobase}}
+            },
+            "spmv_csr_f32_int_non": {
+                "performance": {"status": "Passed", "data": {"fp32": measured}}
+            },
+        }
+    }
+    py = {"result": {k: {"accuracy": {"status": "Passed"}} for k in capi["result"]}}
+    (tmp_path / "py.json").write_text(json.dumps(py), encoding="utf-8")
+    (tmp_path / "capi.json").write_text(json.dumps(capi), encoding="utf-8")
+    out = tmp_path / "merged.json"
+    split.merge_summaries(
+        tmp_path / "py.json",
+        tmp_path / "capi.json",
+        out,
+        h800_reference=str(tmp_path / "h800"),
+        h800_card="musa-s5000",
+    )
+    merged = json.loads(out.read_text(encoding="utf-8"))["result"]
+    f16 = merged["spmv_csr_f16_int_non"]["performance"]
+    assert f16["status"] == "Passed"
+    assert f16["data"]["fp16"]["baseline"] == "h800_scaled"
+    assert f16["data"]["fp16"]["speedup"] == pytest.approx(1.0 * 3050 / 1370 / 2.0)
+    # a variant muSPARSE measured keeps its own baseline
+    assert merged["spmv_csr_f32_int_non"]["performance"]["data"]["fp32"] == measured
+
+
+def test_merge_prefers_the_python_half_then_the_capi_time(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "split_delivery", ROOT / "run_flagsparse_split_delivery.py"
+    )
+    split = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(split)
+
+    ref = tmp_path / "h800" / "spmv_csr"
+    ref.mkdir(parents=True)
+    (ref / "performance.csv").write_text(
+        "matrix,dtype,variant,ms,vendor_ms,status\n"
+        "/d/A.mtx,float16,v_capi,0.5,1.0,PASS\n",
+        encoding="utf-8",
+    )
+
+    def nobase():
+        return {
+            "status": "NoBaseline",
+            "data": {
+                "fp16": {
+                    "result": "NoBaseline",
+                    "speedup": 0.0,
+                    "details": {"A": {"base": 0.0, "gems": 2.0, "speedup": 0.0}},
+                }
+            },
+        }
+
+    python_perf = {
+        "status": "Passed",
+        "data": {"fp16": {"speedup": 0.7, "baseline": "h800_scaled", "details": {}}},
+    }
+    capi = {
+        "result": {v: {"performance": nobase()} for v in ("v_py", "v_capi", "v_none")}
+    }
+    py = {
+        "result": {
+            "v_py": {"accuracy": {"status": "Passed"}, "performance": python_perf},
+            "v_capi": {"accuracy": {"status": "Passed"}},
+            "v_none": {"accuracy": {"status": "Passed"}},
+        }
+    }
+    (tmp_path / "py.json").write_text(json.dumps(py), encoding="utf-8")
+    (tmp_path / "capi.json").write_text(json.dumps(capi), encoding="utf-8")
+    out = tmp_path / "merged.json"
+    split.merge_summaries(
+        tmp_path / "py.json",
+        tmp_path / "capi.json",
+        out,
+        h800_reference=str(tmp_path / "h800"),
+        h800_card="musa-s5000",
+    )
+    merged = json.loads(out.read_text(encoding="utf-8"))["result"]
+    # 2. the Python half (same harness as the H800 reference) wins over the C API
+    assert merged["v_py"]["performance"]["source"] == "python"
+    assert merged["v_py"]["performance"]["data"]["fp16"]["speedup"] == 0.7
+    assert merged["v_py"]["capi_performance"]["status"] == "NoBaseline"
+    # 3. no Python speedup -> the C API time against the same variant + matrix
+    assert merged["v_capi"]["performance"]["source"] == "capi"
+    assert merged["v_capi"]["performance"]["status"] == "Passed"
+    # neither -> still NoBaseline, and said so
+    assert merged["v_none"]["performance"]["status"] == "NoBaseline"
+
+
+def test_with_h800_reference_the_python_half_also_measures(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "split_delivery", ROOT / "run_flagsparse_split_delivery.py"
+    )
+    split = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(split)
+    seen = []
+    monkeypatch.setattr(split, "run", lambda cmd, **kw: seen.append(cmd) or 0)
+    args = split.build_arg_parser().parse_args(["--h800-reference"])
+    args.h800_card = "musa-s5000"
+    split.run_pytest_accuracy(args, tmp_path)
+    cmd = seen[0]
+    assert cmd[cmd.index("--phase") + 1] == "both"
+    assert "--h800-reference" in cmd and "musa-s5000" in cmd
+    args = split.build_arg_parser().parse_args([])
+    args.h800_card = None
+    split.run_pytest_accuracy(args, tmp_path)
+    assert seen[1][seen[1].index("--phase") + 1] == "accuracy"

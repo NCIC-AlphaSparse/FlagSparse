@@ -86,3 +86,10 @@ def test_spgemm_records_the_item_in_flight_for_crash_attribution():
     # written before the work starts, cleared only after a clean finish
     assert "_record_spgemm_inflight(" in export
     assert "_clear_spgemm_inflight(csv_path)" in export
+
+
+def test_spgemm_matrix_worker_cli_is_registered():
+    source = (PROJECT_ROOT / "tests" / "test_spgemm.py").read_text(encoding="utf-8")
+    assert '"--_matrix-worker"' in source
+    assert "if args._matrix_worker:" in source
+    assert "_run_matrix_worker(args)" in source

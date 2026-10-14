@@ -44,6 +44,12 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
 - 原 20 个变体里的 9 个 f64/c64 在本卡上照旧测不了，`delivery_table.py` 里显示 `NotFound` 是预期的；
   `spgemm_csr` 的 runner 会按 dtype 拆开分别跑 float32/float64，float64 那一组的结果不要当真，交付变体
   只用 float32。
+- **`spgemm_csr` 这轮第一次真正能跑**：10-09 那轮 20 行全部是 TLE 编译错误
+  （`iluvatar TLE alloc does not support nv_mma_shared_layout=True`），现在天数上改走 ESC（见文末改动记录）。
+  跑完确认 `spgemm_csr_f32_int_non_non` 精度 Passed、有 `(H800折算)` 加速比；还报 TLE 就说明没拉到新代码。
+- **`--h800-reference` 现在能补上 q4 变体**：10-09 那轮命令也带了它，但当时的参照只有 20 个变体，q4 全对不上，
+  所以全是 `-`。参照已换成 H800 的 65 变体全量，按那轮数据预演，有加速比的变体 25 → 55（再加 spgemm 就是 56，
+  其余 9 个是 fp64）。`sddmm_csr_f16` 标的是 `(H800 PyTorch折算)`，见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
 
 - 外层 `timeout -s KILL` 是整条命令的总限时（内核卡死时 Ctrl-C 送不进去，只能靠 KILL）；`--timeout` 是
   每个算子每个阶段的限时。这两个数是 20 变体时期定的，65 变体多了 6 个父算子，**没有在本机实测过总耗时**，
@@ -131,4 +137,14 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
 - 其他后端是否也需要：是 / 否 / 不确定
 ```
 
-（暂无）
+### 2026-10-14 src/flagsparse/sparse_operations/spgemm_csr.py::_spgemm_compute
+- 改了什么：天数上 SpGEMM 不再走 TLE 共享内存哈希路径，和 MUSA、XPU 一样走纯 ESC（`tle_hash_safe` 加上 `_is_iluvatar_runtime()`）。
+- 为什么改（附报错原文）：天数的 FlagTree 能 import TLE，但编译哈希表时报
+  `Memory allocation failed: iluvatar TLE alloc does not support nv_mma_shared_layout=True`，
+  `results_iluvatar_65_1009` 里 spgemm 的 20 行（f32/f64 × 10 矩阵）全部 FAIL，精度 2/2 失败。
+  （那轮汇总把性能写成 Passed 是 `04135dd` 时 runner 的问题，当前 main 会判为 Failed。）
+- 怎么验证的：CUDA 机器上 `FLAGSPARSE_BACKEND=iluvatar` 模拟：哈希路径调用 0 次，结果与稠密乘积一致；
+  `tests/pytest -m spgemm_csr` 11 passed；`tests/ci/test_spgemm_tle_gate.py`（旧代码上失败）。**未在 BI-V150 实测**，
+  ESC 在天数上的性能也还没有数。
+- 其他后端是否也需要：否（MUSA、XPU 早已排除）。
+

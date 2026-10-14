@@ -1051,3 +1051,102 @@ def test_the_h800_flag_can_be_given_without_a_value():
     assert "conf/h800_reference.json" in proc.stdout.replace("\n", " ").replace(
         "  ", " "
     )
+
+
+def test_spgemm_split_path_also_applies_the_scaled_baseline(tmp_path, monkeypatch):
+    """SpGEMM has its own per-dtype path; it must fill no-baseline rows like the rest."""
+    reference = tmp_path / "h800" / "spgemm_csr"
+    reference.mkdir(parents=True)
+    (reference / "performance.csv").write_text(
+        "matrix,value_dtype,index_dtype,triton_ms,cusparse_ms,cu_status,status\n"
+        "sample.mtx,float32,int32,9.0,4.0,PASS,PASS\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        runner,
+        "_SCALED_BASELINE",
+        {
+            "reference": str(tmp_path / "h800"),
+            "card": "maca-c550",
+            "reference_peaks": "h800-sxm",
+        },
+    )
+
+    def fake_run_subprocess(cmd, **_kwargs):
+        csv_path = Path(cmd[cmd.index("--csv") + 1])
+        dtype = cmd[cmd.index("--dtypes") + 1]
+        rows = "sample.mtx,float32,int32,2.0,,,,PASS\n" if dtype == "float32" else ""
+        csv_path.write_text(
+            "matrix,value_dtype,index_dtype,triton_ms,cusparse_ms,pytorch_ms,"
+            "triton_speedup_vs_cusparse,status\n" + rows,
+            encoding="utf-8",
+        )
+        return 0, "", "", 0.1, False
+
+    monkeypatch.setattr(runner, "run_subprocess", fake_run_subprocess)
+    (tmp_path / "out").mkdir()
+    result = runner._run_spgemm_split_dtypes(
+        project_root=ROOT,
+        op="spgemm_csr",
+        gpu_id=0,
+        script_device=0,
+        template=("tests/test_spgemm.py", "--csv", "{csv}"),
+        op_dir=tmp_path / "out",
+        benchmark_input=None,
+        warmup=1,
+        iters=1,
+        extra_args=[],
+        timeout=10,
+    )
+    assert result["scaled_baseline"]["filled"] == 1
+    with (tmp_path / "out" / "performance.csv").open(encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    # H800 cuSPARSE 4.0 ms rescaled to C550 by bandwidth, against our 2.0 ms
+    assert float(row["speedup_vs_h800_scaled"]) == pytest.approx(
+        4.0 * 3050 / 1440 / 2.0
+    )
+
+
+def test_an_na_vendor_column_does_not_hide_the_scaled_speedup():
+    # MACA/Iluvatar spmv_csr: no vendor, so speedup_vs_vendor and vendor_ms say
+    # "N/A" -- text, not a measurement. The scaled-H800 speedup must still count.
+    row = {
+        "matrix": "a.mtx",
+        "dtype": "float32",
+        "ms": "0.2",
+        "vendor_ms": "N/A",
+        "speedup_vs_vendor": "N/A",
+        "status": "PASS",
+        "h800_scaled_ms": "0.1",
+        "h800_scaled_fs_ms": "0.2",
+        "speedup_vs_h800_scaled": "0.5",
+    }
+    assert runner._performance_schema(row)[0] == "speedup_vs_h800_scaled"
+    assert runner._performance_row_has_complete_speedup(row)
+    data = runner._flaggems_perf_data([row])
+    assert data["float32"]["speedup"] == 0.5
+    assert data["float32"]["baseline"] == "h800_scaled"
+
+
+def test_a_pytorch_fallback_scaled_speedup_is_labelled_as_such():
+    row = {
+        "matrix": "a.mtx",
+        "value_dtype": "float16",
+        "triton_ms": "0.2",
+        "status": "PASS",
+        "h800_scaled_ms": "0.4",
+        "h800_scaled_fs_ms": "0.2",
+        "speedup_vs_h800_scaled": "2.0",
+        "h800_baseline_kind": "pytorch",
+    }
+    data = runner._flaggems_perf_data([row])
+    assert data["float16"]["baseline"] == "h800_pytorch_scaled"
+    strict = runner._strict_flag_gems_perf_data(data)
+    assert strict["fp16"]["baseline"] == "h800_pytorch_scaled"
+
+
+def test_ascend_spgemm_is_measured_on_the_delivery_matrices(monkeypatch):
+    # It used to run the probe, which times synthetic shapes (tiny_square, ...):
+    # no speedup, and nothing an H800 reference could be matched to.
+    command = runner.ASCEND_PERFORMANCE_COMMANDS["spgemm_csr"]
+    assert command[0] == "tests/test_spgemm.py" and "{input}" in command
