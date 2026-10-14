@@ -1173,3 +1173,41 @@ def test_the_reuse_suite_backend_gate_does_not_demote_a_delivery_variant():
     summary = runner.summarize_accuracy_cases(raw)
     assert summary["status"] == "Passed"
     assert summary["skipped"] == 1  # still reported, just not a demotion
+
+
+def test_spgemm_split_path_honours_a_dtypes_override(tmp_path, monkeypatch):
+    # Iluvatar passes spgemm_csr=--dtypes float32: its fp64 child could only fail.
+    seen = []
+
+    def fake_run_subprocess(cmd, **_kwargs):
+        dtype = cmd[cmd.index("--dtypes") + 1]
+        seen.append((dtype, cmd.count("--dtypes")))
+        Path(cmd[cmd.index("--csv") + 1]).write_text(
+            "matrix,value_dtype,triton_ms,status\nsample.mtx,float32,1.0,PASS\n",
+            encoding="utf-8",
+        )
+        return 0, "", "", 0.1, False
+
+    monkeypatch.setattr(runner, "run_subprocess", fake_run_subprocess)
+    result = runner._run_spgemm_split_dtypes(
+        project_root=ROOT,
+        op="spgemm_csr",
+        gpu_id=0,
+        script_device=0,
+        template=("tests/test_spgemm.py", "--csv", "{csv}"),
+        op_dir=tmp_path,
+        benchmark_input=None,
+        warmup=1,
+        iters=1,
+        extra_args=["--dtypes", "float32"],
+        timeout=10,
+    )
+    assert seen == [("float32", 1)]  # one child, one --dtypes
+    assert result["status"] == "Passed" and not result["failed_dtypes"]
+    assert runner._spgemm_split_dtypes([]) == (("float32", "float64"), [])
+    assert runner._spgemm_split_dtypes(["--dtypes=float64,float32", "--x"]) == (
+        ("float32", "float64"),
+        ["--x"],
+    )
+    with pytest.raises(ValueError):
+        runner._spgemm_split_dtypes(["--dtypes", "float16"])

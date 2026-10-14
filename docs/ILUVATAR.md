@@ -201,7 +201,8 @@ setsid timeout -s KILL 14400 python3 -u run_flagsparse_pytest.py \
   `allclose` 里面）；
 - **多卡机器先确认 `--gpus 0` 真的生效**：runner 靠 `CUDA_VISIBLE_DEVICES` 选卡，CoreX 是否遵守这个
   变量未验证，跑起来用 `ixsmi` 看负载落在哪张卡；
-- **不用跑 `spsv` / `spsm` / `spgemm`**，它们不在交付清单里，`--delivery-only` 也选不到。
+- **不用跑 `spsv` / `spsm`**，它们不在交付清单里，`--delivery-only` 也选不到。`spgemm_csr` 现在是交付变体
+  （`spgemm_csr_f32_int_non_non`），命令里用 `spgemm_csr=--dtypes float32` 只跑 f32（本卡 fp64 不可用）。
 
 ---
 
@@ -231,6 +232,7 @@ setsid timeout -s KILL 43200 \
     --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
     --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
     --op-benchmark-args='sddmm_csr=--dtype float32' \
+    --op-benchmark-args='spgemm_csr=--dtypes float32' \
     --results-dir pytest_results_iluvatar_delivery \
   > pytest_results_iluvatar_delivery.log 2>&1 < /dev/null &
 ```

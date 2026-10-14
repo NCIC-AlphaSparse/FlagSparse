@@ -26,6 +26,7 @@ setsid timeout -s KILL 43200 \
     --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
     --op-benchmark-args='spmm_csc=--dtypes float32,complex64' \
     --op-benchmark-args='sddmm_csr=--dtype float32' \
+    --op-benchmark-args='spgemm_csr=--dtypes float32' \
     --results-dir results_iluvatar_65_<日期> \
   > results_iluvatar_65_<日期>.log 2>&1 < /dev/null &
 # 跑完后
@@ -42,8 +43,9 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
 - **新增 `spmv_csc`/`spmm_csc` 的 dtype 限制**：这两个脚本默认会跑 float64/complex128，先跑 fp64 万一
   卡死或崩溃，排在最后追加的新变体行就丢了；它们的交付变体只要 f32/c32/f16，f16 由新变体那一路单独测。
 - 原 20 个变体里的 9 个 f64/c64 在本卡上照旧测不了，`delivery_table.py` 里显示 `NotFound` 是预期的；
-  `spgemm_csr` 的 runner 会按 dtype 拆开分别跑 float32/float64，float64 那一组的结果不要当真，交付变体
-  只用 float32。
+  `spgemm_csr` 的性能 runner 默认按 dtype 拆开分别跑 float32/float64；命令里的
+  `--op-benchmark-args='spgemm_csr=--dtypes float32'` 让它只跑 float32（交付变体只有 f32，fp64 那个子进程在本卡
+  只会失败，崩溃时还会把整个 spgemm 性能阶段判成 FAIL）。精度侧的 fp64 用例已被 `-k` 挡掉。
 - **`spgemm_csr` 这轮第一次真正能跑**：10-09 那轮 20 行全部是 TLE 编译错误
   （`iluvatar TLE alloc does not support nv_mma_shared_layout=True`），现在天数上改走 ESC（见文末改动记录）。
   跑完确认 `spgemm_csr_f32_int_non_non` 精度 Passed、有 `(H800折算)` 加速比；还报 TLE 就说明没拉到新代码。

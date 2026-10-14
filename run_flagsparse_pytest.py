@@ -2133,6 +2133,39 @@ def _merge_csv_rows(paths: list[Path], destination: Path) -> list[dict[str, str]
     return rows
 
 
+_SPGEMM_SPLIT_DTYPES = ("float32", "float64")
+
+
+def _spgemm_split_dtypes(extra_args: list[str]) -> tuple[tuple[str, ...], list[str]]:
+    """The dtypes to run one by one, and ``extra_args`` without their ``--dtypes``.
+
+    Defaults to float32 then float64. An ``--op-benchmark-args='spgemm_csr=--dtypes
+    float32'`` narrows it: Iluvatar's fp64 H2D copy returns zeros, so its float64 child
+    could only fail -- and a crashed child fails the whole phase, float32 included.
+    Passing the user's ``--dtypes`` through unchanged would not work: each child gets
+    its own ``--dtypes <one>`` and argparse keeps the last.
+    """
+    args = list(extra_args)
+    wanted = None
+    for index, arg in enumerate(args):
+        if arg == "--dtypes" and index + 1 < len(args):
+            wanted, args = args[index + 1], args[:index] + args[index + 2 :]
+            break
+        if arg.startswith("--dtypes="):
+            wanted, args = arg.split("=", 1)[1], args[:index] + args[index + 1 :]
+            break
+    if wanted is None:
+        return _SPGEMM_SPLIT_DTYPES, args
+    requested = {part.strip() for part in wanted.split(",") if part.strip()}
+    unknown = requested - set(_SPGEMM_SPLIT_DTYPES)
+    if unknown:
+        raise ValueError(
+            f"spgemm_csr --dtypes {wanted!r}: unsupported {sorted(unknown)}; "
+            f"choose from {', '.join(_SPGEMM_SPLIT_DTYPES)}"
+        )
+    return tuple(d for d in _SPGEMM_SPLIT_DTYPES if d in requested), args
+
+
 def _run_spgemm_split_dtypes(
     *,
     project_root: Path,
@@ -2164,7 +2197,8 @@ def _run_spgemm_split_dtypes(
     failed_dtypes: list[str] = []
     total_duration = 0.0
 
-    for dtype in ("float32", "float64"):
+    dtypes, extra_args = _spgemm_split_dtypes(extra_args)
+    for dtype in dtypes:
         csv_path = op_dir / f"performance_{dtype}.csv"
         cmd, csv_path = render_performance_command(
             template,
