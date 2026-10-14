@@ -81,8 +81,8 @@ python3 tools/delivery_table.py results_ascend_65_<日期>
 - 和 `pytest_results_ascend_full_20261011` 那轮相比：多了 `--h800-reference`；矩阵目录从本机的 `/home/matrix`
   （30 个，靠 `--delivery-only` 挑出 10 个）改成仓库自带的 `tests/data`（正好这 10 个，和其他后端一致）。
   `--results-dir` 用新目录。
-- `--h800-reference`（不带值）：没有 PyTorch-NPU 基线的行（10-11 那轮 25 个）用仓库自带的 H800 结果折算，交付表里标
-  `(H800折算)` / `(H800 PyTorch折算)`，有 PyTorch-NPU 基线的行不受影响。卡型自动识别为 `ascend-910b`，日志里应出现
+- `--h800-reference`（不带值）：没有 PyTorch-NPU 基线的行（10-11 那轮 25 个）用仓库自带的 H800 结果折算，交付表里只显示数字
+  （`--show-baseline` 可看来源），有 PyTorch-NPU 基线的行不受影响。卡型自动识别为 `ascend-910b`，日志里应出现
   `ascend-910b`；没有就加 `--vendor-card ascend-910b`。口径见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
 - 这轮要确认的三件事：
   1. `spgemm_csr` 的性能现在走 `tests/test_spgemm.py`（交付矩阵、按 dtype 分进程），**第一次在 NPU 上跑**。日志里
@@ -152,7 +152,7 @@ sweep、单次 `index_add`）。涉及对 CSC 格式和 SpGEMM 哈希表算法�
 2. `spgemm_csr` 的性能这次第一次走 `tests/test_spgemm.py`（交付矩阵、float32/float64 分进程）：
    应有 `spgemm_csr/performance_float32.csv`、`performance_float64.csv`，`spgemm_csr_f32_int_non_non` 应有加速比。
    失败就贴 `spgemm_csr/performance_stderr.log` 最后 50 行原文。
-3. 有加速比的变体个数（预演 64–65）。带 `(H800折算)` / `(H800 PyTorch折算)` 的变体原样列出；日志里卡型应是 `ascend-910b`。
+3. 有加速比的变体个数（预演 64–65）。`python3 tools/delivery_table.py <结果目录> --show-baseline` 的输出原样贴回；日志里卡型应是 `ascend-910b`。
 4. 折算补上的变体预演大多是 0.001x–0.06x（q4 call 路径每次 0.3–2.4 秒）。如实带回，并挑 3 个最慢的变体贴
    `performance.csv` 原始行（含 `timed`、`triton_ms` 列）。
 
@@ -166,8 +166,8 @@ sweep、单次 `index_add`）。涉及对 CSC 格式和 SpGEMM 哈希表算法�
 你在 昇腾 910B（Ascend） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
 背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
-- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里会标
-  (H800折算) 或 (H800 PyTorch折算)。有本机基线的变体不受影响。
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里只显示数字，
+  delivery_table.py --show-baseline 的最后一列说明哪些是折算的。有本机基线的变体不受影响。
 - 本后端相关的修复，见 docs/debug/ASCEND.md "跑完要确认"一节逐条列出的内容。
 主要目的是收集数据，不是修代码。
 

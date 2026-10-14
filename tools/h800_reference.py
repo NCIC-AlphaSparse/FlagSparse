@@ -405,10 +405,10 @@ def render_markdown(doc):
         "```",
         "",
         "这是**估算**，不是厂商实测：H800 与目标卡的访存效率、缓存、launch 开销并不成比例。"
-        "折算出的加速比在 summary 里带 `baseline: h800_scaled`，`tools/delivery_table.py` 显示为 `(H800折算)`。",
+        "折算出的加速比在 summary 里带 `baseline: h800_scaled`；`tools/delivery_table.py` 只显示数字，加 `--show-baseline` 才显示来源。",
         "",
         "H800 上某个算例**没有** cuSPARSE 时间时（cuSPARSE SDDMM 不支持 fp16），退一步用同一行 H800 PyTorch 的时间"
-        "（PyTorch 结果须通过校验），标 `baseline: h800_pytorch_scaled` / `(H800 PyTorch折算)`；cuSPARSE 跑了但结果"
+        "（PyTorch 结果须通过校验），标 `baseline: h800_pytorch_scaled`；cuSPARSE 跑了但结果"
         "不对的行不退。FlagSparse 自己在 H800 上的时间永远不当基线。",
         "",
         "C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑性能（与本参照同一 benchmark、同一规模），"

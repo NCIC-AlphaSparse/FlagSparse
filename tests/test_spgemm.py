@@ -427,7 +427,10 @@ def _build_scipy_spgemm_reference(
     product = reference_utils.spgemm(a_csr, b_csr)
     product.sort_indices()
     device = a_data.device
-    data = reference_utils.as_torch(product.data, ref_dtype, device).to(a_data.dtype)
+    # as_torch_at, not as_torch(...).to(): BI-V150 zeroes an fp64 H2D copy, so the
+    # reference arrived as zeros and every Iluvatar SpGEMM row failed with
+    # "sparsity pattern mismatch" (the zeros are dropped as explicit zeros).
+    data = reference_utils.as_torch_at(product.data, a_data.dtype, device)
     indices = torch.as_tensor(
         product.indices, dtype=torch.int32, device=device
     ).contiguous()

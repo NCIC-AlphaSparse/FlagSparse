@@ -25,10 +25,10 @@ python3 tools/delivery_table.py results_metax_65_<日期>
   里，拉下来就有）。这条命令没带 `--delivery-only`，runner 不会再筛矩阵，给 30 个矩阵的目录就会 30 个全跑，
   汇总出来的加速比也会掺进非交付矩阵，所以不要换成别的目录。
 - `--h800-reference`（不带值）：没有任何基线的行（目前是 legacy `spmv_csr` f32/f64、SDDMM 的 q4 变体、`spgemm_csr`），
-  用仓库自带的 H800 结果按带宽折算出加速比（`h800_scaled_ms = T_cuSPARSE@H800 × 3050/1440`），`delivery_table.py`
-  里这些行后面会标 `(H800折算)`。**有 PyTorch 基线的行不受影响。** 这是估算，不是厂商实测，汇报时要注明；
+  用仓库自带的 H800 结果按带宽折算出加速比（`h800_scaled_ms = T_cuSPARSE@H800 × 3050/1440`），交付表里只显示数字；
+  要看哪些是折算的用 `delivery_table.py --show-baseline`。**有 PyTorch 基线的行不受影响。** 这是估算，不是厂商实测，汇报时要注明；
   `sddmm_csr_f16_int_non_non_row` 在 H800 上没有 cuSPARSE 时间（cuSPARSE SDDMM 不支持 fp16），改用 H800 上
-  PyTorch 的时间折算，标 `(H800 PyTorch折算)`（C550 自己的 `sampled_addmm` 结果是错的，7.3 节）。
+  PyTorch 的时间折算（`--show-baseline` 显示 `h800_pytorch_scaled`；C550 自己的 `sampled_addmm` 结果是错的，7.3 节）。
   口径和覆盖见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
 - `sddmm_csr=--no-cusparse`、`--timeout 4500` 沿用 `../MACA.md` 0.5 节的 20 变体交付命令，原因见那一节
   （C550 没有可用厂商稀疏库；SDDMM 的 4 个 K 值不收窄，单阶段耗时长）。
@@ -76,8 +76,8 @@ python3 tools/delivery_table.py results_metax_65_<日期>
 ## 跑完要确认（2026-10-14 之后这一轮）
 
 1. `missing` 是不是 0；65 个变体精度是不是全 Passed（`spmv_coo_f32_int_non` 不应再是 Skipped）。
-2. 有加速比的变体是不是 65/65。哪些带 `(H800折算)`、哪些带 `(H800 PyTorch折算)`，原样列出。按 10-13 那轮预演：
-   SDDMM 的 q4 变体、`spgemm_csr` 应带 `(H800折算)`，`sddmm_csr_f16_int_non_non_row` 带 `(H800 PyTorch折算)`（预演 1.595x）。
+2. 有加速比的变体是不是 65/65。`python3 tools/delivery_table.py <结果目录> --show-baseline` 的输出原样贴回。按 10-13 那轮预演：SDDMM 的 q4 变体、
+   `spgemm_csr` 应为 `h800_scaled`，`sddmm_csr_f16_int_non_non_row` 为 `h800_pytorch_scaled`（预演 1.595x）。
 3. `spmv_csr_f32_int_non` / `spmv_csr_f64_int_non` 的加速比和它的基线是什么：`spmv_csr/performance.csv` 里
    `vendor_backend`、`vendor_ms`、`speedup_vs_vendor`、`h800_scaled_ms` 各一行原样贴回（用 PyTorch 基线会是几百倍，
    用 H800 折算预演是 0.68x；这一项待定，先如实带回）。
@@ -95,8 +95,8 @@ python3 tools/delivery_table.py results_metax_65_<日期>
 你在 MetaX C550（MACA） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
 背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
-- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里会标
-  (H800折算) 或 (H800 PyTorch折算)。有本机基线的变体不受影响。
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里只显示数字，
+  delivery_table.py --show-baseline 的最后一列说明哪些是折算的。有本机基线的变体不受影响。
 - 本后端相关的修复，见 docs/debug/MACA.md "跑完要确认"一节逐条列出的内容。
 主要目的是收集数据，不是修代码。
 

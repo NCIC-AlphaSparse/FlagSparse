@@ -54,7 +54,7 @@ python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：2
 
 **`--h800-reference`（不带值）**：没有 PyTorch-NPU 基线的行，用仓库自带的 H800 结果按带宽折算出加速比
 （H800 cuSPARSE 时间 × 3050/1600；H800 也没有 cuSPARSE 时间的 `sddmm_csr_f16` 用 H800 PyTorch），交付表里标
-`(H800折算)` / `(H800 PyTorch折算)`。**有 PyTorch-NPU 基线的行不受影响。** 按 10-11 全量结果预演：有加速比的变体
+只显示数字（`--show-baseline` 可看来源）。**有 PyTorch-NPU 基线的行不受影响。** 按 10-11 全量结果预演：有加速比的变体
 41 → 63，补上的 22 个大多在 0.001x–0.06x——昇腾上这些变体每次调用 0.3–2.4 秒（`timed=call`，PyTorch-NPU 自己
 在 legacy spmm_csr 上也要 20–44 ms），数是真的，不是折算出错。`spgemm_csr` 以前走探测脚本、测的是合成规模，
 现在改为 `tests/test_spgemm.py` 在交付矩阵上测（**未在 NPU 上跑过**），重跑后才能折算。见

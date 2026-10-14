@@ -48,10 +48,10 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
   只会失败，崩溃时还会把整个 spgemm 性能阶段判成 FAIL）。精度侧的 fp64 用例已被 `-k` 挡掉。
 - **`spgemm_csr` 这轮第一次真正能跑**：10-09 那轮 20 行全部是 TLE 编译错误
   （`iluvatar TLE alloc does not support nv_mma_shared_layout=True`），现在天数上改走 ESC（见文末改动记录）。
-  跑完确认 `spgemm_csr_f32_int_non_non` 精度 Passed、有 `(H800折算)` 加速比；还报 TLE 就说明没拉到新代码。
+  跑完确认 `spgemm_csr_f32_int_non_non` 精度 Passed、有加速比；还报 TLE 就说明没拉到新代码。
 - **`--h800-reference` 现在能补上 q4 变体**：10-09 那轮命令也带了它，但当时的参照只有 20 个变体，q4 全对不上，
   所以全是 `-`。参照已换成 H800 的 65 变体全量，按那轮数据预演，有加速比的变体 25 → 55（再加 spgemm 就是 56，
-  其余 9 个是 fp64）。`sddmm_csr_f16` 标的是 `(H800 PyTorch折算)`，见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
+  其余 9 个是 fp64）。`sddmm_csr_f16` 用的是 H800 PyTorch 折算，见 [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
 
 - 外层 `timeout -s KILL` 是整条命令的总限时（内核卡死时 Ctrl-C 送不进去，只能靠 KILL）；`--timeout` 是
   每个算子每个阶段的限时。这两个数是 20 变体时期定的，65 变体多了 6 个父算子，**没有在本机实测过总耗时**，
@@ -80,7 +80,7 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
 1. `missing` 是不是 0。9 个 f64/c64 变体 `NotFound` 是预期的，其余 56 个精度应 Passed。
 2. `spgemm_csr_f32_int_non_non`：精度 Passed、有加速比；日志/CSV 里不应再出现
    `iluvatar TLE alloc does not support nv_mma_shared_layout=True`（出现就说明没拉到新代码）。
-3. 有加速比的变体个数（预演 56 = 10-09 预演的 55 + spgemm）。带 `(H800折算)` / `(H800 PyTorch折算)` 的原样列出。
+3. 有加速比的变体个数（预演 56 = 10-09 预演的 55 + spgemm）。`python3 tools/delivery_table.py <结果目录> --show-baseline` 的输出原样贴回。
 4. 任何一行的 PyTorch 列"看起来正常但可疑"（这张卡的 torch.sparse 有静默算错的先例）；int8/混合精度变体精度是否真的通过。
 
 把这些结果写回来，不用额外分析，原始数据最有用。
@@ -93,8 +93,8 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
 你在 天数智芯 BI-V150（Iluvatar） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
 背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
-- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里会标
-  (H800折算) 或 (H800 PyTorch折算)。有本机基线的变体不受影响。
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里只显示数字，
+  delivery_table.py --show-baseline 的最后一列说明哪些是折算的。有本机基线的变体不受影响。
 - 本后端相关的修复，见 docs/debug/ILUVATAR.md "跑完要确认"一节逐条列出的内容。
 主要目的是收集数据，不是修代码。
 

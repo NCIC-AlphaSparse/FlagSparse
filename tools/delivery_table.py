@@ -41,23 +41,27 @@ def _summary_path(target: Path) -> Path:
 def _speedup(performance: dict) -> str:
     data = performance.get("data")
     values = []
-    labels = set()
     if isinstance(data, dict):
         for entry in data.values():
             if isinstance(entry, dict) and entry.get("speedup"):
                 values.append(float(entry["speedup"]))
-                labels.add(str(entry.get("baseline") or ""))
-    if not values:
-        return "-"
-    # Against a rescaled H800 time (no baseline on this card): an estimate, never
-    # to be read as a measured vendor speedup. H800 PyTorch only where H800's
-    # cuSPARSE had no time for the case.
-    note = ""
-    if any("h800_pytorch_scaled" in label for label in labels):
-        note = " (H800 PyTorch折算)"
-    elif any("h800_scaled" in label for label in labels):
-        note = " (H800折算)"
-    return f"{sum(values) / len(values):.3f}x" + note
+    return f"{sum(values) / len(values):.3f}x" if values else "-"
+
+
+def _baseline(performance: dict) -> str:
+    """Where the speedup's denominator came from (--show-baseline only).
+
+    ``h800_scaled`` / ``h800_pytorch_scaled``: the card had no baseline, so the
+    H800 cuSPARSE (or, where cuSPARSE has no time, PyTorch) time rescaled by
+    bandwidth stands in -- see docs/H800_REFERENCE.md. Empty: measured on the card.
+    """
+    data = performance.get("data")
+    labels = {
+        str(entry.get("baseline"))
+        for entry in (data.values() if isinstance(data, dict) else ())
+        if isinstance(entry, dict) and entry.get("speedup") and entry.get("baseline")
+    }
+    return ",".join(sorted(labels)) or "-"
 
 
 def main() -> int:
@@ -65,6 +69,11 @@ def main() -> int:
     parser.add_argument("target", type=Path, help="results directory or summary json")
     parser.add_argument(
         "--markdown", action="store_true", help="print a Markdown table"
+    )
+    parser.add_argument(
+        "--show-baseline",
+        action="store_true",
+        help="add a column saying which speedups are against the rescaled H800 time",
     )
     args = parser.parse_args()
 
@@ -76,7 +85,7 @@ def main() -> int:
     for variant in variants:
         entry = result.get(variant["id"])
         if entry is None:
-            rows.append((variant["id"], "MISSING", "MISSING", "-"))
+            rows.append((variant["id"], "MISSING", "MISSING", "-", "-"))
             continue
         accuracy = entry.get("accuracy") or {}
         performance = entry.get("performance") or {}
@@ -86,20 +95,29 @@ def main() -> int:
                 str(accuracy.get("status", "-")),
                 str(performance.get("status", "-")),
                 _speedup(performance),
+                _baseline(performance),
             )
         )
 
-    header = ("variant", "accuracy", "performance", "speedup")
+    header = ("variant", "accuracy", "performance", "speedup", "baseline")
+    if not args.show_baseline:
+        header = header[:4]
+        rows = [row[:4] for row in rows]
     if args.markdown:
         print("| # | " + " | ".join(header) + " |")
-        print("|---:|---|---|---|---:|")
+        print("|---:|---|---|---|---:|" + "---|" * (len(header) - 4))
         for index, row in enumerate(rows, 1):
             print(f"| {index} | `{row[0]}` | " + " | ".join(row[1:]) + " |")
     else:
         width = max(len(row[0]) for row in rows)
-        print(f"{'#':>3}  {header[0]:<{width}}  {header[1]:<10}  {header[2]:<12}  {header[3]}")
+
+        def line(index, row):
+            text = f"{index:>3}  {row[0]:<{width}}  {row[1]:<10}  {row[2]:<12}  "
+            return text + (f"{row[3]:<10}  {row[4]}" if len(row) > 4 else row[3])
+
+        print(line("#", header))
         for index, row in enumerate(rows, 1):
-            print(f"{index:>3}  {row[0]:<{width}}  {row[1]:<10}  {row[2]:<12}  {row[3]}")
+            print(line(index, row))
 
     missing = sum(1 for row in rows if row[1] == "MISSING")
     accuracy_counts = Counter(row[1] for row in rows)

@@ -23,13 +23,13 @@ python3 tools/delivery_table.py results_musa_split_65_<日期>
   muSPARSE 不支持的类型组合（fp16、int8、混合精度、SELL 等）显示 `NoBaseline`——跑通了、精度过了，只是没有
   厂商对照，**这是预期的**，不是失败。
 - `--h800-reference`（不带值）：muSPARSE 不支持、标 `NoBaseline` 的变体（2026-10-09 那轮是 26 个），用仓库自带的
-  H800 结果按带宽折算出加速比（H800 时间 × 3050/1370），`delivery_table.py` 里标 `(H800折算)`。**muSPARSE 测得到的
+  H800 结果按带宽折算出加速比（H800 时间 × 3050/1370），交付表里只显示数字（`--show-baseline` 可看来源）。**muSPARSE 测得到的
   变体不受影响。** 加了这个开关，pytest 那一半会从只跑精度变成**精度 + 性能**（多一轮 Python 性能，耗时会明显变长），
   因为 C API 的规模（SpMM `n=8`、SDDMM `k=16/64`、向量类按矩阵）在 H800 上没有对应数据，而 Python 侧和 H800 参照
   是同一个 benchmark、同样规模。合并时按顺序取：① C API 有 muSPARSE 基线 → C API；② Python 侧有折算加速比 →
   Python（条目里 `source: python`，原 C API 结果留在 `capi_performance`）；③ 否则用 C API 时间对 H800 同变体同矩阵
   折算（只有 SpMV 类能对上）。日志会打印三类各补了多少、还剩哪些。`sddmm_csr_f16` 在 H800 上没有 cuSPARSE 时间，
-  用 H800 PyTorch 折算，标 `(H800 PyTorch折算)`。是估算，不是厂商实测，汇报时要注明；见
+  用 H800 PyTorch 折算。是估算，不是厂商实测，汇报时要注明；见
   [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
 - 拉到新代码后第一次跑**不要加 `--skip-capi-build`**，确保 C API 是重新编译的。
 - `--timeout 3600` 沿用 `../MUSA.md` 的结论（`900` 不够），split 会把它同时传给 CTest。CUDA 上 SpMM 这一族
@@ -59,7 +59,7 @@ python3 tools/delivery_table.py results_musa_split_65_<日期>
 1. `missing` 是不是 0；65 个变体精度是不是全 Passed（`spmv_coo_f32_int_non` 不应再是 Skipped）。
 2. 日志里 `--h800-reference (musa-s5000): NoBaseline variants filled from the Python half=…, from the C API time=…,
    still without a baseline=…` 这一行原样贴回。按设计"still without"应该是 0；不是 0 就列出是哪些变体、为什么。
-3. 交付表里还有没有 `NoBaseline`；带 `(H800折算)` / `(H800 PyTorch折算)` 的变体原样列出。
+3. 交付表里还有没有 `NoBaseline`；`python3 tools/delivery_table.py <结果目录> --show-baseline` 的输出原样贴回（最后一列说明哪些加速比是折算的）。
 4. 这轮 pytest 那一半第一次跑性能（加了 `--h800-reference` 的代价），报一下总耗时，以及 Python 性能阶段里有没有
    哪个算子超时或崩溃（`<结果目录>/<算子>/performance_stderr.log`）。
 5. 复数变体有没有 `IndexMusa not implemented`；有没有慢几百倍的可疑变体。
@@ -172,8 +172,8 @@ C API 精度 10/10 测试族通过。唯一的精度瑕疵是 `spmm_csc_f32_int_
 你在 摩尔线程 S5000（MUSA） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
 背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
-- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里会标
-  (H800折算) 或 (H800 PyTorch折算)。有本机基线的变体不受影响。
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里只显示数字，
+  delivery_table.py --show-baseline 的最后一列说明哪些是折算的。有本机基线的变体不受影响。
 - 本后端相关的修复，见 docs/debug/MUSA.md "跑完要确认"一节逐条列出的内容。
 主要目的是收集数据，不是修代码。
 
