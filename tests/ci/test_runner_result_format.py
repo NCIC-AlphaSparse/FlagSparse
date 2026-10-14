@@ -1150,3 +1150,26 @@ def test_ascend_spgemm_is_measured_on_the_delivery_matrices(monkeypatch):
     # no speedup, and nothing an H800 reference could be matched to.
     command = runner.ASCEND_PERFORMANCE_COMMANDS["spgemm_csr"]
     assert command[0] == "tests/test_spgemm.py" and "{input}" in command
+
+
+def test_the_reuse_suite_backend_gate_does_not_demote_a_delivery_variant():
+    # On MUSA/Iluvatar/Ascend the reuse cases skip by design; their float32 token
+    # lands them in spmv_coo_f32_int_non's slice, which must still read Passed.
+    gate = (
+        "Skipped: reuse coverage not yet verified on this backend "
+        "(ROCm, MACA, CUDA only)"
+    )
+    raw = {
+        "tests/pytest/test_spmv_coo_accuracy.py::test_ok[float32]": {
+            "params": {"dtype": "float32"},
+            "result": "passed",
+        },
+        "tests/pytest/test_rocm_sparse_reuse_accuracy.py::test_mixed[f32]": {
+            "params": {"out_dtype": "torch.float32"},
+            "result": "skipped",
+            "reason": gate,
+        },
+    }
+    summary = runner.summarize_accuracy_cases(raw)
+    assert summary["status"] == "Passed"
+    assert summary["skipped"] == 1  # still reported, just not a demotion

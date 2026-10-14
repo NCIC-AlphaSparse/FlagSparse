@@ -1650,6 +1650,11 @@ EXPECTED_ACCURACY_SKIP_REASONS = (
     "external matrix regression directory not configured",
     "legacy bucket requires int32 column indices",
     "ascend complex gather/scatter capability unavailable",
+    # tests/pytest/test_rocm_sparse_reuse_accuracy.py runs only where it has been
+    # verified (ROCm, MACA, CUDA). Its mixed-COO cases carry float32/float16/int8
+    # tokens, so an unexpected skip turned spmv_coo_f32_int_non into "Skipped" on
+    # every other backend (seen on H800 when the gate was still ROCm-only).
+    "reuse coverage not yet verified on this backend",
 )
 
 

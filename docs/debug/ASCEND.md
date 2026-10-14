@@ -379,4 +379,3 @@ git pull --ff-only origin main 之后，完整读一遍 docs/debug/ASCEND.md，�
 - 怎么验证的：只在 CUDA 机器上确认路由（`tests/ci/test_runner_result_format.py::test_ascend_spgemm_is_measured_on_the_delivery_matrices`）；
   `tests/test_spgemm.py` 在 NPU 上能否跑通**未验证**，昇腾 spgemm 的精度用例是通过的（同一 `flagsparse_spgemm_csr`）。
 - 其他后端是否也需要：否。
-
