@@ -15,9 +15,13 @@
 """CPU regressions for the SpGEMM sparse-result comparator."""
 
 import pytest
-import torch
 
-from tests.test_spgemm import _spgemm_compare_metrics
+# CI's tests/ci job runs without torch (or triton); skip there like the rest of
+# tests/ci instead of failing collection.
+torch = pytest.importorskip("torch")
+_spgemm_compare_metrics = pytest.importorskip(
+    "tests.test_spgemm"
+)._spgemm_compare_metrics
 
 
 def _csr(data, indices, indptr, shape, dtype):
