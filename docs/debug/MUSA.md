@@ -8,14 +8,45 @@
 环境按 `../MUSA.md` 第 2 节配好（`FLAGSPARSE_BACKEND=mthreads`、`MUSA_HOME`）后，跑一轮 split：
 
 ```bash
+# 1. 更新代码：至少要包含 a330b62（见下面"2026-10-14 那轮的两个 NoBaseline"）
+git pull --ff-only
+git log --oneline -1
+git merge-base --is-ancestor a330b62 HEAD && echo "包含 a330b62 修复"
+
+# 2. 环境自检
+export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa   # MUSA_HOME 以本机实际安装位置为准
+python3 -c "import flagsparse; print(flagsparse.__file__)"   # 必须是 <仓库>/src/flagsparse/__init__.py
+python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_device_type(), c._accel_fallback_reason())"
+# 期望：mthreads musa None
+ls tests/data/*.mtx | wc -l          # 期望 10
+mthreads-gmi                         # 确认没有别的任务在用 GPU
+
+# 3. 全量 split（每次用新的结果目录）
+D=results_musa_split_65_<日期>
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
   --mode normal --benchmark-input tests/data --timeout 3600 \
   --h800-reference \
-  --results-dir results_musa_split_65_<日期> \
-  > results_musa_split_65_<日期>.log 2>&1 < /dev/null &
-# 跑完后
-python3 tools/delivery_table.py results_musa_split_65_<日期>
+  --results-dir $D \
+  > $D.log 2>&1 < /dev/null &
+
+# 4. 跑完后
+tail -5 $D.log                                    # H800 折算三类各补了多少、还剩哪些
+python3 tools/delivery_table.py $D                # 期望 0 missing，性能里没有 NoBaseline
+python3 tools/delivery_table.py $D --show-baseline | grep -E "scatter_i8_int|spmm_csc_f16"
+# 期望这两行有加速比，来源 h800_scaled
 ```
+
+- `flagsparse.__file__` 那一步不能省：系统 site-packages 里残留的旧安装会顶替 `src/`，基线悄悄变成 `N/A`。
+- `MUSA_HOME` 设错不会报错，muSPARSE 基线同样会悄悄退成 `none`（`../MUSA.md` 第 2 节）。
+
+**2026-10-14 那轮的两个 NoBaseline**（`results_musa_split_65_20261014`，63 Passed + 2 NoBaseline）：
+`scatter_i8_int` 和 `spmm_csc_f16_int_non_non_row` muSPARSE 都不支持（C API 报 `Scatter dtype unsupported`、
+`unsupported SpMM type or operation`），只能靠 Python 侧的折算补，而那轮 Python 侧这两处都崩了：scatter int8 的
+torch 参考被 muDNN 拒绝（`Now muDNN only support float64, float32, half, bfloat16, int32, and int64`，4 行全是
+`ERROR`）；spmm_csc 的 `torch.sparse.mm` 参考在 MUSA 上没有实现（`Could not run 'aten::addmm' with arguments from
+the 'Sparsemusa' backend`，CSV 为空）。`a330b62`（参考改在 CPU / SciPy 上算）修了这两处，但它比那轮结果晚提交，
+所以那份报告里的这两行是旧代码的结果，按上面的命令重跑即可。CUDA 上以 `FLAGSPARSE_BACKEND=mthreads` 模拟已确认
+两行都能测出性能；折算这一步只在真机上走得到。
 
 - 精度那一半调用 `run_flagsparse_pytest.py --phase accuracy --delivery-only`，覆盖全部 65 个变体。
 - 性能那一半取 C API 的 `ctest`（对 muSPARSE），**现在也覆盖全部 65 个变体**：`origin/q4` 的 C API 工作
