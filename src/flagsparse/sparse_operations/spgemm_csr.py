@@ -244,6 +244,11 @@ def prepare_spgemm_csr(
         row_work = torch.empty(0, dtype=torch.int32, device=a_data.device)
         a_pref = torch.empty(0, dtype=torch.int32, device=a_data.device)
         row_work_ready = True
+    elif _is_maca_runtime():
+        from ._spgemm_maca import build_metadata
+
+        row_work, a_pref = build_metadata(a_indices, a_indptr, b_indptr)
+        row_work_ready = True
     elif analyze_rows:
         row_work, a_pref = _build_row_product_metadata(a_indices, a_indptr, b_indptr)
         row_work_ready = True
@@ -842,6 +847,12 @@ def _spgemm_esc_compute_safe(prepared):
     )
 
 
+def _maca_triton_spgemm_compute(prepared):
+    from ._spgemm_maca import compute
+
+    return compute(prepared)
+
+
 def _spgemm_hash_hybrid_compute(prepared):
     """Hybrid: TLE shared-memory hash for rows that fit a table, chunked ESC
     for the rest. Returns ``None`` when hashing does not apply (caller then
@@ -1146,7 +1157,17 @@ def _spgemm_compute(prepared):
     # CUDA and other backends retain the optimized TLE route.  XPU's Triton
     # lowering cannot legalize TLE's shared-memory local_ptr/make_range path;
     # ESC uses ordinary device tensor operations and remains fully on-device.
-    tle_hash_safe = not (_is_mthreads_runtime() or _is_xpu_runtime())
+    # Iluvatar's FlagTree imports TLE but cannot compile its shared-memory
+    # tables ("iluvatar TLE alloc does not support nv_mma_shared_layout=True",
+    # BI-V150, 2026-10-09), which failed every SpGEMM row there.
+    # C550 has no TLE. Its product, reductions and CSR construction use the
+    # MACA-only standard Triton implementation, never torch.sparse.mm or ESC.
+    if _is_maca_runtime() and isinstance(prepared, SpGEMMPrepared):
+        return _maca_triton_spgemm_compute(prepared)
+
+    tle_hash_safe = not (
+        _is_mthreads_runtime() or _is_xpu_runtime() or _is_iluvatar_runtime()
+    )
     if tle_hash_safe and _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
         try:
             result = _spgemm_hash_hybrid_compute(prepared)

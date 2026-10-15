@@ -46,3 +46,32 @@ def test_missing_variant_is_printed_and_fails(tmp_path):
     proc = _run(tmp_path, result)
     assert proc.returncode == 1
     assert f"{ids[0]}" in proc.stdout and "MISSING" in proc.stdout
+
+
+def test_a_scaled_speedup_shows_only_the_number_unless_asked(tmp_path):
+    ids = [v["id"] for v in load_delivery_variants()]
+    result = {
+        vid: {
+            "accuracy": {"status": "Passed"},
+            "performance": {"status": "Passed", "data": {"fp32": {"speedup": 2.0}}},
+        }
+        for vid in ids
+    }
+    result[ids[0]]["performance"]["data"]["fp32"]["baseline"] = "h800_scaled"
+    result[ids[1]]["performance"]["data"]["fp32"]["baseline"] = "h800_pytorch_scaled"
+    proc = _run(tmp_path, result)
+    assert proc.returncode == 0, proc.stderr
+    assert "H800" not in proc.stdout and "h800" not in proc.stdout
+    line = next(line for line in proc.stdout.splitlines() if ids[0] in line)
+    assert line.rstrip().endswith("2.000x")
+    # --show-baseline says where each denominator came from
+    shown = subprocess.run(
+        [sys.executable, str(TOOL), str(tmp_path), "--show-baseline"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    ).stdout.splitlines()
+    by_id = {vid: next(line for line in shown if vid in line) for vid in ids[:3]}
+    assert by_id[ids[0]].rstrip().endswith("h800_scaled")
+    assert by_id[ids[1]].rstrip().endswith("h800_pytorch_scaled")
+    assert by_id[ids[2]].rstrip().endswith("-")

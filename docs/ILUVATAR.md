@@ -201,7 +201,8 @@ setsid timeout -s KILL 14400 python3 -u run_flagsparse_pytest.py \
   `allclose` 里面）；
 - **多卡机器先确认 `--gpus 0` 真的生效**：runner 靠 `CUDA_VISIBLE_DEVICES` 选卡，CoreX 是否遵守这个
   变量未验证，跑起来用 `ixsmi` 看负载落在哪张卡；
-- **不用跑 `spsv` / `spsm` / `spgemm`**，它们不在交付清单里，`--delivery-only` 也选不到。
+- **不用跑 `spsv` / `spsm`**，它们不在交付清单里，`--delivery-only` 也选不到。`spgemm_csr` 现在是交付变体
+  （`spgemm_csr_f32_int_non_non`），命令里用 `spgemm_csr=--dtypes float32` 只跑 f32（本卡 fp64 不可用）。
 
 ---
 
@@ -231,6 +232,7 @@ setsid timeout -s KILL 43200 \
     --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
     --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
     --op-benchmark-args='sddmm_csr=--dtype float32' \
+    --op-benchmark-args='spgemm_csr=--dtypes float32' \
     --results-dir pytest_results_iluvatar_delivery \
   > pytest_results_iluvatar_delivery.log 2>&1 < /dev/null &
 ```
@@ -353,11 +355,14 @@ speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和
 ```
 
 - 自带的数据在 [`conf/h800_reference.json`](../conf/h800_reference.json)（约 1 MB，一个文件），说明见
-  [H800_REFERENCE.md](H800_REFERENCE.md)：H800 ×8，提交 `47a441e`（那轮是脏工作树），17 个算子的 7801 行，
+  [H800_REFERENCE.md](H800_REFERENCE.md)：2026-10-14 起是 H800 ×8 上**全部 65 个变体**的一轮（提交 `643e9c6`，
+  脏工作树），13 个交付算子；spsv/spsm/bsr/bell 新一轮没测，沿用 09-22 那轮（`47a441e`）并在文件里标了来源。共 20 个算子 4645 行，
   每行保留算例键、各 `*_ms` 时间、加速比和状态列。想换成自己的一轮 H800 结果，`--h800-reference 目录或json文件`
   都行；重新生成用 `python3 tools/h800_reference.py <H800 结果目录>`。
-- **有一处覆盖不到**：这轮 H800 数据里 `spmm_bsr`、`spmm_bell` 没有 cuSPARSE 时间（当时基线只有 CuPy，没有
-  BSR / Blocked-ELL 的库），所以这两个算子没有折算基线，行保持 `N/A`；`spmm_csc` 只有 240/720 行有。
+- **H800 没有 cuSPARSE 时间的**：65 个交付变体里只有 `sddmm_csr_f16_int_non_non_row`（cuSPARSE SDDMM 不支持
+  fp16），改用 H800 上 PyTorch 的时间折算。非交付的 `spmm_bsr`、`spmm_bell` 两者都没有。
+  按 10-09 的天数结果预演，换成新参照后有加速比的变体从 25 个变为 55 个；剩下的是不测的 fp64 9 个，和那轮因 TLE
+  编译失败全部 FAIL 的 `spgemm_csr`（已修，见 `debug/ILUVATAR.md` 改动记录，重跑后可折算）。
 - 每行的 `performance.csv` 会多 5 列：`h800_vendor_ms`（H800 上 cuSPARSE 的用时）、`h800_scaled_ms`（折算后的时间，
   即基线 1）、`h800_scaled_fs_ms`（天数上 FlagSparse 的实测）、`speedup_vs_h800_scaled`（加速比）、`h800_scaled_card`（用的卡）。
   `summary.json` / `summary.csv` 里交付变体的 speedup 就是这个数，`delivery_table.py` 也照常显示。

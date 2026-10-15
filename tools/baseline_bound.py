@@ -180,7 +180,18 @@ _DTYPE_KEYS = (
 _OP_KEYS = ("op", "opa", "transpose")
 # Case axes joined into the key when BOTH sides carry the column; one side alone
 # (ROCm spmv_csr has `alg`, CUDA does not) would make every key miss.
-_OPTIONAL_KEYS = ("alg", "layout", "mode", "dense_cols", "k")
+# variant/op_b/out_dtype: q4 rows of one matrix and dtype differ only there (f16 vs
+# f16->f32 SpMV, SDDMM non_non vs non_trans), so without them two cases share a key.
+_OPTIONAL_KEYS = (
+    "alg",
+    "layout",
+    "mode",
+    "dense_cols",
+    "k",
+    "variant",
+    "op_b",
+    "out_dtype",
+)
 _PASS = {"PASS", "PASSED", "OK", "SUCCESS"}
 _TEMPLATE_SIDE = {
     "name": None,
@@ -569,7 +580,40 @@ SCALED_COLUMNS = (
     "h800_scaled_fs_ms",
     "speedup_vs_h800_scaled",
     "h800_scaled_card",
+    "h800_baseline_kind",
 )
+# Which H800 time the scaled baseline is: the vendor library's, or -- only when the
+# H800 run has none for that case (cuSPARSE SDDMM has no fp16) -- PyTorch's.
+BASELINE_KIND_LIBRARY = "cusparse"
+BASELINE_KIND_PYTORCH = "pytorch"
+_PYTORCH_TIME_COLUMNS = ("pytorch_ms", "torch_ms")
+_PYTORCH_MAX_ERROR = 1e-2  # q4_variant_bench's own gate for using a baseline
+
+
+def _reference_baseline(row: dict[str, str]) -> tuple[float | None, str, str]:
+    """``(time, kind, why-not)`` of a reference row's baseline for the scaled speedup.
+
+    The vendor library's time first. Only when the row has NONE -- not when it has
+    one that failed its check -- the same row's PyTorch time, provided PyTorch's own
+    result was checked and close (q4 rows record ``pytorch_max_error``). Never
+    FlagSparse's own time.
+    """
+    t_ref, why = _reference_time(row, None)
+    if t_ref is not None and t_ref > 0:
+        return t_ref, BASELINE_KIND_LIBRARY, ""
+    if not _baseline_ok(row):  # the library ran and disagreed: no fallback
+        return None, "", why
+    status = str(row.get("pt_status") or "").strip().upper()
+    if any(bad in status for bad in ("FAIL", "ERROR")):
+        return None, "", why
+    err = _num(row.get("pytorch_max_error"))
+    if err is not None and err > _PYTORCH_MAX_ERROR:
+        return None, "", why
+    for column in _PYTORCH_TIME_COLUMNS:
+        t_pt = _num(row.get(column))
+        if t_pt is not None and t_pt > 0:
+            return t_pt, BASELINE_KIND_PYTORCH, ""
+    return None, "", why + " nor a PyTorch time"
 
 
 def _usable(row: dict[str, str]) -> bool:
@@ -663,8 +707,8 @@ def scaled_baseline_rows(
         if not _usable(ref):
             skip("the reference row did not pass")
             continue
-        t_ref, why = _reference_time(ref, None)
-        if t_ref is None or t_ref <= 0:
+        t_ref, kind, why = _reference_baseline(ref)
+        if t_ref is None:
             skip(why)
             continue
         resource, _ = _resource_for(ref, "auto", "mem")
@@ -680,8 +724,108 @@ def scaled_baseline_rows(
         row["h800_scaled_fs_ms"] = repr(t_own)
         row["speedup_vs_h800_scaled"] = repr(scaled / t_own)
         row["h800_scaled_card"] = card
+        row["h800_baseline_kind"] = kind
+        if kind == BASELINE_KIND_PYTORCH:
+            info["pytorch_fallback"] = info.get("pytorch_fallback", 0) + 1
         info["filled"] += 1
     return out, info
+
+
+def _reference_by_variant(reference_run: str) -> dict[str, dict[str, dict[str, str]]]:
+    """{variant id: {matrix stem (lowercase): reference row}} over every operator."""
+    out: dict[str, dict[str, dict[str, str]]] = {}
+    for path in _collect(reference_run).values():
+        _, rows = _read_csv(path)
+        for row in rows:
+            variant = str(row.get("variant") or "").strip()
+            matrix = Path(str(row.get("matrix") or "").strip()).stem.lower()
+            if variant and matrix:
+                out.setdefault(variant, {})[matrix] = row
+    return out
+
+
+def scaled_capi_performance(
+    variant_id: str,
+    performance: dict,
+    reference_run: str,
+    card: str,
+    *,
+    reference: str = "h800-sxm",
+    _index: dict | None = None,
+) -> dict | None:
+    """Fill a C API ``NoBaseline`` performance entry from the rescaled H800 time.
+
+    ``performance`` is one variant's entry in capi/tools/write_summary.py's schema
+    (``data[dtype]["details"][matrix] = {base, gems, speedup}``, base 0 when the
+    vendor library had nothing). Only ``NoBaseline`` dtypes are touched; a matrix
+    gets ``base = T_cuSPARSE@H800(variant, matrix) * P_h800 / P_card`` and
+    ``speedup = base / gems``, and the dtype speedup is their mean, as
+    write_summary.py computes it. Matching is by variant id and matrix name, so
+    the vector operators (H800 measured synthetic sizes, not matrices) and the
+    legacy, untagged variants never match and keep ``NoBaseline``.
+
+    Returns the info dict (filled/skipped counts) when anything was filled, else
+    ``None``; ``performance`` is updated in place.
+    """
+    data = performance.get("data")
+    if not isinstance(data, dict):
+        return None
+    index = _index if _index is not None else _reference_by_variant(reference_run)
+    by_matrix = index.get(variant_id) or {}
+    p_ref = REFERENCE_PEAKS[reference]
+    p_v = {"mem_bw_gbs": VENDOR_BANDWIDTH_GBS[card]}
+    info = {"card": card, "reference": str(reference_run), "filled": 0, "skipped": {}}
+
+    def skip(reason: str) -> None:
+        info["skipped"][reason] = info["skipped"].get(reason, 0) + 1
+
+    for dtype_entry in data.values():
+        if not isinstance(dtype_entry, dict) or dtype_entry.get("result") != "NoBaseline":
+            continue
+        speedups, kinds = [], set()
+        for matrix, detail in (dtype_entry.get("details") or {}).items():
+            gems = _num(detail.get("gems"))
+            if gems is None or gems <= 0 or _num(detail.get("base")):
+                continue
+            ref = by_matrix.get(Path(str(matrix)).stem.lower())
+            if ref is None:
+                skip("no such case in the reference run")
+                continue
+            if not _usable(ref):
+                skip("the reference row did not pass")
+                continue
+            t_ref, kind, why = _reference_baseline(ref)
+            if t_ref is None:
+                skip(why)
+                continue
+            kinds.add(kind)
+            resource, _ = _resource_for(ref, "auto", "mem")
+            try:
+                scaled = t_ref * (
+                    _peak(p_ref, resource, _dtype(ref)) / _peak(p_v, resource, _dtype(ref))
+                )
+            except KeyError as exc:
+                skip(f"peak missing: {exc.args[0]}")
+                continue
+            detail["base"] = scaled
+            detail["speedup"] = scaled / gems
+            speedups.append(scaled / gems)
+        if speedups:
+            dtype_entry["no_baseline_reason"] = dtype_entry.pop("reason", None)
+            dtype_entry["result"] = "Passed"
+            dtype_entry["speedup"] = sum(speedups) / len(speedups)
+            dtype_entry["baseline"] = (
+                "h800_pytorch_scaled" if BASELINE_KIND_PYTORCH in kinds else "h800_scaled"
+            )
+            info["filled"] += len(speedups)
+    if not info["filled"]:
+        return None
+    if all(
+        not isinstance(d, dict) or d.get("result") != "NoBaseline" for d in data.values()
+    ):
+        performance["status"] = "Passed"
+    performance["scaled_baseline"] = info
+    return info
 
 
 def _evaluate_op(op: str, ref_path: Path, vendor_path: Path | None, args, peaks):

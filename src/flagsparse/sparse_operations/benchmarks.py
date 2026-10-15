@@ -311,11 +311,15 @@ def benchmark_scatter_case(
     fallback_reason = fallback_reason or prep_meta["fallback_reason"]
 
     base_out = _build_random_dense(dense_size, sparse_values.dtype, device)
+    # The reference is computed on the CPU so it never depends on the backend's own
+    # torch ops: MUSA's muDNN rejects int8 there ("Now muDNN only support float64,
+    # float32, half, bfloat16, int32, and int64"), which used to fail the whole case
+    # and lose the FlagSparse time with it.
     expected = _pytorch_scatter_impl(
-        sparse_values,
-        indices,
+        sparse_values.cpu(),
+        indices.cpu(),
         dense_size,
-        out=base_out.clone(),
+        out=base_out.cpu().clone(),
         reset_output=reset_output,
     )
 
@@ -375,6 +379,10 @@ def benchmark_scatter_case(
     # at parity (measured 1.11x at 32K/1024 and 0.96x at 1M/65536 once the Python
     # overhead is amortised out).  The ops write into preallocated buffers, so the
     # values are read back from those after timing, exactly as gather does.
+    # A backend whose torch cannot run the PyTorch scatter (MUSA int8) has no
+    # PyTorch baseline for that case; FlagSparse is still timed and checked.
+    pytorch_ms = None
+    pytorch_reason = None
     try:
         pytorch_ms = _benchmark_cuda_graph_op(
             pytorch_op,
@@ -383,23 +391,29 @@ def benchmark_scatter_case(
             repeats=iters,
         )
     except Exception as exc:
-        raise RuntimeError(f"PyTorch CUDA Graph timing failed: {exc}") from exc
+        pytorch_reason = f"PyTorch scatter baseline unavailable: {exc}"
     try:
         triton_ms = _benchmark_scatter_triton_op(
             triton_op, warmup=warmup, iters=iters
         )
     except Exception as exc:
         raise RuntimeError(f"Triton CUDA Graph timing failed: {exc}") from exc
-    pytorch_values = pytorch_out
+    pytorch_values = pytorch_out if pytorch_ms is not None else expected
     triton_values = triton_out
 
     atol, rtol = _tolerance_for_dtype(effective_value_dtype)
-    triton_match = torch.allclose(triton_values, expected, atol=atol, rtol=rtol)
-    triton_max_error = (
-        float(torch.max(torch.abs(triton_values - expected)).item())
-        if dense_size > 0
-        else 0.0
-    )
+
+    def _compare(values):
+        # On the CPU, against the CPU reference; int8 is widened first so the
+        # difference cannot wrap around.
+        got, want = values.cpu(), expected
+        if not (got.is_floating_point() or got.is_complex()):
+            got, want = got.to(torch.int64), want.to(torch.int64)
+        match = torch.allclose(got, want, atol=atol, rtol=rtol)
+        error = float(torch.max(torch.abs(got - want)).item()) if dense_size > 0 else 0.0
+        return match, error
+
+    triton_match, triton_max_error = _compare(triton_values)
 
     cusparse_ms = None
     cusparse_match = None
@@ -419,14 +433,7 @@ def benchmark_scatter_case(
                 warmup=warmup,
                 iters=iters,
             )
-            cusparse_match = torch.allclose(
-                cusparse_values, expected, atol=atol, rtol=rtol
-            )
-            cusparse_max_error = (
-                float(torch.max(torch.abs(cusparse_values - expected)).item())
-                if dense_size > 0
-                else 0.0
-            )
+            cusparse_match, cusparse_max_error = _compare(cusparse_values)
         except Exception as exc:
             cusparse_reason = str(exc)
     elif run_cusparse:
@@ -468,19 +475,14 @@ def benchmark_scatter_case(
                     cusparse_values = cusparse_plan.dense_vector
                 finally:
                     cusparse_plan.close()
-                cusparse_match = torch.allclose(
-                    cusparse_values, expected, atol=atol, rtol=rtol
-                )
-                cusparse_max_error = (
-                    float(torch.max(torch.abs(cusparse_values - expected)).item())
-                    if dense_size > 0
-                    else 0.0
-                )
+                cusparse_match, cusparse_max_error = _compare(cusparse_values)
             except Exception as exc:
                 cusparse_reason = str(exc)
 
     triton_speedup_vs_pytorch = (
-        pytorch_ms / triton_ms if triton_ms > 0 else float("inf")
+        None
+        if pytorch_ms is None
+        else (pytorch_ms / triton_ms if triton_ms > 0 else float("inf"))
     )
     triton_speedup_vs_cusparse = (
         cusparse_ms / triton_ms if (cusparse_ms is not None and triton_ms > 0) else None
@@ -519,6 +521,7 @@ def benchmark_scatter_case(
         },
         "backend_status": {
             "cusparse_unavailable_reason": cusparse_reason,
+            "pytorch_unavailable_reason": pytorch_reason,
             "fallback_reason": fallback_reason,
             "index_fallback_applied": bool(triton_index_meta["index_fallback_applied"]),
             "index_fallback_reason": triton_index_meta["index_fallback_reason"],

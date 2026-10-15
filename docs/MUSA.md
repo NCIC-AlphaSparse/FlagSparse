@@ -45,9 +45,20 @@ mthreads-gmi                          # 单卡；跑之前确认没有别的任�
 ```bash
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
   --mode normal --benchmark-input /root/gcx/matrix --timeout 3600 \
+  --h800-reference \
   --results-dir pytest_results_mthreads_split \
   > pytest_results_mthreads_split.log 2>&1 < /dev/null &
 ```
+
+- `--h800-reference`（不带值）：muSPARSE 不支持、标 `NoBaseline` 的变体（2026-10-09 那轮是 26 个），用仓库自带的
+  H800 结果按带宽折算出加速比（H800 时间 × 3050/1370），交付表里只显示数字（`--show-baseline` 可看来源）。**muSPARSE 测得到的
+  变体不受影响。** 加了这个开关，pytest 那一半会从只跑精度变成**精度 + 性能**（多一轮 Python 性能，耗时会明显变长），
+  因为 C API 的规模（SpMM `n=8`、SDDMM `k=16/64`、向量类按矩阵）在 H800 上没有对应数据，而 Python 侧和 H800 参照
+  是同一个 benchmark、同样规模。合并时按顺序取：① C API 有 muSPARSE 基线 → C API；② Python 侧有折算加速比 →
+  Python（条目里 `source: python`，原 C API 结果留在 `capi_performance`）；③ 否则用 C API 时间对 H800 同变体同矩阵
+  折算（只有 SpMV 类能对上）。日志会打印三类各补了多少、还剩哪些。`sddmm_csr_f16` 在 H800 上没有 cuSPARSE 时间，
+  用 H800 PyTorch 折算。是估算，不是厂商实测，汇报时要注明；见
+  [`H800_REFERENCE.md`](H800_REFERENCE.md)。
 
 `--timeout` 同时传给 pytest 的每个算子阶段和 C API 的 CTest（`-DFLAGSPARSE_CTEST_TIMEOUT`）。
 首次运行会从零构建 C API（`capi/build`），配置日志里应当出现

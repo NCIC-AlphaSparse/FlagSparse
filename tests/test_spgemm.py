@@ -22,6 +22,7 @@ import csv
 import gc
 import glob
 import json
+import math
 import os
 import subprocess
 import sys
@@ -243,6 +244,12 @@ def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
     )
     cols = indices[start:end].to(torch.int64)
     vals = data[start:end]
+    # Sparse products may retain structural entries whose value is exactly
+    # zero (explicit input zeros or cancellation). SciPy drops some of them.
+    # Compare the mathematical sparse result, keeping every nonzero entry and
+    # the existing numerical tolerances. Do this per block to bound memory.
+    nonzero = vals != 0
+    rows, cols, vals = rows[nonzero], cols[nonzero], vals[nonzero]
     keys = rows * max(1, int(n_cols)) + cols
     order = torch.argsort(keys)
     return keys[order], vals[order]
@@ -263,16 +270,7 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
 
     c_nnz = int(c_indptr[-1].item()) if c_indptr.numel() > 0 else 0
     r_nnz = int(r_indptr[-1].item()) if r_indptr.numel() > 0 else 0
-    if c_nnz != r_nnz:
-        return {
-            "pattern_ok": False,
-            "pass": False,
-            "err_ratio": float("inf"),
-            "max_abs_error": float("inf"),
-            "max_relative_error": float("inf"),
-            "reason": f"nnz mismatch {c_nnz} vs {r_nnz}",
-        }
-    if c_nnz == 0:
+    if c_nnz == 0 and r_nnz == 0:
         return {
             "pattern_ok": True,
             "pass": True,
@@ -430,7 +428,10 @@ def _build_scipy_spgemm_reference(
     product = reference_utils.spgemm(a_csr, b_csr)
     product.sort_indices()
     device = a_data.device
-    data = reference_utils.as_torch(product.data, ref_dtype, device).to(a_data.dtype)
+    # as_torch_at, not as_torch(...).to(): BI-V150 zeroes an fp64 H2D copy, so the
+    # reference arrived as zeros and every Iluvatar SpGEMM row failed with
+    # "sparsity pattern mismatch" (the zeros are dropped as explicit zeros).
+    data = reference_utils.as_torch_at(product.data, a_data.dtype, device)
     indices = torch.as_tensor(
         product.indices, dtype=torch.int32, device=device
     ).contiguous()
@@ -479,6 +480,56 @@ def _build_torch_spgemm_reference(
             f"Unexpected torch sparse.mm result layout: {ref_sparse.layout}"
         )
     return ast_ops._torch_sparse_to_csr(ref_sparse), ref_format, op
+
+
+def _benchmark_maca_torch_spgemm_baseline(
+    a_data, a_indices, a_indptr, a_shape,
+    b_data, b_indices, b_indptr, b_shape,
+    oracle, warmup, iters,
+):
+    """Time native CSR multiplication; accept only a SciPy-validated result."""
+    state = {
+        "pytorch_ms": None,
+        "pytorch_baseline_status": "ERROR",
+        "pytorch_baseline_format": "CSR",
+        "pytorch_baseline_max_error": None,
+        "pytorch_reason": None,
+    }
+    try:
+        # Match the candidate's CSR types. Descriptor setup is outside timing,
+        # just like the existing PyTorch reference; FlagSparse stays single-shot.
+        a = torch.sparse_csr_tensor(
+            a_indptr, a_indices, a_data, size=a_shape,
+            device=a_data.device, check_invariants=False,
+        )
+        b = torch.sparse_csr_tensor(
+            b_indptr, b_indices, b_data, size=b_shape,
+            device=b_data.device, check_invariants=False,
+        )
+        output, ms = ast_ops._benchmark_cuda_op(
+            lambda: torch.sparse.mm(a, b), warmup=warmup, iters=iters
+        )
+        candidate = _convert_result_for_compare(
+            ast_ops._torch_sparse_to_csr(output), "cpu", a_data.device
+        )
+        reference = _convert_result_for_compare(oracle, "cpu", a_data.device)
+        if not bool(torch.isfinite(candidate[0]).all()):
+            state.update(pytorch_baseline_status="FAIL", pytorch_reason="PyTorch CSR baseline returned non-finite values")
+            return state
+        metrics = _compare_spgemm_cpu(candidate, reference, a_data.dtype)
+        state["pytorch_baseline_max_error"] = metrics["err_ratio"]
+        if not metrics["pass"]:
+            state.update(
+                pytorch_baseline_status="FAIL",
+                pytorch_reason=f"PyTorch CSR baseline failed SciPy validation: {metrics['reason']} (err_ratio={metrics['err_ratio']})",
+            )
+        elif ms is None or not math.isfinite(ms) or ms <= 0:
+            state["pytorch_reason"] = "PyTorch CSR baseline returned invalid latency"
+        else:
+            state.update(pytorch_ms=ms, pytorch_baseline_status="PASS")
+    except Exception as exc:
+        state["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
+    return state
 
 
 def _build_torch_spgemm_reference_blocked(
@@ -785,7 +836,6 @@ def _run_matrix_worker(args):
             ref_isolated_retry=args.ref_isolated_retry,
             ref_cleanup=args.ref_cleanup,
             compare_device=args.compare_device,
-            isolate_matrices=ast_common._is_maca_runtime(),
         )
         torch.save({"success": True, "entry": entry}, args._worker_output)
         return 0
@@ -859,7 +909,14 @@ def _run_matrix_worker_subprocess(
         if os.path.exists(tmp_path):
             payload = torch.load(tmp_path, map_location="cpu")
     except Exception as exc:
-        payload = {"success": False, "reason": f"failed to load matrix worker result: {exc}"}
+        stderr = proc.stderr.strip() if proc.stderr else ""
+        detail = f"{type(exc).__name__}: {exc}"
+        if stderr:
+            detail = f"{detail}; worker stderr: {stderr[-1000:]}"
+        payload = {
+            "success": False,
+            "reason": f"failed to load matrix worker result: {detail}",
+        }
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -1333,7 +1390,25 @@ def run_one_mtx(
     if ref_cleanup:
         _cleanup_reference_pools()
 
-    if run_cusparse:
+    maca_torch_baseline = (
+        ast_common._is_maca_runtime()
+        and ast_common._expected_vendor_sparse_backend() == "torch"
+        and ast_common._use_scipy_accuracy_reference()
+    )
+    if maca_torch_baseline and pt_ref_success:
+        _log_stage(mtx_path, "pytorch-csr-baseline", case_start)
+        result.update(_benchmark_maca_torch_spgemm_baseline(
+            a_data, a_indices, a_indptr, a_shape,
+            b_data, b_indices, b_indptr, b_shape,
+            pt_ref_result, ref_warmup, ref_iters,
+        ))
+
+    if maca_torch_baseline:
+        # This backend's native baseline was measured above, not via CuPy.
+        result["cusparse_reason"] = "MACA PyTorch CSR baseline is reported in pytorch_ms"
+        result["cu_exec_mode"] = "disabled"
+        result["attempted_modes_cu"] = "disabled"
+    elif run_cusparse:
         # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
         vendor_backend, _vendor_reason = ast_ops._spgemm_csr_sparse_ref_backend(
             value_dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
@@ -1738,6 +1813,9 @@ SPGEMM_CSV_FIELDNAMES = [
         "triton_ms",
         "cusparse_ms",
         "pytorch_ms",
+        "pytorch_baseline_status",
+        "pytorch_baseline_format",
+        "pytorch_baseline_max_error",
         "triton_speedup_vs_cusparse",
         "triton_speedup_vs_pytorch",
         "pt_status",
@@ -1799,6 +1877,9 @@ def _spgemm_csv_row(entry, value_dtype, index_dtype):
                     "triton_ms": entry.get("triton_ms"),
                     "cusparse_ms": entry.get("cusparse_ms"),
                     "pytorch_ms": entry.get("pytorch_ms"),
+                    "pytorch_baseline_status": entry.get("pytorch_baseline_status"),
+                    "pytorch_baseline_format": entry.get("pytorch_baseline_format"),
+                    "pytorch_baseline_max_error": entry.get("pytorch_baseline_max_error"),
                     "triton_speedup_vs_cusparse": _speedup_ratio(
                         entry.get("cusparse_ms"), entry.get("triton_ms")
                     ),
@@ -2309,6 +2390,11 @@ def main():
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--_matrix-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--_worker-mtx", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--_worker-output", type=str, default=None, help=argparse.SUPPRESS
@@ -2335,6 +2421,11 @@ def main():
         if not args._worker_mtx or not args._worker_output:
             raise SystemExit("worker mode requires --_worker-mtx and --_worker-output")
         raise SystemExit(_run_reference_worker(args))
+
+    if args._matrix_worker:
+        if not args._worker_mtx or not args._worker_output:
+            raise SystemExit("matrix worker mode requires --_worker-mtx and --_worker-output")
+        raise SystemExit(_run_matrix_worker(args))
 
     if not ACCEL.is_available():
         print("CUDA is not available.")

@@ -45,11 +45,20 @@ python3 -c "from flagsparse.sparse_operations import _common as c; print(c._back
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 6,7 --timeout 3600 \
   --benchmark-input /home/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --h800-reference \
   --results-dir pytest_results_ascend_delivery \
   > pytest_results_ascend_delivery.log 2>&1 < /dev/null &
 
 python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：20 行结果，缺变体时退出码为 1
 ```
+
+**`--h800-reference`（不带值）**：没有 PyTorch-NPU 基线的行，用仓库自带的 H800 结果按带宽折算出加速比
+（H800 cuSPARSE 时间 × 3050/1600；H800 也没有 cuSPARSE 时间的 `sddmm_csr_f16` 用 H800 PyTorch），交付表里标
+只显示数字（`--show-baseline` 可看来源）。**有 PyTorch-NPU 基线的行不受影响。** 按 10-11 全量结果预演：有加速比的变体
+41 → 63，补上的 22 个大多在 0.001x–0.06x——昇腾上这些变体每次调用 0.3–2.4 秒（`timed=call`，PyTorch-NPU 自己
+在 legacy spmm_csr 上也要 20–44 ms），数是真的，不是折算出错。`spgemm_csr` 以前走探测脚本、测的是合成规模，
+现在改为 `tests/test_spgemm.py` 在交付矩阵上测（**未在 NPU 上跑过**），重跑后才能折算。见
+[`H800_REFERENCE.md`](H800_REFERENCE.md)。
 
 **两个 timeout 不是一回事**：外层 `timeout -s KILL 43200` 是**整条命令**的总限时（12 小时），到点
 直接强制杀掉整个进程；`--timeout 3600` 是**每个子任务**的限时，大多数算子是每个阶段（精度、性能）

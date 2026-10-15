@@ -56,6 +56,7 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
   --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
   --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
   --op-benchmark-args='sddmm_csr=--no-cusparse' \
+  --h800-reference \
   --results-dir pytest_results_metax_delivery \
   > pytest_results_metax_delivery.log 2>&1 < /dev/null &
 ```
@@ -63,6 +64,12 @@ setsid timeout -s KILL 39600 python3 -u run_flagsparse_pytest.py \
 - `--op-benchmark-args='sddmm_csr=--no-cusparse'`：C550 上没有可用的厂商稀疏库，且 SDDMM 的
   `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），因此只对 SDDMM 禁用该参考并改用 PyTorch。
   `--benchmark-args` 会广播给所有性能脚本，而其他脚本不一定接受 `--no-cusparse`，所以用逐算子的形式；
+- `--h800-reference`（不带值）：没有任何基线的行（例如 SDDMM 的 q4 变体，或本机 baseline 校验失败的行），
+  用仓库自带的 H800 结果按带宽折算出加速比（`h800_scaled_ms = T_cuSPARSE@H800 × 3050/1440`），交付表里只显示数字；
+  要看哪些是折算的用 `delivery_table.py --show-baseline`。**有 PyTorch 基线的行不受影响。** 这是估算，不是厂商实测，汇报时要注明；
+  `sddmm_csr_f16_int_non_non_row` 在 H800 上没有 cuSPARSE 时间（cuSPARSE SDDMM 不支持 fp16），改用 H800 上
+  PyTorch 的时间折算（`--show-baseline` 显示 `h800_pytorch_scaled`；C550 自己的 `sampled_addmm` 结果是错的，7.3 节）。
+  口径和覆盖见 [`H800_REFERENCE.md`](H800_REFERENCE.md)。
 - `--timeout 4500`：`--delivery-only` 已把 spmv/spmm 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
   不收窄**（交付名里没有 K），按 30 个矩阵实测推算全量至少 3660 秒（7.4 节；现在交付只用 10 个矩阵，这个数会小一截，没有重新实测）。只想快速出数，可以改用
   `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
@@ -605,6 +612,31 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --g
 ```
 
 该命令在前台运行；如需脱离终端，可由调用方以 `setsid` 或 `tmux` 包裹，命令本身不依赖后台参数。
+
+### 7.3.1 SpGEMM 本机 PyTorch CSR baseline
+
+MACA 的矩阵 runner 在 `FLAGSPARSE_MACA_VENDOR=torch` 且默认 SciPy 精度参考下，独立计时
+`torch.sparse.mm(A_csr, B_csr)`，支持 float32/float64。CSR 描述符构造在 baseline 计时窗口外；
+FlagSparse 沿用原有单次调用口径，包含 prepare 和输出写回，不因接入 baseline 改变计时范围。
+两侧使用相同输入、warmup 和 iters。基线计时后的输出必须通过 SciPy 校验，才填入 `pytorch_ms`
+及 `triton_speedup_vs_pytorch`；校验失败或调用异常只影响 baseline，不替代算子的 SciPy 精度判定。
+CSV 的 `pytorch_baseline_status`、`pytorch_baseline_format`、`pytorch_baseline_max_error`
+和 `pytorch_reason` 记录基线状态；原有 `pt_status` 在默认参考下仍表示 FlagSparse 对 SciPy 的精度结果。
+`--no-cusparse` 不禁用此 PyTorch baseline；显式设置 `FLAGSPARSE_MACA_VENDOR=none` 才不测本机基线。
+
+```bash
+env PYTHONPATH=src FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch \
+  python3 -u run_flagsparse_pytest.py \
+  --ops spgemm_csr --phase both --mode normal --gpus 0 --timeout 2400 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir results_metax_spgemm_<日期>
+```
+
+本节 SpGEMM 只使用本机 PyTorch CSR baseline，不开启 H800 折算。MACA 的 float32/float64
+计算路径为纯 Triton：metadata、行内排序归并、长行全局哈希、CSR 前缀扫描和结果压紧均不依赖
+TLE，也不调用 `torch.sparse.mm` 或旧的 PyTorch ESC。PyTorch 仅用于存储分配和独立 baseline；
+公共接口仍执行原有输入校验、输入 contiguous 和 out 写回。
+CUDA、ROCm 及其他后端的 baseline 路径不变。
 
 ### 7.4 交付性能：只跑交付范围（2026-09-18 实测）
 

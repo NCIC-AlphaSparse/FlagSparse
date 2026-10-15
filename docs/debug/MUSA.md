@@ -10,6 +10,7 @@
 ```bash
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
   --mode normal --benchmark-input tests/data --timeout 3600 \
+  --h800-reference \
   --results-dir results_musa_split_65_<日期> \
   > results_musa_split_65_<日期>.log 2>&1 < /dev/null &
 # 跑完后
@@ -21,6 +22,15 @@ python3 tools/delivery_table.py results_musa_split_65_<日期>
   2026-10-08 已移植进 main（见下面"C API 现在覆盖全部 65 个变体"一节），每个变体按自己的 id 单独测一次。
   muSPARSE 不支持的类型组合（fp16、int8、混合精度、SELL 等）显示 `NoBaseline`——跑通了、精度过了，只是没有
   厂商对照，**这是预期的**，不是失败。
+- `--h800-reference`（不带值）：muSPARSE 不支持、标 `NoBaseline` 的变体（2026-10-09 那轮是 26 个），用仓库自带的
+  H800 结果按带宽折算出加速比（H800 时间 × 3050/1370），交付表里只显示数字（`--show-baseline` 可看来源）。**muSPARSE 测得到的
+  变体不受影响。** 加了这个开关，pytest 那一半会从只跑精度变成**精度 + 性能**（多一轮 Python 性能，耗时会明显变长），
+  因为 C API 的规模（SpMM `n=8`、SDDMM `k=16/64`、向量类按矩阵）在 H800 上没有对应数据，而 Python 侧和 H800 参照
+  是同一个 benchmark、同样规模。合并时按顺序取：① C API 有 muSPARSE 基线 → C API；② Python 侧有折算加速比 →
+  Python（条目里 `source: python`，原 C API 结果留在 `capi_performance`）；③ 否则用 C API 时间对 H800 同变体同矩阵
+  折算（只有 SpMV 类能对上）。日志会打印三类各补了多少、还剩哪些。`sddmm_csr_f16` 在 H800 上没有 cuSPARSE 时间，
+  用 H800 PyTorch 折算。是估算，不是厂商实测，汇报时要注明；见
+  [`../H800_REFERENCE.md`](../H800_REFERENCE.md)。
 - 拉到新代码后第一次跑**不要加 `--skip-capi-build`**，确保 C API 是重新编译的。
 - `--timeout 3600` 沿用 `../MUSA.md` 的结论（`900` 不够），split 会把它同时传给 CTest。CUDA 上 SpMM 这一族
   单独就要 18 分钟（65 个变体里 17 个是 SpMM，3 种宽度 × 10 个矩阵），MUSA 上 SpMM 只测第一种宽度。
@@ -44,16 +54,17 @@ python3 tools/delivery_table.py results_musa_split_65_<日期>
 - **muDNN 的 gemv 不支持 fp64/复数**（gemm 支持）。这条主要影响原有 fp64 变体，新变体里的 fp64 相关
   路径（如果有间接依赖 gemv 的）也要留意。
 
-## 跑完要确认
+## 跑完要确认（2026-10-14 之后这一轮）
 
-1. 65 个变体精度是不是全 Passed，`missing` 是不是 0。
-2. 性能列只应该出现 `Passed`（有 muSPARSE 加速比）和 `NoBaseline`，**不应该再有 `NOT_CONFIGURED`/`NotFound`**。
-   和下面那张 2026-10-06 q4 实测表对照：那张表里有加速比的 21 个变体这次也应该有；原来 20 个上次实机都有加速比，
-   少了就是回归。
-3. 所有复数变体（c32）是不是真的跑通了，还是报了 `IndexMusa` 之类的错误；以及有没有哪个变体的耗时可疑（比如
-   慢几百倍，通常意味着走了某种 fallback 循环，而不是真正的 kernel）。
+1. `missing` 是不是 0；65 个变体精度是不是全 Passed（`spmv_coo_f32_int_non` 不应再是 Skipped）。
+2. 日志里 `--h800-reference (musa-s5000): NoBaseline variants filled from the Python half=…, from the C API time=…,
+   still without a baseline=…` 这一行原样贴回。按设计"still without"应该是 0；不是 0 就列出是哪些变体、为什么。
+3. 交付表里还有没有 `NoBaseline`；`python3 tools/delivery_table.py <结果目录> --show-baseline` 的输出原样贴回（最后一列说明哪些加速比是折算的）。
+4. 这轮 pytest 那一半第一次跑性能（加了 `--h800-reference` 的代价），报一下总耗时，以及 Python 性能阶段里有没有
+   哪个算子超时或崩溃（`<结果目录>/<算子>/performance_stderr.log`）。
+5. 复数变体有没有 `IndexMusa not implemented`；有没有慢几百倍的可疑变体。
 
-把这三条的结果写回来，不用额外分析，原始数据最有用。
+把这些结果写回来，不用额外分析，原始数据最有用。
 
 ## C API 现在覆盖全部 65 个变体（2026-10-08 在 CUDA 上完成移植）
 
@@ -155,43 +166,54 @@ C API 精度 10/10 测试族通过。唯一的精度瑕疵是 `spmm_csc_f32_int_
 
 ## 交给 Codex 的 prompt
 
-上机时把下面整段原样贴给 Codex（或其他代理）。不用改任何内容。
+上机时把下面整段原样贴给 Codex（或其他代理），不用改任何内容。
 
 ````text
-你在 摩尔线程 S5000（MUSA） 实机上复测 FlagSparse 的 65 个交付变体。仓库在当前目录，main 分支。
+你在 摩尔线程 S5000（MUSA） 实机上复测 FlagSparse 的 65 个交付变体（2026-10-14 之后的这一轮）。仓库在当前目录，main 分支。
 
-背景：65 个变体（原 20 个 + 新合并的 45 个）只在 CUDA 上实测过，本机从没跑过。
-任务是在本机跑一遍，把原始结果带回来。主要目的是收集数据，不是修代码。
+背景：这台机器上一轮已经跑过 65 项。之后仓库改了两类东西，这轮就是验证它们：
+- 没有基线的变体，现在用仓库自带的 H800 结果按带宽折算出加速比（命令里的 --h800-reference），交付表里只显示数字，
+  delivery_table.py --show-baseline 的最后一列说明哪些是折算的。有本机基线的变体不受影响。
+- 本后端相关的修复，见 docs/debug/MUSA.md "跑完要确认"一节逐条列出的内容。
+主要目的是收集数据，不是修代码。
 
 步骤：
-1. git pull --ff-only origin main。
+1. git pull --ff-only origin main；git log -1 --oneline 的提交应不早于 d7d1919（"ci again"）。
 2. 按 docs/MUSA.md 配好环境，做完它的环境自检。
 3. 确认导入的是仓库源码：python3 -c "import flagsparse; print(flagsparse.__file__)"
    输出必须在当前目录的 src/ 下。如果指向 site-packages / dist-packages，先停下来汇报，不要继续。
-   旧安装包会让基线列全部变成 N/A，看起来像正常结果。
-4. 完整读一遍 docs/debug/MUSA.md，照"要做的事"一节的命令原样跑。
-   不要自己删减或改写参数，每个参数的来由那一节都写了。
-   - --results-dir 用新目录（<日期> 填今天），不要复用旧目录。
+4. 核对测试矩阵：这轮只用仓库自带的 10 个交付矩阵（conf/operators.yaml 的 delivery_matrices），路径和大小：
+   tests/data/ASIC_680ks.mtx  69268748 字节
+   tests/data/GL7d14.mtx  26726293 字节
+   tests/data/NACA0015.mtx  43158387 字节
+   tests/data/amazon0601.mtx  44469712 字节
+   tests/data/auto.mtx  44768883 字节
+   tests/data/cage12.mtx  61548649 字节
+   tests/data/cfd2.mtx  41954205 字节
+   tests/data/filter3D.mtx  47472525 字节
+   tests/data/roadNet-TX.mtx  27699282 字节
+   tests/data/wave.mtx  13325709 字节
+   用 ls -l tests/data/*.mtx 核对：恰好这 10 个文件、大小一致。缺文件或大小不对（例如 git lfs 指针、下载不全）
+   先停下来汇报，不要换别的矩阵目录。命令里的 --benchmark-input tests/data 指的就是它们。
+5. 完整读一遍 docs/debug/MUSA.md，照"要做的事"一节的命令原样跑（已带 --h800-reference，不要去掉）。
+   - --results-dir 用新目录（<日期> 填今天），不要复用旧目录，也不要往旧目录里补跑。
    - 命令本身已经用 setsid 放到后台，定期看日志进度，不要中途打断。
    - 不要用 pytest --forked，它在 GPU 上会让所有用例失败。
-5. 跑完执行 python3 tools/delivery_table.py <结果目录>。
+6. 跑完执行 python3 tools/delivery_table.py <结果目录>。
 
 规矩：
 - 不要为了"让它通过"去改 src/ 或 tests/ 下的代码。确实非改不可（比如环境适配）时，每改一个文件，
-  都按 docs/debug/MUSA.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动放在同一个
-  commit 里。没改就在那一节写"无"。
+  都按 docs/debug/MUSA.md 末尾"实机改动记录"一节的格式追加一条记录，并和代码改动放在同一个 commit 里。
 - 不要猜根因。遇到报错就给出完整报错原文，以及出错变体在结果目录里那一行的 reason/error 字段。
-- 性能列出现 NoBaseline 是预期的（muSPARSE 不支持 fp16、int8、混合精度、SELL 等），不应该再出现
-  NOT_CONFIGURED / NotFound。拿结果对照 docs/debug/MUSA.md 里 q4 那张 2026-10-06 的实测表，
-  逐个列出和那张表差别明显的变体（那张表有加速比、这次没有，或者加速比差两倍以上）。
-- 复数变体如果报 IndexMusa not implemented，列出是哪些变体。
+- 折算出来的加速比是估算，低也照实报，不要为了数字好看换基线或改参数。
+- 结果目录整个打包带回（至少 summary.json、summary.csv、各算子的 performance.csv 和 *_stderr.log）。
 
 汇报包含：
 1. delivery_table.py 的完整输出，尤其是第一行 "N registered variants, M missing"。
-2. 所有非 Passed 的变体：变体名、阶段（精度/性能）、reason 或 error 原文。
+2. 所有非 Passed 的变体、以及加速比为 "-" 的变体：变体名、阶段（精度/性能）、reason 或 error 原文。
 3. 逐条回答 docs/debug/MUSA.md "跑完要确认"一节。
-4. 环境指纹：torch、triton 版本，设备名，warp size，驱动/SDK 版本，整轮总耗时。
-5. docs/debug/MUSA.md "实机改动记录"一节的内容。
+4. 环境指纹：torch、triton 版本，设备名，驱动/SDK 版本，git log -1 --oneline，整轮总耗时。
+5. docs/debug/MUSA.md "实机改动记录"一节的内容（没改写"无"）。
 ````
 
 ## 实机改动记录

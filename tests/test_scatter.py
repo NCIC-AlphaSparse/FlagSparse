@@ -314,6 +314,9 @@ def run_cli(args):
                             "cusparse_unavailable_reason": backend.get(
                                 "cusparse_unavailable_reason"
                             ),
+                            "pytorch_unavailable_reason": backend.get(
+                                "pytorch_unavailable_reason"
+                            ),
                             "fallback_reason": backend.get("fallback_reason"),
                             "index_fallback_reason": backend.get(
                                 "index_fallback_reason"
@@ -393,6 +396,7 @@ def run_cli(args):
             "triton_max_error",
             "cusparse_max_error",
             "cusparse_unavailable_reason",
+            "pytorch_unavailable_reason",
             "fallback_reason",
             "index_fallback_reason",
             "status",

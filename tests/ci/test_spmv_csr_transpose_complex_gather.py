@@ -31,6 +31,12 @@ if str(SRC) not in sys.path:
 transpose = importlib.import_module("flagsparse.sparse_operations._spmv_csr_transpose")
 
 
+@pytest.fixture(autouse=True)
+def portable_host_cache(monkeypatch):
+    # These CPU tests simulate the portable/MUSA launch, even on a MACA host.
+    monkeypatch.setattr(transpose, "_is_maca_runtime", lambda: False)
+
+
 class MusaLikeTensor(torch.Tensor):
     """Raises on complex advanced indexing, as torch_musa does."""
 

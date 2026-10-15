@@ -38,6 +38,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+import reference_utils
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
 
@@ -361,6 +362,35 @@ def _logical_out_rows(shape, op):
     return int(shape[1]) if _op_transposes(op) else int(shape[0])
 
 
+def _scipy_spmm_csc_reference(data, indices, indptr, B, shape, dtype, op):
+    """Same value as _torch_spmm_coo_reference, computed on the CPU with SciPy.
+
+    The CSC arrays of A are the CSR arrays of A.T. The result is cast on the CPU and
+    moved once at the output dtype (as_torch_at): CoreX zeroes an fp64 H2D copy.
+    """
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    ref_dtype = reference_utils.reference_dtype(dtype)
+    a_t = reference_utils.scipy_csr(data, indices, indptr, (n_cols, n_rows), ref_dtype)
+    product = reference_utils.spmm(a_t.transpose().tocsr(), B, ref_dtype, op=op)
+    return reference_utils.as_torch_at(product, dtype, B.device)
+
+
+def _correctness_reference(data, indices, indptr, B, shape, dtype, op):
+    """The value the kernel is compared against, per backend policy.
+
+    MUSA registers no sparse matmul at all ("Could not run 'aten::addmm' with
+    arguments from the 'Sparsemusa' backend"): the torch reference crashed the
+    script on its first case, so spmm_csc measured nothing there -- including the
+    q4 rows appended after the classic sweep.
+    """
+    builder = (
+        _scipy_spmm_csc_reference
+        if fs_common._use_scipy_accuracy_reference()
+        else _torch_spmm_coo_reference
+    )
+    return builder(data, indices, indptr, B, shape, dtype, op)
+
+
 def _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, op):
     ref_dtype = _reference_dtype(dtype)
     A = _csc_to_torch_coo(data.to(ref_dtype), indices, indptr, shape)
@@ -557,7 +587,7 @@ def _run_case(
         _random_values((_logical_b_rows(shape, op), int(dense_cols)), dtype, data.device) * 0.125,
         layout,
     )
-    ref = _torch_spmm_coo_reference(data, indices, indptr, B, shape, dtype, op)
+    ref = _correctness_reference(data, indices, indptr, B, shape, dtype, op)
     logical_out_rows = _logical_out_rows(shape, op)
     row = {
         "matrix": matrix_name,

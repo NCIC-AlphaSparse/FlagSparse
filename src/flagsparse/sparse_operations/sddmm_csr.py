@@ -456,6 +456,13 @@ def _resolve_sddmm_launch_config(k, mean_row_len=None, value_dtype=None):
     if _is_iluvatar_runtime() and value_dtype == torch.float32:
         return 64, 16, 4
 
+    # MACA's complex lowering has a substantially higher register and address
+    # calculation cost than its real path.  The narrower tile keeps enough
+    # resident programs to hide the gathered CSR loads on C550.  This branch is
+    # intentionally runtime-local; CUDA/ROCm retain their measured profiles.
+    if _is_maca_runtime() and value_dtype == torch.complex64:
+        return 16, 16, 2
+
     block_k = 32 if k >= 32 else max(1, triton.next_power_of_2(int(k)))
     if (
         value_dtype != torch.float64
@@ -799,6 +806,72 @@ def _sddmm_csr_complex_kernel(
     tl.store(out_ri_ptr + offs_p * 2 + 1, out_im, mask=mask_p)
 
 
+@triton.jit
+def _sddmm_csr_complex_kernel_maca(
+    indices_ptr,
+    row_ids_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    in_ri_ptr,
+    out_ri_ptr,
+    nnz,
+    k_dim,
+    stride_xm,
+    stride_xk,
+    stride_ym,
+    stride_yk,
+    alpha,
+    beta,
+    HAS_IN: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    """MACA complex SDDMM with pair loads for interleaved complex64."""
+    pid = tl.program_id(0)
+    offs_p = pid * BLOCK_P + tl.arange(0, BLOCK_P)
+    mask_p = offs_p < nnz
+    rows = tl.load(row_ids_ptr + offs_p, mask=mask_p, other=0)
+    cols = tl.load(indices_ptr + offs_p, mask=mask_p, other=0)
+    parts = tl.arange(0, 2)
+    acc_re = tl.zeros([BLOCK_P], dtype=ACC_DTYPE)
+    acc_im = tl.zeros([BLOCK_P], dtype=ACC_DTYPE)
+
+    for k0 in tl.range(0, k_dim, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask = mask_p[:, None, None] & (offs_k[None, :, None] < k_dim)
+        x_base = (rows[:, None] * stride_xm + offs_k[None, :] * stride_xk) * 2
+        y_base = (cols[:, None] * stride_ym + offs_k[None, :] * stride_yk) * 2
+        x_pair = tl.load(
+            x_ri_ptr + x_base[:, :, None] + parts[None, None, :],
+            mask=mask,
+            other=0.0,
+        ).to(ACC_DTYPE)
+        y_pair = tl.load(
+            y_ri_ptr + y_base[:, :, None] + parts[None, None, :],
+            mask=mask,
+            other=0.0,
+        ).to(ACC_DTYPE)
+        x_re, x_im = tl.split(x_pair)
+        y_re, y_im = tl.split(y_pair)
+        acc_re += tl.sum(x_re * y_re - x_im * y_im, axis=1)
+        acc_im += tl.sum(x_re * y_im + x_im * y_re, axis=1)
+
+    out_re = acc_re * alpha
+    out_im = acc_im * alpha
+    if HAS_IN:
+        in_pair = tl.load(
+            in_ri_ptr + offs_p[:, None] * 2 + parts[None, :],
+            mask=mask_p[:, None],
+            other=0.0,
+        ).to(ACC_DTYPE)
+        in_re, in_im = tl.split(in_pair)
+        out_re += in_re * beta
+        out_im += in_im * beta
+    tl.store(out_ri_ptr + offs_p * 2, out_re, mask=mask_p)
+    tl.store(out_ri_ptr + offs_p * 2 + 1, out_im, mask=mask_p)
+
+
 def _validate_sddmm_dense_inputs(data, prepared, x, y):
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError("x and y must be 2D dense tensors")
@@ -932,6 +1005,8 @@ def _run_sddmm_prepared(
         k_dim, mean_row_len=mean_row_len, value_dtype=x.dtype
     )
     kernel, acc_dtype = _resolve_sddmm_diagnostic_kernel(variant, x.dtype)
+    if _is_maca_runtime() and x.dtype == torch.complex64 and variant == "baseline":
+        kernel = _sddmm_csr_complex_kernel_maca
     grid = (triton.cdiv(nnz, block_p),)
     fallback_used = False
     # Strides captured in COMPLEX-element units before view_as_real (which adds
@@ -1038,6 +1113,17 @@ def _apply_sddmm_dense_ops(x, y, op_a, op_b, dense_layout):
         x = x.transpose(0, 1)
     if _normalize_sddmm_dense_op(op_b, "trans") == "non":
         y = y.transpose(0, 1)
+
+    # MetaX C550 pays a large penalty for the strided views produced by the
+    # cuSPARSE-style transpose flags (and by column-major dense inputs).  The
+    # SDDMM kernel is nnz-parallel, so each lane otherwise walks a large stride
+    # in the K dimension.  Materialize only these non-contiguous views on MACA;
+    # other runtimes keep the original zero-copy stride behavior.
+    if _is_maca_runtime() and x.dtype in (torch.float32, torch.complex64):
+        if x.ndim == 2 and x.stride(1) != 1:
+            x = x.contiguous()
+        if y.ndim == 2 and y.stride(1) != 1:
+            y = y.contiguous()
     return x, y
 
 
