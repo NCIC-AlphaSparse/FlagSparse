@@ -22,6 +22,7 @@ import csv
 import gc
 import glob
 import json
+import math
 import os
 import subprocess
 import sys
@@ -479,6 +480,56 @@ def _build_torch_spgemm_reference(
             f"Unexpected torch sparse.mm result layout: {ref_sparse.layout}"
         )
     return ast_ops._torch_sparse_to_csr(ref_sparse), ref_format, op
+
+
+def _benchmark_maca_torch_spgemm_baseline(
+    a_data, a_indices, a_indptr, a_shape,
+    b_data, b_indices, b_indptr, b_shape,
+    oracle, warmup, iters,
+):
+    """Time native CSR multiplication; accept only a SciPy-validated result."""
+    state = {
+        "pytorch_ms": None,
+        "pytorch_baseline_status": "ERROR",
+        "pytorch_baseline_format": "CSR",
+        "pytorch_baseline_max_error": None,
+        "pytorch_reason": None,
+    }
+    try:
+        # Match the candidate's CSR types. Descriptor setup is outside timing,
+        # just like the existing PyTorch reference; FlagSparse stays single-shot.
+        a = torch.sparse_csr_tensor(
+            a_indptr, a_indices, a_data, size=a_shape,
+            device=a_data.device, check_invariants=False,
+        )
+        b = torch.sparse_csr_tensor(
+            b_indptr, b_indices, b_data, size=b_shape,
+            device=b_data.device, check_invariants=False,
+        )
+        output, ms = ast_ops._benchmark_cuda_op(
+            lambda: torch.sparse.mm(a, b), warmup=warmup, iters=iters
+        )
+        candidate = _convert_result_for_compare(
+            ast_ops._torch_sparse_to_csr(output), "cpu", a_data.device
+        )
+        reference = _convert_result_for_compare(oracle, "cpu", a_data.device)
+        if not bool(torch.isfinite(candidate[0]).all()):
+            state.update(pytorch_baseline_status="FAIL", pytorch_reason="PyTorch CSR baseline returned non-finite values")
+            return state
+        metrics = _compare_spgemm_cpu(candidate, reference, a_data.dtype)
+        state["pytorch_baseline_max_error"] = metrics["err_ratio"]
+        if not metrics["pass"]:
+            state.update(
+                pytorch_baseline_status="FAIL",
+                pytorch_reason=f"PyTorch CSR baseline failed SciPy validation: {metrics['reason']} (err_ratio={metrics['err_ratio']})",
+            )
+        elif ms is None or not math.isfinite(ms) or ms <= 0:
+            state["pytorch_reason"] = "PyTorch CSR baseline returned invalid latency"
+        else:
+            state.update(pytorch_ms=ms, pytorch_baseline_status="PASS")
+    except Exception as exc:
+        state["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
+    return state
 
 
 def _build_torch_spgemm_reference_blocked(
@@ -1339,7 +1390,25 @@ def run_one_mtx(
     if ref_cleanup:
         _cleanup_reference_pools()
 
-    if run_cusparse:
+    maca_torch_baseline = (
+        ast_common._is_maca_runtime()
+        and ast_common._expected_vendor_sparse_backend() == "torch"
+        and ast_common._use_scipy_accuracy_reference()
+    )
+    if maca_torch_baseline and pt_ref_success:
+        _log_stage(mtx_path, "pytorch-csr-baseline", case_start)
+        result.update(_benchmark_maca_torch_spgemm_baseline(
+            a_data, a_indices, a_indptr, a_shape,
+            b_data, b_indices, b_indptr, b_shape,
+            pt_ref_result, ref_warmup, ref_iters,
+        ))
+
+    if maca_torch_baseline:
+        # This backend's native baseline was measured above, not via CuPy.
+        result["cusparse_reason"] = "MACA PyTorch CSR baseline is reported in pytorch_ms"
+        result["cu_exec_mode"] = "disabled"
+        result["attempted_modes_cu"] = "disabled"
+    elif run_cusparse:
         # Vendor baseline per backend: hipSPARSE on DCU/ROCm, cuSPARSE via CuPy on CUDA.
         vendor_backend, _vendor_reason = ast_ops._spgemm_csr_sparse_ref_backend(
             value_dtype, a_indices.dtype, a_indptr.dtype, b_indices.dtype, b_indptr.dtype
@@ -1744,6 +1813,9 @@ SPGEMM_CSV_FIELDNAMES = [
         "triton_ms",
         "cusparse_ms",
         "pytorch_ms",
+        "pytorch_baseline_status",
+        "pytorch_baseline_format",
+        "pytorch_baseline_max_error",
         "triton_speedup_vs_cusparse",
         "triton_speedup_vs_pytorch",
         "pt_status",
@@ -1805,6 +1877,9 @@ def _spgemm_csv_row(entry, value_dtype, index_dtype):
                     "triton_ms": entry.get("triton_ms"),
                     "cusparse_ms": entry.get("cusparse_ms"),
                     "pytorch_ms": entry.get("pytorch_ms"),
+                    "pytorch_baseline_status": entry.get("pytorch_baseline_status"),
+                    "pytorch_baseline_format": entry.get("pytorch_baseline_format"),
+                    "pytorch_baseline_max_error": entry.get("pytorch_baseline_max_error"),
                     "triton_speedup_vs_cusparse": _speedup_ratio(
                         entry.get("cusparse_ms"), entry.get("triton_ms")
                     ),

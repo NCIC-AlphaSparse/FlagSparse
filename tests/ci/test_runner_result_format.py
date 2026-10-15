@@ -1175,6 +1175,24 @@ def test_the_reuse_suite_backend_gate_does_not_demote_a_delivery_variant():
     assert summary["skipped"] == 1  # still reported, just not a demotion
 
 
+def test_the_maca_only_spmv_csr_gate_does_not_demote_a_delivery_variant():
+    # Seen on CUDA 2026-10-15: spmv_csr accuracy read "Skipped" (0 failed).
+    raw = {
+        "tests/pytest/test_spmv_csr_accuracy.py::test_ok[float16]": {
+            "params": {"dtype": "torch.float16"},
+            "result": "passed",
+        },
+        "tests/pytest/test_spmv_csr_maca_accuracy.py::test_live[float16]": {
+            "params": {"dtype": "torch.float16"},
+            "result": "skipped",
+            "reason": "Skipped: MACA required",
+        },
+    }
+    summary = runner.summarize_accuracy_cases(raw)
+    assert summary["status"] == "Passed"
+    assert summary["skipped"] == 1
+
+
 def test_spgemm_split_path_honours_a_dtypes_override(tmp_path, monkeypatch):
     # Iluvatar passes spgemm_csr=--dtypes float32: its fp64 child could only fail.
     seen = []

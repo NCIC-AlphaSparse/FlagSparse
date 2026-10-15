@@ -1655,6 +1655,9 @@ EXPECTED_ACCURACY_SKIP_REASONS = (
     # tokens, so an unexpected skip turned spmv_coo_f32_int_non into "Skipped" on
     # every other backend (seen on H800 when the gate was still ROCm-only).
     "reuse coverage not yet verified on this backend",
+    # tests/pytest/test_spmv_csr_maca_accuracy.py is a MACA-only regression; its
+    # float16/complex64 cases turned spmv_csr_f16 / _c64 "Skipped" elsewhere.
+    "maca required",
 )
 
 
