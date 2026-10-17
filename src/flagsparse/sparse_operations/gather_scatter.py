@@ -272,6 +272,19 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
+    if _is_mthreads_runtime() and dense_vector.dtype == torch.float16:
+        # Native indexing avoids the MUSA Triton launch overhead for short gathers.
+        if out is not None:
+            if out.shape != (nnz,):
+                raise ValueError("out shape must match gather output shape")
+            if out.dtype != dense_vector.dtype:
+                raise TypeError("out dtype must match gather output dtype")
+        dense_vector = dense_vector.contiguous()
+        if out is not None and not out.is_contiguous():
+            out.copy_(torch.index_select(dense_vector, 0, kernel_indices))
+            return out
+        return torch.index_select(dense_vector, 0, kernel_indices, out=out)
+
     max_programs = _gather_max_programs(dense_vector.device, DEFAULT_GATHER_NUM_WARPS)
     grid = lambda meta: (min(max_programs, triton.cdiv(nnz, meta["BLOCK_SIZE"])),)
 
@@ -333,6 +346,11 @@ def _triton_scatter_impl(
     index_fallback_policy = str(index_fallback_policy).lower()
     if index_fallback_policy not in ("auto", "strict"):
         raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+    native_scatter = (
+        _is_mthreads_runtime()
+        and block_size is None
+        and sparse_values.dtype in (torch.float16, torch.int8)
+    )
     block_size = _resolve_scatter_block_size(
         block_size, sparse_values.dtype, kernel_indices.numel()
     )
@@ -353,6 +371,13 @@ def _triton_scatter_impl(
         "kernel_index_dtype": str(kernel_indices.dtype).replace("torch.", ""),
     }
     if nnz == 0:
+        if return_metadata:
+            return dense_values, scatter_meta
+        return dense_values
+
+    if native_scatter:
+        dense_values.index_copy_(0, kernel_indices.to(torch.int64), sparse_values)
+        scatter_meta["kernel_index_dtype"] = "int64"
         if return_metadata:
             return dense_values, scatter_meta
         return dense_values

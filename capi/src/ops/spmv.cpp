@@ -328,7 +328,10 @@ flagsparseStatus_t launch_csr_row_tile_short(flagsparseHandle_t handle, SpMatDes
     sig += std::to_string(rows_per_program) + ",";
     sig += std::to_string(lanes_per_row) + ",";
     sig += ops.acc_is_fp64 ? "True," : "False,";
-    sig += ops.has_beta ? "True" : "False";
+    sig += ops.has_beta ? "True," : "False,";
+    const bool wide = A->rows > INT32_MAX - 128 || A->nnz > INT32_MAX - 128 ||
+                      A->cols > INT32_MAX - 128;
+    sig += wide ? "True" : "False";
     std::vector<jit::Arg> args;
     args.reserve(8);
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
@@ -596,7 +599,8 @@ flagsparseStatus_t run_mixed_sell(flagsparseHandle_t handle, const SpMatDescr* A
     if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
     const char* it = triton_index_dtype(A->indices_type);
     const char* ot = triton_index_dtype(A->offsets_type);
-    const int block_r = next_power_of_two(A->slice_size);
+    const bool parallel = std::string(adaptor::backend_name()) == "musa";
+    const int block_r = parallel ? 32 : next_power_of_two(A->slice_size);
     const int64_t n_slices = (A->rows + A->slice_size - 1) / A->slice_size;
 
     std::string sig;
@@ -617,9 +621,10 @@ flagsparseStatus_t run_mixed_sell(flagsparseHandle_t handle, const SpMatDescr* A
 
     std::string err;
     const flagsparseStatus_t st = jit::launch(
-        jit::codegen_module("spmv_sell.py"), "spmv_sell_i32acc", sig,
-        ctx(handle)->stream, n_slices, 1, 1, /*num_warps=*/1,
-        /*num_stages=*/2, args, &err);
+        jit::codegen_module("spmv_sell.py"),
+        parallel ? "spmv_sell_musa_i32acc" : "spmv_sell_i32acc", sig,
+        ctx(handle)->stream, parallel ? (A->rows + 31) / 32 : n_slices, 1, 1, parallel ? 4 : 1,
+        parallel ? 1 : 2, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
 }
@@ -630,7 +635,8 @@ flagsparseStatus_t run_sell(flagsparseHandle_t handle, const SpMatDescr* A,
     if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
     const char* it = triton_index_dtype(A->indices_type);
     const char* ot = triton_index_dtype(A->offsets_type);
-    const int block_r = next_power_of_two(A->slice_size);
+    const bool parallel = std::string(adaptor::backend_name()) == "musa";
+    const int block_r = parallel ? 32 : next_power_of_two(A->slice_size);
     const int64_t n_slices = (A->rows + A->slice_size - 1) / A->slice_size;
     const bool complex = ops.complex_op;
 
@@ -642,7 +648,7 @@ flagsparseStatus_t run_sell(flagsparseHandle_t handle, const SpMatDescr* A,
     sig += "*"; sig += ot; sig += ":16,";
     sig += "*"; sig += ops.vt; sig += ":16,i32,";
     sig += std::to_string(A->slice_size) + "," + std::to_string(block_r);
-    if (complex) sig += ",1";  // GROUP in the shared complex SELL kernel
+    if (complex) sig += parallel ? ",4" : ",1";  // SLOTS or GROUP
 
     std::vector<jit::Arg> args;
     args.reserve(6);
@@ -661,9 +667,10 @@ flagsparseStatus_t run_sell(flagsparseHandle_t handle, const SpMatDescr* A,
     }
     const flagsparseStatus_t st = jit::launch(
         jit::codegen_module("spmv_sell.py"),
-        complex ? "_spmv_sell_complex_kernel" : "spmv_sell_f32acc", sig,
-        ctx(handle)->stream, n_slices, 1, 1, /*num_warps=*/1,
-        /*num_stages=*/2, args, &err);
+        complex ? (parallel ? "spmv_sell_musa_c32" : "_spmv_sell_complex_kernel")
+                : (parallel ? "spmv_sell_musa_f32acc" : "spmv_sell_f32acc"), sig,
+        ctx(handle)->stream, parallel ? (A->rows + 31) / 32 : n_slices, 1, 1, parallel ? 4 : 1,
+        parallel ? 1 : 2, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
 }

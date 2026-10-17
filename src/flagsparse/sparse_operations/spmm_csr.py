@@ -1057,8 +1057,11 @@ def _run_spmm_csr_base_route_impl(
         and prepared.avg_nnz_per_row <= 32.0
         and prepared.max_row_nnz <= 256
     )
-    use_gather = (_backend_name() == "cuda" and not accuracy
-                  and prepared.data.dtype == torch.complex64 and int(B.shape[1]) == 32)
+    use_gather = (not accuracy and (
+        (_backend_name() == "cuda" and prepared.data.dtype == torch.complex64
+         and int(B.shape[1]) == 32)
+        or (_is_mthreads_runtime() and prepared.data.dtype == torch.float16)
+    ))
     if use_gather:
         from . import _spmm_row_gather
         C = _spmm_row_gather.compute(prepared.data, prepared.kernel_indices,

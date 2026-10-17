@@ -678,7 +678,11 @@ def test_spmv_csr_empty_dtype_ops(alg, dtype, op, shape):
     prepared = _new_prepared(data, col, ptr, shape, alg, op=op)
     actual = spmv_mod.flagsparse_spmv_csr_run(prepared, x)
     assert actual.shape == (shape[0] if op == "non" else shape[1],)
-    assert torch.count_nonzero(actual) == 0
+    checked = (
+        torch.view_as_real(actual)
+        if common._is_mthreads_runtime() and actual.is_complex() else actual
+    )
+    assert torch.count_nonzero(checked) == 0
 
 
 @pytest.mark.spmv_csr

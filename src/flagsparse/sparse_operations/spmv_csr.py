@@ -1058,6 +1058,7 @@ def prepare_spmv_csr(
     elif (not transpose and requested_alg == "auto" and config is None
           and data.dtype in (torch.float16, torch.complex64)
           and (_backend_name() == "cuda" or
+               (_is_mthreads_runtime() and data.dtype == torch.float16) or
                (_is_maca_runtime() and
                 (data.dtype == torch.float16 or data.numel() > 4 * n_rows)))):
         from . import _spmv_csr_transpose

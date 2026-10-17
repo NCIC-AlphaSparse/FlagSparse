@@ -91,7 +91,8 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opX,
     if (c32) {
         sig += opX == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE ? "True," : "False,";
     }
-    sig += std::to_string(kBlock);
+    const bool small_musa = std::string(adaptor::backend_name()) == "musa" && X->nnz <= 32;
+    sig += std::to_string(small_musa ? 32 : kBlock);
 
     std::vector<jit::Arg> args;
     args.reserve(5);
@@ -105,16 +106,17 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opX,
     flagsparseStatus_t st = jit::launch(
         jit::codegen_module("spvv.py"), c32 ? "spvv_c32" :
         (computeType == FLAGSPARSE_R_32I ? "spvv_mixed_i32acc" : "spvv_mixed_f32acc"),
-        sig, ctx(handle)->stream, 1, 1, 1, /*num_warps=*/4, /*num_stages=*/2,
+        sig, ctx(handle)->stream, 1, 1, 1, small_musa ? 1 : 4, /*num_stages=*/2,
         args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) {
         ctx(handle)->last_error = err;
         return st;
     }
     if (!result_on_device) {
-        // The runtime copies are synchronous and do not carry the handle's
-        // stream, so finish the launch before copying the scalar to host.
-        adaptor::synchronize();
+        // MUSA's synchronous D2H copy is ordered after a default-stream launch.
+        // A different handle stream still needs the explicit synchronization.
+        if (std::string(adaptor::backend_name()) != "musa" || ctx(handle)->stream != nullptr)
+            adaptor::synchronize();
         st = adaptor::memcpy_d2h(result,
                                  reinterpret_cast<adaptor::DevicePtr>(device_result),
                                  dtype_size(computeType));

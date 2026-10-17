@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import _gather_values, _is_maca_runtime
+from ._common import _gather_values, _is_maca_runtime, _is_mthreads_runtime
 
 
 def prepare(indices, indptr, shape):
@@ -19,8 +19,12 @@ def prepare(indices, indptr, shape):
     )
     order = torch.argsort(indices, stable=True).to(indices.dtype)
     cols = source_rows[order]
-    counts = torch.bincount(indices.long(), minlength=n)
-    ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(indptr.dtype)
+    if _is_mthreads_runtime():
+        boundaries = torch.arange(n + 1, device=indices.device, dtype=indices.dtype)
+        ptr = torch.searchsorted(indices[order], boundaries).to(indptr.dtype)
+    else:
+        counts = torch.bincount(indices.long(), minlength=n)
+        ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(indptr.dtype)
     return make_plan(cols, ptr, order, n)
 
 
@@ -35,6 +39,9 @@ def make_plan(cols, ptr, order, n):
         # C550 favors a small one-wave tile over the CUDA 512-element tile.
         lanes = 32 if avg >= 32 else 16
         return cols, ptr, order, row_order, lanes, 128 // lanes, {}
+    if _is_mthreads_runtime():
+        lanes, batch = (4, 128) if avg <= 4 else (8, 64) if avg <= 24 else (8, 16)
+        return cols, ptr, order, row_order, lanes, batch, {}
     return cols, ptr, order, row_order, lanes, 512 // lanes, {}
 
 
@@ -76,6 +83,15 @@ def _gather(V, I, P, ORDER, ROWS, X, Y, M: tl.constexpr,
 
 
 def gather(values, x, plan, n_rows, conjugate=False, out=None):
+    if _is_mthreads_runtime() and values.dtype == torch.float16 and plan[2] is None:
+        from .mixed_spmx import _musa_csr_spmv
+        result = _musa_csr_spmv(values.contiguous(), plan[0], plan[1], x.contiguous(),
+                                n_rows, values.dtype if out is None else out.dtype,
+                                torch.float32, out)
+        if out is not None and result is not out:
+            out.copy_(result)
+            return out
+        return result
     y = out if out is not None else torch.empty(n_rows, dtype=values.dtype, device=values.device)
     if not n_rows:
         return y
@@ -108,6 +124,13 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
         v, vector, target = cache["component_view"], torch.view_as_real(x), torch.view_as_real(y)
     else:
         v, vector, target = values, x, y
+    if _is_mthreads_runtime() and not complex_values and values.dtype == torch.float16:
+        from .mixed_spmx import _musa_csr_spmv
+        result = _musa_csr_spmv(values, cols, ptr, x, n_rows,
+                                y.dtype, torch.float32, y)
+        if result is not y:
+            y.copy_(result)
+        return y
     if maca and values.dtype == torch.complex64:
         from ._spmv_csr_maca import complex_gather
         complex_gather[(triton.cdiv(n_rows, batch),)](
