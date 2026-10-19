@@ -19,11 +19,19 @@ from ._common import *
 
 import ctypes
 import ctypes.util
+from collections import OrderedDict
 
 HipPointer = _common_mod.HipPointer
 
 import triton
 import triton.language as tl
+
+from ._rocm_sparse_cache import TensorPlanCache
+from ._musa_spmv_launch import launch as _musa_launch
+
+_MUSA_SCATTER_INDEX_CACHE = TensorPlanCache(maxsize=16)
+_MUSA_COPY_RUNNERS = OrderedDict()
+_MUSA_COPY_RUNNER_LIMIT = 32
 
 SUPPORTED_SCATTER_VALUE_DTYPES = GATHER_SCATTER_VALUE_DTYPES
 DEFAULT_GATHER_BLOCK_SIZE = 256
@@ -256,6 +264,131 @@ def _scatter_complex_kernel(
     tl.store(dense_values_ri_ptr + dense_offsets + 1, values_imag, mask=mask)
 
 
+@triton.jit
+def _musa_indexed_copy_kernel(
+    DST, SRC, IDX, N,
+    DST_STRIDE: tl.constexpr, SRC_STRIDE: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    COMPONENTS: tl.constexpr, GATHER: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    elements = offsets // COMPONENTS
+    component = offsets % COMPONENTS
+    valid = elements < N
+    indices = tl.load(IDX + elements * INDEX_STRIDE, valid, other=0)
+    if GATHER:
+        source = indices * SRC_STRIDE + component
+        destination = elements * DST_STRIDE + component
+    else:
+        source = elements * SRC_STRIDE + component
+        destination = indices * DST_STRIDE + component
+    values = tl.load(SRC + source, valid, other=0)
+    tl.store(DST + destination, values, valid)
+
+
+@triton.jit
+def _musa_zero_vector_kernel(
+    DST, N, STRIDE: tl.constexpr, COMPONENTS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    elements = offsets // COMPONENTS
+    tl.store(DST + elements * STRIDE + offsets % COMPONENTS, 0, elements < N)
+
+
+@triton.jit
+def _musa_scatter_inverse_fill_kernel(INVERSE, N, BLOCK: tl.constexpr):
+    pos = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(INVERSE + pos, -1, pos < N)
+
+
+@triton.jit
+def _musa_scatter_inverse_kernel(
+    INVERSE, INDICES, NNZ, N, INDEX_STRIDE: tl.constexpr, BLOCK: tl.constexpr,
+):
+    pos = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.load(INDICES + pos * INDEX_STRIDE, pos < NNZ, other=-1)
+    # Last source position wins even for duplicate destinations. Separate
+    # initialization and construction launches avoid a cross-program race.
+    tl.atomic_max(INVERSE + row, pos, (pos < NNZ) & (row >= 0) & (row < N),
+                  sem="relaxed")
+
+
+@triton.jit
+def _musa_scatter_dense_kernel(
+    DST, SRC, INVERSE, N, DST_STRIDE: tl.constexpr, SRC_STRIDE: tl.constexpr,
+    COMPONENTS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = offsets // COMPONENTS
+    pos = tl.load(INVERSE + row, row < N, other=-1)
+    value = tl.load(SRC + pos * SRC_STRIDE + offsets % COMPONENTS,
+                    (row < N) & (pos >= 0), other=0)
+    tl.store(DST + row * DST_STRIDE + offsets % COMPONENTS, value, row < N)
+
+
+def _musa_scatter_dense(dst, src, indices, block_size):
+    """Reuse index topology only; read source values and write every output anew."""
+    from ._musa_spmv_launch import launch
+
+    n, nnz = dst.numel(), indices.numel()
+    inverse = _MUSA_SCATTER_INDEX_CACHE.get((indices,), (n,))
+    if inverse is None:
+        inverse = torch.empty(n, dtype=torch.int32, device=dst.device)
+        launch(_musa_scatter_inverse_fill_kernel, (triton.cdiv(n, 1024),),
+               (inverse,), (n,), (1024,))
+        launch(_musa_scatter_inverse_kernel, (triton.cdiv(nnz, 1024),),
+               (inverse, indices), (nnz, n), (indices.stride(0), 1024))
+        _MUSA_SCATTER_INDEX_CACHE.put((indices,), (n,), inverse)
+    components = 2 if _is_complex_dtype(src.dtype) else 1
+    dst_view = torch.view_as_real(dst) if components == 2 else dst
+    src_view = torch.view_as_real(src) if components == 2 else src
+    launch(_musa_scatter_dense_kernel, (triton.cdiv(n * components, block_size),),
+           (dst_view, src_view, inverse), (n,),
+           (dst_view.stride(0), src_view.stride(0), components, block_size))
+
+
+def _musa_indexed_copy(dst, src, indices, gather, block_size):
+    """Triton-only indexed copies, including noncontiguous real/complex views."""
+    components = 2 if _is_complex_dtype(src.dtype) else 1
+    dst_view = torch.view_as_real(dst) if components == 2 else dst
+    src_view = torch.view_as_real(src) if components == 2 else src
+    nnz = indices.numel()
+    grid = ((nnz * components + block_size - 1) // block_size,)
+    scalars = (nnz,)
+    constants = (dst_view.stride(0), src_view.stride(0), indices.stride(0),
+                 components, gather, block_size)
+    addresses = (dst_view.data_ptr(), src_view.data_ptr(), indices.data_ptr())
+    signature = tuple((t.dtype, t.device, p % 16) for t, p in
+                      zip((dst_view, src_view, indices), addresses))
+    aliases = (addresses[0] == addresses[1], addresses[0] == addresses[2],
+               addresses[1] == addresses[2])
+    key = (signature, aliases, nnz, constants)
+    entry = _MUSA_COPY_RUNNERS.get(key)
+    if entry is not None:
+        entry((dst_view, src_view, indices), scalars, constants, addresses)
+        _MUSA_COPY_RUNNERS.move_to_end(key)
+        return
+    runner = _musa_launch(
+        _musa_indexed_copy_kernel, grid, (dst_view, src_view, indices),
+        scalars, constants,
+    )
+    if runner is not None:
+        _MUSA_COPY_RUNNERS[key] = runner
+        _MUSA_COPY_RUNNERS.move_to_end(key)
+        while len(_MUSA_COPY_RUNNERS) > _MUSA_COPY_RUNNER_LIMIT:
+            _MUSA_COPY_RUNNERS.popitem(last=False)
+
+
+def _musa_zero_vector(out):
+    from ._musa_spmv_launch import launch
+
+    if not out.numel():
+        return
+    components = 2 if _is_complex_dtype(out.dtype) else 1
+    view = torch.view_as_real(out) if components == 2 else out
+    launch(_musa_zero_vector_kernel, (triton.cdiv(out.numel() * components, 256),),
+           (view,), (out.numel(),), (view.stride(0), components, 256))
+
+
 def _triton_gather_impl(
     dense_vector,
     kernel_indices,
@@ -270,6 +403,17 @@ def _triton_gather_impl(
             raise ValueError("out shape must match gather output shape")
         if out.dtype != dense_vector.dtype:
             raise TypeError("out dtype must match gather output dtype")
+        return out
+
+    if _is_mthreads_runtime():
+        if out is not None:
+            if out.shape != (nnz,):
+                raise ValueError("out shape must match gather output shape")
+            if out.dtype != dense_vector.dtype:
+                raise TypeError("out dtype must match gather output dtype")
+        else:
+            out = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
+        _musa_indexed_copy(out, dense_vector, kernel_indices, True, block_size)
         return out
 
     max_programs = _gather_max_programs(dense_vector.device, DEFAULT_GATHER_NUM_WARPS)
@@ -333,18 +477,28 @@ def _triton_scatter_impl(
     index_fallback_policy = str(index_fallback_policy).lower()
     if index_fallback_policy not in ("auto", "strict"):
         raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+    musa = _is_mthreads_runtime()
     block_size = _resolve_scatter_block_size(
         block_size, sparse_values.dtype, kernel_indices.numel()
     )
 
     if out is None:
-        dense_values = torch.zeros(
+        allocate = torch.empty if musa else torch.zeros
+        dense_values = allocate(
             dense_size, dtype=sparse_values.dtype, device=sparse_values.device
         )
     else:
         dense_values = out
-        if reset_output:
+        if reset_output and not musa:
             dense_values.zero_()
+    fused_musa = (
+        musa and sparse_values.device.type == "musa"
+        and (out is None or reset_output) and kernel_indices.numel() > 0
+        and kernel_indices.numel() <= _INDEX_LIMIT_INT32
+        and sparse_values.dtype in (torch.float16, torch.int8)
+    )
+    if musa and (out is None or reset_output) and not fused_musa:
+        _musa_zero_vector(dense_values)
 
     nnz = kernel_indices.numel()
     scatter_meta = {
@@ -358,13 +512,16 @@ def _triton_scatter_impl(
         return dense_values
 
     try:
-        _launch_triton_scatter_kernel(
-            dense_values,
-            sparse_values,
-            kernel_indices,
-            nnz,
-            block_size=block_size,
-        )
+        if fused_musa:
+            _musa_scatter_dense(dense_values, sparse_values, kernel_indices, block_size)
+        else:
+            _launch_triton_scatter_kernel(
+                dense_values,
+                sparse_values,
+                kernel_indices,
+                nnz,
+                block_size=block_size,
+            )
     except Exception as exc:
         if kernel_indices.dtype != torch.int64 or index_fallback_policy != "auto":
             raise RuntimeError(
@@ -381,6 +538,8 @@ def _triton_scatter_impl(
 
         fallback_indices = kernel_indices.to(torch.int32)
         try:
+            if fused_musa:
+                _musa_zero_vector(dense_values)
             _launch_triton_scatter_kernel(
                 dense_values,
                 sparse_values,
@@ -409,6 +568,9 @@ def _launch_triton_scatter_kernel(
     dense_values, sparse_values, kernel_indices, nnz, block_size=None
 ):
     block_size = _resolve_scatter_block_size(block_size, sparse_values.dtype, nnz)
+    if _is_mthreads_runtime():
+        _musa_indexed_copy(dense_values, sparse_values, kernel_indices, False, block_size)
+        return
     grid = lambda meta: (triton.cdiv(nnz, meta["BLOCK_SIZE"]),)
     launch_kwargs = {"BLOCK_SIZE": block_size}
     if _is_rocm_runtime():

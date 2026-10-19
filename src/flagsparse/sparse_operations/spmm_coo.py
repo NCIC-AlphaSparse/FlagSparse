@@ -800,9 +800,14 @@ class PreparedCooSpmmRoute:
         self.op = str(op)
         self.alg = str(alg)
         self.gather_ptr = None
-        if _backend_name() == "cuda" and self.output_dtype == torch.complex64:
-            counts = torch.bincount(row.long(), minlength=self.n_rows)
-            self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
+        if ((_backend_name() == "cuda" and self.output_dtype == torch.complex64)
+                or (_is_mthreads_runtime() and self.output_dtype == torch.float16)):
+            if _is_mthreads_runtime():
+                boundaries = torch.arange(self.n_rows + 1, device=row.device, dtype=row.dtype)
+                self.gather_ptr = torch.searchsorted(row, boundaries).to(row.dtype)
+            else:
+                counts = torch.bincount(row.long(), minlength=self.n_rows)
+                self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
 
 
 @triton.jit

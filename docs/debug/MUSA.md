@@ -3,19 +3,52 @@
 `FLAGSPARSE_BACKEND=mthreads`。环境搭建、交付复现见 [`../MUSA.md`](../MUSA.md)。背景见本目录
 [`README.md`](README.md)。
 
+**MUSA 实现约束（用户于 2026-10-18 明确）**：算子计算内核必须使用 Triton，允许使用当前后端支持且经实测验证的 TLE 特性。禁止以手写 MUSA C++/`.mu` 内核、mcc 编译的计算库或 PyTorch 原生索引替代被测算子的计算内核。C API 主机封装、设备内存/流管理和厂商对照基线不属于计算内核；其他后端保持原实现。本文后半部保留的原生实验为撤回历史，不能用于全 Triton 验收。
+
 ## 要做的事
 
 环境按 `../MUSA.md` 第 2 节配好（`FLAGSPARSE_BACKEND=mthreads`、`MUSA_HOME`）后，跑一轮 split：
 
 ```bash
+# 1. 更新代码：至少要包含 a330b62（见下面"2026-10-14 那轮的两个 NoBaseline"）
+git pull --ff-only
+git log --oneline -1
+git merge-base --is-ancestor a330b62 HEAD && echo "包含 a330b62 修复"
+
+# 2. 环境自检
+export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa   # MUSA_HOME 以本机实际安装位置为准
+python3 -c "import flagsparse; print(flagsparse.__file__)"   # 必须是 <仓库>/src/flagsparse/__init__.py
+python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_device_type(), c._accel_fallback_reason())"
+# 期望：mthreads musa None
+ls tests/data/*.mtx | wc -l          # 期望 10
+mthreads-gmi                         # 确认没有别的任务在用 GPU
+
+# 3. 全量 split（每次用新的结果目录）
+D=results_musa_split_65_<日期>
 setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
   --mode normal --benchmark-input tests/data --timeout 3600 \
   --h800-reference \
-  --results-dir results_musa_split_65_<日期> \
-  > results_musa_split_65_<日期>.log 2>&1 < /dev/null &
-# 跑完后
-python3 tools/delivery_table.py results_musa_split_65_<日期>
+  --results-dir $D \
+  > $D.log 2>&1 < /dev/null &
+
+# 4. 跑完后
+tail -5 $D.log                                    # H800 折算三类各补了多少、还剩哪些
+python3 tools/delivery_table.py $D                # 期望 0 missing，性能里没有 NoBaseline
+python3 tools/delivery_table.py $D --show-baseline | grep -E "scatter_i8_int|spmm_csc_f16"
+# 期望这两行有加速比，来源 h800_scaled
 ```
+
+- `flagsparse.__file__` 那一步不能省：系统 site-packages 里残留的旧安装会顶替 `src/`，基线悄悄变成 `N/A`。
+- `MUSA_HOME` 设错不会报错，muSPARSE 基线同样会悄悄退成 `none`（`../MUSA.md` 第 2 节）。
+
+**2026-10-14 那轮的两个 NoBaseline**（`results_musa_split_65_20261014`，63 Passed + 2 NoBaseline）：
+`scatter_i8_int` 和 `spmm_csc_f16_int_non_non_row` muSPARSE 都不支持（C API 报 `Scatter dtype unsupported`、
+`unsupported SpMM type or operation`），只能靠 Python 侧的折算补，而那轮 Python 侧这两处都崩了：scatter int8 的
+torch 参考被 muDNN 拒绝（`Now muDNN only support float64, float32, half, bfloat16, int32, and int64`，4 行全是
+`ERROR`）；spmm_csc 的 `torch.sparse.mm` 参考在 MUSA 上没有实现（`Could not run 'aten::addmm' with arguments from
+the 'Sparsemusa' backend`，CSV 为空）。`a330b62`（参考改在 CPU / SciPy 上算）修了这两处，但它比那轮结果晚提交，
+所以那份报告里的这两行是旧代码的结果，按上面的命令重跑即可。CUDA 上以 `FLAGSPARSE_BACKEND=mthreads` 模拟已确认
+两行都能测出性能；折算这一步只在真机上走得到。
 
 - 精度那一半调用 `run_flagsparse_pytest.py --phase accuracy --delivery-only`，覆盖全部 65 个变体。
 - 性能那一半取 C API 的 `ctest`（对 muSPARSE），**现在也覆盖全部 65 个变体**：`origin/q4` 的 C API 工作
@@ -231,4 +264,508 @@ C API 精度 10/10 测试族通过。唯一的精度瑕疵是 `spmm_csc_f32_int_
 - 其他后端是否也需要：是 / 否 / 不确定
 ```
 
-（暂无）
+### 2026-10-15 优化与复测口径
+
+本轮按用户要求优化代码，验收目标是**每个交付变体各自的平均加速比 > 0.8x**，不是 65 项的整体平均。
+矩阵仍为 `tests/data` 的原始 10 个文件，split runner、测试规模、容差和基线优先级不变。
+本机 CPU cgroup 配额为 15 核，后续配对测量统一设置
+`OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8`，原始源码也用相同设置复测，
+避免默认大线程池触发 CPU 限流。H800 带宽折算仍是估算，不能当作本机厂商实测。
+下列定向性能结果只用于调优，未替代最终完整 split；未达标和缺基线的条目必须继续如实报告。
+
+### 2026-10-15 src/flagsparse/sparse_operations/mixed_spmx.py::MUSA SpMV/SpMM 路由
+- 改了什么：COO/CSC 转 CSR 使用有界、张量版本感知的缓存；短行 SpMV 调整行块，严重不均衡短行复用 NNZ 分块内核；SpMM 复用行批量 gather；避免输出自拷贝。
+- 为什么改（附报错原文）：无报错，原 COO 半精度/整数原子路径及逐行 SpMM 的实测加速比低于 0.8x。只缓存结构和必要的值重排，不缓存计算结果；输入变更失效。
+- 怎么验证的：10 矩阵定向复测 `results_musa_opt_20261015_nnz_threads8/`；Python 定向回归 80 passed、3 skipped，含乱序/重复 COO、值/索引/向量修改、无版本推理张量、非连续输出。
+- 其他后端是否也需要：否；新路由仅 MUSA。
+
+### 2026-10-15 src/flagsparse/sparse_operations/_spmm_row_gather.py::_kernel/compute
+- 改了什么：增加可选累加类型以支持 int8 到 int32；MUSA 使用 8 行、4 个稀疏槽、4 warps。
+- 为什么改（附报错原文）：无报错；MUSA 多行批量配置比逐行混合精度内核更快，整数输出必须保持整数累加。
+- 怎么验证的：上述 80 项回归与 10 矩阵 SpMM 定向性能复测。
+- 其他后端是否也需要：否；默认累加类型和其他后端的配置保持不变。
+
+### 2026-10-15 src/flagsparse/sparse_operations/_spmv_csr_nnz.py::_musa_segmented_add
+- 改了什么：MUSA 专用分段扫描的零分支使用整数文字 `0`，避免 int32 被浮点文字隐式提升；通过默认 False 的编译期 MUSA 开关选择，原共享归约函数保留原样。
+- 为什么改（附报错原文）：无报错；复用到 MUSA int8/int32 时必须保持精确整数归约。
+- 怎么验证的：整数 NNZ 路径包含重复列、空行、输入变更和非连续输出的精确回归。
+- 其他后端是否也需要：否；其他后端仍使用原 `_segmented_add` 及浮点零分支。
+
+### 2026-10-15 src/flagsparse/sparse_operations/_spmv_csr_transpose.py::make_plan/gather
+- 改了什么：MUSA 调整行块；半精度实数 gather 复用混合精度 CSR 执行器。
+- 为什么改（附报错原文）：无报错；原半精度 CSR 标量路径很慢。实验中的全行排序未带来收益，未用于最终混合 SpMV 路径。
+- 怎么验证的：80 项 Python 定向回归；含复数转置用例，未修改精度容差。
+- 其他后端是否也需要：否；配置与路由均以 MUSA 为条件。
+
+### 2026-10-15 src/flagsparse/sparse_operations/spmv_csr.py::prepare_spmv_csr
+- 改了什么：MUSA 半精度默认配置建立 non-gather plan，运行时使用优化的行批量路径。
+- 为什么改（附报错原文）：无报错；原 FP16 SpMV 性能明显落后。
+- 怎么验证的：半精度交付精度用例及 10 矩阵定向性能测试。
+- 其他后端是否也需要：否；显式配置和其他后端保持原行为。
+
+### 2026-10-15 src/flagsparse/sparse_operations/spmv_csc.py::_spmv_csc_via_mixed
+- 改了什么：MUSA 半精度非转置调用缓存化的 `spmv_csc_half`。
+- 为什么改（附报错原文）：无报错；原路径每次展开列号，抵消了缓存收益。
+- 怎么验证的：CSC 值/索引变更回归，10 矩阵定向复测约 4.61x（H800 折算）。
+- 其他后端是否也需要：否；原 CUDA/MACA 路由不变。
+
+### 2026-10-15 src/flagsparse/sparse_operations/spmm_csr.py::默认半精度执行
+- 改了什么：MUSA 非 accuracy 模式 FP16 复用 row-gather。
+- 为什么改（附报错原文）：无报错；原路径逐行/逐槽执行缓慢。
+- 怎么验证的：80 项回归及 10 矩阵定向性能复测，FP16 变体约 2.08x（H800 折算）。
+- 其他后端是否也需要：否；CUDA 复数路由与其他后端不变。
+
+### 2026-10-15 src/flagsparse/sparse_operations/spmm_coo.py::PreparedCooSpmmRoute
+- 改了什么：MUSA FP16 准备 CSR gather 指针，复用现有行批量执行器。
+- 为什么改（附报错原文）：无报错；避免原子累加/逐非零元程序的高开销。
+- 怎么验证的：COO 精度用例和 10 矩阵定向性能复测，FP16 约 2.19x（H800 折算）。
+- 其他后端是否也需要：否。
+
+### 2026-10-15 src/flagsparse/sparse_operations/spmv_sell.py::csr_to_sell/并行执行
+- 改了什么：MUSA 复数转换按实虚分量 index_copy；实数使用并行稀疏槽归约，复数使用已有并行内核。
+- 为什么改（附报错原文）：原转换报 `"IndexPut" not implemented for 'ComplexFloat'`；串行稀疏槽性能较慢。
+- 怎么验证的：10 矩阵、5 种数据/输出组合均 PASS；包含部分 slice、空行和 padding 的回归。
+- 其他后端是否也需要：否；复数规避复用 Ascend 的已有方式，其他后端执行路由不变。
+
+### 2026-10-15 src/flagsparse/sparse_operations/gather_scatter.py::_triton_gather_impl
+- 改了什么：MUSA FP16 使用原生 index_select；保留输出形状/类型检查，非连续输入先连续化，非连续输出经临时缓冲区复制。
+- 为什么改（附报错原文）：无异常；原 Triton 启动约 25us，原生索引约 7--16us。实测原生非连续输出有错误，不能直接传入。
+- 怎么验证的：4 个原始 Gather 性能规模均 PASS；重复索引、非连续输入/输出、原地修改、错误形状/类型回归。
+- 其他后端是否也需要：否。
+
+### 2026-10-15 capi/flagsparse_codegen/spmv_csr.py::spmv_csr_row_tile_real
+- 改了什么：增加 WIDE 开关，小矩阵使用 int32 地址计算，大范围仍保留 int64。
+- 为什么改（附报错原文）：无报错；无条件 int64 地址计算增加 MUSA 指令成本。
+- 怎么验证的：C API SpMV 精度测试族通过，10 矩阵 FP32 定向实测约 0.824x。
+- 其他后端是否也需要：否；默认 WIDE 为 True。
+
+### 2026-10-15 capi/src/ops/spmv.cpp::短行 CSR 与 SELL 启动
+- 改了什么：按边界选择 CSR WIDE；MUSA SELL 选择并行稀疏槽内核和对应的 4-warps 配置。
+- 为什么改（附报错原文）：无报错；减少地址计算与串行 slot 循环的开销。
+- 怎么验证的：C API SpMV 精度测试族通过；10 矩阵定向性能复测。
+- 其他后端是否也需要：否；SELL 其他后端沿用原内核和配置。
+
+### 2026-10-15 capi/flagsparse_codegen/spmv_sell.py::并行 SELL 包装
+- 改了什么：导出共享复数并行内核，增加 FP32/int32 累加的薄包装。
+- 为什么改（附报错原文）：无报错；C API 复用 Python 中同一个实现，避免复制计算逻辑。
+- 怎么验证的：C API SpMV 精度测试族通过，覆盖 SELL 实数、半精度、复数、整数。
+- 其他后端是否也需要：否；原导出仍保留。
+
+### 2026-10-15 capi/flagsparse_codegen/spmm_csr.py::spmm_csr_batched8_real
+- 改了什么：按 WIDE 选择地址宽度，增加可调稀疏槽宽度 K，默认值保持 4。
+- 为什么改（附报错原文）：无报错；int64 寻址与固定槽宽限制了 MUSA FP32/FP64 性能。
+- 怎么验证的：C API SpMM 精度测试族通过；10 矩阵定向性能测试。
+- 其他后端是否也需要：否；该内核只由 MUSA 路由选择。
+
+### 2026-10-15 capi/src/ops/spmm.cpp::run_csr
+- 改了什么：MUSA N=8 按累加类型选择行批量和槽宽，使用 4 warps；大地址保留 64 位。
+- 为什么改（附报错原文）：无报错；原 batch=4/1 warp 实测吞吐低。
+- 怎么验证的：10 矩阵定向实测 FP32 约 0.863x、FP64 约 0.902x，精度测试族通过。
+- 其他后端是否也需要：否。
+
+### 2026-10-15 capi/src/ops/spvv.cpp::run
+- 改了什么：MUSA nnz<=32 使用 block=32、1 warp，其他情况保持原配置。
+- 为什么改（附报错原文）：无报错；小向量不需要 256 个归约槽。
+- 怎么验证的：C API SpVV 精度测试族通过；定向性能有波动，尚不能据此认定稳定达到 0.8x。
+- 其他后端是否也需要：否。
+
+### 2026-10-15 capi/src/ops/spgemm.cpp::workEstimation/compute/launch_hash
+- 改了什么：MUSA 按行产品工作量分桶；复用主机计数存储，合并相邻的计数/溢出标志传输与前缀扫描。
+- 为什么改（附报错原文）：无报错；原来全矩阵使用最坏行的哈希容量，短行也承担单行哈希和大表开销。
+- 怎么验证的：C API SpGEMM 精度测试族通过；10 矩阵定向复测约 0.825x，存在波动。排序去重实验精度通过但性能退化，已撤回。每次重新计算，不缓存输出计数。
+- 其他后端是否也需要：否；分桶与主机缓冲复用均限定 MUSA，其他后端保留原两次传输、溢出检查和前缀扫描流程。
+
+### 2026-10-15 tests/pytest/test_musa_sparse_routes.py::新增回归
+- 改了什么：新增 MUSA 格式转换缓存失效、整数精确累加、SELL padding/部分 slice、非连续输出、推理张量和 Gather 边界测试。
+- 为什么改（附报错原文）：优化后必须验证输入实时可变，不能只测同一输入重复执行。
+- 怎么验证的：连同 q4 SpMV/SpMM 精度用例共 80 passed、3 skipped；跳过的是不在该缓存路由内的 CSC 组合，不是交付变体跳过。
+- 其他后端是否也需要：否；该文件显式要求 MUSA，原跨后端测试未删除或放宽。
+
+### 2026-10-15 MUSA-only 范围收紧
+- 改了什么：按用户补充要求，`mixed_spmx._finish` 仅在 MUSA 避免输出自拷贝，非 MUSA 恢复原行块选择；`_spmm_row_gather.compute` 的 int32 累加仅在 MUSA 启用；`_spmv_csr_nnz` 的 MUSA 归约通过编译期开关隔离；`capi/src/ops/spgemm.cpp` 的缓冲复用和分桶显式限定 MUSA。
+- 为什么改（附报错原文）：无报错；用户要求“修改仅限于musa后端”，不能把共享行为变化带给其他后端。
+- 怎么验证的：新增不执行 GPU 内核的路由隔离回归，分别模拟 MUSA/非 MUSA 检查自拷贝、整数累加和行块参数，6 passed；`git diff --check` 通过。此前 80 项 GPU 回归是隔离前结果；隔离后的 Python 回归、C API 重新编译及 SpMV/SpMM/SpGEMM/SpVV 精度复验排在当前 split 完成后运行，日志 `results_musa_scope_20261015.log`，未完成前不视为通过。
+- 其他后端是否也需要：否；没有 CUDA/ROCm 等其他后端的真机验证，不声称已验证。
+- 测试版本说明：`results_musa_split_65_20261015_opt/` 在隔离修改前启动。修改未调整 MUSA 算法、配置或基线，但源码哈希发生变化；该轮作为隔离前优化结果保留，不标为最终隔离后完整验收。
+
+### 2026-10-16 本轮状态与定向数据
+
+用户确认停止旧整轮后，旧 runner 及排队验证已停止，原目录与日志全部保留。本轮继续限定 MUSA，未修改测试矩阵、规模、容差或基线优先级。核对 `tests/data` 的 10 个 `.mtx` 大小与上文一致；导入路径为当前仓库 `src/flagsparse/__init__.py`，运行环境为 `mthreads musa None`、torch 2.7.1、Triton 3.6.0、MTT S5000。
+
+定向结果不是完整交付验收，所有 H800 折算均仍为估算：
+
+- `results_musa_opt_20261016_complex3d/`：原 10 矩阵上每条精度 PASS；`spmv_csr_f32c32_int_non` 平均从本轮改动前约 0.703x 提升至 0.819x。FP16→FP32 0.779x、FP16 0.754x、int8→FP32 0.820x、int8→int32 0.812x。COO 对应三项约 0.586x、0.685x、0.645x，仍未达标。
+- `results_musa_opt_20261016_sell_flat/sell.csv`：5 种值/输出组合、10 矩阵，共 50 条 PASS。按已有同规模 Python 折算基线，SELL FP16 0.609x、FP32 0.695x、int8→int32 0.590x，仍未达标。
+- `results_musa_opt_20261016_capi_sell/`：4 个交付 SELL 变体各 10 矩阵，40 条 `status=ok`、精度通过；复数 SELL 按已有 H800 同矩阵折算基线为 0.610x（旧轮约 0.275x），仍未达标。
+- 固定最大行宽展开、SELL 行连续布局、成对复数加载、自动 Graph 重放均仅作临时探针，未显示稳定整体收益，没有接入正式源码。SELL→CSR 在 ASIC 上明显改善、其他矩阵有退化，也未接入。
+- Python 扩大回归（MUSA 专用回归、q4 SpMV/SpMM、原 CSR 精度文件）已得到 559 passed、1659 skipped、23 deselected；跳过为原有后端/算法适用性规则，未新增或放宽规则。最终补充非连续输出后的结果及完整 split 见后续记录。
+
+**尚未达到“每个变体各自平均 > 0.8x”目标，不能用上述单项或整体平均代替验收。**
+
+### 2026-10-16 src/flagsparse/sparse_operations/mixed_spmx.py::_musa_csr_real_by_complex_kernel/_musa_coo_csr
+- 改了什么：实数×复数使用三维实虚分量布局；严重不均衡短行可走复数 NNZ 路径。MUSA COO 从已排序行号用 `searchsorted` 建 CSR 指针，稀疏输入检查随版本感知缓存失效重新执行，RHS/输出仍每次检查。
+- 为什么改（附报错原文）：无异常；原实数×复数逐行 kernel 慢。另复现原生 MUSA `bincount` 偶发少计数，4930 个输入得到计数和 4917，导致后续行指针及结果错误。
+- 怎么验证的：10 矩阵定向结果见本轮状态；FP32/FP64 实数×复数、跨块、空行、输入修改回归通过，不缓存输出。
+- 其他后端是否也需要：否；新 kernel 和预处理均仅 MUSA 路由选择。
+
+### 2026-10-16 src/flagsparse/sparse_operations/_spmv_csr_nnz.py::_nnz_kernel
+- 改了什么：增加默认 False 的 `COMPLEX_RHS`，MUSA 分别扫描实虚分量并处理跨块前缀；MUSA 的前缀补偿零分支保持整数类型。
+- 为什么改（附报错原文）：无异常；实数×复数需要 NNZ 均衡，int8→int32 不允许跨块补偿隐式转 FP32 而丢失大整数低位。
+- 怎么验证的：新增 1101 个 127×127 的精确整数累加，以及 601 个非零元跨块复数、空行和实时修改回归；未开启新参数的其他后端保持原扫描/补偿路径。
+- 其他后端是否也需要：否。
+
+### 2026-10-16 src/flagsparse/sparse_operations/_spmv_csr_transpose.py::prepare/gather
+- 改了什么：MUSA 转置预处理使用排序后 `searchsorted` 替代 `bincount`；FP16 已按 CSR 排列时提前进入执行器；非连续输出使用临时缓冲区后复制回调用方视图。
+- 为什么改（附报错原文）：复现 MUSA `bincount` 少计数；通用处理存在额外调用开销，且临时输出不能丢失调用方指定的非连续输出。
+- 怎么验证的：扩大 CSR 精度、q4 SpMV/SpMM 回归通过，补充直接/间接 FP16 gather 的非连续输出回归。
+- 其他后端是否也需要：否；其他后端仍使用原预处理和执行路径。
+
+### 2026-10-16 src/flagsparse/sparse_operations/spmv_coo.py::PreparedCoo.__init__
+- 改了什么：仅 MUSA 对排序后的转置行号使用 `searchsorted` 构造 CSR 行指针。
+- 为什么改（附报错原文）：q4 COO FP32 转置出现 `AssertionError: max error 24 (scale 21.4)`；诊断时行指针末值 4862 而实际 nnz=4930。独立重复计数探针亦复现少计数，不是归约容差问题。
+- 怎么验证的：新增 30 次重复 COO 转置回归，原 q4 转置及 CSR 精度回归通过。
+- 其他后端是否也需要：否。
+
+### 2026-10-16 src/flagsparse/sparse_operations/spmm_coo.py::PreparedCooSpmmRoute.__init__
+- 改了什么：MUSA FP16 的已排序 COO gather 指针也由 `searchsorted` 生成，CUDA 复数仍保持原 `bincount` 路径。
+- 为什么改（附报错原文）：同一 MUSA 计数原语用于该路由；避免把少计数风险留在 SpMM 中。
+- 怎么验证的：q4 SpMM 与 MUSA 混合输入修改回归通过。
+- 其他后端是否也需要：否。
+
+### 2026-10-16 src/flagsparse/sparse_operations/spmv_sell.py::_musa_spmv_sell_kernel/flagsparse_spmv_sell
+- 改了什么：MUSA 使用按行并行的二维 ROWS×SLOTS 布局；实数、整数和复数共享索引逻辑，复数累加显式映射 FP32/FP64。
+- 为什么改（附报错原文）：旧 SELL 性能低；新路由最初遗漏复数累加类型，回归报 `KeyError: torch.complex64` / `torch.complex128`，现已修正。
+- 怎么验证的：部分 slice、空行、padding、FP64/complex128 回归通过；上述 50 条 Python 和 40 条 C API 定向记录通过精度。
+- 其他后端是否也需要：否；其他后端内核和配置保持不变。
+
+### 2026-10-16 capi/flagsparse_codegen/spmv_sell.py / capi/src/ops/spmv.cpp::MUSA SELL
+- 改了什么：MUSA 专用薄包装导出新的共享二维 SELL kernel，按 32 行/program、4 slots、4 warps 启动；非 MUSA 保留原包装和网格。
+- 为什么改（附报错原文）：无报错；复用经过 Python 回归的实现降低旧串行 SELL 开销。
+- 怎么验证的：重新构建确认无待编译项，C API SpMV 精度族通过，40 条 SELL 定向记录全部精度通过。
+- 其他后端是否也需要：否。
+
+### 2026-10-16 capi/src/ops/spvv.cpp::run / capi/ctest/accuracy/test_spvv.cpp
+- 改了什么：MUSA 默认流主机结果依赖有序同步 D2H，省去重复全设备同步；非默认流和其他后端仍显式同步。增加 MUSA 默认流/非默认流、复数输入反复变更的主机结果检查。
+- 为什么改（附报错原文）：无报错；重复同步影响小向量耗时。
+- 怎么验证的：40 次双流复数结果检查及 C API SpVV 精度族通过；`results_musa_opt_20261015_spvv_sync/` 原 10 矩阵目录口径下的向量 fixture 定向约 1.202x，完整验收仍以新 split 为准。
+- 其他后端是否也需要：否。
+
+### 2026-10-16 tests/pytest/test_musa_sparse_routes.py::补充回归
+- 改了什么：增加重复 COO 转置、大整数跨块、实数×复数的跨块/输入变更/FP64/部分 tile，以及直接和间接 FP16 gather 非连续输出用例。
+- 为什么改（附报错原文）：覆盖本轮预处理及启动配置变更的真实失败和边界条件；不放宽原容差。
+- 怎么验证的：扩大 GPU 回归见本轮状态与后续最终验证记录。
+- 其他后端是否也需要：否；文件显式限定 MUSA。
+
+### 2026-10-16 tests/pytest/test_spmv_csr_accuracy.py::test_spmv_csr_empty_dtype_ops
+- 改了什么：仅 MUSA 复数结果改为对 `view_as_real(actual)` 执行原零值断言。
+- 为什么改（附报错原文）：原检查调用 MUSA 不支持的复数 `count_nonzero`，报 `RuntimeError: SetMUTensorDType Unsupported tensor dtype: ComplexFloat` / `ComplexDouble`。
+- 怎么验证的：原测试覆盖的所有 MUSA 空矩阵/数据类型/转置组合通过；仍断言非零元素数严格为 0，未跳过测试或改变精度标准。
+- 其他后端是否也需要：否；其他后端检查保持原样。
+
+### 2026-10-16 最终启动前验证与阶段性完整复测
+
+- 最终 Python 回归：`561 passed, 1659 skipped, 23 deselected`，15.82 秒；日志 `results_musa_opt_20261016_validation.log`。包含后来补充的直接/间接 FP16 gather 非连续输出检查。
+- C API 交付相关精度族：`accuracy.axpby/spmv/spmm/spvv/spgemm/sddmm/gather/scatter`，8/8 passed，44.97 秒。未把非交付 SpSV/SpSM 纳入本轮验收。
+- `cmake --build capi/build --parallel 8` 确认 `ninja: no work to do.`；`git diff --check` 通过。
+- 新整轮目录：`results_musa_split_65_20261016_opt`，日志 `results_musa_split_65_20261016_opt.log`。使用 `setsid`、12 小时外层限时、原 split runner，`--mode normal --benchmark-input tests/data --timeout 3600 --h800-reference`，并固定三种 CPU 线程池为 8。
+- 此整轮用于检查当前阶段代码的 65 项结果，不预先视为所有加速比达标；定向测量中 FP16、COO、SELL 仍低于 0.8x，完整表生成后仍需按每个变体逐项检查。
+
+### 2026-10-16 上述整轮完成后的原始数据复核
+
+`results_musa_split_65_20261016_opt/` 已完成，65 项、0 missing，合并表的精度/性能标签均为 Passed，
+但逐行复核仍有 16 个变体平均加速比低于 0.8x，另有 2 条 C API 原始精度失败，**不能按标签认定完全通过**。
+Python 普通 CSC SpMM 的 `amazon0601 float32 trans n=32` 也有误差比 2.53 的失败，使 runner 返回 1。
+C API 原始文件已保留在该目录的 `capi_raw_snapshot/`。Python CSC 性能族耗时 1212.88 秒；C API 8 个性能族
+合计 1097.73 秒。补基线日志原文：
+
+```text
+--h800-reference (musa-s5000): NoBaseline variants filled from the Python half=26, from the C API time=0, still without a baseline=0 [] (estimates, marked baseline=h800_scaled)
+```
+
+后续整轮显式使用独立的 `--capi-bench-out <新结果目录>/capi`，不再复用共享输出目录。
+
+### 2026-10-16 src/flagsparse/sparse_operations/gather_scatter.py::_triton_scatter_impl
+- 改了什么：MUSA FP16/int8 默认配置使用原生 `index_copy_`，显式 block_size 仍走原 Triton 路径；原生索引提升到 int64 并如实记录执行索引类型。保留原输出分配、清零、reset_output 和空输入行为。
+- 为什么改（附报错原文）：小向量 Triton 启动开销较大；原生 int32 索引实际报 `RuntimeError: index_copy_(): Expected a long tensor for index, but got Int`，不能假定支持。
+- 怎么验证的：`results_musa_opt_20261016_routes_v2/scatter.csv` 8/8 PASS，FP16/int8 对本机 PyTorch 约 0.96x/0.94x；增加非连续输入输出、实时修改、显式调优和非 MUSA 路由隔离回归。后续完整验证见最后记录。
+- 其他后端是否也需要：否；原生路由仅 MUSA 默认配置。
+
+### 2026-10-16 src/flagsparse/sparse_operations/spmm_csc.py::FP16 路由和转置 gather
+- 改了什么：MUSA 默认非转置 FP16 缓存 CSC 到 CSR 的结构/值重排，使用已有混合 SpMM；原始索引、指针、值、存储或版本变化均失效，不缓存输出。MUSA 未指定调优块参数的 FP32/complex64 转置使用行拥有输出的 gather；支持 auto 和其解析后的 spmm_csc_base，保留其他类型和显式块参数路径。索引回退保留路由标志，元数据反映实际块配置。
+- 为什么改（附报错原文）：FP16 每次转 FP32 并原子散射，旧折算均值仅 0.012703x。普通 FP32 转置出现上述误差比 2.53；旧 complex64 转置在 amazon0601 约 1.2 秒/次。
+- 怎么验证的：`results_musa_opt_20261016_csc_integrated_v2/` FP16 原 10 矩阵全 PASS，折算均值 3.3125x；`results_musa_opt_20261016_routes_v4/csc_trans.csv` 普通 FP32/complex64、trans/conj、原 10 矩阵共 40 条 PASS。amazon0601 FP32 约 65.82 ms 到 0.917 ms，complex64 约 1233 ms 到 13.32 ms，均为同脚本本身耗时，不是新的厂商基线。
+- 其他后端是否也需要：否；新增选择条件显式限定 MUSA，其他后端保持原实现。
+
+### 2026-10-16 src/flagsparse/sparse_operations/mixed_spmx.py::_musa_csr_spmv/_musa_row_tile
+- 改了什么：MUSA 网格使用整数上取整，去掉复数路径未用网格；超短实数/整数行采用 256 行、2 slots，大规模中短行采用 128 行、8 slots，小规模中短行仍为 64 行。
+- 为什么改（附报错原文）：无异常；减少主机调用开销和超短行 program 数量。
+- 怎么验证的：`results_musa_opt_20261016_wide_rows_v1/measurements.json` 配置探针保留首尾原配置作对照；roadNet-TX FP16/int8 约快 10%～15%。原有完整精度标准不变，新增实时存储替换回归。整轮验收仍以新 split 为准。
+- 其他后端是否也需要：否；仅修改 MUSA 专用 helper。
+
+### 2026-10-16 src/flagsparse/sparse_operations/spmv_sell.py::MUSA 分发与计划
+- 改了什么：MUSA 提前分发，省去通用路径未用的网格/环境变量处理；对 padding 超过有效非零元 2 倍的实数/整数 SELL 压缩为 CSR。版本感知计划复用稀疏校验和连续化结果，RHS 与输出仍每次检查；validate=False 计划升级到 True 时重新校验，输入修改后失效。
+- 为什么改（附报错原文）：无异常；ASIC 和 filter3D 的 SELL padding 分别约 3.98 倍、2.48 倍，读取无效槽开销大；重复包装校验影响短 kernel。
+- 怎么验证的：原 10 矩阵 50 条精度 PASS，包含非交付 FP16 到 FP32；`results_musa_opt_20261016_routes_v4/sell.csv` 保留全部原始时间（包括 wave FP16 的较慢单次记录），不删慢行。新增高 padding、部分 slice、指针/列/值修改、推理张量、非连续 RHS/out、校验升级和非法索引回归。
+- 其他后端是否也需要：否；其他后端的校验和计算分支保持原样。
+
+### 2026-10-16 capi/flagsparse_codegen/sparse_gather.py::sparse_gather_spmv_f32
+- 改了什么：复数各 lane 的累加仍为 FP32，仅最终跨 lane 归约提升到 FP64，再转回 FP32 执行 alpha/beta。
+- 为什么改（附报错原文）：ASIC 第 405878 行的 3 个乘积包含小项和约正负 74 的抵消；原 FP32 归约丢小项，严格误差比 1.363375。CPU 与 GPU 探针均复现，未修改容差。
+- 怎么验证的：`results_musa_opt_20261016_precision_v1/measurements.json`；加宽最后归约后 ASIC 该变体整体严格误差比约 0.0495。C API 新增双分量抵消回归，精度族通过。
+- 其他后端是否也需要：否；该模块由 MUSA 专用 sparse_gather 分支使用。
+
+### 2026-10-16 capi/src/core/sparse_gather.hpp::launch_sparse_gather
+- 改了什么：间接实数 SpMV 平均行长不足 12 时保留 scatter，较长行采用确定性 gather。
+- 为什么改（附报错原文）：cfd2 CSC FP32 的原子加法顺序导致原始严格精度失败；较长行可摊薄间接读取开销。
+- 怎么验证的：`results_musa_opt_20261016_capi_precision_v2/` 原 10 矩阵，CSC FP32 10 条可比且精度通过，muSPARSE 平均约 0.974x；复数 CSR 共轭转置 10 条精度通过，muSPARSE 平均约 0.860x。
+- 其他后端是否也需要：否；调用方只在 MUSA 选择此执行器。
+
+### 2026-10-16 capi/src/ops/gather_scatter.cpp::gather_max_programs
+- 改了什么：仅 MUSA 使用按设备区分的 thread_local program 上限缓存，避免每次查询硬件 SM/warp/线程属性。
+- 为什么改（附报错原文）：无异常；小 Gather 的主机属性查询占比高。
+- 怎么验证的：上述 C API 定向目录中 FP32/FP64/complex64/complex128 各 10 条精度通过，对 muSPARSE 平均约 0.970x/0.973x/0.966x/0.971x。
+- 其他后端是否也需要：否；其他后端仍保留原查询行为。
+
+### 2026-10-16 capi/ctest/accuracy/test_spmv.cpp::MusaComplexGatherCancellation
+- 改了什么：MUSA 专用宏下增加来自 ASIC 的三项抵消回归，使用原有 complex64 严格容差，检查两个分量。
+- 为什么改（附报错原文）：覆盖上文精度缺陷，防止只通过总体状态标签而漏掉原始失败。
+- 怎么验证的：重新构建并运行 accuracy.spmv/gather/scatter，3/3 passed；后续扩大验证见最后记录。
+- 其他后端是否也需要：否；新测试显式限定 MUSA。
+
+### 2026-10-16 定向调优中未接入的实验
+
+- `results_musa_opt_20261016_sorted_ell_v1/`：按行长重排的连续布局有局部收益，但多矩阵退化，未接入。
+- `results_musa_opt_20261016_coo_cache_pair_v1/`：同进程交替配对表明，拆分 COO 拓扑/值缓存没有稳定收益，部分短行慢约 1%～10%；仅撤销本次实验，保留此前版本感知缓存。
+- `results_musa_opt_20261016_loop_v1/`、`results_musa_opt_20261016_load_v1/`：循环展开、软件流水和读取缓存提示没有可靠整体收益，未接入。
+- `results_musa_opt_20261016_sell_complex_compact_v1/`：复数 SELL 压缩在 filter3D 有收益，但 ASIC 退化，10 矩阵平均约 0.744x；未接入。稀疏校验计划也仅在 FP16/BF16/FP32/int8 使用，复数保持原校验与 kernel。
+- 当前验证过的扩大 Python 回归为 845 passed、1658 skipped，另增 6 项原生 Scatter 调优/后端隔离回归通过。仍未达到每个变体 >0.8x；任何定向均值不能替代新的完整 split 结果。
+
+### 2026-10-16 本次源码固定后的验证与下一轮完整复测
+
+- Python 扩大回归：851 passed、1658 skipped，18.69 秒；`results_musa_opt_20261016_routes_v4/accuracy.xml`。包含 CSR/CSC/SELL、q4、Gather/Scatter 和 MUSA 路由隔离回归；没有降低容差或新增跳过规则。
+- C API 交付相关精度族：8/8 passed，39.42 秒；`results_musa_opt_20261016_routes_v4/capi_accuracy.log`。构建确认 `ninja: no work to do.`，`git diff --check` 通过。
+- `results_musa_opt_20261016_spmv_final_v1/`：CSR 5 项、COO 3 项各原 10 矩阵，共 80 条 PASS。CSR FP16/FP16到FP32/FP32乘complex64/int8到FP32/int8到int32 的折算均值分别为 0.810x/0.825x/0.842x/0.887x/0.876x；COO 对应三项仍为 0.679x/0.634x/0.691x，未达标。这些 H800 折算仍是估算。
+- `results_musa_opt_20261016_routes_v4/scatter_final.csv`：默认 20 次 warmup、200 次迭代，FP16/int8 × 4 个原向量规模，8/8 PASS；对本机 PyTorch 各行约 0.92x～0.97x，不能与厂商或 H800 折算基线混称。
+- SELL 最新定向数据仍有低于 0.8x 的类型，所有慢行原样保留。因此下一轮是阶段性完整复测，**不是全部 65 项达标声明**。
+- `tests/data` 的原 10 个文件大小再次核对一致，torch 2.7.1、Triton 3.6.0、MTT S5000、驱动 3.3.5-server，HEAD `4d5ab61`；导入当前 `src/`，`mthreads musa None`。
+
+新目录 `results_musa_split_65_20261016_opt2/`，保留本地源码补丁、未跟踪回归测试补丁和代码 SHA256。
+命令如下；是否完成及是否达标必须检查该目录的新结果，不能沿用旧表：
+
+```bash
+setsid env PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa \
+  OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 \
+  timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
+  --mode normal --benchmark-input tests/data --timeout 3600 --h800-reference \
+  --results-dir results_musa_split_65_20261016_opt2 \
+  --capi-bench-out results_musa_split_65_20261016_opt2/capi \
+  > results_musa_split_65_20261016_opt2.log 2>&1 < /dev/null &
+```
+
+### 2026-10-17 上一轮结果与本轮优化范围
+
+`results_musa_split_65_20261016_opt2/` 已完成，65 项、0 missing，合并精度/性能标签均为 Passed，
+但实际仍有 8 个变体均值小于 0.8x：COO FP16到FP32/FP16/int8到int32、SELL FP16/int8到int32/complex64、
+AXPBY FP16、SpGEMM FP32。继续按用户要求只优化 MUSA 后端；原始 10 矩阵、容差、迭代次数和基线优先级不变。
+下述定向数据不是完整验收结论，尤其不能把 H800 折算值当成本机厂商实测。
+
+### 2026-10-17 src/flagsparse/sparse_operations/vector_ops.py::_musa_axpby
+- 改了什么：MUSA FP16/BF16 的中小向量用单个融合 kernel 完成缩放与稀疏更新，缓存有界、版本感知的索引反向映射；值和输出每次重新读取。大向量和其他后端保留原路由。
+- 为什么改（附报错原文）：无报错；旧轮 AXPBY FP16 均值为 0.723508x，分开的缩放/更新启动开销较高。
+- 怎么验证的：原 4 个向量规模全部 PASS，对本机 PyTorch 平均 1.221323x；原始数据 `results_musa_opt_20261017_layout_v1/axpby_public.csv`。新增 FP16/BF16、索引宽度、输入变更、推理张量、空输入和后端隔离回归，均纳入本轮扩大验证。
+- 其他后端是否也需要：否。
+
+### 2026-10-17 capi/flagsparse_codegen/spgemm_csr.py::musa_spgemm_scan_*
+- 改了什么：增加 MUSA 分块行计数前缀和、块级前缀和及偏移回填 kernel，同时归约总 nnz、最大行 nnz 与溢出标志。
+- 为什么改（附报错原文）：无报错；SpGEMM compute 阶段原先回传每行 counts/overflow 并在主机执行前缀和，旧轮均值为 0.715145x。
+- 怎么验证的：MUSA C API 重新构建，accuracy.spgemm 通过，含下述跨块边界回归；原 10 矩阵定向记录 `results_musa_opt_20261017_layout_v1/capi_spgemm/`，6 个规则内可比矩阵对本机 muSPARSE 平均 1.076070x。非方阵、输出预算与厂商精度状态按原规则保留。
+- 其他后端是否也需要：否；新 kernel 只由 MUSA 分支调用。
+
+### 2026-10-17 capi/src/ops/spgemm.cpp::musa_build_indptr/compute/copy
+- 改了什么：MUSA compute 在设备上构建 indptr，只回传 3 个 int64 元数据；copy 阶段仍按原排序流程回传所需行指针。不缓存输出计数，每次重新执行 count 和 scan。其他后端的 counts/overflow 回传与主机前缀和保持原样。
+- 为什么改（附报错原文）：无报错；减少 compute 阶段逐行回传及主机扫描成本。
+- 怎么验证的：同上 SpGEMM 原 10 矩阵定向性能和 C API 精度测试；完整 split 仍需重新验收。
+- 其他后端是否也需要：否。
+
+### 2026-10-17 capi/ctest/accuracy/test_spgemm.cpp::MusaMultiBlockRowPrefix
+- 改了什么：增加 MUSA 专用 1024、1025、3079 行的 FP32/FP64 用例，检查 scan 块边界、部分末块和完整结果。
+- 为什么改（附报错原文）：无报错；原有小规模精度用例不能覆盖新增前缀和的跨块路径。
+- 怎么验证的：accuracy.spgemm 通过，未更改原有精度判定。
+- 其他后端是否也需要：否；其他后端不运行新增 MUSA 专用用例。
+
+### 2026-10-17 src/flagsparse/sparse_operations/_musa_spmv_launch.py::launch
+- 改了什么：新增最多 64 项的编译启动器 LRU，只缓存 CompiledKernel 的公开 launcher，不保留输入张量或输出。key 包含 kernel、网格、数据类型、设备、地址对齐、非零指针别名、运行时标量、constexpr 和 kernel.debug；每次执行仍解析当前流并运行 Triton profiling hooks。存在 pre-run hook、运行时 debug、instrumentation 或自定义编译阶段 hook 时回退正常 JIT。
+- 为什么改（附报错原文）：无报错；MUSA 短行 SpMV 受 JIT 参数绑定及特化处理的主机开销限制，公开 API 配对测量确认启动器复用有收益。
+- 怎么验证的：新增 key 隔离、LRU 淘汰、调试/插桩回退、未对齐连续输入/输出、输出独立性、实时 RHS、非默认流及非 MUSA 路由隔离回归；本轮扩大回归全部通过。
+- 其他后端是否也需要：否；模块导入不初始化 MUSA 或导入 Triton knobs，只有 MUSA 路由调用 launch。
+
+### 2026-10-17 src/flagsparse/sparse_operations/mixed_spmx.py::_musa_csr_spmv/_musa_row_tile
+- 改了什么：MUSA 实数/整数短行 CSR 和 NNZ 路由复用上述启动器；按平均行长、行数与整数累加选择行块和 slots。普通实数乘复数行 kernel 保持原启动方式。
+- 为什么改（附报错原文）：无报错；旧轮 COO 三个半精度/整数变体低于 0.8x，格式转换缓存后的重复 JIT 启动仍占比较高。
+- 怎么验证的：最终公开 API 定向复测 `results_musa_opt_20261017_dispatch_v2/coo_public_final.csv`，原 10 矩阵共 30 条精度 PASS；FP16到FP32/FP16/int8到int32 的 H800 折算均值分别为 0.821573x/0.897036x/0.902609x。首项裕量较小，不能以定向数据代替完整 split。
+- 其他后端是否也需要：否。
+
+### 2026-10-17 src/flagsparse/sparse_operations/spmv_sell.py::MUSA kernel 启动
+- 改了什么：MUSA SELL 复用上述编译启动器；保留已有版本感知计划、高 padding 实数压缩及 dtype/规模分块策略。
+- 为什么改（附报错原文）：无报错；旧轮 SELL FP16/int8到int32/complex64 均值为 0.735946x/0.718123x/0.787854x，短 kernel 的主机启动成本占比较高。
+- 怎么验证的：`results_musa_opt_20261017_dispatch_v2/sell_public.csv` 原 10 矩阵共 30 条精度 PASS；三项 H800 折算均值为 0.969267x/0.961707x/0.893333x。最终重复测量 `sell_public_final.csv` 仍为 30 条 PASS，均值为 0.981482x/0.984545x/0.911817x。
+- 其他后端是否也需要：否。
+
+### 2026-10-17 tests/pytest/test_musa_sparse_routes.py::AXPBY 与启动缓存回归
+- 改了什么：新增上述 AXPBY、启动缓存特化/回退、公开 COO/SELL 缓冲区及流切换、后端路由隔离用例；保留之前所有回归。
+- 为什么改（附报错原文）：无报错；优化不能依赖输入地址不变、复用旧输出或忽略运行时调试设置。
+- 怎么验证的：最终扩大 Python 回归 `879 passed, 1658 skipped`，18.79 秒，`results_musa_opt_20261017_dispatch_v2/accuracy_final.xml`；跳过均沿用已有适用性规则，未放宽容差。C API 交付相关精度族 8/8 passed，39.89 秒，`capi_accuracy.log`；`git diff --check` 通过。
+- 其他后端是否也需要：否；此回归文件显式要求 MUSA。
+
+### 2026-10-17 未接入的实验
+
+- MUSA mixed COO 块内 segmented atomic 实验没有公开 API 的整体收益，新增实验 kernel 和 wrapper 已撤回；不改变当前 CSR 缓存路线。
+- 裸 kernel 启动探针低估了公开 API 的主机开销，最终采用同一公开 API 的原规模配对测量与仓库原 benchmark 校验收益。
+- SELL 的额外 tile 实验没有稳定整体收益，保留原配置；性能与精度原始记录见 `results_musa_opt_20261017_layout_v1/` 和 `results_musa_opt_20261017_dispatch_v2/`。
+
+### 2026-10-17 冻结源码与完整复测
+
+- 新结果目录 `results_musa_split_65_20261017_opt3/`，不复用旧轮；包含源码补丁、未跟踪 helper/回归测试补丁和 SHA256。
+- 源码导入路径 `/root/gcx/FlagSparse/src/flagsparse/__init__.py`；HEAD `4d5ab61`；torch 2.7.1、torch_musa 2.7.1+5ee0a64、Triton 3.6.0、MTT S5000，驱动 3.3.5-server，mcc 5.1.0，torch.version.musa=40305。
+- 再次核对 `tests/data` 原 10 个矩阵名称与大小一致；固定三个 CPU 线程池为 8。不跳过 C API 构建，不改变原 runner 的规模、容差、迭代次数或基线优先级。
+- 这是本轮优化后的完整验收启动记录，不是已完成或全部达标声明。必须等新整轮结束后逐变体检查实际平均加速比及原始精度记录。
+
+```bash
+setsid env PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa \
+  OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 \
+  timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
+  --mode normal --benchmark-input tests/data --timeout 3600 --h800-reference \
+  --results-dir results_musa_split_65_20261017_opt3 \
+  --capi-bench-out results_musa_split_65_20261017_opt3/capi \
+  > results_musa_split_65_20261017_opt3.log 2>&1 < /dev/null &
+```
+
+### 2026-10-18 上游同步后的复测与优化口径
+
+> 此节及下方原生实现记录为已撤回的实验历史，不代表当前全 Triton 实现。
+> 用户随后明确禁止原生 MUSA 内核；原生定向结果与 opt4 均不用于全 Triton 验收。
+
+- 基准提交为 `3cea4bc3615655dabcf676850de7d770d7da795a`。此前优化已被上游吸收；旧 stash、完整轮结果和打包文件均保留。本轮开始先重建 C API，恢复源码与二进制一致。
+- 最近完成的完整轮仍是 `results_musa_split_65_20261017_opt3/`，65/65 精度 Passed、0 missing，但下表 7 个变体未过 0.8x。这里继续按用户要求优化**每个变体各自的矩阵平均值**，不是整个交付集的平均值，也不要求每个矩阵单独大于 0.8x。
+- 性能输入仍为 `tests/data` 的原 10 个矩阵，名称与字节数再次核对一致。固定三个 CPU 线程池为 8，GPU 测量串行；未改 runner、测试规模、迭代次数、容差、跳过规则或基线优先级。
+- 最终源码重复测量如下。COO 三项取原 q4 benchmark（5 warmup / 20 iters）的公开 API 耗时，对照旧完整轮同变体同矩阵的 `h800_scaled_ms`；**属于 H800 带宽折算估算，不是本机厂商实测**。Gather/Scatter 取原 C API benchmark（10 warmup / 100 iters）的本机 muSPARSE 基线。
+
+| 变体 | 旧完整轮 | 最终定向复测 | 矩阵精度 | 基线 |
+|---|---:|---:|---|---|
+| `spmv_coo_f16f32_int_non` | 0.726342x | 0.884297x | 10/10 PASS | H800 带宽折算 |
+| `spmv_coo_f16_int_non` | 0.790823x | 0.936304x | 10/10 PASS | H800 带宽折算 |
+| `spmv_coo_i8i32_int_non` | 0.772409x | 0.944477x | 10/10 PASS | H800 带宽折算 |
+| `gather_f32_int` | 0.794171x | 0.987362x | 10/10 pass | 本机 muSPARSE |
+| `scatter_f64_int` | 0.794720x | 0.996308x | 10/10 pass | 本机 muSPARSE |
+| `scatter_c32_int` | 0.791277x | 0.995981x | 10/10 pass | 本机 muSPARSE |
+| `scatter_c64_int` | 0.795244x | 0.997719x | 10/10 pass | 本机 muSPARSE |
+
+原始数据：`results_musa_opt_20261018_followup_v1/coo_native_final.csv`、`capi_native_final/*_benchmark.json`；COO 全部 6 个 q4 变体共 60 条均 PASS。早期探针和集成中间轮完整保留，不能选取最好一次替代最终数据。
+
+### 2026-10-18 src/flagsparse/sparse_operations/_musa_spmv_native.py::try_spmv/_load
+- 改了什么：增加可选 MUSA 原生行子组 SpMV，FP16 在 FP32 中累加，int8 按请求在 int32/FP32 中累加；只在实测过的 mp_31 架构使用。按平均行长选择 2/8 lanes，平均行长 (3,4] 的不规则短行保留原 NNZ 路线，不按矩阵文件名选路。每次分配或使用调用方输出，实时读取 RHS；只缓存编译代码，不缓存结果。首次通过 mcc 编译到 Triton 原子代码缓存；编译器缺失或构建失败回退 Triton。每次解析当前流，原生包装保留/恢复当前设备；调试、插桩或启动钩子存在时回退正常 Triton 路径。
+- 为什么改（附报错原文）：无算子错误；COO FP16 到 FP32 在旧完整轮和拉取后的原规模复测中持续约 0.73x，单纯调整 tile/启动器不足以达标。原生行子组减少动态行块归约及启动开销，配对测量确认有收益。集成时曾把 Triton 空 HookChain 误判为存在钩子，现按其 calls 判断；中间轮原始记录保留。
+- 怎么验证的：原 10 矩阵公开 API 配对探针、原 q4 benchmark 两次正式入口复测；最终三项均值见上表。新增回归明确拒绝意外回退，并检查部分块、空行、非连续输入输出、值/索引/存储修改、推理张量及调试/钩子/编译器不可用回退；原非默认流回归同样通过。
+- 其他后端是否也需要：否；模块仅在 MUSA COO 分支惰性导入。
+
+### 2026-10-18 src/flagsparse/sparse_operations/mixed_spmx.py::spmv_coo_mixed
+- 改了什么：仅 MUSA COO 路由先尝试上述原生内核，不适用时继续调用原 `_musa_csr_spmv`；保留原有版本/存储感知 COO 转 CSR 缓存、输出和计时语义。CSR、CSC、SpMM 和非 MUSA 路由不变。
+- 为什么改（附报错原文）：无报错；接入经实测确认有收益的 MUSA COO 实现。
+- 怎么验证的：最终 COO 60 条 q4 精度全部 PASS；扩大 Python 回归 1199 passed、1678 skipped（沿用原适用性规则，20.12 秒），日志和 JUnit 为 `native_accuracy_final.log/.xml`。
+- 其他后端是否也需要：否。
+
+### 2026-10-18 capi/src/adaptor/backend/musa/gather_scatter.mu 与 gather_scatter.hpp
+- 改了什么：新增 MUSA 原生按索引逐元素复制，支持 1/2/4/8/16 字节值和 int32/int64 索引；按原始位模式复制实数/复数，无预处理或结果缓存。每次使用 handle 指定的流，网格步进覆盖全部输入。
+- 为什么改（附报错原文）：无报错；原 Scatter 三项约 0.79x，短向量重复 JIT 调度的主机开销较高。
+- 怎么验证的：原 C API Gather/Scatter 精度族通过；新增逐字节回归包含特殊浮点位模式、未写位置保留、输入/索引更新、部分块、两种索引宽度、默认/非默认流。原 10 矩阵两轮定向测量 40 条各自精度通过，最终均值见上表。
+- 其他后端是否也需要：否。
+
+### 2026-10-18 capi/src/adaptor/CMakeLists.txt::MUSA 原生复制构建
+- 改了什么：只在 MUSA 分支且找到 mcc 时生成 mp_31 原生复制目标并链接到库；未找到 mcc 或其他架构继续使用原 Triton 路径，其他后端构建不变。
+- 为什么改（附报错原文）：接入上述原生内核。初版构建规则曾报 `missing and no known rule to make it`，已增加明确 custom target 依赖；原始构建日志保留。
+- 怎么验证的：C API 重新构建通过，基线仍为 `/usr/local/musa/lib/libmusparse.so`；8 个交付相关精度测试族全部通过。
+- 其他后端是否也需要：否。
+
+### 2026-10-18 capi/src/ops/gather_scatter.cpp::flagsparseGather/flagsparseScatter
+- 改了什么：在 MUSA 原生目标存在且架构为 31 时调用原生复制；保留原 descriptor 校验、零输入语义和其他后端路径。
+- 为什么改（附报错原文）：无报错；减少短向量重复 JIT 调度开销，保证已有相邻 0.8x 的变体有实测余量。
+- 怎么验证的：原 benchmark 原 10 矩阵，Gather/Scatter 四项最终 0.987362x/0.996308x/0.995981x/0.997719x，40 条精度全部 pass；C API 精度族和新增流回归通过。
+- 其他后端是否也需要：否。
+
+### 2026-10-18 tests/pytest/test_musa_sparse_routes.py::原生 COO 回归
+- 改了什么：增加原生路径实际执行、不同平均行长、部分块/空行、四种输出组合、输入/存储修改、推理张量和调试/钩子/编译器缺失回退用例；保留所有原用例和精度容差。
+- 为什么改（附报错原文）：无报错；防止原生集成静默回退、复用旧结果或忽略运行时钩子。
+- 怎么验证的：纳入上述扩大 Python 回归，1199 passed、1678 skipped。另跑后端/基线契约检查为 28 passed、1 failed；失败原文 `AssertionError: mthreads: no fallback reason on a CUDA box`，对应测试明确假定 CUDA 机器且 MUSA 插件缺失，当前是真实 MUSA 环境。未修改测试或后端探测以让它通过，原日志 `native_backend_contract.log` 保留。
+- 其他后端是否也需要：否；本文件显式要求 MUSA。
+
+### 2026-10-18 capi/ctest/accuracy/test_scatter.cpp::MusaLiveBitCopiesOnDefaultAndNondefaultStreams
+- 改了什么：仅 MUSA 增加 Gather 到 Scatter 的原始位复制回归，覆盖 6 种值类型、两种索引宽度、默认/非默认流和多次修改；保留原测试。
+- 为什么改（附报错原文）：无算子错误；原有测试不能覆盖原生复制的非默认流、输入实时性及特殊浮点位模式。新增测试初版误用辅助函数名，已修正，构建日志保留。
+- 怎么验证的：C API 8 个交付相关精度族全部通过（29.30 秒），加上 Gather/Scatter benchmark 共 10/10 passed（42.15 秒），见 `capi_native_final.log`。
+- 其他后端是否也需要：否。
+
+### 2026-10-18 冻结与新完整轮
+
+- 上述定向结果不覆盖旧完整轮，也不代表 65 项已经全部达标。新完整轮使用 `results_musa_split_65_20261018_opt4/`；该目录保存冻结补丁、源码 SHA256 与运行信息。
+- 不跳过 C API 构建，沿用原 runner 和原 10 矩阵。命令如下；实际进程和启动时间以结果目录内记录及日志为准。
+
+```bash
+setsid env PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa \
+  OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 \
+  timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
+  --mode normal --benchmark-input tests/data --timeout 3600 --h800-reference \
+  --results-dir results_musa_split_65_20261018_opt4 \
+  --capi-bench-out results_musa_split_65_20261018_opt4/capi \
+  > results_musa_split_65_20261018_opt4.log 2>&1 < /dev/null &
+```
+
+### 2026-10-18 撤回原生 MUSA 实现，恢复全 Triton 约束
+
+- 用户要求：计算内核必须保持全 Triton，允许使用 TLE，不允许原生 MUSA 实现。
+- opt4 在 C API SDDMM 性能阶段停止；进程组 1776109 已退出，原日志、结果和冻结补丁全部保留。该轮包含原生实现，不能计作全 Triton 结果。
+- 移除 `_musa_spmv_native.py`、`gather_scatter.mu/.hpp` 及 Python/CMake/C API 原生接入；可恢复副本见 `results_musa_opt_20261018_triton_v1/withdrawn_native/`。COO 混合精度 SpMV 恢复原 Triton 路径。
+- 同时移除此前 MUSA Python FP16 Gather 和 FP16/int8 Scatter 的 PyTorch 原生索引分支，改为支持输入/索引/输出 stride 的 `@triton.jit` 索引复制和清零 kernel，保留其他后端的原路由。
+- 将原生专属回归调整为断言 Triton 路由，并禁止 `index_select`/`gather`/`index_copy_` 调用；保留输入修改、非连续输出和流的精度覆盖。
+- C API 已重新构建；构建规则和库符号核对不再包含原生复制目标。8 个交付精度族全部通过（38.07 秒），日志 `results_musa_opt_20261018_triton_v1/capi_accuracy.log`。
+- Python 路由及 Gather/Scatter 精度回归 188 passed、2 skipped；扩大 SpMV/SpMM/Gather/Scatter 回归 1088 passed、1658 skipped（20.12 秒），日志/JUnit 为 `accuracy_final.log/.xml`。初轮 4 个 CPU mock 因未隔离 Triton 清零函数而失败，修正测试隔离后通过；初轮日志保留。最终源码精度复测记录另行追加。
+- 原 10 矩阵纯 Triton C API 定向性能 `capi_before_v2/*_benchmark.json`：Gather FP32 0.966756x，Scatter FP64/complex64/complex128 分别 0.985301x/0.979894x/0.982658x，40 条精度全部 pass；本机 muSPARSE 对照，未修改 benchmark。首次定向运行未提前创建输出子目录，CTest 通过但未产生 JSON，不用作性能证据；重跑创建目录后的数据完整保留。
+- COO 的归约布局/warp 配置探针未确认稳定收益；未将其集成入生产路径。临时的可调 launch 参数也撤回，保持此前上游 Triton launcher 不变。TLE 安装及 MUSA 特性白名单已检查，此轮未启用未经验证的 TLE kernel。
+- 尚未重新完成全 Triton 的完整 65 项性能验收；COO 等未达标项仍需优化，不能沿用含原生实现的数字声明通过。
+- 最终源码复测为 **1087 passed、1658 skipped**（18.85 秒），见 `accuracy_restored.log/.xml`；相比上面的临时探针版本少 1 个仅测试可调 launcher 编译参数的用例，因为对应生产改动已撤回，并非减少算子精度覆盖。原有 Triton launcher 与上游一致。当前未启动新的完整后台轮。
+
+### 2026-10-18 src/flagsparse/sparse_operations/gather_scatter.py::MUSA Triton 索引复制
+- 改了什么：MUSA 的 Gather/Scatter 统一调用 `@triton.jit` 索引复制，清零也使用 Triton；显式传入值/索引/输出 stride，并通过实部视图覆盖复数。移除原有 MUSA FP16 `index_select` 和 FP16/int8 `index_copy_` 分支。
+- 为什么改（附报错原文）：无算子报错；落实用户的全 Triton 约束，并保留原生分支此前提供的非连续输入/输出语义。
+- 怎么验证的：上述扩大 Python 回归；新增测试禁止 PyTorch 原生索引调用，并验证公开 API、实时输入、非连续输出、int32/int64 索引。
+- 其他后端是否也需要：否；新路径严格限于 MUSA，厂商性能基线不改。
+
+### 2026-10-18 全 Triton 新完整轮后台启动
+
+- 按用户要求于 2026-10-18 00:10:30 UTC 用 setsid 启动完整 65 项精度与性能复测。新目录为 `results_musa_split_65_20261018_triton1/`，日志为 `results_musa_split_65_20261018_triton1.log`；不复用含原生实现的 opt4。
+- 启动后核验 timeout PID/PGID/SID 均为 1914848，PPID=1；split runner PID=1914850，Python 阶段 PID=1914851，日志已进入 delivery-only 测试。此记录更新此前“当前未启动新的完整后台轮”的状态，不代表整轮已完成。
+- HEAD `3cea4bc3615655dabcf676850de7d770d7da795a`；源码导入和 `mthreads musa None` 指纹核对通过；torch 2.7.1、torch_musa 2.7.1+5ee0a64、Triton 3.6.0、MTT S5000、驱动 3.3.5-server。
+- 性能输入仍为 `tests/data` 的原 10 矩阵，名称和字节数一致；固定 OMP/MKL/OPENBLAS 线程池为 8，CTest 串行，启动前设备空闲。没有修改实现、runner、测试规模、容差、迭代次数或基线优先级。
+- 沿用 `--mode normal --benchmark-input tests/data --timeout 3600 --h800-reference`，不跳过 C API 构建，显式 `--capi-bench-out results_musa_split_65_20261018_triton1/capi`；12 小时仅为外层限时。完整命令、PID 与源码/矩阵指纹见本轮 `RUN_INFO.md`、`runner.pid`、`source.patch` 和 `input_source.sha256`。
+- 完成后检查 `summary_split.json` 和 `tools/delivery_table.py --show-baseline`；H800 折算仍属估算。尚不能声明 65 项全部精度通过或每项平均加速比 >0.8x。
+
+### 2026-10-19 全 Triton 完整轮结果及继续优化
+
+- 最近完成轮为 `results_musa_split_65_20261019_triton2/`：65/65 精度 Passed、65/65 性能测试 Passed、0 missing；按每个变体的矩阵平均加速比检查为 64/65 超过 0.8x，剩余 `spmv_coo_f16f32_int_non` 为 0.760595x。该变体采用 H800 带宽折算估算，不能当作本机 muSPARSE 实测。
+- 本轮继续使用 `tests/data` 原 10 个矩阵、原 q4 benchmark 的 5 warmup / 20 iters 和原 split runner；未改规模、容差、基线或迭代次数。旧轮、归档和全部探索数据保留。
+
+### 2026-10-19 src/flagsparse/sparse_operations/mixed_spmx.py::MUSA FP16 到 FP32 COO SpMV
+- 改了什么：在 MUSA FP16 到 FP32 COO 路由新增 Triton 固定最大行长循环，避免每个 program 动态归约循环上界；仅在最大行长不超过 128 且平均行长大于 4 时启用。其他形状沿用原 NNZ/动态行块 Triton kernel。版本/存储感知 COO 缓存附带绑定的 Triton 启动特化，校验 RHS 类型、设备、对齐和指针别名，每次读取当前 RHS/输出地址及当前流，不缓存输出。COO SpMM 保留原三项缓存接口。
+- 为什么改（附报错原文）：无算子报错；上一完整轮该变体为 0.760595x，未达到用户要求。探针定位到动态行长归约和重复启动特化开销；行长排序、额外布局/warp 探针没有稳定整体收益，未接入生产路径。
+- 怎么验证的：原 q4 公开 API 六个 COO 变体共 60 条精度全部 PASS；目标变体两次定向十矩阵平均为 0.810783x、0.806586x（同一旧轮 H800 折算分母），记录 `results_musa_opt_20261019_triton_v3/coo_bound_public.csv` 和 `coo_bound_repeat.csv`。最终回归 194 passed、2 skipped，见 `accuracy_final.log/.xml`。启动器缓存键补齐 RHS dtype 后由完整轮再验收，不能以定向结果声明 65/65 性能达标。
+- 其他后端是否也需要：否；新增调用严格位于 MUSA 分支。`audit_scope.py` 确认共享 kernel 定义、非 MUSA COO 路由及 C API 计算/构建代码与上游一致；非 MUSA 索引复制 CPU mock 对照为 96 passed、1 deselected，不代表其他加速器实机性能验证。
+
+### 2026-10-19 tests/pytest/test_musa_sparse_routes.py::绑定启动器实时性回归
+- 改了什么：增加固定行长、NNZ、短行三条路线与连续/非连续输出的六个用例，覆盖默认/非默认流、RHS 修改与对齐变化、输出独立性、值/索引修改、替换存储及预热后类型校验。
+- 为什么改（附报错原文）：无算子报错；防止绑定启动器复用错误指针、旧结果、旧流或绕过参数校验。
+- 怎么验证的：与 Gather/Scatter 精度回归一起为 194 passed、2 skipped；既有乱序/非连续 COO 和推理张量回归保留并通过。
+- 其他后端是否也需要：否；测试要求实机 MUSA。
+
+### 2026-10-19 全 Triton 第三轮完整复测
+
+- 新目录 `results_musa_split_65_20261019_triton3/`，显式将 C API 原始数据存入该目录下 `capi/`，避免覆盖上一轮原始数据。仍按 setsid 在后台启动，不跳过精度、性能或 C API 构建。源码补丁、SHA256、矩阵指纹和命令保存在结果目录。
+- 此处是待验收记录：完整轮约需 50 分钟，完成后再检查 65 项精度、missing、基线来源和各变体平均加速比；不能提前声明全部达标。

@@ -4,20 +4,21 @@
 import torch
 import triton
 import triton.language as tl
+from ._common import _is_mthreads_runtime
 
 
 @triton.jit
 def _kernel(V, I, P, B, C, M, N, BK, BN, CM, CN,
             COMPLEX: tl.constexpr, R: tl.constexpr, K: tl.constexpr,
-            TILE_N: tl.constexpr):
+            TILE_N: tl.constexpr, ACC: tl.constexpr = tl.float32):
     rows = tl.program_id(0) * R + tl.arange(0, R)
     valid = rows < M
     starts = tl.load(P + rows, valid, other=0)
     ends = tl.load(P + rows + 1, valid, other=0)
     ns = tl.program_id(1) * TILE_N + tl.arange(0, TILE_N)
     ks = tl.arange(0, K)
-    real = tl.zeros((R, TILE_N), tl.float32)
-    imag = tl.zeros((R, TILE_N), tl.float32)
+    real = tl.zeros((R, TILE_N), ACC)
+    imag = tl.zeros((R, TILE_N), ACC)
     for base in range(0, tl.max(ends - starts, 0), K):
         pos = starts[:, None] + base + ks[None, :]
         mask = valid[:, None] & (pos < ends[:, None])
@@ -32,8 +33,8 @@ def _kernel(V, I, P, B, C, M, N, BK, BN, CM, CN,
             real += tl.sum(vr[:, :, None] * br - vi[:, :, None] * bi, 1)
             imag += tl.sum(vr[:, :, None] * bi + vi[:, :, None] * br, 1)
         else:
-            v = tl.load(V + pos, mask, other=0.).to(tl.float32)
-            b = tl.load(B + dense_pos, dense_mask, other=0.).to(tl.float32)
+            v = tl.load(V + pos, mask, other=0.).to(ACC)
+            b = tl.load(B + dense_pos, dense_mask, other=0.).to(ACC)
             real += tl.sum(v[:, :, None] * b, 1)
     out = rows[:, None] * CM + ns[None, :] * CN
     store_mask = valid[:, None] & (ns[None, :] < N)
@@ -53,10 +54,14 @@ def compute(values, cols, ptr, b, out):
     v, dense, target = (torch.view_as_real(t.resolve_conj()) for t in (values, b, out)) if is_complex else (values, b, out)
     mean = values.numel() / max(m, 1)
     batch, lanes = (8, 4) if mean <= 4 else (4, 8)
+    musa = _is_mthreads_runtime()
+    if musa:
+        batch, lanes = 8, 4
+    acc = tl.int32 if musa and values.dtype == torch.int8 and out.dtype == torch.int32 else tl.float32
     tile_n = min(32, triton.next_power_of_2(n))
     _kernel[(triton.cdiv(m, batch), triton.cdiv(n, tile_n))](
         v, cols, ptr, dense, target, m, n, b.stride(0), b.stride(1),
         out.stride(0), out.stride(1), is_complex, batch, lanes, tile_n,
-        num_warps=4, num_stages=1,
+        ACC=acc, num_warps=4, num_stages=1,
     )
     return out

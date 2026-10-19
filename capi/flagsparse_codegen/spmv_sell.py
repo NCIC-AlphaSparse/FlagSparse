@@ -14,6 +14,9 @@ import triton.language as tl  # noqa: E402
 
 from flagsparse.sparse_operations.spmv_sell import _spmv_sell_real_kernel  # noqa: E402
 from flagsparse.sparse_operations.spmv_sell import _spmv_sell_complex_kernel  # noqa: E402
+from flagsparse.sparse_operations.spmv_sell import (  # noqa: E402
+    _musa_spmv_sell_kernel,
+)
 
 
 @triton.jit
@@ -35,4 +38,37 @@ def spmv_sell_i32acc(
     _spmv_sell_real_kernel(
         y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
         SLICE=SLICE, BLOCK_R=BLOCK_R, ACC=tl.int32,
+    )
+
+
+@triton.jit
+def spmv_sell_musa_f32acc(
+    y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
+    SLICE: tl.constexpr, ROWS: tl.constexpr,
+):
+    _musa_spmv_sell_kernel(
+        y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
+        SLICE=SLICE, ROWS=ROWS, SLOTS=4, COMPLEX=False, ACC=tl.float32,
+    )
+
+
+@triton.jit
+def spmv_sell_musa_i32acc(
+    y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
+    SLICE: tl.constexpr, ROWS: tl.constexpr,
+):
+    _musa_spmv_sell_kernel(
+        y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
+        SLICE=SLICE, ROWS=ROWS, SLOTS=4, COMPLEX=False, ACC=tl.int32,
+    )
+
+
+@triton.jit
+def spmv_sell_musa_c32(
+    y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
+    SLICE: tl.constexpr, ROWS: tl.constexpr, SLOTS: tl.constexpr,
+):
+    _musa_spmv_sell_kernel(
+        y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
+        SLICE=SLICE, ROWS=ROWS, SLOTS=SLOTS, COMPLEX=True, ACC=tl.float32,
     )

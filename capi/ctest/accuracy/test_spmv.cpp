@@ -981,6 +981,48 @@ TEST_F(SpMVAccuracy, CsrAndCooFloat32TransposeMatchHostReference) {
     }
 }
 
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+TEST_F(SpMVAccuracy, MusaComplexGatherCancellation) {
+    using C = std::complex<float>;
+    const std::vector<C> values{C(0.07468984f, -0.07468984f),
+                                C(-37.027058f, 37.027058f),
+                                C(37.027058f, -37.027058f)};
+    const std::vector<int32_t> ptr{0, 1, 2, 3}, indices{0, 0, 0};
+    const std::vector<C> x{C(1.5f, 0), C(2, 0), C(2, 0)};
+    DeviceBuffer dv = DeviceBuffer::from(values), dp = DeviceBuffer::from(ptr);
+    DeviceBuffer di = DeviceBuffer::from(indices), dx = DeviceBuffer::from(x);
+    DeviceBuffer dy(sizeof(C));
+    flagsparseSpMatDescr_t a = nullptr;
+    flagsparseDnVecDescr_t vx = nullptr, vy = nullptr;
+    ASSERT_EQ(flagsparseCreateCsr(&a, 3, 1, 3, dp.get(), di.get(), dv.get(),
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vx, 3, dx.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&vy, 1, dy.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    const C one(1, 0), zero(0, 0);
+    size_t bytes = 0;
+    const auto op = FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE;
+    ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, op, &one, a, vx, &zero, vy,
+                                        FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes),
+              FLAGSPARSE_STATUS_SUCCESS);
+    DeviceBuffer scratch(bytes);
+    ASSERT_EQ(flagsparseSpMV_preprocess(handle.h, op, &one, a, vx, &zero, vy,
+                                        FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get()),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpMV(handle.h, op, &one, a, vx, &zero, vy, FLAGSPARSE_C_32F,
+                             FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const C actual = dy.download<C>(1)[0];
+    const double expected = static_cast<double>(values[0].real()) * 1.5;
+    const Tolerance tol = default_tolerance(FLAGSPARSE_C_32F);
+    EXPECT_LE(max_error_ratio({actual.real(), actual.imag()}, {expected, expected}, tol), 1.0);
+    flagsparseDestroyDnVec(vy);
+    flagsparseDestroyDnVec(vx);
+    flagsparseDestroySpMat(a);
+}
+#endif
+
 TEST_F(SpMVAccuracy, CsrAndCooComplex64ConjugateTransposeMatchHostReference) {
     const CsrMatrix A = random_csr(67, 89, 0.08, 73);
     for (auto format : {FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_FORMAT_COO}) {

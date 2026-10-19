@@ -156,10 +156,15 @@ class PreparedCoo:
         ):
             from . import _spmv_csr_transpose
 
-            counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
-            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
-                self.row_trans.dtype
-            )
+            if _is_mthreads_runtime():
+                boundaries = torch.arange(self.n_cols + 1, device=self.row_trans.device,
+                                          dtype=self.row_trans.dtype)
+                ptr = torch.searchsorted(self.row_trans, boundaries).to(self.row_trans.dtype)
+            else:
+                counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
+                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
+                    self.row_trans.dtype
+                )
             self.transpose_csr_plan = _spmv_csr_transpose.make_plan(
                 self.col_trans, ptr, None, self.n_cols
             )

@@ -117,9 +117,11 @@ def sparse_gather_spmv_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
         else:
             value = tl.load(V + src, valid, other=0.)
             re += value * tl.load(B + col, valid, other=0.)
-    real = tl.sum(re, 1)
     if COMPLEX:
-        imag = tl.sum(im, 1)
+        # Widen the final tree so small terms survive cancellation between
+        # lanes without widening the sparse loop's per-lane accumulators.
+        real = tl.sum(re.to(tl.float64), 1).to(tl.float32)
+        imag = tl.sum(im.to(tl.float64), 1).to(tl.float32)
         yr = ar * real - ai * imag
         yi = ar * imag + ai * real
         if HAS_BETA:
@@ -130,6 +132,7 @@ def sparse_gather_spmv_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
         tl.store(C + 2 * rows, yr, active)
         tl.store(C + 2 * rows + 1, yi, active)
     else:
+        real = tl.sum(re, 1)
         result = ar * real
         if HAS_BETA:
             result += br * tl.load(C + rows, active, other=0.)

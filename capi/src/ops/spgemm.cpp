@@ -31,6 +31,7 @@
 // reports NOT_SUPPORTED instead of quietly returning a short row.
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +49,12 @@ using namespace flagsparse;
 namespace {
 
 constexpr int kNumStages = 1;
+constexpr int kMusaScanBlock = 1024;
+
+bool musa_backend() {
+    static const bool musa = std::string(adaptor::backend_name()) == "musa";
+    return musa;
+}
 
 // (max products per row, CAP, BLOCK, num_warps). The threshold is 0.75 * CAP,
 // the hash table's load limit; a row past the last bucket cannot be served.
@@ -79,6 +86,9 @@ struct SpGEMMDescr {
     int64_t max_row_work = 0;
     int64_t max_row_nnz = 0;
     std::vector<std::int32_t> host_indptr;   // the CSR indptr compute derived
+    std::vector<std::int32_t> group_counts;
+    std::vector<size_t> group_offsets;
+    std::vector<std::int32_t> host_counts;
 };
 
 SpGEMMDescr* spgemm(flagsparseSpGEMMDescr_t d) {
@@ -89,11 +99,15 @@ size_t align_up(size_t v) { return (v + 255u) & ~static_cast<size_t>(255u); }
 
 size_t buffer1_bytes(int64_t rows, int64_t nnz_a) {
     return align_up(static_cast<size_t>(rows) * sizeof(std::int32_t)) +
-           align_up(static_cast<size_t>(nnz_a) * sizeof(std::int32_t));
+           align_up(static_cast<size_t>(nnz_a) * sizeof(std::int32_t)) +
+           (std::string(adaptor::backend_name()) == "musa"
+                ? align_up((static_cast<size_t>(rows) + 20) * sizeof(std::int32_t)) : 0);
 }
 size_t buffer2_bytes(int64_t rows) {
-    return align_up(static_cast<size_t>(rows) * sizeof(std::int32_t)) * 2 +
-           align_up(static_cast<size_t>(rows + 1) * sizeof(std::int32_t));
+    const size_t base = align_up(static_cast<size_t>(rows) * sizeof(std::int32_t)) * 2 +
+                        align_up(static_cast<size_t>(rows + 1) * sizeof(std::int32_t));
+    const size_t blocks = (static_cast<size_t>(rows) + kMusaScanBlock - 1) / kMusaScanBlock;
+    return base + (musa_backend() ? align_up((4 * blocks + 3) * sizeof(int64_t)) : 0);
 }
 
 // Read an index array back to the host as int64, whatever width it is stored in.
@@ -245,7 +259,8 @@ flagsparseStatus_t launch_hash(flagsparseHandle_t handle, const char* kernel,
                                void* c_indptr, void* c_ind, void* c_data,
                                const char* c_offsets_type, const Bucket& bucket,
                                bool report, bool fill,
-                               flagsparseDataType_t computeType) {
+                               flagsparseDataType_t computeType,
+                               void* row_ids = nullptr, int64_t row_count = 0) {
     const char* vt = triton_dtype(computeType);
     const char* ait = triton_index_dtype(A->indices_type);
     const char* aot = triton_index_dtype(A->offsets_type);
@@ -273,7 +288,7 @@ flagsparseStatus_t launch_hash(flagsparseHandle_t handle, const char* kernel,
     sig += "*i32:16,";                                      // ovf
     sig += std::to_string(bucket.cap) + ",";
     sig += std::to_string(bucket.block) + ",";
-    sig += "False";                                         // USE_ROWS
+    sig += row_ids ? "True" : "False";                     // USE_ROWS
     if (fill) { sig += report ? ",True" : ",False"; }       // REPORT
 
     std::vector<jit::Arg> args;
@@ -288,8 +303,9 @@ flagsparseStatus_t launch_hash(flagsparseHandle_t handle, const char* kernel,
     if (fill) args.push_back(ptr(B->values));
     args.push_back(ptr(B->indices));
     args.push_back(ptr(B->offsets));
-    args.push_back(ptr(rw));                                // rows_ptr placeholder
-    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+    args.push_back(ptr(row_ids ? row_ids : rw));
+    const int64_t launch_rows = row_ids ? row_count : A->rows;
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(launch_rows)));
     args.push_back(ptr(rw));
     if (fill) { args.push_back(ptr(c_indptr)); args.push_back(ptr(c_ind));
                 args.push_back(ptr(c_data)); }
@@ -299,9 +315,53 @@ flagsparseStatus_t launch_hash(flagsparseHandle_t handle, const char* kernel,
     std::string err;
     const flagsparseStatus_t st = jit::launch(
         jit::codegen_module("spgemm_csr.py"), kernel, sig, ctx(handle)->stream,
-        A->rows, 1, 1, bucket.warps, kNumStages, args, &err);
+        launch_rows, 1, 1, bucket.warps, kNumStages, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
+}
+
+flagsparseStatus_t musa_build_indptr(flagsparseHandle_t handle, void* counts, void* overflow,
+                                    void* indptr, void* scratch, int64_t rows,
+                                    int64_t* total, int64_t* maximum) {
+    const int blocks = static_cast<int>((rows + kMusaScanBlock - 1) / kMusaScanBlock);
+    auto* summary = static_cast<int64_t*>(scratch);
+    auto* offsets = summary + 3 * blocks;
+    auto* metadata = summary + 4 * blocks;
+    const auto ptr = [](void* p) {
+        return jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p));
+    };
+    const auto module = jit::codegen_module("spgemm_csr.py");
+    std::string err;
+    auto st = jit::launch(
+        module, "musa_spgemm_scan_rows", "*i32:16,*i32:16,*i32:16,*i64:16,i32,i32,1024",
+        ctx(handle)->stream, blocks, 1, 1, 4, 1,
+        {ptr(counts), ptr(overflow), ptr(indptr), ptr(summary),
+         jit::Arg::i(static_cast<int32_t>(rows)), jit::Arg::i(blocks)}, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return st; }
+    int scan_width = 1;
+    while (scan_width < blocks) scan_width *= 2;
+    st = jit::launch(
+        module, "musa_spgemm_scan_blocks", "*i64:16,*i64,*i64,i32," + std::to_string(scan_width),
+        ctx(handle)->stream, 1, 1, 1, 4, 1,
+        {ptr(summary), ptr(offsets), ptr(metadata), jit::Arg::i(blocks)}, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return st; }
+    adaptor::synchronize();
+    std::array<int64_t, 3> host{};
+    if (auto s = adaptor::memcpy_d2h(host.data(),
+            reinterpret_cast<adaptor::DevicePtr>(metadata), sizeof(host))) return s;
+    if (host[2] != 0) {
+        ctx(handle)->last_error = "SpGEMM row overflowed the shared-memory hash table";
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (host[0] > INT32_MAX) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    st = jit::launch(
+        module, "musa_spgemm_add_offsets", "*i32:16,*i64,i32,1024",
+        ctx(handle)->stream, blocks, 1, 1, 4, 1,
+        {ptr(indptr), ptr(offsets), jit::Arg::i(static_cast<int32_t>(rows))}, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return st; }
+    *total = host[0];
+    *maximum = host[1];
+    return FLAGSPARSE_STATUS_SUCCESS;
 }
 
 }  // namespace
@@ -389,6 +449,31 @@ flagsparseStatus_t flagsparseSpGEMM_workEstimation(
             if (flagsparseStatus_t s = adaptor::memcpy_h2d(
                     reinterpret_cast<adaptor::DevicePtr>(pref_dev), a_pref.data(),
                     a_pref.size() * sizeof(std::int32_t))) return s;
+        }
+
+        d->group_counts.clear();
+        d->group_offsets.clear();
+        if (std::string(adaptor::backend_name()) == "musa" && max_work <= 6144) {
+            // Match the existing hash capacity to each row's product work,
+            // rather than allocating the worst row's table for every row.
+            std::vector<std::int32_t> row_ids;
+            for (const auto& group : kBuckets) {
+                d->group_offsets.push_back(row_ids.size());
+                const int64_t lower = &group == &kBuckets[0]
+                    ? -1 : (&group - 1)->max_work;
+                for (int64_t r = 0; r < A->rows; ++r) {
+                    if (rw[r] > lower && rw[r] <= group.max_work)
+                        row_ids.push_back(static_cast<std::int32_t>(r));
+                }
+                d->group_counts.push_back(static_cast<std::int32_t>(
+                    row_ids.size() - d->group_offsets.back()));
+                while (row_ids.size() % 4) row_ids.push_back(0);
+            }
+            void* rows_dev = base + align_up(static_cast<size_t>(A->rows) * sizeof(std::int32_t)) +
+                align_up(static_cast<size_t>(A->nnz) * sizeof(std::int32_t));
+            if (flagsparseStatus_t s = adaptor::memcpy_h2d(
+                    reinterpret_cast<adaptor::DevicePtr>(rows_dev), row_ids.data(),
+                    row_ids.size() * sizeof(std::int32_t))) return s;
         }
 
         d->buffer1 = externalBuffer1;
@@ -495,42 +580,60 @@ flagsparseStatus_t flagsparseSpGEMM_compute(
         void* rw = b1;
         void* a_pref = b1 + align_up(static_cast<size_t>(A->rows) * sizeof(std::int32_t));
 
-        if (flagsparseStatus_t s = launch_hash(
-                handle, "_spgemm_hash_count_kernel", A, B, rw, a_pref, row_nnz, ovf,
-                nullptr, nullptr, nullptr, "i32", *bucket, false, false, computeType)) {
-            return s;
+        if (std::string(adaptor::backend_name()) == "musa" && !d->group_counts.empty()) {
+            auto* row_ids = b1 + align_up(static_cast<size_t>(A->rows) * sizeof(std::int32_t)) +
+                align_up(static_cast<size_t>(A->nnz) * sizeof(std::int32_t));
+            for (size_t i = 0; i < d->group_counts.size(); ++i) {
+                if (!d->group_counts[i]) continue;
+                if (flagsparseStatus_t s = launch_hash(
+                        handle, "_spgemm_hash_count_kernel", A, B, rw, a_pref, row_nnz, ovf,
+                        nullptr, nullptr, nullptr, "i32", kBuckets[i], false, false, computeType,
+                        row_ids + d->group_offsets[i] * sizeof(std::int32_t), d->group_counts[i]))
+                    return s;
+            }
+        } else {
+            if (flagsparseStatus_t s = launch_hash(
+                    handle, "_spgemm_hash_count_kernel", A, B, rw, a_pref, row_nnz, ovf,
+                    nullptr, nullptr, nullptr, "i32", *bucket, false, false, computeType)) return s;
         }
-        adaptor::synchronize();
-
-        std::vector<std::int32_t> host_nnz(static_cast<std::size_t>(A->rows));
-        std::vector<std::int32_t> host_ovf(static_cast<std::size_t>(A->rows));
-        if (flagsparseStatus_t s = adaptor::memcpy_d2h(
-                host_nnz.data(), reinterpret_cast<adaptor::DevicePtr>(row_nnz),
-                host_nnz.size() * sizeof(std::int32_t))) return s;
-        if (flagsparseStatus_t s = adaptor::memcpy_d2h(
-                host_ovf.data(), reinterpret_cast<adaptor::DevicePtr>(ovf),
-                host_ovf.size() * sizeof(std::int32_t))) return s;
-        for (std::int32_t f : host_ovf) {
-            if (f != 0) {
-                ctx(handle)->last_error =
-                    "SpGEMM row overflowed the shared-memory hash table after "
-                    "product-count sizing; expand-sort-compress fallback is not "
-                    "implemented in the C API";
-                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+        int64_t total = 0, max_row = 0;
+        if (musa_backend()) {
+            void* scratch = base + 2 * rows_bytes +
+                align_up(static_cast<size_t>(A->rows + 1) * sizeof(int32_t));
+            if (auto s = musa_build_indptr(handle, row_nnz, ovf, c_indptr, scratch,
+                                           A->rows, &total, &max_row)) return s;
+        } else {
+            adaptor::synchronize();
+            std::vector<std::int32_t> host_nnz(static_cast<std::size_t>(A->rows));
+            std::vector<std::int32_t> host_ovf(static_cast<std::size_t>(A->rows));
+            if (flagsparseStatus_t s = adaptor::memcpy_d2h(
+                    host_nnz.data(), reinterpret_cast<adaptor::DevicePtr>(row_nnz),
+                    host_nnz.size() * sizeof(std::int32_t))) return s;
+            if (flagsparseStatus_t s = adaptor::memcpy_d2h(
+                    host_ovf.data(), reinterpret_cast<adaptor::DevicePtr>(ovf),
+                    host_ovf.size() * sizeof(std::int32_t))) return s;
+            for (std::int32_t f : host_ovf) {
+                if (f != 0) {
+                    ctx(handle)->last_error =
+                        "SpGEMM row overflowed the shared-memory hash table after "
+                        "product-count sizing; expand-sort-compress fallback is not "
+                        "implemented in the C API";
+                    return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+                }
+            }
+            d->host_indptr.assign(static_cast<std::size_t>(A->rows) + 1, 0);
+            for (int64_t r = 0; r < A->rows; ++r) {
+                total += host_nnz[static_cast<std::size_t>(r)];
+                max_row = std::max<int64_t>(max_row, host_nnz[static_cast<std::size_t>(r)]);
+                if (total > static_cast<int64_t>(INT32_MAX)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+                d->host_indptr[static_cast<std::size_t>(r) + 1] = static_cast<std::int32_t>(total);
             }
         }
-
-        d->host_indptr.assign(static_cast<std::size_t>(A->rows) + 1, 0);
-        int64_t total = 0, max_row = 0;
-        for (int64_t r = 0; r < A->rows; ++r) {
-            total += host_nnz[static_cast<std::size_t>(r)];
-            max_row = std::max<int64_t>(max_row, host_nnz[static_cast<std::size_t>(r)]);
-            if (total > static_cast<int64_t>(INT32_MAX)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
-            d->host_indptr[static_cast<std::size_t>(r) + 1] = static_cast<std::int32_t>(total);
+        if (!musa_backend()) {
+            if (flagsparseStatus_t s = adaptor::memcpy_h2d(
+                    reinterpret_cast<adaptor::DevicePtr>(c_indptr), d->host_indptr.data(),
+                    d->host_indptr.size() * sizeof(std::int32_t))) return s;
         }
-        if (flagsparseStatus_t s = adaptor::memcpy_h2d(
-                reinterpret_cast<adaptor::DevicePtr>(c_indptr), d->host_indptr.data(),
-                d->host_indptr.size() * sizeof(std::int32_t))) return s;
 
         // This is the whole point of the two-call dance: the caller now learns
         // C's nnz through flagsparseSpMatGetSize and allocates for it.
@@ -567,6 +670,15 @@ flagsparseStatus_t flagsparseSpGEMM_copy(
                 "C has no arrays yet: read its size with flagsparseSpMatGetSize, "
                 "allocate, then attach them with flagsparseCsrSetPointers.";
             return FLAGSPARSE_STATUS_INVALID_VALUE;
+        }
+        if (musa_backend() && !d->host_fallback && A->rows > 0) {
+            const size_t rows_bytes = align_up(static_cast<size_t>(A->rows) * sizeof(int32_t));
+            auto* indptr = static_cast<unsigned char*>(d->buffer2) + 2 * rows_bytes;
+            d->host_indptr.resize(static_cast<size_t>(A->rows) + 1);
+            adaptor::synchronize();
+            if (auto s = adaptor::memcpy_d2h(d->host_indptr.data(),
+                    reinterpret_cast<adaptor::DevicePtr>(indptr),
+                    d->host_indptr.size() * sizeof(int32_t))) return s;
         }
         // C's own offsets array gets the indptr compute derived.
         if (C->offsets_type == FLAGSPARSE_INDEX_32I) {

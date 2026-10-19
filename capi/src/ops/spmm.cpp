@@ -665,7 +665,7 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     // and its 1-warp launch were measured there and nowhere else.
     const bool batched8 =
         musa_backend() && !ops.complex_op && ops.n == 8 && max_row_nnz <= 256;
-    const int batch_rows = 4;
+    const int batch_rows = ops.acc_is_fp64 ? 16 : 32;
 
     const char* it = triton_index_dtype(A->indices_type);
     const char* ot = triton_index_dtype(A->offsets_type);
@@ -681,7 +681,16 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
     if (batched8) {
         sig += std::to_string(batch_rows) + ",";
         sig += ops.acc_is_fp64 ? "True," : "False,";
-        sig += ops.has_beta ? "True" : "False";
+        sig += ops.has_beta ? "True," : "False,";
+        // Each operand's row/column contribution is bounded separately, so
+        // their sum fits int32 as well. Large strided views keep int64 math.
+        const bool narrow = A->nnz <= INT32_MAX - 128 && ops.m <= INT32_MAX - 128 &&
+            ops.stride_bk <= INT32_MAX / (2 * std::max<int64_t>(1, A->cols)) &&
+            ops.stride_bn <= INT32_MAX / (2 * std::max<int64_t>(1, ops.n)) &&
+            ops.stride_cm <= INT32_MAX / (2 * std::max<int64_t>(1, ops.m)) &&
+            ops.stride_cn <= INT32_MAX / (2 * std::max<int64_t>(1, ops.n));
+        sig += narrow ? "False" : "True";
+        sig += ops.acc_is_fp64 ? ",1" : ",4";
     } else {
         sig += std::to_string(cfg.block_n) + ",";
         sig += std::to_string(cfg.block_nnz) + ",";
@@ -710,7 +719,7 @@ flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
         ops.complex_op ? "spmm_csr_complex"
                        : (batched8 ? "spmm_csr_batched8_real" : "spmm_csr_real"), sig,
         ctx(handle)->stream, batched8 ? (ops.m + batch_rows - 1) / batch_rows : ops.m,
-        grid_n, 1, batched8 ? 1 : cfg.num_warps, batched8 ? 1 : cfg.num_stages,
+        grid_n, 1, batched8 ? 4 : cfg.num_warps, batched8 ? 1 : cfg.num_stages,
         args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;

@@ -13,19 +13,35 @@ def _segmented_add(left_row, left_value, right_row, right_value):
 
 
 @triton.jit
+def _musa_segmented_add(left_row, left_value, right_row, right_value):
+    return right_row, right_value + tl.where(left_row == right_row, left_value, 0)
+
+
+@triton.jit
 def _nnz_kernel(A, CI, RP, ROW, X, Y, EMPTY, NE: tl.constexpr,
-                NNZ: tl.constexpr, B: tl.constexpr, ACC: tl.constexpr):
+                NNZ: tl.constexpr, B: tl.constexpr, ACC: tl.constexpr,
+                MUSA: tl.constexpr = False, COMPLEX_RHS: tl.constexpr = False):
     pid = tl.program_id(0)
     lane = tl.arange(0, B)
     pos = pid * B + lane
     empty_row = tl.load(EMPTY + pos, pos < NE, 0)
-    tl.store(Y + empty_row, 0., pos < NE)
+    if COMPLEX_RHS:
+        tl.store(Y + 2 * empty_row, 0., pos < NE)
+        tl.store(Y + 2 * empty_row + 1, 0., pos < NE)
+    else:
+        tl.store(Y + empty_row, 0., pos < NE)
     valid = pos < NNZ
     row = tl.load(ROW + pos, valid, -1)
     col = tl.load(CI + pos, valid, 0)
     value = tl.load(A + pos, valid, 0).to(ACC)
-    vector = tl.load(X + col, valid, 0).to(ACC)
-    _, total = tl.associative_scan((row, value * vector), 0, _segmented_add)
+    vector = tl.load(X + (2 * col if COMPLEX_RHS else col), valid, 0).to(ACC)
+    if MUSA:
+        _, total = tl.associative_scan((row, value * vector), 0, _musa_segmented_add)
+    else:
+        _, total = tl.associative_scan((row, value * vector), 0, _segmented_add)
+    if COMPLEX_RHS:
+        vector_im = tl.load(X + 2 * col + 1, valid, 0).to(ACC)
+        _, total_im = tl.associative_scan((row, value * vector_im), 0, _musa_segmented_add)
     next_row = tl.load(ROW + pos + 1, pos + 1 < NNZ, -1)
     # Only the block containing a row's last nonzero owns its output.
     boundary = valid & (row != next_row)
@@ -33,6 +49,8 @@ def _nnz_kernel(A, CI, RP, ROW, X, Y, EMPTY, NE: tl.constexpr,
     start = tl.load(RP + first_row)
     end = tl.load(RP + first_row + 1)
     prefix = tl.full((), 0., ACC)
+    if COMPLEX_RHS:
+        prefix_im = tl.full((), 0., ACC)
     if (start < pid * B) & (end <= (pid + 1) * B) & (pid * B < NNZ):
         # Recompute the short prefix crossing a block boundary, avoiding an
         # atomic update or a second launch to merge a partial-sum buffer.
@@ -41,10 +59,21 @@ def _nnz_kernel(A, CI, RP, ROW, X, Y, EMPTY, NE: tl.constexpr,
             active = index < pid * B
             column = tl.load(CI + index, active, 0)
             a = tl.load(A + index, active, 0).to(ACC)
-            x = tl.load(X + column, active, 0).to(ACC)
+            x = tl.load(X + (2 * column if COMPLEX_RHS else column), active, 0).to(ACC)
             prefix += tl.sum(a * x, 0)
-    total += tl.where(row == first_row, prefix, 0.)
-    tl.store(Y + row, total, boundary)
+            if COMPLEX_RHS:
+                xi = tl.load(X + 2 * column + 1, active, 0).to(ACC)
+                prefix_im += tl.sum(a * xi, 0)
+    if MUSA:
+        total += tl.where(row == first_row, prefix, 0)
+    else:
+        total += tl.where(row == first_row, prefix, 0.)
+    if COMPLEX_RHS:
+        total_im += tl.where(row == first_row, prefix_im, 0)
+        tl.store(Y + 2 * row, total, boundary)
+        tl.store(Y + 2 * row + 1, total_im, boundary)
+    else:
+        tl.store(Y + row, total, boundary)
 
 
 def prepare(prepared):
