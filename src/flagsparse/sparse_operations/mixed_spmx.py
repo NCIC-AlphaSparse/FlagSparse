@@ -256,6 +256,14 @@ def _csr_row_tile(nnz, n_rows):
 
 
 def _musa_row_tile(nnz, n_rows, integer=False):
+    override = os.environ.get("FLAGSPARSE_MUSA_CSR_TILE")
+    if override:
+        try:
+            rows, block = (int(v.strip()) for v in override.split(",", 1))
+            if rows > 0 and block > 0:
+                return rows, block
+        except (TypeError, ValueError):
+            pass
     mean = nnz / max(1, n_rows)
     if mean <= 3:
         return 256, 2
@@ -266,7 +274,95 @@ def _musa_row_tile(nnz, n_rows, integer=False):
     return 16, 8
 
 
-def _musa_coo_csr(data, row, col, shape):
+@triton.jit
+def _musa_csr_half_fixed_kernel(
+    Y, V, C, P, X, M, ROWS: tl.constexpr, BLOCK: tl.constexpr,
+    MAX_LENGTH: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    begin = tl.load(P + rows, rows < M, other=0)
+    end = tl.load(P + rows + 1, rows < M, other=0)
+    acc = tl.zeros((ROWS, BLOCK), tl.float32)
+    # The version-checked row pointers bound every row, so no per-program
+    # reduction is needed to discover the loop limit on each invocation.
+    for offset in range(0, MAX_LENGTH, BLOCK):
+        pos = begin[:, None] + offset + tl.arange(0, BLOCK)[None, :]
+        valid = (rows[:, None] < M) & (pos < end[:, None])
+        col = tl.load(C + pos, valid, other=0)
+        value = tl.load(V + pos, valid, other=0).to(tl.float32)
+        rhs = tl.load(X + col, valid, other=0).to(tl.float32)
+        acc += value * rhs
+    tl.store(Y + rows, tl.sum(acc, 1), rows < M)
+
+
+def _musa_coo_half_spmv(data, cols, ptr, x, n_rows, plans, out=None):
+    """Reuse topology and launch specializations; always read live operands."""
+    plan = plans.get("half_f32")
+    if plan is None:
+        lengths = ptr[1:] - ptr[:-1]
+        maximum = int(lengths.max().item())
+        mean = data.numel() / n_rows
+        nnz_mode = maximum > 128 and mean <= 4
+        if nnz_mode:
+            # Keep row ownership and the existing cross-block prefix merge.
+            from ._spmv_csr_nnz import _nnz_kernel
+
+            row_ids = torch.repeat_interleave(
+                torch.arange(n_rows, device=ptr.device, dtype=torch.int32),
+                lengths.long(), output_size=data.numel(),
+            )
+            empty = torch.nonzero(lengths == 0).flatten().to(torch.int32)
+            sparse = (data, cols, ptr, row_ids, empty)
+            kernel = _nnz_kernel
+            grid = ((max(data.numel(), empty.numel()) + 511) // 512,)
+            scalars = ()
+            constants = (empty.numel(), data.numel(), 512, tl.float32, True, False)
+        else:
+            sparse = (data, cols, ptr)
+            if maximum <= 128 and mean > 4:
+                rows, block = (32, 4) if mean <= 12 and n_rows >= 262144 else (16, 8)
+                kernel = _musa_csr_half_fixed_kernel
+                constants = (rows, block, maximum)
+            else:
+                rows, block = _musa_row_tile(data.numel(), n_rows)
+                kernel = _csr_spmv_mixed_kernel
+                constants = (tl.float32, rows, block)
+            grid = ((n_rows + rows - 1) // rows,)
+            scalars = (n_rows,)
+        plan = (kernel, grid, sparse, tuple(t.data_ptr() for t in sparse),
+                scalars, constants, nnz_mode, {})
+        plans["half_f32"] = plan
+    kernel, grid, sparse, sparse_addresses, scalars, constants, nnz_mode, runners = plan
+    y = out if out is not None and out.is_contiguous() else torch.empty(
+        n_rows, dtype=torch.float32, device=x.device
+    )
+    yp, xp = y.data_ptr(), x.data_ptr()
+    # The sparse cache checks all source versions/storage/metadata. RHS and
+    # output may change on every call: preserve alignment/device/alias JIT
+    # specializations while resolving their current pointers and stream.
+    aliases = tuple((p == yp, p == xp) for p in sparse_addresses) + (yp == xp,)
+    key = (x.dtype, x.device, xp % 16, yp % 16, aliases, kernel.debug)
+    runner = runners.get(key)
+    if nnz_mode:
+        tensors = (*sparse[:4], x, y, sparse[4])
+        addresses = (*sparse_addresses[:4], xp, yp, sparse_addresses[4])
+    else:
+        tensors = (y, *sparse, x)
+        addresses = (yp, *sparse_addresses, xp)
+    if runner is None:
+        runner = _launch_musa_spmv(
+            kernel, grid, tensors, scalars, constants,
+        )
+        if runner is not None:
+            if len(runners) >= 16:
+                runners.pop(next(iter(runners)))
+            runners[key] = runner
+    else:
+        runner(tensors, scalars, constants, addresses)
+    return y
+
+
+def _musa_coo_csr(data, row, col, shape, *, spmv=False):
     """Reuse row ownership, invalidating both topology and values on mutation."""
     sources = (data, row, col)
     options = tuple(shape)
@@ -284,9 +380,9 @@ def _musa_coo_csr(data, row, col, shape):
         # MUSA bincount can lose updates for repeated sorted row IDs.
         boundaries = torch.arange(int(shape[0]) + 1, device=rows.device, dtype=rows.dtype)
         ptr = torch.searchsorted(rows, boundaries).to(torch.int32)
-        state = data.contiguous(), cols.contiguous(), ptr.contiguous()
+        state = data.contiguous(), cols.contiguous(), ptr.contiguous(), {}
         _MUSA_COO_CSR_CACHE.put(sources, options, state)
-    return state
+    return state if spmv else state[:3]
 
 
 def _musa_csr_spmv(data, cols, ptr, x, n_rows, result_dtype, acc_dtype, out=None):
@@ -469,9 +565,12 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
         raise ValueError("out shape/device must match the COO SpMV result")
     if musa:
         t0 = _start(return_time)
-        values, cols, ptr = _musa_coo_csr(data, row, col, shape)
-        y = _musa_csr_spmv(values, cols, ptr, x.contiguous(), n_rows,
-                           result_dtype, acc_dtype, out)
+        values, cols, ptr, plans = _musa_coo_csr(data, row, col, shape, spmv=True)
+        if data.dtype == torch.float16 and result_dtype == torch.float32 and n_rows:
+            y = _musa_coo_half_spmv(values, cols, ptr, x.contiguous(), n_rows, plans, out)
+        else:
+            y = _musa_csr_spmv(values, cols, ptr, x.contiguous(), n_rows,
+                               result_dtype, acc_dtype, out)
         return _finish(y, out, t0, return_time)
     sources = (data, row, col)
     data, x = data.contiguous(), x.contiguous()

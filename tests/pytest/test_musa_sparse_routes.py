@@ -185,7 +185,7 @@ def test_musa_csc_half_spmm_strides_and_out(index_dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int8])
 @pytest.mark.parametrize("reset", [False, True])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_musa_scatter_native_strides_and_live_inputs(dtype, reset, index_dtype):
+def test_musa_scatter_triton_strides_and_live_inputs(dtype, reset, index_dtype):
     from flagsparse.sparse_operations.gather_scatter import _triton_scatter_impl
 
     dev = accelerator_device()
@@ -210,7 +210,7 @@ def test_musa_scatter_native_strides_and_live_inputs(dtype, reset, index_dtype):
 
 @pytest.mark.parametrize("musa,block", [(False, None), (True, None), (True, 256)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int8])
-def test_musa_scatter_native_scope_and_explicit_tuning(monkeypatch, musa, block, dtype):
+def test_musa_scatter_triton_scope_and_explicit_tuning(monkeypatch, musa, block, dtype):
     from flagsparse.sparse_operations import gather_scatter as scatter
 
     values = torch.tensor([1, 2], dtype=dtype)
@@ -223,13 +223,13 @@ def test_musa_scatter_native_scope_and_explicit_tuning(monkeypatch, musa, block,
         dense.index_copy_(0, index.long(), sparse)
 
     monkeypatch.setattr(scatter, "_is_mthreads_runtime", lambda: musa)
+    monkeypatch.setattr(scatter, "_musa_zero_vector", lambda dense: dense.zero_())
     monkeypatch.setattr(scatter, "_launch_triton_scatter_kernel", launch)
     result, meta = scatter._triton_scatter_impl(values, indices, 3, out=out,
                                                block_size=block, return_metadata=True)
-    native = musa and block is None
     assert result is out
-    assert bool(launches) != native
-    assert meta["kernel_index_dtype"] == ("int64" if native else "int32")
+    assert launches == [scatter._resolve_scatter_block_size(block, dtype, 2)]
+    assert meta["kernel_index_dtype"] == "int32"
     assert not meta["index_fallback_applied"]
     assert torch.equal(result, torch.tensor([2, 0, 1], dtype=dtype))
 
@@ -629,10 +629,11 @@ def musa_launch_cache(monkeypatch):
     from flagsparse.sparse_operations import _musa_spmv_launch as cache
 
     monkeypatch.setattr(cache, "_LAUNCHERS", OrderedDict())
+    monkeypatch.setattr(cache, "_RAW_STREAM", lambda device: 123)
 
     class Compiled:
         def __getitem__(self, grid):
-            def run(*args):
+            def run(*args, stream=None):
                 kernel.calls.append(("compiled", grid, args))
             return run
 
@@ -795,3 +796,148 @@ def test_musa_cached_launch_backend_scope(monkeypatch, fmt, musa):
         monkeypatch.setattr(module, "_spmv_sell_real_kernel", Kernel())
         module.flagsparse_spmv_sell(values, indices, offsets, rhs, (1, 2), slice_size=1)
     assert calls == (["musa"] if musa else ["generic"])
+
+
+@pytest.mark.parametrize("dtype,out_dtype", [
+    (torch.float16, torch.float16), (torch.float16, torch.float32),
+    (torch.int8, torch.int32), (torch.int8, torch.float32),
+])
+@pytest.mark.parametrize("width", [2, 9, 29])
+def test_musa_triton_coo_live_partial_rows(monkeypatch, dtype, out_dtype, width):
+    from flagsparse.sparse_operations import mixed_spmx as mixed
+
+    dev = accelerator_device()
+    launches = []
+    original = mixed._launch_musa_spmv
+
+    def triton_launch(kernel, *args):
+        from triton.runtime.jit import JITFunction
+        assert isinstance(kernel, JITFunction)
+        launches.append(kernel)
+        return original(kernel, *args)
+
+    monkeypatch.setattr(mixed, "_launch_musa_spmv", triton_launch)
+    m, n = 67, 41
+    lengths = torch.tensor([width if r % 7 else 0 for r in range(m)])
+    rr = torch.repeat_interleave(torch.arange(m), lengths).int()
+    cc = (torch.arange(rr.numel()) * 7 % n).int()
+    vv = (torch.arange(rr.numel()) % 5 - 2).to(dtype)
+    # Start unsorted, with noncontiguous sparse operands and vector.
+    rows = torch.stack((rr.flip(0), rr), 1).to(dev)[:, 0]
+    cols = torch.stack((cc.flip(0), cc), 1).to(dev)[:, 0]
+    values = torch.stack((vv.flip(0), vv), 1).to(dev)[:, 0]
+    rhs = torch.arange(n * 2, dtype=torch.int32).to(dtype).to(dev)[::2]
+    backing = torch.full((m * 2,), -99, dtype=out_dtype, device=dev)
+    out = backing[::2]
+
+    def check():
+        reference = torch.zeros(m, dtype=torch.float64)
+        reference.index_add_(0, rows.cpu().long(), values.cpu().double() *
+                             rhs.cpu().double()[cols.cpu().long()])
+        actual = fs.flagsparse_spmv_coo(values, rows, cols, rhs, (m, n),
+                                        out=out, out_dtype=out_dtype)
+        assert launches
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), reference.to(out_dtype), rtol=0, atol=0)
+        assert torch.equal(backing[1::2].cpu(), torch.full((m,), -99, dtype=out_dtype))
+
+    check()
+    values.add_(1)
+    rhs.add_(1)
+    check()
+    values.data = (values + 1).data
+    cols.data = ((cols + 1) % n).data
+    check()
+    rows[0] = 0
+    check()
+    with torch.inference_mode():
+        values, rows, cols = values.clone(), rows.clone(), cols.clone()
+        check()
+        values.sub_(1)
+        cols[0] = 3
+        check()
+
+
+@pytest.mark.parametrize("kind", ["fixed", "nnz", "short"])
+@pytest.mark.parametrize("strided_out", [False, True])
+def test_musa_half_coo_bound_launch_live_storage_and_stream(kind, strided_out):
+    from flagsparse.sparse_operations._common import _ACCEL
+    from flagsparse.sparse_operations import mixed_spmx as mixed
+
+    dev = accelerator_device()
+    m, n, nnz = (67, 19, 493) if kind == "fixed" else (1025, 19, 1101)
+    rows = (torch.arange(nnz) % m).int().to(dev)
+    if kind == "nnz":
+        rows.zero_()
+    cols = (torch.arange(nnz) % n).int().to(dev)
+    values = (torch.arange(nnz) % 5 - 2).half().to(dev)
+    backing = torch.full((m * 2 + 2,), -99, dtype=torch.float32, device=dev)
+    out = backing[1:2 * m:2] if strided_out else backing[1:m + 1]
+    stream = _ACCEL.Stream()
+    stream.wait_stream(_ACCEL.current_stream())
+
+    def check(rhs, target=None):
+        reference = torch.zeros(m, dtype=torch.float64)
+        reference.index_add_(0, rows.cpu().long(), values.cpu().double() *
+                             rhs.cpu().double()[cols.cpu().long()])
+        result = fs.flagsparse_spmv_coo(values, rows, cols, rhs, (m, n),
+                                        out=target, out_dtype=torch.float32)
+        _ACCEL.synchronize()
+        if target is not None:
+            assert result is target
+        torch.testing.assert_close(result.cpu().double(), reference, rtol=0, atol=0)
+        return result
+
+    for offset in (0, 1):
+        with _ACCEL.stream(stream):
+            rhs = torch.arange(n + offset, device=dev).half()[offset:]
+            first = check(rhs)
+            preserved = first.clone()
+            rhs.add_(1)
+            check(rhs, out)
+            torch.testing.assert_close(first, preserved, rtol=0, atol=0)
+            stream.synchronize()
+        check(rhs)
+        # Unsupported operand types must still fail after warming the cache.
+        with pytest.raises(TypeError, match="not a supported combination"):
+            fs.flagsparse_spmv_coo(values, rows, cols, rhs.float(), (m, n),
+                                   out_dtype=torch.float32)
+        check(rhs)
+        values.add_(1)
+        rows[0] = m - 1
+        check(rhs)
+        # Replacing storage does not increment the Tensor's version counter.
+        values.data = (values - 1).data
+        cols.data = ((cols + 1) % n).data
+        check(rhs, out)
+    state = mixed._MUSA_COO_CSR_CACHE.get((values, rows, cols), (m, n))
+    assert state is not None and state[3]["half_f32"][-1]
+    assert torch.equal(backing[:1].cpu(), torch.tensor([-99.]))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int8, torch.complex64])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_musa_indexed_copies_never_call_native_indexing(monkeypatch, dtype, index_dtype):
+    from flagsparse.sparse_operations import gather_scatter as copies
+
+    dev = accelerator_device()
+    dense = torch.arange(18, dtype=torch.int32).to(dtype).to(dev)[::2]
+    indices = torch.tensor([7, 2, 0], dtype=index_dtype, device=dev)
+    sparse = torch.empty(6, dtype=dtype, device=dev)[::2]
+    target = torch.full((18,), -9, dtype=dtype, device=dev)[::2]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("MUSA indexed copies must execute Triton kernels")
+
+    monkeypatch.setattr(torch, "index_select", forbidden)
+    monkeypatch.setattr(torch, "gather", forbidden)
+    monkeypatch.setattr(torch.Tensor, "index_select", forbidden)
+    monkeypatch.setattr(torch.Tensor, "index_copy_", forbidden)
+    copies._triton_gather_impl(dense, indices, out=sparse)
+    copies._triton_scatter_impl(sparse, indices, 9, out=target, reset_output=True)
+    assert torch.equal(sparse.cpu(), torch.tensor([14, 4, 0], dtype=dtype))
+    assert torch.equal(target.cpu(), torch.tensor([0, 0, 4, 0, 0, 0, 0, 14, 0], dtype=dtype))
+    assert fs.flagsparse_gather(dense, indices, out=sparse) is sparse
+    fs.flagsparse_scatter(target, indices, sparse, reset_output=True)
+    assert torch.equal(sparse.cpu(), torch.tensor([14, 4, 0], dtype=dtype))
+    assert torch.equal(target.cpu(), torch.tensor([0, 0, 4, 0, 0, 0, 0, 14, 0], dtype=dtype))

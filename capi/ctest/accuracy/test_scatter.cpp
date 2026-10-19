@@ -25,6 +25,10 @@
 
 #include "common.hpp"
 
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+#include <musa.h>
+#endif
+
 using namespace fstest;
 
 namespace {
@@ -221,5 +225,74 @@ TEST_F(ScatterAccuracy, SizeMismatchIsRejected) {
     flagsparseDestroyDnVec(vecY);
     flagsparseDestroySpVec(vecX);
 }
+
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+template <typename I>
+void musa_live_copies(flagsparseHandle_t handle, flagsparseDataType_t dtype,
+                       flagsparseIndexType_t itype, std::size_t bytes) {
+    constexpr int n = 259, nnz = 71;  // partial blocks, distinct mutable indices
+    std::vector<std::uint8_t> dense(n * bytes), poison(nnz * bytes, 0xa5);
+    std::vector<std::uint8_t> initial(n * bytes, 0x5a);
+    std::vector<I> indices(nnz);
+    DeviceBuffer d_dense = DeviceBuffer::from(dense);
+    DeviceBuffer d_sparse = DeviceBuffer::from(poison);
+    DeviceBuffer d_out = DeviceBuffer::from(initial);
+    DeviceBuffer d_indices = DeviceBuffer::from(indices);
+    flagsparseDnVecDescr_t source = nullptr, destination = nullptr;
+    flagsparseSpVecDescr_t sparse = nullptr;
+    ASSERT_EQ(flagsparseCreateDnVec(&source, n, d_dense.get(), dtype),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&destination, n, d_out.get(), dtype),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateSpVec(&sparse, n, nnz, d_indices.get(), d_sparse.get(),
+                                     itype, FLAGSPARSE_INDEX_BASE_ZERO, dtype),
+              FLAGSPARSE_STATUS_SUCCESS);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        // Treat floating-point values as bytes to check NaNs/sign bits exactly.
+        for (std::size_t j = 0; j < dense.size(); ++j)
+            dense[j] = static_cast<std::uint8_t>(j * 37 + repeat * 19);
+        for (int j = 0; j < nnz; ++j) indices[j] = (j * 3 + repeat) % n;
+        ASSERT_EQ(to_device(d_dense.get(), dense.data(), dense.size()), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(to_device(d_indices.get(), indices.data(), indices.size() * sizeof(I)),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(to_device(d_out.get(), initial.data(), initial.size()), FLAGSPARSE_STATUS_SUCCESS);
+        dev_sync();  // uploads complete before the nonblocking handle stream
+        ASSERT_EQ(flagsparseGather(handle, source, sparse), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseScatter(handle, sparse, destination), FLAGSPARSE_STATUS_SUCCESS);
+        dev_sync();
+        auto expected = initial;
+        std::vector<std::uint8_t> gathered(nnz * bytes);
+        for (int j = 0; j < nnz; ++j)
+            for (std::size_t k = 0; k < bytes; ++k) {
+                gathered[j * bytes + k] = dense[indices[j] * bytes + k];
+                expected[indices[j] * bytes + k] = gathered[j * bytes + k];
+            }
+        EXPECT_EQ(d_sparse.download<std::uint8_t>(gathered.size()), gathered);
+        EXPECT_EQ(d_out.download<std::uint8_t>(expected.size()), expected);
+    }
+    flagsparseDestroySpVec(sparse);
+    flagsparseDestroyDnVec(destination);
+    flagsparseDestroyDnVec(source);
+}
+
+TEST_F(ScatterAccuracy, MusaLiveBitCopiesOnDefaultAndNondefaultStreams) {
+    struct Stream {
+        MUstream value = nullptr;
+        ~Stream() { if (value) muStreamDestroy(value); }
+    } stream;
+    ASSERT_EQ(muStreamCreate(&stream.value, MU_STREAM_NON_BLOCKING), MUSA_SUCCESS);
+    for (flagsparseStream_t selected : {static_cast<flagsparseStream_t>(nullptr),
+                                        reinterpret_cast<flagsparseStream_t>(stream.value)}) {
+        ASSERT_EQ(flagsparseSetStream(handle.h, selected), FLAGSPARSE_STATUS_SUCCESS);
+        for (const auto dtype : {FLAGSPARSE_R_8I, FLAGSPARSE_R_16F, FLAGSPARSE_R_32F,
+                                  FLAGSPARSE_R_64F, FLAGSPARSE_C_32F, FLAGSPARSE_C_64F}) {
+            const std::size_t bytes = value_bytes(dtype);
+            musa_live_copies<int32_t>(handle.h, dtype, FLAGSPARSE_INDEX_32I, bytes);
+            musa_live_copies<int64_t>(handle.h, dtype, FLAGSPARSE_INDEX_64I, bytes);
+        }
+    }
+    EXPECT_EQ(flagsparseSetStream(handle.h, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+}
+#endif
 
 }  // namespace
