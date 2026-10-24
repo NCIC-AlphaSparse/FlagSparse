@@ -259,7 +259,6 @@ def _csr_spmv_real_by_complex_kernel(
 @triton.jit
 def _csr_spmv_real_by_complex_cached_kernel(
     y_ri_ptr, data_ptr, cols_ptr, indptr_ptr, x_ri_ptr, n_rows,
-    ROWS: tl.constexpr, BLOCK: tl.constexpr,
 ):
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     rmask = rows < n_rows
@@ -286,8 +285,6 @@ def _csr_spmv_real_by_complex_cached_kernel(
 
 @triton.jit
 def _musa_csr_real_by_complex_kernel(
-    Y, V, C, P, X, M, R: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr,
-):
     rows = tl.program_id(0) * R + tl.arange(0, R)
     start = tl.load(P + rows, rows < M, other=0)
     end = tl.load(P + rows + 1, rows < M, other=0)

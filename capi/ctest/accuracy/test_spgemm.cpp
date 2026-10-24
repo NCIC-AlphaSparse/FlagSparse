@@ -26,6 +26,7 @@
 #include <array>
 #include <vector>
 
+#include "adaptor/adaptor.hpp"
 #include "common.hpp"
 
 using namespace fstest;
@@ -211,6 +212,16 @@ TEST_F(SpGEMMAccuracy, Float32) {
     const CsrMatrix A = random_csr(96, 64, 0.05, 21);
     const CsrMatrix B = random_csr(64, 96, 0.05, 23);
     run_and_check<float>(A, B, FLAGSPARSE_R_32F, "fp32");
+}
+
+TEST_F(SpGEMMAccuracy, MusaMultiBlockRowPrefix) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    for (int64_t rows : {1024, 1025, 3079}) {
+        const CsrMatrix A = random_csr(rows, 17, 0.14, 71);
+        const CsrMatrix B = random_csr(17, 23, 0.20, 73);
+        run_and_check<float>(A, B, FLAGSPARSE_R_32F, "musa_multiblock_fp32");
+        run_and_check<double>(A, B, FLAGSPARSE_R_64F, "musa_multiblock_fp64");
+    }
 }
 
 // Rows of A with no entries produce empty rows of C; the discovered indptr has

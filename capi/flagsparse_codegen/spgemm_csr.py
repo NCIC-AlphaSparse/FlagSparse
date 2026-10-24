@@ -47,14 +47,58 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
 
+import triton
+import triton.language as tl
+
 from flagsparse.sparse_operations.spgemm_csr import (  # noqa: E402,F401
     _spgemm_hash_count_kernel,
     _spgemm_hash_fill_kernel,
     _spgemm_hash_fill_kernel_f64,
 )
 
+
+@triton.jit
+def musa_spgemm_scan_rows(counts, overflow, indptr, summary, nrows, nblocks,
+                          BLOCK: tl.constexpr):
+    block = tl.program_id(0)
+    rows = block * BLOCK + tl.arange(0, BLOCK)
+    count = tl.load(counts + rows, rows < nrows, 0)
+    failed = tl.load(overflow + rows, rows < nrows, 0)
+    tl.store(indptr + rows + 1, tl.cumsum(count, 0), rows < nrows)
+    if block == 0:
+        tl.store(indptr, 0)
+    tl.store(summary + block, tl.sum(count.to(tl.int64), 0))
+    tl.store(summary + nblocks + block, tl.max(count, 0).to(tl.int64))
+    tl.store(summary + 2 * nblocks + block, tl.max(failed, 0).to(tl.int64))
+
+
+@triton.jit
+def musa_spgemm_scan_blocks(summary, offsets, metadata, nblocks,
+                            BLOCK: tl.constexpr):
+    block = tl.arange(0, BLOCK)
+    count = tl.load(summary + block, block < nblocks, 0)
+    maximum = tl.load(summary + nblocks + block, block < nblocks, 0)
+    failed = tl.load(summary + 2 * nblocks + block, block < nblocks, 0)
+    tl.store(offsets + block, tl.cumsum(count, 0) - count, block < nblocks)
+    tl.store(metadata, tl.sum(count, 0))
+    tl.store(metadata + 1, tl.max(maximum, 0))
+    tl.store(metadata + 2, tl.max(failed, 0))
+
+
+@triton.jit
+def musa_spgemm_add_offsets(indptr, offsets, nrows, BLOCK: tl.constexpr):
+    block = tl.program_id(0)
+    rows = block * BLOCK + tl.arange(0, BLOCK)
+    local = tl.load(indptr + rows + 1, rows < nrows, 0)
+    offset = tl.load(offsets + block)
+    tl.store(indptr + rows + 1, (local.to(tl.int64) + offset).to(tl.int32), rows < nrows)
+
+
 __all__ = [
     "_spgemm_hash_count_kernel",
     "_spgemm_hash_fill_kernel",
     "_spgemm_hash_fill_kernel_f64",
+    "musa_spgemm_scan_rows",
+    "musa_spgemm_scan_blocks",
+    "musa_spgemm_add_offsets",
 ]

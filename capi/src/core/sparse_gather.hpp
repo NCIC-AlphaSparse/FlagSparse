@@ -119,9 +119,11 @@ inline flagsparseStatus_t launch_sparse_gather(flagsparseHandle_t handle, SpMatD
         if (auto s = prepare_sparse_gather(A, buffer)) return s;
     }
     const bool complex = A->value_type == FLAGSPARSE_C_32F;
-    if (n == 1 && indirect && !complex)
-        return launch_sparse_scatter(handle, A, B, C, m, ar, br, buffer);
     const double average = static_cast<double>(A->nnz) / std::max<int64_t>(m, 1);
+    // Longer rows amortize indirect gather loads and avoid order-dependent
+    // scatter accumulation in cancellation-sensitive fp32 outputs.
+    if (n == 1 && indirect && !complex && average < 12.)
+        return launch_sparse_scatter(handle, A, B, C, m, ar, br, buffer);
     const bool stream = n == 8;
     const int r = n == 1 ? (average <= 4. ? 128 : 16) : (stream ? (average <= 8. ? 8 : 16) : 4);
     const int k = n == 1 ? (average <= 4. ? 4 : 8) : (stream ? 1 : 16);

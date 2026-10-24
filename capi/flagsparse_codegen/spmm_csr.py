@@ -173,21 +173,31 @@ def spmm_csr_batched8_real(
     data_ptr, indices_ptr, indptr_ptr, b_ptr, c_ptr, alpha, beta,
     n_rows, n_dense_cols, stride_bk, stride_bn, stride_cm, stride_cn,
     BATCH_ROWS: tl.constexpr, ACC_IS_FP64: tl.constexpr, HAS_BETA: tl.constexpr,
+    WIDE: tl.constexpr = True,
+    K: tl.constexpr = 4,
 ):
-    rows = tl.program_id(0) * BATCH_ROWS + tl.arange(0, BATCH_ROWS)
+    pid = tl.program_id(0).to(tl.int64) if WIDE else tl.program_id(0)
+    rows = pid * BATCH_ROWS + tl.arange(0, BATCH_ROWS)
     active = rows < n_rows
-    start = tl.load(indptr_ptr + rows, mask=active, other=0).to(tl.int64)
-    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0).to(tl.int64)
+    start = tl.load(indptr_ptr + rows, mask=active, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0)
+    if WIDE:
+        start, end = start.to(tl.int64), end.to(tl.int64)
+    else:
+        start, end = start.to(tl.int32), end.to(tl.int32)
+        stride_bk, stride_bn = tl.cast(stride_bk, tl.int32), tl.cast(stride_bn, tl.int32)
+        stride_cm, stride_cn = tl.cast(stride_cm, tl.int32), tl.cast(stride_cn, tl.int32)
     max_row_nnz = tl.max(end - start)
     offs_n = tl.arange(0, 8)
     acc_dtype = tl.float64 if ACC_IS_FP64 else tl.float32
     acc = tl.zeros((BATCH_ROWS, 8), dtype=acc_dtype)
-    for chunk_start in tl.range(0, max_row_nnz, 4):
-        offs_k = chunk_start + tl.arange(0, 4)
+    for chunk_start in tl.range(0, max_row_nnz, K):
+        offs_k = chunk_start + tl.arange(0, K)
         positions = start[:, None] + offs_k[None, :]
         valid = active[:, None] & (positions < end[:, None])
         values = tl.load(data_ptr + positions, mask=valid, other=0.0).to(acc_dtype)
-        cols = tl.load(indices_ptr + positions, mask=valid, other=0).to(tl.int64)
+        cols = tl.load(indices_ptr + positions, mask=valid, other=0)
+        cols = cols.to(tl.int64) if WIDE else cols.to(tl.int32)
         dense = tl.load(
             b_ptr + cols[:, :, None] * stride_bk + offs_n[None, None, :] * stride_bn,
             mask=valid[:, :, None], other=0.0,

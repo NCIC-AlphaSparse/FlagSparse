@@ -53,11 +53,17 @@ def spmv_csr_row_tile_real(
     data_ptr, indices_ptr, indptr_ptr, x_ptr, y_ptr, alpha, beta, n_rows,
     ROWS_PER_PROGRAM: tl.constexpr, LANES_PER_ROW: tl.constexpr,
     ACC_IS_FP64: tl.constexpr, HAS_BETA: tl.constexpr,
+    WIDE: tl.constexpr = True,
 ):
-    rows = tl.program_id(0).to(tl.int64) * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
+    pid = tl.program_id(0).to(tl.int64) if WIDE else tl.program_id(0)
+    rows = pid * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
     active = rows < n_rows
-    start = tl.load(indptr_ptr + rows, mask=active, other=0).to(tl.int64)
-    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0).to(tl.int64)
+    start = tl.load(indptr_ptr + rows, mask=active, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=active, other=0)
+    if WIDE:
+        start, end = start.to(tl.int64), end.to(tl.int64)
+    else:
+        start, end = start.to(tl.int32), end.to(tl.int32)
     steps = tl.max(tl.cdiv(end - start, LANES_PER_ROW), 0)
     lane = tl.arange(0, LANES_PER_ROW)
     acc_dtype = tl.float64 if ACC_IS_FP64 else tl.float32
@@ -66,7 +72,8 @@ def spmv_csr_row_tile_real(
         positions = start[:, None] + step * LANES_PER_ROW + lane[None, :]
         mask = active[:, None] & (positions < end[:, None])
         values = tl.load(data_ptr + positions, mask=mask, other=0.0).to(acc_dtype)
-        cols = tl.load(indices_ptr + positions, mask=mask, other=0).to(tl.int64)
+        cols = tl.load(indices_ptr + positions, mask=mask, other=0)
+        cols = cols.to(tl.int64) if WIDE else cols.to(tl.int32)
         acc += values * tl.load(x_ptr + cols, mask=mask, other=0.0).to(acc_dtype)
     out = alpha * tl.sum(acc, axis=1)
     if HAS_BETA:

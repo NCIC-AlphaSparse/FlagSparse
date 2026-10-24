@@ -210,9 +210,7 @@ class PreparedCscSpmm:
         self.rocm_non_gather_plan = None
         self.musa_trans_gather = bool(musa_trans_gather)
         if ((_is_rocm_runtime() or _is_iluvatar_runtime()) and not _is_ascend_runtime()
-                and data.dtype == torch.complex64 and self.op == "non"):
             from . import _spmv_csr_transpose
-            cols, ptr, order, rows, _, _, _ = _spmv_csr_transpose.prepare(
                 kernel_indices, kernel_indptr, (n_cols, n_rows)
             )
             self.rocm_non_gather_plan = (

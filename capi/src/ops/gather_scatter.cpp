@@ -23,6 +23,7 @@
 // Triton has and the one the Python package already uses.
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,11 @@ constexpr int kNumStages = 2;
 // Deriving it from the device keeps it right across backends, whose SM counts
 // and warp sizes differ.
 int64_t gather_max_programs(const Context* c) {
+    const bool musa = std::strcmp(adaptor::backend_name(), "musa") == 0;
+    static thread_local int cached_device = -1;
+    static thread_local int64_t cached_programs = 0;
+    if (musa && cached_device == c->device_index && cached_programs > 0)
+        return cached_programs;
     const int sm = adaptor::multiprocessor_count(c->device_index);
     const int threads_per_sm = adaptor::max_threads_per_multiprocessor(c->device_index);
     const int warp = adaptor::warp_size(c->device_index);
@@ -52,7 +58,12 @@ int64_t gather_max_programs(const Context* c) {
     const int block_threads = std::max(1, kNumWarps * (warp > 0 ? warp : 32));
     const int blocks_per_sm =
         threads_per_sm > 0 ? std::max(1, threads_per_sm / block_threads) : 1;
-    return std::max<int64_t>(1, static_cast<int64_t>(sm) * blocks_per_sm);
+    const int64_t programs = std::max<int64_t>(1, static_cast<int64_t>(sm) * blocks_per_sm);
+    if (musa) {
+        cached_device = c->device_index;
+        cached_programs = programs;
+    }
+    return programs;
 }
 
 struct Plan {

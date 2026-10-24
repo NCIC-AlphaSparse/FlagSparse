@@ -9,6 +9,10 @@
 
 #include "common.hpp"
 
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+#include <musa.h>
+#endif
+
 using namespace fstest;
 
 namespace {
@@ -23,10 +27,12 @@ template <typename In, typename Out>
 Out run_spvv(flagsparseHandle_t handle, flagsparseDataType_t input_type,
              flagsparseDataType_t output_type, const std::vector<In>& sparse,
              const std::vector<int32_t>& indices, const std::vector<In>& dense,
-             flagsparseOperation_t op = FLAGSPARSE_OPERATION_NON_TRANSPOSE) {
+             flagsparseOperation_t op = FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+             bool synchronize_inputs = false) {
     DeviceBuffer d_sparse = DeviceBuffer::from(sparse);
     DeviceBuffer d_indices = DeviceBuffer::from(indices);
     DeviceBuffer d_dense = DeviceBuffer::from(dense);
+    if (synchronize_inputs) dev_sync();
 
     flagsparseSpVecDescr_t vecX = nullptr;
     flagsparseDnVecDescr_t vecY = nullptr;
@@ -94,5 +100,31 @@ TEST_F(SpVVAccuracy, Complex64Conjugate) {
                                FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE)),
               C(3, -20));
 }
+
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+TEST_F(SpVVAccuracy, MusaRepeatedHostResultsOnDefaultAndNondefaultStreams) {
+    struct Stream {
+        MUstream value = nullptr;
+        ~Stream() { if (value) muStreamDestroy(value); }
+    } stream;
+    ASSERT_EQ(muStreamCreate(&stream.value, MU_STREAM_NON_BLOCKING), MUSA_SUCCESS);
+    using C = std::complex<float>;
+    const std::vector<int32_t> indices{0, 2};
+    const std::vector<C> dense{C(3, -2), C(0, 0), C(4, 1)};
+    for (flagsparseStream_t selected : {
+            static_cast<flagsparseStream_t>(nullptr),
+            reinterpret_cast<flagsparseStream_t>(stream.value)}) {
+        ASSERT_EQ(flagsparseSetStream(handle.h, selected), FLAGSPARSE_STATUS_SUCCESS);
+        for (int repeat = 0; repeat < 20; ++repeat) {
+            const std::vector<C> sparse{C(2 + repeat, 1), C(-1, 3)};
+            EXPECT_EQ((run_spvv<C, C>(handle.h, FLAGSPARSE_C_32F, FLAGSPARSE_C_32F,
+                        sparse, indices, dense,
+                        FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, true)),
+                      C(3 + 3 * repeat, -20 - 2 * repeat));
+        }
+    }
+    EXPECT_EQ(flagsparseSetStream(handle.h, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+}
+#endif
 
 }  // namespace
