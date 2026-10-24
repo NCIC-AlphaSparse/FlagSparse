@@ -1001,9 +1001,29 @@ def _run_sddmm_prepared(
 
     k_dim = int(x.shape[1])
     mean_row_len = nnz / prepared.n_rows if prepared.n_rows > 0 else float(nnz)
+    biv_complex = _is_iluvatar_runtime() and x.dtype == torch.complex64 and k_dim == 32
+    if (
+        _is_iluvatar_runtime()
+        and x.dtype == torch.float32
+        and k_dim == 32
+        and mean_row_len > 4
+        and x.stride(1) != 1
+        and y.stride(1) != 1
+    ):
+        # BI-V's transposed dense operands otherwise gather across large K
+        # strides for every nonzero. At this reuse level, packing both operands
+        # on each call is cheaper; short sparse rows retain the zero-copy path.
+        # Always read live operands, including updates between prepared calls.
+        x, y = x.contiguous(), y.contiguous()
+    if biv_complex:
+        # The small one-warp complex tile avoids register pressure on BI-V.
+        # Packing the live operands makes its K-axis loads contiguous.
+        x, y = x.contiguous(), y.contiguous()
     block_p, block_k, num_warps = _resolve_sddmm_launch_config(
         k_dim, mean_row_len=mean_row_len, value_dtype=x.dtype
     )
+    if biv_complex:
+        block_p, block_k, num_warps = 8, 32, 1
     kernel, acc_dtype = _resolve_sddmm_diagnostic_kernel(variant, x.dtype)
     if _is_maca_runtime() and x.dtype == torch.complex64 and variant == "baseline":
         kernel = _sddmm_csr_complex_kernel_maca

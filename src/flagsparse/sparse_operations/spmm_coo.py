@@ -768,6 +768,7 @@ class PreparedCooSpmmRoute:
         "op",
         "alg",
         "gather_ptr",
+        "full_row_ptr",
     )
 
     def __init__(
@@ -800,9 +801,20 @@ class PreparedCooSpmmRoute:
         self.op = str(op)
         self.alg = str(alg)
         self.gather_ptr = None
-        if _backend_name() == "cuda" and self.output_dtype == torch.complex64:
-            counts = torch.bincount(row.long(), minlength=self.n_rows)
-            self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
+        self.full_row_ptr = None
+        if _is_iluvatar_runtime() and self.alg in ("auto", "coo_rowrun"):
+            # The BI-V rowrun route writes every output row, including empty ones,
+            # so its prepared calls can allocate C without a separate zero fill.
+            boundaries = torch.arange(self.n_rows + 1, device=row.device, dtype=row.dtype)
+            self.full_row_ptr = torch.searchsorted(row, boundaries).to(torch.int32)
+        if ((_backend_name() == "cuda" and self.output_dtype == torch.complex64)
+                or (_is_mthreads_runtime() and self.output_dtype == torch.float16)):
+            if _is_mthreads_runtime():
+                boundaries = torch.arange(self.n_rows + 1, device=row.device, dtype=row.dtype)
+                self.gather_ptr = torch.searchsorted(row, boundaries).to(row.dtype)
+            else:
+                counts = torch.bincount(row.long(), minlength=self.n_rows)
+                self.gather_ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(row.dtype)
 
 
 @triton.jit
@@ -1077,6 +1089,39 @@ def _spmm_coo_rowrun_complex_kernel(
         out_im = out_im + beta_re * prev_im + beta_im * prev_re
     tl.store(c_re_ptrs, out_re, mask=mask_n)
     tl.store(c_im_ptrs, out_im, mask=mask_n)
+
+
+@triton.jit
+def _spmm_coo_biv_complex_rows_kernel(
+    values, columns, pointers, dense, output, n_rows, n_cols,
+    STRIDE_BK: tl.constexpr, STRIDE_BN: tl.constexpr,
+    STRIDE_CM: tl.constexpr, STRIDE_CN: tl.constexpr,
+    ROWS: tl.constexpr, LANES: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    dense_cols = tl.arange(0, 32)
+    lanes = tl.arange(0, LANES)
+    start = tl.load(pointers + rows, rows < n_rows, 0)
+    end = tl.load(pointers + rows + 1, rows < n_rows, 0)
+    real = tl.zeros((ROWS, LANES, 32), tl.float32)
+    imag = tl.zeros((ROWS, LANES, 32), tl.float32)
+    for step in range(0, tl.max(end - start, 0), LANES):
+        position = start[:, None] + step + lanes[None, :]
+        valid = (rows[:, None] < n_rows) & (position < end[:, None])
+        column = tl.load(columns + position, valid, 0)
+        matrix_real = tl.load(values + position * 2, valid, 0)
+        matrix_imag = tl.load(values + position * 2 + 1, valid, 0)
+        address = (column[:, :, None] * STRIDE_BK
+                   + dense_cols[None, None, :] * STRIDE_BN) * 2
+        active = valid[:, :, None] & (dense_cols[None, None, :] < n_cols)
+        dense_real = tl.load(dense + address, active, 0)
+        dense_imag = tl.load(dense + address + 1, active, 0)
+        real += matrix_real[:, :, None] * dense_real - matrix_imag[:, :, None] * dense_imag
+        imag += matrix_real[:, :, None] * dense_imag + matrix_imag[:, :, None] * dense_real
+    address = (rows[:, None] * STRIDE_CM + dense_cols[None, :] * STRIDE_CN) * 2
+    active = (rows[:, None] < n_rows) & (dense_cols[None, :] < n_cols)
+    tl.store(output + address, tl.sum(real, 1), active)
+    tl.store(output + address + 1, tl.sum(imag, 1), active)
 
 
 @triton.jit
@@ -1431,6 +1476,7 @@ def _triton_spmm_coo_rowrun_impl(
     dense_layout="row",
     seg_starts=None,
     num_warps=None,
+    full_rows=False,
 ):
     if _use_spmm_coo_ascend_dispatch():
         return _spmm_coo_ascend_scatter(
@@ -1475,7 +1521,21 @@ def _triton_spmm_coo_rowrun_impl(
             (n_rows, n_dense_cols), output_dtype, device, dense_layout
         )
 
-    all_rows_covered = _is_rocm_runtime() and n_segs == n_rows
+    if (_is_iluvatar_runtime() and dtype == torch.complex64
+            and output_dtype == dtype and full_rows and n_dense_cols == 32):
+        C_compute = out if out is not None else _empty_dense_layout(
+            (n_rows, n_dense_cols), output_dtype, device, dense_layout
+        )
+        batch_rows, lanes = (2, 1) if data.numel() <= 8 * n_rows else (1, 2)
+        _spmm_coo_biv_complex_rows_kernel[(triton.cdiv(n_rows, batch_rows),)](
+            torch.view_as_real(data), col, seg_starts,
+            torch.view_as_real(B), torch.view_as_real(C_compute),
+            n_rows, n_dense_cols, *B.stride(), *C_compute.stride(),
+            ROWS=batch_rows, LANES=lanes, num_warps=1,
+        )
+        return C_compute
+
+    all_rows_covered = full_rows or (_is_rocm_runtime() and n_segs == n_rows)
     # Low-NNZ COO matrices are dispatch-bound on gfx936. Grouping two adjacent
     # row runs keeps independent output rows while halving the grid height.
     use_rocm_rows2 = _is_rocm_runtime() and not _is_complex_dtype(dtype)
@@ -1510,10 +1570,8 @@ def _triton_spmm_coo_rowrun_impl(
             B,
             C_compute,
             seg_starts,
-            # This operator computes C = A @ B into a zeroed C; alpha/beta exist
-            # for the C API's cuSPARSE-compatible signature, and SEG_IS_ROW=False
-            # keeps the run-compressed seg_starts this path builds. Both constexprs
-            # fold away, so the generated kernel is unchanged.
+            # SEG_IS_ROW switches BI-V's prepared route to full row offsets;
+            # other routes keep the run-compressed segment starts.
             1,
             0,
             n_segs,
@@ -1525,7 +1583,7 @@ def _triton_spmm_coo_rowrun_impl(
             BLOCK_N=block_n,
             BLOCK_NNZ=block_nnz,
             ACC_DTYPE=acc_dtype,
-            SEG_IS_ROW=False,
+            SEG_IS_ROW=full_rows,
             HAS_BETA=False,
             num_warps=num_warps,
         )
@@ -1567,7 +1625,7 @@ def _triton_spmm_coo_rowrun_impl(
         B_ri,
         C_ri,
         seg_starts,
-        # See the real kernel above: identity alpha/beta, run-compressed segments.
+        # See the real kernel above: identity alpha/beta and segment mapping.
         1,
         0,
         0,
@@ -1583,7 +1641,7 @@ def _triton_spmm_coo_rowrun_impl(
         BLOCK_N=block_n,
         BLOCK_NNZ=block_nnz,
         ACC_DTYPE=acc_dtype,
-        SEG_IS_ROW=False,
+        SEG_IS_ROW=full_rows,
         HAS_BETA=False,
         num_warps=num_warps,
     )
@@ -1972,7 +2030,14 @@ def _run_spmm_coo_rowrun_route(
     dense_layout = _normalize_dense_layout(dense_layout)
     use_gather = (prepared.gather_ptr is not None and torch.is_tensor(B)
                   and B.ndim == 2 and int(B.shape[1]) == 32)
-    B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, wide=not use_gather)
+    use_biv_half = (_is_iluvatar_runtime() and prepared.output_dtype == torch.float16
+                    and prepared.full_row_ptr is not None)
+    # Keep canonical sparse values in fp32 (including duplicate sums), but
+    # widen dense loads in registers and store directly to the half output.
+    # This removes two full dense conversions on BI-V's prepared half route.
+    B = _validate_spmm_coo_route_runtime_inputs(
+        prepared, B, dense_layout, wide=not (use_gather or use_biv_half)
+    )
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -1987,20 +2052,35 @@ def _run_spmm_coo_rowrun_route(
                                 prepared.data.device, dense_layout)
         C = _spmm_row_gather.compute(prepared.data, prepared.col, prepared.gather_ptr, B, C)
     else:
-        C = _triton_spmm_coo_rowrun_impl(
-            prepared.data,
-            prepared.row,
-            prepared.col,
-            B,
-            prepared.n_rows,
-            int(B.shape[1]),
-            block_n=launch["block_n"],
-            block_nnz=launch["block_nnz"],
-            output_dtype=prepared.output_dtype,
-            dense_layout=dense_layout,
-            seg_starts=prepared.seg_starts,
-            num_warps=launch["num_warps"],
-        )
+        if use_biv_half:
+            from .mixed_spmx import _csr_spmm_mixed_rows_kernel
+
+            n = int(B.shape[1])
+            C = _empty_dense_layout((prepared.n_rows, n), prepared.output_dtype,
+                                    prepared.data.device, dense_layout)
+            if prepared.n_rows and n:
+                _csr_spmm_mixed_rows_kernel[(triton.cdiv(prepared.n_rows, 8), triton.cdiv(n, 32))](
+                    C, prepared.data, prepared.col, prepared.full_row_ptr, B,
+                    prepared.n_rows, n, *B.stride(), *C.stride(),
+                    ACC=tl.float32, ROWS=8, BLOCK_N=32, num_warps=1,
+                )
+        else:
+            C = _triton_spmm_coo_rowrun_impl(
+                prepared.data,
+                prepared.row,
+                prepared.col,
+                B,
+                prepared.n_rows,
+                int(B.shape[1]),
+                block_n=launch["block_n"],
+                block_nnz=launch["block_nnz"],
+                output_dtype=prepared.output_dtype,
+                dense_layout=dense_layout,
+                seg_starts=(prepared.full_row_ptr if prepared.full_row_ptr is not None
+                            else prepared.seg_starts),
+                num_warps=launch["num_warps"],
+                full_rows=prepared.full_row_ptr is not None,
+            )
     if timing:
         end.record()
         _ACCEL.synchronize()
@@ -2050,6 +2130,22 @@ def _run_spmm_coo_rowrun_route(
                 block_n=32, block_nnz=lanes, batch_rows=batch, num_warps=4,
                 grid_m=triton.cdiv(prepared.n_rows, batch), grid_n=1,
                 compute_dtype="complex64")
+        elif use_biv_half:
+            meta["diagnostics"].update(
+                launch_version="coo_biv_half_rows_v1", block_n=32, block_nnz=1,
+                batch_rows=8, num_warps=1, compute_dtype="float32",
+                grid_m=triton.cdiv(prepared.n_rows, 8),
+                grid_n=triton.cdiv(int(B.shape[1]), 32),
+            )
+        elif (_is_iluvatar_runtime() and prepared.output_dtype == torch.complex64
+              and prepared.full_row_ptr is not None and int(B.shape[1]) == 32):
+            batch, lanes = (2, 1) if prepared.nnz <= 8 * prepared.n_rows else (1, 2)
+            meta["diagnostics"].update(
+                launch_version="coo_biv_complex_rows_v1", block_n=32,
+                block_nnz=lanes, batch_rows=batch, num_warps=1,
+                compute_dtype="complex64", grid_m=triton.cdiv(prepared.n_rows, batch),
+                grid_n=1,
+            )
     return C, meta
 
 

@@ -37,6 +37,8 @@ import time
 import triton
 import triton.language as tl
 
+from ._rocm_sparse_cache import TensorPlanCache
+
 AXPBY_VALUE_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -47,6 +49,8 @@ AXPBY_VALUE_DTYPES = (
 )
 SPVV_VALUE_DTYPES = AXPBY_VALUE_DTYPES + (torch.int8,)
 _VECTOR_BLOCK = 1024
+_MUSA_AXPBY_INDEX_CACHE = TensorPlanCache()
+_ILUVATAR_AXPBY_INDEX_CACHE = TensorPlanCache()
 
 
 def _vector_compute_dtype(value_dtype):
@@ -154,6 +158,61 @@ def _axpy_complex_kernel(
     tl.store(y_ri_ptr + 2 * idx + 1, yi + alpha_re * xi + alpha_im * xr, mask=mask)
 
 
+@triton.jit
+def _musa_axpby_inverse_kernel(inverse, indices, nnz, n, BLOCK: tl.constexpr):
+    pos = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.load(indices + pos, pos < nnz, -1)
+    tl.store(inverse + row, pos, (pos < nnz) & (row >= 0) & (row < n))
+
+
+@triton.jit
+def _musa_axpby_kernel(y, values, inverse, n, alpha, beta, BLOCK: tl.constexpr):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    pos = tl.load(inverse + row, row < n, -1)
+    value = tl.load(values + pos, (row < n) & (pos >= 0), 0).to(tl.float32)
+    previous = tl.load(y + row, row < n, 0).to(tl.float32)
+    tl.store(y + row, beta * previous + alpha * value, row < n)
+
+
+def _musa_axpby(values, indices, y, alpha, beta):
+    n = y.numel()
+    if not n:
+        return
+    inverse = _MUSA_AXPBY_INDEX_CACHE.get((indices,), (n,))
+    if inverse is None:
+        inverse = torch.full((n,), -1, dtype=torch.int32, device=y.device)
+        nnz = indices.numel()
+        if nnz:
+            _musa_axpby_inverse_kernel[((nnz + 1023) // 1024,)](
+                inverse, indices.contiguous(), nnz, n, BLOCK=1024,
+                num_warps=4,
+            )
+        _MUSA_AXPBY_INDEX_CACHE.put((indices,), (n,), inverse)
+    _musa_axpby_kernel[((n + 2047) // 2048,)](
+        y, values, inverse, n, alpha, beta, BLOCK=2048, num_warps=4,
+    )
+
+
+def _iluvatar_axpby(values, indices, y, alpha, beta):
+    """BI-V fused Axpby using a cached sparse-index inverse map."""
+    n = y.numel()
+    if not n:
+        return
+    inverse = _ILUVATAR_AXPBY_INDEX_CACHE.get((indices,), (n,))
+    if inverse is None:
+        inverse = torch.full((n,), -1, dtype=torch.int32, device=y.device)
+        nnz = indices.numel()
+        if nnz:
+            _musa_axpby_inverse_kernel[((nnz + 1023) // 1024,)](
+                inverse, indices.contiguous(), nnz, n, BLOCK=1024,
+                num_warps=4,
+            )
+        _ILUVATAR_AXPBY_INDEX_CACHE.put((indices,), (n,), inverse)
+    _musa_axpby_kernel[((n + 2047) // 2048,)](
+        y, values, inverse, n, alpha, beta, BLOCK=2048, num_warps=4,
+    )
+
+
 def _torch_axpby(values, indices, y, alpha, beta):
     """Ascend path, also the reference shape of the Triton path."""
     compute = _vector_compute_dtype(y.dtype)
@@ -192,11 +251,17 @@ def flagsparse_axpby(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    # On gfx936, the native half-precision indexed add is substantially faster
-    # than launching separate fp32 scale and scatter kernels.  AXPBY's indices
-    # are required to be unique, so doing the update in the requested dtype is
-    # deterministic and matches the documented half output contract.
-    if _is_rocm_runtime() and y.dtype in (torch.float16, torch.bfloat16):
+    if (
+        _is_mthreads_runtime() and y.dtype in (torch.float16, torch.bfloat16)
+        and y.numel() <= 4 * 1024 * 1024
+    ):
+        # Cache index ownership only; every call reads the current values/y.
+        _musa_axpby(values, indices, y, a_re, b_re)
+    elif _is_iluvatar_runtime() and y.dtype in (torch.float16, torch.float32):
+        _iluvatar_axpby(values, kernel_idx, y, a_re, b_re)
+    elif _is_rocm_runtime() and y.dtype in (torch.float16, torch.bfloat16):
+        # Native half indexed add avoids a second launch on gfx936. Indices
+        # are unique, as required by the sparse-vector API.
         y.mul_(b_re)
         if values.numel():
             y.index_add_(0, kernel_idx.to(torch.int64), values * a_re)

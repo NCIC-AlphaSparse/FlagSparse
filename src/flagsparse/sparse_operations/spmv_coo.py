@@ -156,10 +156,15 @@ class PreparedCoo:
         ):
             from . import _spmv_csr_transpose
 
-            counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
-            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
-                self.row_trans.dtype
-            )
+            if _is_mthreads_runtime():
+                boundaries = torch.arange(self.n_cols + 1, device=self.row_trans.device,
+                                          dtype=self.row_trans.dtype)
+                ptr = torch.searchsorted(self.row_trans, boundaries).to(self.row_trans.dtype)
+            else:
+                counts = torch.bincount(self.row_trans.long(), minlength=self.n_cols)
+                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
+                    self.row_trans.dtype
+                )
             self.transpose_csr_plan = _spmv_csr_transpose.make_plan(
                 self.col_trans, ptr, None, self.n_cols
             )
@@ -173,6 +178,13 @@ class PreparedCoo:
                 self.non_csr_plan = _spmv_csr_transpose.make_plan(
                     self.col_non, ptr, None, self.n_rows
                 )
+                if _is_iluvatar_runtime():
+                    cols, plan_ptr, order, rows, _lanes, _batch, cache = (
+                        self.non_csr_plan
+                    )
+                    self.non_csr_plan = (
+                        cols, plan_ptr, order, rows, 16, 16, cache
+                    )
                 if _is_rocm_runtime():
                     # gfx936's wave64 complex gather is register-pressure
                     # bound at the default 8-lane row tile. Four lanes and a
@@ -182,6 +194,14 @@ class PreparedCoo:
                         self.non_csr_plan
                     )
                     self.non_csr_plan = (cols, plan_ptr, order, rows, 4, 128, cache)
+            elif _is_iluvatar_runtime():
+                counts = torch.bincount(self.row_non.long(), minlength=self.n_rows)
+                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
+                    self.row_non.dtype
+                )
+                self.non_csr_plan = _spmv_csr_transpose.make_plan(
+                    self.col_non, ptr, None, self.n_rows
+                )
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -559,7 +579,12 @@ def _prepare_coo_tensors(data, row, col, shape, sort_by_row):
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.numel() != row.numel() or data.numel() != col.numel():
         raise ValueError("data, row, col must have the same length")
-    if data.dtype not in SUPPORTED_SPMV_COO_VALUE_DTYPES:
+    prepare_value_dtypes = SUPPORTED_SPMV_COO_VALUE_DTYPES + (
+        torch.float16,
+        torch.bfloat16,
+        torch.int8,
+    )
+    if data.dtype not in prepare_value_dtypes:
         raise TypeError(_spmv_coo_dtype_error_message())
     if row.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("row dtype must be torch.int32 or torch.int64")
@@ -1028,6 +1053,29 @@ def flagsparse_spmv_coo(
     float16 / bfloat16 / int8 matrices and widened outputs (``out_dtype`` or
     ``out.dtype``: half -> float32, int8 -> int32 / float32) run in ``mixed_spmx``.
     """
+    if prepared is not None and torch.is_tensor(x):
+        mixed_data = prepared.data_non
+        if _mixed_spmx.spmv_needs_mixed(
+            mixed_data.dtype, x.dtype, out, out_dtype, coo=True
+        ):
+            transpose_flag = False if transpose is None else bool(transpose)
+            op_code = _normalize_spmv_coo_op(
+                op if op is not None else prepared.op,
+                transpose=transpose_flag if op is None else False,
+            )
+            launch = _resolve_spmv_coo_launch(prepared, op_code)
+            return _mixed_spmx.spmv_coo_mixed(
+                launch.data,
+                launch.row,
+                launch.col,
+                x,
+                launch.shape,
+                op=None,
+                transpose=False,
+                out=out,
+                out_dtype=out_dtype,
+                return_time=return_time,
+            )
     if (
         prepared is None
         and torch.is_tensor(data)

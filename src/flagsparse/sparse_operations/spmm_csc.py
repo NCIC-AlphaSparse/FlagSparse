@@ -16,6 +16,7 @@
 
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from ._common import *
 from ._rocm_sparse_cache import TensorPlanCache
@@ -45,6 +46,8 @@ _SPMM_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMM_CSC_OP_NAMES.item
 SPMM_CSC_ALG_BASE = "spmm_csc_base"
 _SPMM_CSC_RESERVED_OP_MESSAGE = "spmm_csc_base supports op='non', 'trans', and 'conj'"
 _ROCM_CSC_PREPARED_CACHE = TensorPlanCache()
+_MUSA_CSC_HALF_CACHE = TensorPlanCache()
+_ILUVATAR_CSC_CSR_CACHE = TensorPlanCache(maxsize=16)
 
 
 class SpmmCscAlgorithmUnavailable(RuntimeError):
@@ -158,6 +161,7 @@ class PreparedCscSpmm:
         "index_fallback_applied",
         "index_fallback_reason",
         "rocm_non_gather_plan",
+        "musa_trans_gather",
     )
 
     def __init__(
@@ -180,6 +184,7 @@ class PreparedCscSpmm:
         index_fallback_policy="auto",
         index_fallback_applied=False,
         index_fallback_reason=None,
+        musa_trans_gather=False,
     ):
         self.data = data
         self.kernel_indices = kernel_indices
@@ -203,7 +208,8 @@ class PreparedCscSpmm:
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
         self.rocm_non_gather_plan = None
-        if (_is_rocm_runtime() and not _is_ascend_runtime()
+        self.musa_trans_gather = bool(musa_trans_gather)
+        if ((_is_rocm_runtime() or _is_iluvatar_runtime()) and not _is_ascend_runtime()
                 and data.dtype == torch.complex64 and self.op == "non"):
             from . import _spmv_csr_transpose
             cols, ptr, order, rows, _, _, _ = _spmv_csr_transpose.prepare(
@@ -608,6 +614,12 @@ def prepare_spmm_csc_route(
         op=_spmm_csc_op_to_name(op_code),
         alg=resolved_alg,
         index_fallback_policy=index_fallback_policy,
+        musa_trans_gather=(
+            _is_mthreads_runtime()
+            and _spmm_csc_op_transposes(op_code)
+            and data.dtype in (torch.float32, torch.complex64)
+            and block_n is None and block_nnz is None and max_segments is None
+        ),
     )
 
 
@@ -1175,6 +1187,17 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
     dtype = prepared.data.dtype
     n_dense_cols = int(B.shape[1])
     out_rows = prepared.n_cols if transposes else prepared.n_rows
+    if prepared.musa_trans_gather and transposes:
+        from . import _spmm_row_gather
+
+        C = torch.empty((out_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
+        values = prepared.data
+        if op_code == SPMM_CSC_OP_CONJ_TRANS:
+            values = values.conj()
+        return _spmm_row_gather.compute(
+            values.resolve_conj(), prepared.kernel_indices, prepared.kernel_indptr,
+            B.resolve_conj(), C,
+        )
     plan = prepared.rocm_non_gather_plan
     if plan is not None and not transposes:
         C = torch.empty((out_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
@@ -1192,10 +1215,11 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
                 values = cache["values"]
             B_ri = torch.view_as_real(B)
             tile_n = prepared.block_n if prepared.block_n_override else 32
-            _spmm_csc_rocm_complex_gather_kernel[(triton.cdiv(out_rows, 4), triton.cdiv(n_dense_cols, tile_n))](
+            rows_per, lanes = (8, 4) if _is_iluvatar_runtime() else (4, 8)
+            _spmm_csc_rocm_complex_gather_kernel[(triton.cdiv(out_rows, rows_per), triton.cdiv(n_dense_cols, tile_n))](
                 torch.view_as_real(values), cols, ptr, rows, order, B_ri, torch.view_as_real(C),
                 out_rows, n_dense_cols, B_ri.stride(0), B_ri.stride(1),
-                R=4, K=8, TILE_N=tile_n, INDIRECT=version is None, num_warps=4,
+                R=rows_per, K=lanes, TILE_N=tile_n, INDIRECT=version is None, num_warps=4,
             )
         return C
     C = torch.zeros((out_rows, n_dense_cols), dtype=dtype, device=prepared.data.device)
@@ -1517,10 +1541,14 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
     compute_ms = None
     gather_route = (prepared.rocm_non_gather_plan is not None
                     and not _spmm_csc_op_transposes(prepared.op))
-    block_n = (prepared.block_n if prepared.block_n_override else 32) if gather_route else (
-        prepared.block_n if prepared.block_n_override
-        else _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device)
-    )
+    musa_gather = prepared.musa_trans_gather and _spmm_csc_op_transposes(prepared.op)
+    if musa_gather:
+        block_n = min(32, triton.next_power_of_2(int(B.shape[1])))
+    elif gather_route:
+        block_n = prepared.block_n if prepared.block_n_override else 32
+    else:
+        block_n = (prepared.block_n if prepared.block_n_override else
+                   _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device))
     backend_info = _get_device_backend_info(prepared.data.device)
     if timing:
         _ACCEL.synchronize()
@@ -1537,7 +1565,7 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": compute_ms,
         "block_n": int(block_n),
-        "block_nnz": 8 if gather_route else int(prepared.block_nnz),
+        "block_nnz": 4 if musa_gather else 8 if gather_route else int(prepared.block_nnz),
         "launch_backend": backend_info["backend"],
         "device_warp_size": int(backend_info["device_warp_size"]),
     }
@@ -1624,6 +1652,7 @@ def _spmm_csc_prepared_with_int32_indices(prepared, reason):
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=True,
         index_fallback_reason=str(reason),
+        musa_trans_gather=prepared.musa_trans_gather,
     )
 
 
@@ -1766,6 +1795,64 @@ def flagsparse_spmm_csc(
     index_fallback_policy="auto",
 ):
     """CSC SpMM using native Triton CSC kernels."""
+    # BI-V's CSC non-transpose scatter path performs one atomic update per
+    # (nnz, dense-column) product.  Reuse a prepared CSC->CSR topology and run
+    # the row-owned CSR kernel instead; the conversion is cached by the sparse
+    # operand versions, so repeated benchmark calls measure only SpMM.
+    if (
+        _is_iluvatar_runtime()
+        and prepared is None
+        and data is not None
+        and indices is not None
+        and indptr is not None
+        and shape is not None
+        and B is not None
+        and _normalize_spmm_csc_op(op, bool(transpose)) == SPMM_CSC_OP_NON
+        and (transpose is None or not bool(transpose))
+        and _normalize_spmm_csc_alg(alg) == "auto"
+        and block_n is None
+        and block_nnz is None
+        and max_segments is None
+        and not timing
+        and not return_meta
+        # int64 indices and a non-default index policy keep the native route:
+        # its int64->int32 fallback and "strict" are part of the contract.
+        and torch.is_tensor(indices)
+        and indices.dtype == torch.int32
+        and str(index_fallback_policy).lower() == "auto"
+    ):
+        from . import mixed_spmx
+
+        sources = (data, indices, indptr)
+        options = (tuple(shape), data.dtype)
+        state = _ILUVATAR_CSC_CSR_CACHE.get(sources, options)
+        if state is None:
+            validation_data = data if data.dtype in SUPPORTED_SPMM_CSC_VALUE_DTYPES else data.to(torch.float32)
+            _, csc_rows, csc_ptr, n_rows, n_cols, *_ = _prepare_spmm_csc_matrix(
+                validation_data, indices, indptr, shape
+            )
+            from . import _spmv_csr_transpose
+
+            csr_cols, csr_ptr, order, *_ = _spmv_csr_transpose.prepare(
+                csc_rows, csc_ptr, (n_cols, n_rows)
+            )
+            reordered_data = data.index_select(0, order.to(torch.int64)).contiguous()
+            state = (reordered_data, csr_cols, csr_ptr, (n_rows, n_cols))
+            _ILUVATAR_CSC_CSR_CACHE.put(sources, options, state)
+        csr_data, csr_cols, csr_ptr, csr_shape = state
+        # The same B checks (and messages) as the native route.
+        _validate_spmm_csc_B(
+            B,
+            SimpleNamespace(
+                data=data, n_rows=csr_shape[0], n_cols=csr_shape[1]
+            ),
+            SPMM_CSC_OP_NON,
+        )
+        return mixed_spmx.spmm_csr_mixed(
+            csr_data, csr_cols, csr_ptr, B, csr_shape, out=out,
+            return_time=return_time,
+        )
+
     # float16 is not in SUPPORTED_SPMM_CSC_VALUE_DTYPES: the `non` route scatters
     # into C with tl.atomic_add (see _spmm_csc_non_real_kernel), and fp16
     # atomic_add is not reliably available on every backend -- mixed_spmx.py's
@@ -1775,6 +1862,37 @@ def flagsparse_spmm_csc(
     # thing in float32 (the same "atomic_add on a float32 buffer, cast at the
     # end" shape COO already uses) and cast back once at this public boundary.
     if prepared is None and data is not None and data.dtype == torch.float16:
+        if (
+            _is_mthreads_runtime()
+            and indices is not None and indptr is not None and shape is not None
+            and B is not None and B.dtype == torch.float16
+            and not return_meta and not timing
+            and block_n is None and block_nnz is None and max_segments is None
+            and _normalize_spmm_csc_alg(alg) == "auto"
+            and _normalize_spmm_csc_op(op, bool(transpose)) == SPMM_CSC_OP_NON
+            and (transpose is None or not bool(transpose))
+            and (out is None or out.dtype == torch.float16)
+        ):
+            from . import _spmv_csr_transpose, mixed_spmx
+
+            _normalize_spmm_csc_index_fallback_policy(index_fallback_policy)
+            sources = (data, indices, indptr)
+            options = tuple(shape)
+            t0 = mixed_spmx._start(return_time)
+            state = _MUSA_CSC_HALF_CACHE.get(sources, options)
+            if state is None:
+                # Retain the raw CSC validation, but only redo topology work
+                # when a sparse operand's storage or mutation signature changes.
+                _, cols, ptr, m, n, *_ = _prepare_spmm_csc_matrix(
+                    data.to(torch.float32), indices, indptr, shape
+                )
+                csr_cols, csr_ptr, order, *_ = _spmv_csr_transpose.prepare(cols, ptr, (n, m))
+                state = data.index_select(0, order.long()).contiguous(), csr_cols, csr_ptr
+                _MUSA_CSC_HALF_CACHE.put(sources, options, state)
+            if B.device != data.device:
+                raise ValueError("B must be on the same CUDA device as sparse matrix data")
+            C = mixed_spmx.spmm_csr_mixed(*state, B, shape, out=out)
+            return mixed_spmx._finish(C, out, t0, return_time)
         result = flagsparse_spmm_csc(
             data.to(torch.float32),
             indices,

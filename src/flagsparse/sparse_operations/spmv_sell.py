@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from ._rocm_sparse_cache import TensorPlanCache
+from ._musa_spmv_launch import launch as _launch_musa_spmv
 
 SPMV_SELL_VALUE_DTYPES = (
     torch.float16,
@@ -74,6 +75,49 @@ _TL = {
     torch.int32: tl.int32,
 }
 _ROCM_SELL_CSR_CACHE = TensorPlanCache(maxsize=16)
+_MUSA_SELL_PLAN_CACHE = TensorPlanCache(maxsize=16)
+_ILUVATAR_SELL_CSC_CACHE = TensorPlanCache(maxsize=16)
+
+
+def _iluvatar_sell_csc_plan(values, cols, offsets, n_rows, n_cols, slice_size):
+    sources = (values, cols, offsets)
+    options = (int(n_rows), int(n_cols), int(slice_size))
+    cached = _ILUVATAR_SELL_CSC_CACHE.get(sources, options)
+    if cached is not None:
+        return cached
+    rows = _sell_entry_rows(cols, offsets, slice_size)
+    valid = (cols >= 0) & (rows < n_rows)
+    row_ids = rows[valid].to(torch.int64)
+    col_ids = cols[valid].to(torch.int64)
+    order = torch.argsort(col_ids, stable=True)
+    row_ids = row_ids.index_select(0, order).to(cols.dtype)
+    data = values[valid].index_select(0, order).contiguous()
+    indices = row_ids.contiguous()
+    counts = torch.bincount(col_ids, minlength=n_cols)
+    indptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(cols.dtype)
+    plan = (data, indices, indptr)
+    _ILUVATAR_SELL_CSC_CACHE.put(sources, options, plan)
+    return plan
+
+
+def _musa_sell_csr_plan(values, cols, offsets, n_rows, slice_size):
+    """Compact heavily padded real SELL without retaining computed outputs."""
+    rows = _sell_entry_rows(cols, offsets, slice_size)
+    positions = torch.nonzero((cols >= 0) & (rows < n_rows)).flatten()
+    plan = ()
+    if values.numel() > max(positions.numel(), 1) * 2:
+        rows = rows.index_select(0, positions)
+        order = torch.argsort(rows, stable=True)
+        rows = rows.index_select(0, order)
+        positions = positions.index_select(0, order)
+        boundaries = torch.arange(n_rows + 1, device=rows.device, dtype=rows.dtype)
+        ptr = torch.searchsorted(rows, boundaries).to(cols.dtype)
+        plan = (
+            values.index_select(0, positions),
+            cols.index_select(0, positions),
+            ptr,
+        )
+    return plan
 
 
 def _rocm_sell_csr_plan(values, cols, offsets, n_rows, slice_size):
@@ -130,6 +174,8 @@ def _rocm_sell_real_kernel(values, cols, offsets, x, y, n_rows, slice_size):
     )
     return y
 
+
+
 @triton.jit
 def _spmv_sell_real_kernel(
     y_ptr, values_ptr, cols_ptr, offsets_ptr, x_ptr, n_rows,
@@ -181,6 +227,45 @@ def _spmv_sell_complex_kernel(
     mask = rmask & (row < n_rows)
     tl.store(y_ri_ptr + 2 * row, acc_re, mask=mask)
     tl.store(y_ri_ptr + 2 * row + 1, acc_im, mask=mask)
+
+
+@triton.jit
+def _musa_spmv_sell_kernel(
+    Y, V, C, P, X, M,
+    SLICE: tl.constexpr, ROWS: tl.constexpr, SLOTS: tl.constexpr,
+    COMPLEX: tl.constexpr, ACC: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    slices = rows // SLICE
+    start = tl.load(P + slices, rows < M, other=0)
+    stop = tl.load(P + slices + 1, rows < M, other=0)
+    width = (stop - start) // SLICE
+    base = start + rows % SLICE
+    slots = tl.arange(0, SLOTS)
+    real = tl.zeros((ROWS, SLOTS), ACC)
+    imag = tl.zeros((ROWS, SLOTS), ACC)
+    for offset in range(0, tl.max(width, 0), SLOTS):
+        j = offset + slots
+        pos = base[:, None] + j[None, :] * SLICE
+        active = (rows[:, None] < M) & (j[None, :] < width[:, None])
+        col = tl.load(C + pos, active, other=-1)
+        valid = active & (col >= 0)
+        if COMPLEX:
+            vr = tl.load(V + 2 * pos, valid, other=0).to(ACC)
+            vi = tl.load(V + 2 * pos + 1, valid, other=0).to(ACC)
+            xr = tl.load(X + 2 * col, valid, other=0).to(ACC)
+            xi = tl.load(X + 2 * col + 1, valid, other=0).to(ACC)
+            real += vr * xr - vi * xi
+            imag += vr * xi + vi * xr
+        else:
+            value = tl.load(V + pos, valid, other=0).to(ACC)
+            vector = tl.load(X + col, valid, other=0).to(ACC)
+            real += value * vector
+    if COMPLEX:
+        tl.store(Y + 2 * rows, tl.sum(real, 1), rows < M)
+        tl.store(Y + 2 * rows + 1, tl.sum(imag, 1), rows < M)
+    else:
+        tl.store(Y + rows, tl.sum(real, 1), rows < M)
 
 
 @triton.jit
@@ -288,6 +373,45 @@ def _validate_spmv_sell(values, cols, offsets, x, shape, slice_size, validate):
     return n_rows, n_cols, slice_size, n_slices
 
 
+def _musa_sell_plan(values, cols, offsets, x, shape, slice_size, validate):
+    sources = (values, cols, offsets)
+    options = (int(shape[0]), int(shape[1]), int(slice_size))
+    state = _MUSA_SELL_PLAN_CACHE.get(sources, options)
+    if state is None:
+        dims = _validate_spmv_sell(values, cols, offsets, x, shape, slice_size, validate)
+        state = {"dims": dims, "validated": bool(validate), "csr": None,
+                 "arrays": (values.contiguous(), cols.contiguous(), offsets.contiguous())}
+        _MUSA_SELL_PLAN_CACHE.put(sources, options, state)
+    elif validate and not state["validated"]:
+        _validate_spmv_sell(values, cols, offsets, x, shape, slice_size, True)
+        state["validated"] = True
+    else:
+        if not torch.is_tensor(x):
+            raise TypeError("x must be a torch.Tensor")
+        if x.ndim != 1:
+            raise ValueError("x must be a 1D tensor")
+        if not _is_accel_tensor(x):
+            raise ValueError("x must be an accelerator tensor")
+        if x.device != values.device:
+            raise ValueError("SELL SpMV inputs must be on one device")
+        if x.dtype != values.dtype:
+            raise TypeError("x dtype must match values dtype")
+        if x.numel() != state["dims"][1]:
+            raise ValueError(f"x length {x.numel()} does not match n_cols {state['dims'][1]}")
+    return state
+
+
+def _musa_sell_tile(n_values, n_rows, n_slices, slice_size, complex_values):
+    mean_width = n_values / max(1, n_slices * slice_size)
+    if mean_width <= 4.5:
+        return 128, 1
+    if 9 < mean_width <= 16 and n_rows <= 524288:
+        return 64, 2
+    if not complex_values and 16 < mean_width <= 24 and n_rows >= 262144:
+        return 128, 1
+    return 32, 4
+
+
 def flagsparse_spmv_sell(
     values,
     col_indices,
@@ -310,9 +434,25 @@ def flagsparse_spmv_sell(
     """
     if str(op).strip().lower() not in ("non", "n", "non_trans"):
         raise NotImplementedError("SELL SpMV supports op='non' only")
-    n_rows, _n_cols, slice_size, n_slices = _validate_spmv_sell(
-        values, col_indices, slice_offsets, x, shape, slice_size, validate
+    musa = _is_mthreads_runtime()
+    cached_musa = (
+        musa and torch.is_tensor(values)
+        and values.dtype in (
+            torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.complex64
+        )
     )
+    t0 = None
+    if cached_musa:
+        if return_time:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        state = _musa_sell_plan(values, col_indices, slice_offsets, x, shape, slice_size, validate)
+        n_rows, _n_cols, slice_size, n_slices = state["dims"]
+        values, cols, offsets = state["arrays"]
+    else:
+        n_rows, _n_cols, slice_size, n_slices = _validate_spmv_sell(
+            values, col_indices, slice_offsets, x, shape, slice_size, validate
+        )
     allowed = _SPMV_SELL_OUT_DTYPES[values.dtype]
     if out is not None:
         if out_dtype is not None and out.dtype != out_dtype:
@@ -325,16 +465,51 @@ def flagsparse_spmv_sell(
         names = ", ".join(str(d).replace("torch.", "") for d in allowed)
         raise TypeError(f"{values.dtype} SELL SpMV can write: {names}")
     acc_dtype = _sell_acc_dtype(values.dtype, out_dtype)
-    values = values.contiguous()
-    cols = col_indices.contiguous()
-    offsets = slice_offsets.contiguous()
+    if not cached_musa:
+        values = values.contiguous()
+        cols = col_indices.contiguous()
+        offsets = slice_offsets.contiguous()
     x = x.contiguous()
 
-    t0 = None
-    if return_time:
+    if return_time and not cached_musa:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    if _is_ascend_runtime():
+    if musa:
+        y = out if out is not None and out.is_contiguous() else torch.empty(
+            n_rows, dtype=out_dtype, device=x.device
+        )
+        plan = ()
+        if cached_musa:
+            if state["csr"] is None:
+                state["csr"] = ()
+                if (
+                    n_slices and not _is_complex_dtype(values.dtype)
+                    and values.numel() > n_rows * 4.5
+                ):
+                    state["csr"] = _musa_sell_csr_plan(values, cols, offsets, n_rows, slice_size)
+            plan = state["csr"]
+        if plan:
+            from .mixed_spmx import _musa_csr_spmv
+
+            _musa_csr_spmv(*plan, x, n_rows, out_dtype, acc_dtype, y)
+        elif n_slices:
+            complex_values = _is_complex_dtype(values.dtype)
+            rows, slots = _musa_sell_tile(
+                values.numel(), n_rows, n_slices, slice_size, complex_values
+            )
+            target, matrix, vector = (
+                (torch.view_as_real(t) for t in (y, values, x))
+                if complex_values else (y, values, x)
+            )
+            _launch_musa_spmv(
+                _musa_spmv_sell_kernel, ((n_rows + rows - 1) // rows,),
+                (target, matrix, cols, offsets, vector), (n_rows,),
+                (slice_size, rows, slots, complex_values,
+                 tl.float64 if acc_dtype == torch.complex128 else (
+                    tl.float32 if complex_values else _TL[acc_dtype]
+                 )),
+            )
+    elif _is_ascend_runtime():
         y = _torch_spmv_sell(values, cols, offsets, x, n_rows, slice_size, acc_dtype)
         y = y if y.dtype == out_dtype else y.to(out_dtype)
     else:
@@ -346,6 +521,28 @@ def flagsparse_spmv_sell(
         y = out if out is not None and out.is_contiguous() else torch.empty(
             n_rows, dtype=out_dtype, device=x.device
         )
+        if (
+            _is_iluvatar_runtime()
+            and values.dtype == torch.complex64
+            and os.environ.get("FLAGSPARSE_SELL_USE_CSC") == "1"
+        ):
+            from .spmv_csc import flagsparse_spmv_csc
+
+            csc_data, csc_rows, csc_ptr = _iluvatar_sell_csc_plan(
+                values, cols, offsets, n_rows, _n_cols, slice_size
+            )
+            result = flagsparse_spmv_csc(
+                csc_data, csc_rows, csc_ptr, x, (n_rows, _n_cols), op="non"
+            )
+            if out is not None:
+                out.copy_(result)
+                y = out
+            else:
+                y = result
+            if return_time:
+                _ACCEL.synchronize()
+                return y, (time.perf_counter() - t0) * 1000.0
+            return y
         block_r = triton.next_power_of_2(slice_size)
         # Group existing slices; changing SLICE would reinterpret the storage.
         group = max(1, min(8, (256 if _is_rocm_runtime() else 128) // block_r))
@@ -372,6 +569,12 @@ def flagsparse_spmv_sell(
         warp_override = os.environ.get("FLAGSPARSE_SELL_ROCM_WARPS")
         if _is_rocm_runtime() and warp_override:
             num_warps = max(1, min(8, int(warp_override)))
+        if _is_iluvatar_runtime() and not _is_complex_dtype(values.dtype):
+            # BI-V benefits from one warp per slice until the launch grid gets
+            # large enough that grouping two slices amortizes program overhead.
+            group, num_warps = (1 if n_slices <= 32768 else 2), 1
+            if slice_size <= 32:
+                block_r = 64
         grid = (triton.cdiv(n_slices, group),)
         if n_slices:
             if _is_complex_dtype(values.dtype):
@@ -444,7 +647,7 @@ def csr_to_sell(data, indices, indptr, n_rows, slice_size, index_dtype=None):
         )
         slot = torch.arange(nnz, device=device, dtype=torch.int64) - ptr[rows]
         pos = offsets[rows // slice_size] + slot * slice_size + rows % slice_size
-        if _is_ascend_runtime() and data.is_complex():
+        if (_is_ascend_runtime() or _is_mthreads_runtime()) and data.is_complex():
             # torch_npu's IndexPut implementation rejects complex tensors.  Store
             # the two real planes instead; IndexCopy supports the corresponding
             # floating dtype and view_as_complex restores the SELL value layout.
