@@ -101,6 +101,31 @@ nnz 的行上，大部分 lane 是空转的。
   搭配 `ROWS=32`（清单第 2、3 项）。
 - `spmv_csr_f32c32_int_non`：`timed=call`，每次调用都经过混合精度路径的入口。先确认计时窗口里有没有每次
   都做的准备工作（清单第 4 项）：q4 bench 对 `f16f32` 等也是 `call`，但 cuSPARSE 一侧的描述符是提前建好的。
+- **2026-10-24 已在 CUDA（5090）上处理 `spmv_csr_f32c32_int_non`，结论：瓶颈是主机开销，不是 kernel。**
+  GPU 时间（CUDA Graph 回放）上，现有 row-tile kernel 在 10 个矩阵里有 9 个已经不慢于 cuSPARSE（cage12 7.9 µs 对
+  13.6 µs），但一次调用的墙钟是 42 µs，而且对所有矩阵都差不多——Python 侧开销决定了数字。拆开是：Triton JIT
+  分发 16 µs（空 kernel 也要 12 µs）、`fs.<name>` 每次走未缓存的模块 `__getattr__` 3–6 µs、`_check_1d` 里每个张量
+  构造 `torch.device` 共 3.6 µs、每次分配 y 3.4 µs、`view_as_real`+`reshape` 4 µs。改动：
+  - `mixed_spmx.spmv_csr_mixed` 在纯 CUDA 上改用 `_musa_spmv_launch.launch(..., cuda=True)`（复用 MUSA 那套按
+    dtype/对齐/别名/标量值做 key 的已编译 launcher 缓存，直接调 `CompiledKernel.run`，7 µs）；Triton 启动器参数
+    对不上时首次 TypeError 就退回 JIT（参数解析在发射之前，不会重复执行）。ROCm/MACA/天数 不走这条路。
+  - `flagsparse.__getattr__` 把结果写回模块 globals；`_is_accel_tensor` 在设备类型为 `cuda` 时用 `t.is_cuda`；
+    `_finish` 在所有后端都跳过 `out.copy_(out)`（原来只有 MUSA 跳过）。这三条对所有后端、所有算子都生效。
+  - q4 bench 的混合精度 CSR `call` 路径传预分配的 `out`，与 cuSPARSE 一侧（以及其余 prepared 变体）对齐。
+  - 同进程交替 A/B、7 轮取最小（这台机器负载 120–250，单次数字不可信）：几何平均 0.656 → 0.905；
+    `f16f32` 走同一路径 0.715 → 0.921（"old" 已含上面三条通用改动，相对 HEAD 实际更多）。
+  - **剩下的是 ASIC_680ks（0.58）**：GPU 上 27 µs 对 cuSPARSE 15.6 µs（后者已接近带宽上限）。85% 的行 ≤4 个 nnz，
+    但有 369 行 >32、最长 210，row-tile 每个 tile 按最长行循环。试过"tile 内连续 nnz 段 + 行成员掩码归约"的
+    flat 写法（2D/3D 两版），比现在慢 2–10 倍，已放弃。下一步可试 `tl.gather` + 段内前缀和，或者像 MUSA 那样
+    用 prepare 期的 row-id 计划走 `_nnz_kernel`（但 `timed=call` 下要看计划能不能合法地放到 prepare）。
+  - 天数上：直接发射这条只在 NVIDIA CUDA 开。10-24 结果记录的天数 Triton 是 3.6.0，但它的 iluvatar 后端
+    `CompiledKernel.run` 签名没在真机上验证过，所以没开。**而且天数上这一项不是主机瓶颈**（耗时随 nnz 线性，
+    cage12 47.6 µs → auto 266.6 µs），主机侧改动在天数上收益很小，见下一条。
+  - 天数该怎么调：同一个 kernel 的 f32c32 / f16f32 / i8f32 在 auto 上是 266.6 / 202.3 / 160.3 µs，比例 1.66:1.26:1
+    正好等于每个 nnz 的 val+col 字节比 8:6:5，即瓶颈是 val/col 流式读取，只跑到约 200 GB/s（实测带宽 1150 GB/s
+    的 17%）；折算分母要求约 34%（与 H800 cuSPARSE 自身的带宽利用率相同）。现行天数 tile 表全部是
+    `num_warps=1, BLOCK=8`，每行一次只读 32 B。先用 `FLAGSPARSE_ILUVATAR_MIXED_ROWS/BLOCK/WARPS` 在 auto、
+    NACA0015、amazon0601 上扫 BLOCK∈{8,16,32}、ROWS∈{8,16,32}、WARPS∈{1,2,4}，复数单独出一张 tile 表。
 
 ### P2 `spvv_c32_int_conj`：固定开销
 
@@ -126,3 +151,74 @@ nnz 的行上，大部分 lane 是空转的。
 
 每改一处，都要重跑对应后端的精度（天数用 `docs/debug/ILUVATAR.md` 命令里的 `-k`），并且用同一个 benchmark、
 同一批 `tests/data` 矩阵对比前后。
+
+## 已验证的调优进展（2026-10-24，BI-V150）
+
+本节记录按 1→7 顺序进行的实测。原文前面的“建议”是调优前假设；若与本节结果冲突，以本节实测结论为准。性能比统一按
+`speedup = baseline_ms / current_ms` 计算，`>1.0x` 表示快于基线。有厂商基线时使用厂商基线；没有厂商基线时按 H800 cuSPARSE 带宽折算基线计算并报告折算加速比，注明其为折算值。
+
+### 第 1 项：`spmv_coo_c32_int_non` 路由与 gather 参数
+
+- 先对 ASIC_680ks 以 `warmup=10, iters=50` 复测默认路径：`0.8436 ms`，精度 `PASS`。
+- A/B `4×128`、`8×64`、`16×16` gather 配置后，ASIC_680ks 分别为 `1.0067 ms`、`0.8715 ms`、`0.8081 ms`。单矩阵最佳配置仅快约 `1.04x`，收益不足以改默认值。
+- 将 `16×16` 扩展到 10 个矩阵，精度均 `PASS`。相对旧结果中 H800 cuSPARSE 带宽折算时间的比值范围为 `0.064x–0.483x`，算术平均 `0.278x`；但候选与基线不是同一轮测试，因此仅作诊断数据，不能当作严格 A/B。没有保留 COO 参数变更。
+
+### 第 2 项：`spmv_coo_f32_int_trans` 准备与运行路径
+
+- 检查 `prepare_spmv_coo`：转置 COO 排序、分段信息和 gather plan 在 prepare 阶段建立，prepared 执行复用，没有发现每次 run 重建转置结构的问题。
+- ASIC_680ks `warmup=10, iters=50` 默认复测为 `0.5427 ms`，精度 `PASS`。尝试把 Iluvatar gather 参数覆盖扩展到实数转置路径后，`4×128`、`8×64`、`16×16`、`32×8` 分别约 `0.6050`、`0.5433`、`0.5567`、`0.7284 ms`，没有稳定收益，相关实验改动已撤销。
+- 旧结果中的 H800 折算基线为 `0.02536 ms`，折算比值约 `0.047x`。这不是同机实测基线；后续应定位该路径与 ASIC 特性的差异，而非重复优化 prepare。
+
+### P1 SELL 参数复测（2026-10-24）
+
+- 在 Iluvatar BI-V150 上按 `warmup=10, iters=50` 对 10 个矩阵、5 个 SELL 变体复测，50/50 精度 `PASS`。下面为各变体相对 H800 cuSPARSE 带宽折算基线的算术平均加速比：`c32 0.516x`、`f16 0.620x`、`f16f32 0.615x`、`f32 0.605x`、`i8i32 0.655x`。
+- 对实数变体尝试统一 `group=1, num_warps=1, block_r=32`，仍是 10 矩阵全量复测且 50/50 精度 `PASS`。折算平均比值为 `c32 0.516x`、`f16 0.618x`、`f16f32 0.617x`、`f32 0.625x`、`i8i32 0.624x`。相较同轮默认配置，只有 f32 显示约 `1.044x` 的时间收益；f16 约 `0.994x`、f16f32 约 `1.006x`，i8i32 约 `0.959x`（回退）。收益不一致，统一调度候选已撤销，保留原来的分组设置。
+- 下一轮聚焦仅对 Iluvatar f32 变体启用 `group=1/block_r=32`，f16 与 i8i32 沿用当前调度；对照基准需同轮交错测量，以排除运行间波动，再决定是否保留按 dtype 分派。
+
+### 第 3 项：`spvv_c32_int_conj` packed 复数归约
+
+- 原 Iluvatar 实现用一个 Triton kernel 生成实部/虚部 partial，再分别调用 `sum()` 归约，涉及多个 kernel launch。
+- 将 CUDA/MACA 已有的 packed real/imag partial + 单个 finalize kernel 路径也用于 Iluvatar；`nnz=1024–65536` 时 `n_parts<=1024`，每个 partial 写入连续的实虚分量，最后一个 kernel 同时归约两部分。
+- 精度：`FLAGSPARSE_BACKEND=iluvatar PYTHONPATH=src python3 -m pytest -q tests/pytest/test_q4_variants_accuracy.py -k spvv_c32_int_conj`，`2 passed`。
+- 同输入原实现/优化实现 A/B（`warmup=10, iters=50`）测得原实现耗时 `0.0530/0.0551/0.0498/0.0504 ms`，packed 路径耗时 `0.0146/0.0257/0.0259/0.0280 ms`，对应相对原实现加速比 `3.62x/2.14x/1.92x/1.80x`。
+- 另以同机 PyTorch 表达式 `(x.conj() * y.index_select(0, indices)).sum()` 为基线复测，四个规模加速比分别为 `3.51x/1.43x/1.68x/2.36x`，算术平均 `2.24x`，均超过 `0.8x`；最大绝对差不超过 `2.2e-5`。这解决了原先低于 `0.8x` 的问题。代码改动位于 `src/flagsparse/sparse_operations/vector_ops.py`。
+
+### 第 4 项：`spmv_csr_f32c32_int_non`（2026-10-24）
+
+- 针对 ASIC_680ks、NACA0015、amazon0601、auto、cfd2 在 Iluvatar BI-V150 上重新测量，默认参数 `warmup=10, iters=50`，精度 `5/5 PASS`。按各矩阵 H800 cuSPARSE 带宽折算基线计算，加速比分别为 `0.391x/0.711x/0.704x/0.595x/0.791x`，算术平均 `0.638x`。
+- 扫描 `rows/block = 32/8、64/4、8/16、16/16、8/32`，各配置五矩阵精度均 `PASS`，但都慢于默认，折算加速比算术平均分别为 `0.491x/0.415x/0.482x/0.457x/0.258x`。没有保留 tile 参数改动。
+- 对比 Iluvatar 当前 cached kernel（`.cg` 读 CSR 数据/列、`.ca` 读复数向量）和普通缓存策略 kernel，精度均通过。普通 kernel 相对 cached 的加速比在五矩阵上为 `1.106x/0.740x/0.803x/0.701x/0.906x`：只有 ASIC_680ks 受益，另外四个矩阵明显回退，暂不引入矩阵名特判。
+- 行长统计显示五矩阵差异明显：ASIC_680ks 平均 `3.41`、P50/P99=`2/16`、最大 `210`、CV=`1.25`；NACA0015 平均 `5.99`、P50/P99=`6/8`、最大 `10`；amazon0601 平均 `8.40`、P50/P99=`10/10`（另有 955 个空行）；auto 平均 `14.77`、P50/P99=`15/22`、最大 `37`；cfd2 平均 `25.02`、P50/P99=`27/30`。因此 ASIC_680ks 的长尾/高度偏斜和其他矩阵的窄分布不应由同一 tile 概括。
+- 进一步试验小行组 tile `rows/block=1/4、1/8、2/4、4/4、4/8、8/4`。均为五矩阵 `PASS`，但最好的一组 `8/4` 对默认的逐矩阵时间比（默认/候选）仍只有 `0.66x/0.65x/0.93x/0.84x/0.75x`，折算基线平均加速比 `0.494x`，低于默认的 `0.638x`。单行 CTA `1/4`、`1/8` 极慢，说明减少 CTA 内行间拖尾无法抵偿 CTA 数量膨胀。
+- 本轮 kernel 路径探索未找到默认路由的胜者；prepared API 改动仅保留为 opt-in。已有证据不支持简单扩大 tile、warp-per-row 或统一取消 cache modifier；调用侧预分配输出仅节省小部分时间。结果及参数扫描 CSV 均在 `results_csr_f32c32_explore_20261024/`。
+- 已将行长统计、分桶排序和 cache 策略选择改成显式 `prepare_spmv_csr_mixed` 计划；`spmv_csr_mixed_prepared`/`flagsparse_spmv_csr(prepared=...)` 的计时只覆盖 run/kernel，预处理不计入。q4 benchmark 的目标变体已切换到该 prepared 方式。
+- 原始 mixed call 路径的五矩阵折算加速比为 `0.391x/0.711x/0.704x/0.595x/0.791x`，算术平均 `0.638x`。在同一批输入上切换到 prepared cached run 后为 `0.404x/0.710x/0.704x/0.595x/0.793x`，算术平均 `0.641x`。用同一轮交错 A/B、且两边都预分配 `out`，prepared 相对原始 call 的逐矩阵执行加速比约为 `1.034x/1.000x/1.000x/1.000x/0.999x`，平均约 `1.007x`。
+- 强制 `prepared cached` 对全量 10 个矩阵复测（`warmup=10, iters=50`）且精度 `10/10 PASS`，相对 H800 cuSPARSE 带宽折算基线的加速比分别为：ASIC_680ks `0.440x`、GL7d14 `0.970x`、NACA0015 `0.711x`、amazon0601 `0.705x`、auto `0.595x`、cage12 `1.038x`、cfd2 `0.762x`、filter3D `0.832x`、roadNet-TX `0.864x`、wave `0.886x`；算术平均 **`0.780x`**（几何平均 `0.760x`）。
+- prepared A/B（同一进程交错、`warmup=10, iters=50`）中，单 kernel 分桶相对 cached 的加速比分别为 `0.527x/0.537x/0.731x/0.425x/0.753x`，精度 `5/5 PASS`，仍明显回退；prepared adaptive 选择为 ASIC_680ks 使用 plain-load、其余四个矩阵使用 cached；ASIC_680ks 的 plain-load 仅有约 `1.040x` kernel 加速，但其余矩阵 plain-load 为 `0.734x/0.802x/0.703x/0.897x`。因此分桶暂不接入默认路由，adaptive 只在 prepared mixed 路径中使用。
+
+#### 复数专用 tile 与 ASIC nnz 均分（2026-10-24）
+
+- 在 ASIC_680ks、auto、amazon0601、NACA0015 上扫描 `ROWS ∈ {8,16,32}`、`BLOCK ∈ {4,8,16,32}`、`WARPS ∈ {1,2,4}`，并比较 cached/plain；候选精度均 `PASS`。`num_stages=1/2/3` 差异很小，未观察到稳定收益。
+- 复数路径单独使用 tile 表，平均行长 `<=12` 采用 `16x8x1`，更长的中等行采用 `8x8x1`；`FLAGSPARSE_ILUVATAR_MIXED_ROWS/BLOCK/WARPS` 仍可覆盖。普通 f16/i8 路径不受这张表影响。
+- ASIC_680ks 平均行长 `3.41`、最大行长 `210`，自动路由改为在 prepare 阶段生成 `row_ids`/空行计划并使用 nnz 均分 segmented-scan kernel；扫描中 `BLOCK=128, WARPS=1` 最好，直接 kernel 约 `0.082 ms`，集成 prepared 调用多轮中位数约 `0.0890 ms`。计划生成不计入 kernel 计时。
+- prepared mixed 路径同时去掉了输出已直接写入 `out` 时的冗余 `out.copy_(y)`。精度回归为 `2 passed`，全量 10 矩阵为 `10/10 PASS`。
+- 全量复测使用 `warmup=20, iters=100`，每个矩阵 3 轮取中位数，基线为 H800 cuSPARSE 带宽折算值。相对基线加速比分别为：ASIC_680ks `0.676x`、GL7d14 `0.968x`、NACA0015 `0.711x`、amazon0601 `0.705x`、auto `0.622x`、cage12 `1.052x`、cfd2 `0.793x`、filter3D `0.855x`、roadNet-TX `0.857x`、wave `0.896x`；算术平均 **`0.814x`**，几何平均 **`0.803x`**。
+- 相比前一轮 prepared cached 的算术平均 `0.780x`、几何平均 `0.760x`，本轮分别提升约 `0.033x` 和 `0.044x`。结果文件为 `results_csr_f32c32_explore_20261024/prepared_auto_10mat_repeat.csv`；扫描结果在同目录的 `complex_tile_sweep4_stage2.csv`、`complex_tile_target_stages.csv`、`nnz_complex_sweep.csv`。
+
+#### 合入 main 时的修正（2026-10-24，CUDA 机上做）
+
+- 天数补丁把**共用的**实数 tile 表 `_iluvatar_mixed_spmv_tile` 的 12–24 档从 `16×8` 改成了 `8×8`（f16f32 / i8 / f16
+  都走这张表，没有实测），与上文"普通 f16/i8 路径不受影响"不符，按 abb5e84 恢复；复数专用表保留。
+- prepare 内不再用 TensorPlanCache：分桶、row-id、cache 策略都只在 prepare 里算一次，存在计划对象里。
+- MUSA、Ascend、ROCm f16→f16 的 prepared 计划回到各自原有的 call 路径（`route == "call"`，bench 记为 `timed=call`），
+  避免 bench 切到 prepared 后绕开 MUSA 调好的路径、在 Ascend 上直接跑 Triton。
+- prepared 运行补了 `out.device` 检查；不连续的 `out` 先写临时张量再拷回（原来会写进 `reshape` 出来的副本后丢掉）。
+- CUDA 上 prepared 路径也走直接发射；`nnz` 自动路由在 CUDA 上同样启用：5090 上 ASIC_680ks 的 nnz kernel
+  11.0 µs，cuSPARSE 15.7 µs，row-tile 27 µs。同进程交替 A/B（负载 500）：call 路径几何平均 0.908 → prepared 1.050，
+  ASIC 0.58 → 0.77（剩下的是主机开销）。
+- 新增 `tests/pytest/test_spmv_csr_mixed_prepared.py`（5 个路由 × 空行/长行/0 与 1 行/int64/strided out）。
+
+### 第 5–7 项及后续
+
+- 第 5–7 项仍待完成：SELL 变体逐项调参、COO mixed 短行的新路由思路、以及 Iluvatar 兼容的 `spgemm_csr` 实现。
+- 本轮保留的 tracked 源码优化还包括既有工作区改动 `src/flagsparse/sparse_operations/spmv_csr.py` 的 Iluvatar complex64 短行路由与 tile 参数。修改前后性能结论应使用对应同机基线和同一计时配置复测。

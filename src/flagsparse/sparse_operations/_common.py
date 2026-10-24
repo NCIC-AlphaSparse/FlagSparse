@@ -1044,6 +1044,8 @@ def _accel_fallback_reason():
 
 def _is_accel_tensor(t):
     """Backend-neutral replacement for Tensor.is_cuda."""
+    if _ACCEL_DEVICE_TYPE == "cuda" and isinstance(t, torch.Tensor):
+        return t.is_cuda  # same answer without building a torch.device
     return getattr(t, "device", None) is not None and t.device.type == _ACCEL_DEVICE_TYPE
 
 

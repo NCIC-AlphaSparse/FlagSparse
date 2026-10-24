@@ -164,6 +164,11 @@ from .spmv_csr import (
     prepare_spmv_coo_tocsr,
     prepare_spmv_csr,
 )
+from .mixed_spmx import (
+    PreparedCsrMixedSpmv,
+    prepare_spmv_csr_mixed,
+    spmv_csr_mixed_prepared,
+)
 from .spsm import (
     SPSM_ASCEND_DISPATCH,
     benchmark_spsm_case,
@@ -354,6 +359,9 @@ __all__ = [
     "prepare_spmv_coo_tocsr",
     "prepare_spmv_csc",
     "prepare_spmv_csr",
+    "PreparedCsrMixedSpmv",
+    "prepare_spmv_csr_mixed",
+    "spmv_csr_mixed_prepared",
     "resolve_spmm_csr_algorithm",
     "resolve_spmm_coo_algorithm",
     "resolve_spmm_bsr_algorithm",

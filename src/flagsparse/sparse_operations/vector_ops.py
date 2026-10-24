@@ -406,7 +406,11 @@ def flagsparse_spvv(values, indices, y, op="non", return_time=False, *, validate
         # complex lowering behavior.
         if (
             _is_complex_dtype(compute)
-            and (_backend_name() == "cuda" or _is_maca_runtime())
+            and (
+                _backend_name() == "cuda"
+                or _is_maca_runtime()
+                or _is_iluvatar_runtime()
+            )
             and n_parts <= 1024
         ):
             result = torch.empty((), dtype=compute, device=y.device)

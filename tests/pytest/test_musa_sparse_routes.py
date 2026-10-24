@@ -528,7 +528,8 @@ def test_musa_scope_output_self_copy(monkeypatch, musa):
     monkeypatch.setattr(mixed_spmx, "_is_mthreads_runtime", lambda: musa)
     out = Output()
     assert mixed_spmx._finish(out, out, None, False) is out
-    assert out.copies == (0 if musa else 1)
+    # Every backend skips the self-copy now: it was one dispatch per call.
+    assert out.copies == 0
 
 
 @pytest.mark.parametrize("musa", [False, True])

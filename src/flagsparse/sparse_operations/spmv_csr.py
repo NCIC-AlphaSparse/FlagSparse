@@ -1427,7 +1427,7 @@ def _triton_spmv_csr_impl_prepared(prepared, x, out=None):
             )
         if use_row_tile:
             if mean_row_nnz <= 4.0:
-                rows_per, block_nnz = 16, 8
+                rows_per, block_nnz = 32, 4
             elif mean_row_nnz <= 8.0:
                 rows_per, block_nnz = 8, 8
             elif mean_row_nnz <= 16.0:
@@ -1852,7 +1852,27 @@ def _spmv_execution_matrix(prepared):
 
 
 def _execute_spmv_route(prepared, x, out=None, timing=False):
-    if prepared.non_gather_plan is not None and prepared.alg_requested == "auto":
+    complex_short_rows = (
+        _is_iluvatar_runtime()
+        and prepared.data.dtype == torch.complex64
+        and prepared.data.numel() / max(1, prepared.n_rows) <= 3.0
+        and prepared.max_row_nnz <= 16
+    )
+    if (
+        prepared.non_gather_plan is not None
+        and prepared.alg_requested == "auto"
+        and not (
+            _is_iluvatar_runtime()
+            and prepared.data.dtype == torch.complex64
+            and (
+                os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE") == "row_tile"
+                or (
+                    os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto") == "auto"
+                    and complex_short_rows
+                )
+            )
+        )
+    ):
         from . import _spmv_csr_transpose
         y, compute_ms = _spmv_phase(
             lambda: _spmv_csr_transpose.gather(prepared.data, x, prepared.non_gather_plan,
@@ -2097,6 +2117,22 @@ def flagsparse_spmv_csr(
     bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
     ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
     """
+    if isinstance(prepared, _mixed_spmx.PreparedCsrMixedSpmv):
+        if any(value is not None for value in (data, indices, indptr, shape)):
+            raise ValueError("prepared mixed CSR calls must not also pass raw CSR arguments")
+        if any(value is not None for value in (alg, config, use_opt, op, transpose)):
+            raise ValueError("algorithm options do not apply to a prepared mixed CSR plan")
+        result = _mixed_spmx.spmv_csr_mixed_prepared(
+            prepared, x=x,
+            out=out, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return result
+        y, elapsed = result
+        if return_meta:
+            meta = {"route": "mixed_prepared", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     if (
         prepared is None
         and torch.is_tensor(data)

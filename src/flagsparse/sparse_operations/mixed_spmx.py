@@ -65,6 +65,39 @@ _WIDE_OUT = {
 }
 # real matrix dtype -> complex vector dtype it may multiply (SpMV only).
 _REAL_TIMES_COMPLEX = {torch.float32: torch.complex64, torch.float64: torch.complex128}
+# NVIDIA CUDA reuses compiled launchers (_musa_spmv_launch): Triton's JIT dispatch
+# alone outlasts these kernels on short matrices. Needs a Triton with knobs.
+try:
+    from triton import knobs as _knobs  # noqa: F401
+
+    _CUDA_DIRECT_LAUNCH = _backend_name() == "cuda"
+except ImportError:
+    _CUDA_DIRECT_LAUNCH = False
+
+
+class PreparedCsrMixedSpmv:
+    __slots__ = (
+        "data", "indices", "indptr", "shape", "n_rows", "n_cols",
+        "result_dtype", "acc_dtype", "rows_per", "block", "num_warps",
+        "route", "bucket_plan", "nnz_plan",
+    )
+
+    def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype,
+                 rows_per, block, num_warps, route, bucket_plan=None,
+                 nnz_plan=None):
+        self.data = data
+        self.indices = indices
+        self.indptr = indptr
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows, self.n_cols = self.shape
+        self.result_dtype = result_dtype
+        self.acc_dtype = acc_dtype
+        self.rows_per = rows_per
+        self.block = block
+        self.num_warps = num_warps
+        self.route = route
+        self.bucket_plan = bucket_plan
+        self.nnz_plan = nnz_plan
 
 
 def _requested_out_dtype(out, out_dtype):
@@ -167,7 +200,7 @@ def _csr_row_ids(indptr, n_rows, nnz):
 
 def _finish(y, out, t0, return_time):
     if out is not None:
-        if not _is_mthreads_runtime() or y is not out:
+        if y is not out:
             out.copy_(y)
         y = out
     if return_time:
@@ -282,6 +315,252 @@ def _csr_spmv_real_by_complex_cached_kernel(
         acc += value[:, :, None] * vector
     result = tl.sum(acc, axis=1)
     tl.store(y_ri_ptr + 2 * rows[:, None] + components[None, :], result, mask=rmask[:, None])
+
+
+@triton.jit
+def _csr_spmv_real_by_complex_bucket_kernel(
+    y_ri_ptr, data_ptr, cols_ptr, indptr_ptr, x_ri_ptr, row_ids, n_rows, n_bucket_rows,
+    ROWS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    bucket_rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    bucket_mask = bucket_rows < n_bucket_rows
+    rows = tl.load(row_ids + bucket_rows, mask=bucket_mask, other=0)
+    row_mask = bucket_mask & (rows < n_rows)
+    start = tl.load(indptr_ptr + rows, mask=row_mask, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=row_mask, other=0)
+    max_len = tl.max(end - start, axis=0)
+    acc = tl.zeros((ROWS, BLOCK, 2), dtype=tl.float32)
+    components = tl.arange(0, 2)
+    for offset in range(0, max_len, BLOCK):
+        offs = start[:, None] + offset + tl.arange(0, BLOCK)[None, :]
+        mask = (offs < end[:, None]) & row_mask[:, None]
+        col = tl.load(cols_ptr + offs, mask=mask, other=0, cache_modifier=".cg")
+        value = tl.load(data_ptr + offs, mask=mask, other=0.0, cache_modifier=".cg")
+        vector = tl.load(
+            x_ri_ptr + 2 * col[:, :, None] + components[None, None, :],
+            mask=mask[:, :, None], other=0.0, cache_modifier=".ca",
+        )
+        acc += value[:, :, None] * vector
+    result = tl.sum(acc, axis=1)
+    tl.store(y_ri_ptr + 2 * rows[:, None] + components[None, :], result, mask=row_mask[:, None])
+
+
+def _iluvatar_csr_complex_bucket_plan(ptr, n_rows, cutoff=16):
+    # Built once by prepare_spmv_csr_mixed and held by the prepared plan.
+    cutoff = int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_BUCKET_CUTOFF", cutoff))
+    lengths = ptr[1:] - ptr[:-1]
+    short_rows = torch.nonzero(lengths <= cutoff, as_tuple=False).reshape(-1).to(torch.int32)
+    long_rows = torch.nonzero(lengths > cutoff, as_tuple=False).reshape(-1).to(torch.int32)
+    return torch.cat((short_rows, long_rows)), short_rows.numel(), long_rows.numel()
+
+
+def _iluvatar_csr_complex_bucket_run(y, data, cols, ptr, x, n_rows, plan):
+    row_ids, short_count, long_count = plan
+    rows_per = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_BUCKET_ROWS", "16")))
+    block = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_BUCKET_BLOCK", "16")))
+    y_ri = torch.view_as_real(y).reshape(-1)
+    x_ri = torch.view_as_real(x)
+    count = short_count + long_count
+    if count:
+        _csr_spmv_real_by_complex_bucket_kernel[(triton.cdiv(count, rows_per),)](
+            y_ri, data, cols, ptr, x_ri, row_ids, n_rows, count,
+            ROWS=rows_per, BLOCK=block, num_warps=1, num_stages=2,
+        )
+    return y
+
+
+def _iluvatar_csr_complex_nnz_plan(ptr, n_rows):
+    lengths = ptr[1:] - ptr[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=ptr.device, dtype=torch.int32),
+        lengths, output_size=int(ptr[-1].item()),
+    )
+    empty = torch.nonzero(lengths == 0, as_tuple=False).reshape(-1).to(torch.int32)
+    return row_ids, empty
+
+
+def _iluvatar_csr_complex_nnz_run(y, data, cols, ptr, x, plan):
+    from ._spmv_csr_nnz import _nnz_kernel
+
+    row_ids, empty = plan
+    nnz = data.numel()
+    block = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_NNZ_BLOCK", "128")))
+    warps = max(1, min(8, int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_NNZ_WARPS", "1"))))
+    grid = (triton.cdiv(max(nnz, empty.numel()), block),)
+    if grid[0]:
+        # Same launch on CUDA (5090, ASIC_680ks: 11.0 us vs row-tile 27 us,
+        # cuSPARSE 15.7 us); MUSA=False, COMPLEX_RHS=True.
+        _launch_mixed(
+            _nnz_kernel, grid,
+            (data, cols, ptr, row_ids, torch.view_as_real(x), torch.view_as_real(y), empty),
+            (), (empty.numel(), nnz, block, tl.float32, False, True), warps,
+        )
+    return y
+
+
+def _launch_mixed(kernel, grid, tensors, scalars, constants, num_warps, num_stages=None):
+    """Positional launch; reuses the compiled launcher on NVIDIA CUDA."""
+    if _CUDA_DIRECT_LAUNCH:
+        _launch_musa_spmv(kernel, grid, tensors, scalars, constants,
+                          num_warps=num_warps, num_stages=num_stages, cuda=True)
+        return
+    options = {"num_warps": num_warps}
+    if num_stages is not None:
+        options["num_stages"] = num_stages
+    kernel[grid](*tensors, *scalars, *constants, **options)
+
+
+def _iluvatar_csr_complex_use_plain_loads(ptr, n_rows):
+    lengths = (ptr[1:] - ptr[:-1]).to(torch.float32)
+    mean = float(lengths.mean().item())
+    variance = float(((lengths - mean) ** 2).mean().item())
+    coefficient = variance ** 0.5 / max(mean, 1.0)
+    return mean <= 4.0 and coefficient >= 0.8
+
+
+def _csr_mixed_tile(nnz, n_rows, n_cols):
+    if _is_iluvatar_runtime():
+        return _iluvatar_mixed_spmv_tile(nnz, n_rows, n_cols)
+    rows_per, block = _csr_row_tile(nnz, n_rows)
+    return rows_per, block, _csr_mixed_num_warps()
+
+
+def _expected_rhs_dtype(data_dtype, result_dtype):
+    if data_dtype == torch.float32 and result_dtype == torch.complex64:
+        return torch.complex64
+    if data_dtype == torch.float64 and result_dtype == torch.complex128:
+        return torch.complex128
+    return data_dtype
+
+
+def _prepared_mixed_uses_call(data_dtype, result_dtype):
+    """Backends whose mixed CSR route is not these Triton kernels keep it."""
+    return (
+        _is_mthreads_runtime()
+        or _is_ascend_runtime()
+        or (_is_rocm_runtime() and data_dtype == torch.float16 and result_dtype == torch.float16)
+    )
+
+
+def prepare_spmv_csr_mixed(data, indices, indptr, x_dtype, shape, *,
+                           out=None, out_dtype=None, route="auto"):
+    """Plan a mixed-precision / real-by-complex CSR SpMV once; run it with
+    ``spmv_csr_mixed_prepared`` or ``flagsparse_spmv_csr(prepared=...)``.
+
+    Row statistics, the short/long bucket order and the per-nonzero row ids are
+    built here (synchronizing) and held by the plan. The plan keeps the CSR
+    tensors, not copies: later in-place writes to their values are seen, but a
+    changed sparsity structure needs a new plan. MUSA, Ascend and ROCm f16->f16
+    keep their own call routes (``route == "call"``).
+    """
+    _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+        raise ValueError("invalid CSR dimensions")
+    result_dtype, acc_dtype = _resolve_types(data.dtype, x_dtype, out, out_dtype, True)
+    data, indices, indptr = data.contiguous(), _index32(indices.contiguous()), _index32(indptr.contiguous())
+    real_by_complex64 = data.dtype == torch.float32 and x_dtype == torch.complex64
+    if _is_iluvatar_runtime() and real_by_complex64:
+        rows_per, block, num_warps = _iluvatar_complex_mixed_spmv_tile(
+            data.numel(), n_rows, n_cols
+        )
+    else:
+        rows_per, block, num_warps = _csr_mixed_tile(data.numel(), n_rows, n_cols)
+    selected = str(route or "auto").lower()
+    bucket_plan = None
+    nnz_plan = None
+    if _prepared_mixed_uses_call(data.dtype, result_dtype):
+        if selected not in ("auto", "call"):
+            raise ValueError("this backend runs mixed CSR through its call route only")
+        selected = "call"
+    elif real_by_complex64 and (_is_iluvatar_runtime() or _CUDA_DIRECT_LAUNCH):
+        if selected in ("auto", "adaptive"):
+            lengths = indptr[1:] - indptr[:-1]
+            mean = float(data.numel()) / max(1, n_rows)
+            maximum = int(lengths.max().item()) if n_rows else 0
+            if mean <= 4.0 and maximum > 128:
+                selected = "nnz"
+            elif _is_iluvatar_runtime() and _iluvatar_csr_complex_use_plain_loads(indptr, n_rows):
+                selected = "plain"
+            else:
+                selected = "cached"
+        if selected == "bucket":
+            bucket_plan = _iluvatar_csr_complex_bucket_plan(indptr, n_rows)
+        elif selected == "nnz":
+            if int(indptr[0].item()) != 0 or int(indptr[-1].item()) != data.numel():
+                raise ValueError("indptr must start at 0 and end at nnz")
+            nnz_plan = _iluvatar_csr_complex_nnz_plan(indptr, n_rows)
+        elif selected not in ("plain", "cached"):
+            raise ValueError("route must be auto, cached, plain, bucket, or nnz")
+    elif selected not in ("auto", "cached", "plain"):
+        raise ValueError("route is unsupported for this mixed CSR dtype combination")
+    if selected == "auto":
+        selected = "cached"
+    return PreparedCsrMixedSpmv(
+        data, indices, indptr, shape, result_dtype, acc_dtype,
+        rows_per, block, num_warps, selected, bucket_plan, nnz_plan,
+    )
+
+
+def spmv_csr_mixed_prepared(prepared, x, *, out=None, return_time=False):
+    if not isinstance(prepared, PreparedCsrMixedSpmv):
+        raise TypeError("prepared must be PreparedCsrMixedSpmv")
+    if not torch.is_tensor(x) or x.ndim != 1 or x.dtype != _expected_rhs_dtype(
+        prepared.data.dtype, prepared.result_dtype
+    ):
+        raise TypeError("x has an incompatible dtype or shape")
+    if x.numel() != prepared.n_cols or x.device != prepared.data.device:
+        raise ValueError("x shape/device does not match the prepared CSR matrix")
+    if out is not None and (
+        out.shape != (prepared.n_rows,) or out.dtype != prepared.result_dtype
+        or out.device != x.device
+    ):
+        raise ValueError("out shape/dtype/device does not match the prepared CSR result")
+    if prepared.route == "call":
+        return spmv_csr_mixed(
+            prepared.data, prepared.indices, prepared.indptr, x, prepared.shape,
+            out=out, out_dtype=prepared.result_dtype, return_time=return_time,
+        )
+    x = x.contiguous()
+    # A strided out cannot be viewed as its real components; write a temporary.
+    y = out if out is not None and out.is_contiguous() else torch.empty(
+        prepared.n_rows, dtype=prepared.result_dtype, device=x.device
+    )
+    t0 = _start(return_time)
+    if prepared.n_rows:
+        grid = ((prepared.n_rows + prepared.rows_per - 1) // prepared.rows_per,)
+        if prepared.route == "bucket":
+            _iluvatar_csr_complex_bucket_run(
+                y, prepared.data, prepared.indices, prepared.indptr,
+                x, prepared.n_rows, prepared.bucket_plan,
+            )
+        elif prepared.route == "nnz":
+            _iluvatar_csr_complex_nnz_run(
+                y, prepared.data, prepared.indices, prepared.indptr,
+                x, prepared.nnz_plan,
+            )
+        elif _is_complex_dtype(prepared.result_dtype):
+            cached = prepared.route == "cached"
+            kernel = (
+                _csr_spmv_real_by_complex_cached_kernel if cached
+                else _csr_spmv_real_by_complex_kernel
+            )
+            _launch_mixed(
+                kernel, grid,
+                (torch.view_as_real(y), prepared.data, prepared.indices,
+                 prepared.indptr, torch.view_as_real(x)),
+                (prepared.n_rows,), (prepared.rows_per, prepared.block),
+                prepared.num_warps, 2 if cached else None,
+            )
+        else:
+            _launch_mixed(
+                _csr_spmv_mixed_kernel, grid,
+                (y, prepared.data, prepared.indices, prepared.indptr, x),
+                (prepared.n_rows,),
+                (_TL_ACC[prepared.acc_dtype], prepared.rows_per, prepared.block),
+                prepared.num_warps,
+            )
+    return _finish(y, out, t0, return_time)
 
 
 @triton.jit
@@ -533,6 +812,26 @@ def _iluvatar_mixed_spmv_tile(nnz, n_rows, n_cols):
     return rows_per, block, num_warps
 
 
+def _iluvatar_complex_mixed_spmv_tile(nnz, n_rows, n_cols):
+    mean_row_nnz = nnz / max(1, n_rows)
+    if mean_row_nnz <= 3:
+        rows_per, block, num_warps = 64, 2, 1
+    elif mean_row_nnz <= 12:
+        rows_per, block, num_warps = 16, 8, 1
+    else:
+        rows_per, block, num_warps = 8, 8, 1
+    rows_override = os.environ.get("FLAGSPARSE_ILUVATAR_MIXED_ROWS")
+    block_override = os.environ.get("FLAGSPARSE_ILUVATAR_MIXED_BLOCK")
+    warps_override = os.environ.get("FLAGSPARSE_ILUVATAR_MIXED_WARPS")
+    if rows_override:
+        rows_per = max(1, int(rows_override))
+    if block_override:
+        block = max(1, int(block_override))
+    if warps_override:
+        num_warps = max(1, min(8, int(warps_override)))
+    return rows_per, block, num_warps
+
+
 def _torch_spmv_rows(data, rows, cols, x, n_out, acc_dtype):
     """Ascend path: gather, multiply in the accumulate type, index_add by output row."""
     cols = cols.to(torch.int64)
@@ -598,16 +897,33 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
         rows = _csr_row_ids(ptr, n_rows, data.numel())
         y = _torch_spmv_rows(data, rows, cols, x, n_rows, acc_dtype).to(result_dtype)
         return _finish(y, out, t0, return_time)
-    y = out if out is not None else torch.empty(
+    # A strided out cannot be viewed as its real components; write a temporary.
+    y = out if out is not None and out.is_contiguous() else torch.empty(
         n_rows, dtype=result_dtype, device=x.device
     )
-    if n_rows:
+    if n_rows and _CUDA_DIRECT_LAUNCH:
+        rows_per, block = _csr_row_tile(data.numel(), n_rows)
+        grid = ((n_rows + rows_per - 1) // rows_per,)
+        if _is_complex_dtype(result_dtype):
+            kernel, constants = _csr_spmv_real_by_complex_kernel, (rows_per, block)
+            tensors = (torch.view_as_real(y), data, cols, ptr, torch.view_as_real(x))
+        else:
+            kernel = _csr_spmv_mixed_kernel
+            constants = (_TL_ACC[acc_dtype], rows_per, block)
+            tensors = (y, data, cols, ptr, x)
+        _launch_musa_spmv(kernel, grid, tensors, (n_rows,), constants, num_warps=4, cuda=True)
+    elif n_rows:
         rows_per, block = _csr_row_tile(data.numel(), n_rows)
         num_warps = _csr_mixed_num_warps()
         if _is_iluvatar_runtime():
-            rows_per, block, num_warps = _iluvatar_mixed_spmv_tile(
-                data.numel(), n_rows, n_cols
-            )
+            if data.dtype == torch.float32 and x.dtype == torch.complex64:
+                rows_per, block, num_warps = _iluvatar_complex_mixed_spmv_tile(
+                    data.numel(), n_rows, n_cols
+                )
+            else:
+                rows_per, block, num_warps = _iluvatar_mixed_spmv_tile(
+                    data.numel(), n_rows, n_cols
+                )
         grid = (triton.cdiv(n_rows, rows_per),)
         if _is_complex_dtype(result_dtype):
             if (
