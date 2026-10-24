@@ -14,7 +14,6 @@ from ._common import (
     _is_maca_runtime,
     _is_mthreads_runtime,
 )
-from ._common import _gather_values, _is_maca_runtime, _is_mthreads_runtime
 
 
 def prepare(indices, indptr, shape):
