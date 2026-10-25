@@ -1024,11 +1024,44 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
                 rows = rows.index_select(0, order).contiguous()
             counts = torch.bincount(rows.to(torch.int64), minlength=n_rows)
             ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32).contiguous()
-            state = (use_data, use_cols, ptr)
+            nnz_plan = None
+            nnz_route = os.environ.get(
+                "FLAGSPARSE_ILUVATAR_COO_MIXED_NNZ", "auto"
+            ).strip().lower()
+            if _is_iluvatar_runtime() and nnz_route not in ("0", "false", "off"):
+                lengths = ptr[1:] - ptr[:-1]
+                if data.numel() / max(1, n_rows) <= 4 and int(lengths.max().item()) > 128:
+                    nnz_rows = torch.repeat_interleave(
+                        torch.arange(n_rows, device=rows.device, dtype=torch.int32),
+                        lengths,
+                        output_size=data.numel(),
+                    )
+                    empty_rows = torch.nonzero(lengths == 0).flatten().to(torch.int32)
+                    nnz_plan = (nnz_rows.contiguous(), empty_rows.contiguous())
+            state = (use_data, use_cols, ptr, nnz_plan)
             _ROCM_COO_CSR_CACHE.put(sources, options, state)
-        use_data, use_cols, ptr = state
+        if len(state) == 3:
+            use_data, use_cols, ptr = state
+            nnz_plan = None
+        else:
+            use_data, use_cols, ptr, nnz_plan = state
         y = torch.empty(n_rows, dtype=result_dtype, device=x.device)
         if n_rows:
+            if _is_iluvatar_runtime() and nnz_plan is not None:
+                from ._spmv_csr_nnz import _nnz_kernel
+
+                nnz_rows, empty_rows = nnz_plan
+                if data.dtype == torch.float16 and x.dtype == torch.float32:
+                    block, num_warps = 128, 2
+                else:
+                    block, num_warps = 256, 2
+                grid = (triton.cdiv(max(data.numel(), empty_rows.numel()), block),)
+                _nnz_kernel[grid](
+                    use_data, use_cols, ptr, nnz_rows, x, y, empty_rows,
+                    empty_rows.numel(), data.numel(), block, _TL_ACC[acc_dtype],
+                    num_warps=num_warps,
+                )
+                return _finish(y, out, t0, return_time)
             rows_per, block = _csr_row_tile(data.numel(), n_rows)
             num_warps = _csr_mixed_num_warps()
             if _is_iluvatar_runtime():

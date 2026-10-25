@@ -39,6 +39,7 @@ import triton.language as tl
 
 from ._rocm_sparse_cache import TensorPlanCache
 from ._musa_spmv_launch import launch as _launch_musa_spmv
+from .mixed_spmx import _CUDA_DIRECT_LAUNCH
 
 SPMV_SELL_VALUE_DTYPES = (
     torch.float16,
@@ -341,11 +342,28 @@ def _validate_spmv_sell(values, cols, offsets, x, shape, slice_size, validate):
             raise ValueError(f"{name} must be an accelerator tensor")
     if len({values.device, cols.device, offsets.device, x.device}) != 1:
         raise ValueError("SELL SpMV inputs must be on one device")
+    if values.dtype in SPMV_SELL_VALUE_DTYPES and x.dtype != values.dtype:
+        raise TypeError("x dtype must match values dtype")
+    dims = _validate_sell_arrays(values, cols, offsets, shape, slice_size, validate)
+    if x.numel() != dims[1]:
+        raise ValueError(f"x length {x.numel()} does not match n_cols {dims[1]}")
+    return dims
+
+
+def _validate_sell_arrays(values, cols, offsets, shape, slice_size, validate):
+    """The matrix half of ``_validate_spmv_sell``; ``prepare_spmv_sell`` has no x."""
+    for t, name in ((values, "values"), (cols, "col_indices"), (offsets, "slice_offsets")):
+        if not torch.is_tensor(t):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if t.ndim != 1:
+            raise ValueError(f"{name} must be a 1D tensor")
+        if not _is_accel_tensor(t):
+            raise ValueError(f"{name} must be an accelerator tensor")
+    if len({values.device, cols.device, offsets.device}) != 1:
+        raise ValueError("SELL SpMV inputs must be on one device")
     if values.dtype not in SPMV_SELL_VALUE_DTYPES:
         names = ", ".join(str(d).replace("torch.", "") for d in SPMV_SELL_VALUE_DTYPES)
         raise TypeError(f"SELL SpMV supports value dtypes: {names}")
-    if x.dtype != values.dtype:
-        raise TypeError("x dtype must match values dtype")
     if cols.dtype not in SUPPORTED_INDEX_DTYPES or offsets.dtype != cols.dtype:
         raise TypeError("col_indices and slice_offsets must share int32 or int64 dtype")
     n_rows, n_cols = int(shape[0]), int(shape[1])
@@ -357,8 +375,6 @@ def _validate_spmv_sell(values, cols, offsets, x, shape, slice_size, validate):
         raise ValueError("slice_offsets must have ceil(n_rows / slice_size) + 1 entries")
     if values.numel() != cols.numel():
         raise ValueError("values and col_indices must have the same length")
-    if x.numel() != n_cols:
-        raise ValueError(f"x length {x.numel()} does not match n_cols {n_cols}")
     if validate and values.numel() > 0:
         lengths = offsets[1:] - offsets[:-1]
         if (
@@ -413,27 +429,42 @@ def _musa_sell_tile(n_values, n_rows, n_slices, slice_size, complex_values):
 
 
 def flagsparse_spmv_sell(
-    values,
-    col_indices,
-    slice_offsets,
-    x,
-    shape,
+    values=None,
+    col_indices=None,
+    slice_offsets=None,
+    x=None,
+    shape=None,
     *,
-    slice_size,
+    slice_size=None,
     out=None,
     out_dtype=None,
     op="non",
     validate=True,
     return_time=False,
+    prepared=None,
 ):
     """``y = A @ x`` for a sliced-ELLPACK ``A`` (layout in the module docstring).
 
     ``out_dtype`` (or the dtype of ``out``) selects a wider output where cuSPARSE
     allows it; see ``_SPMV_SELL_OUT_DTYPES``. Only ``op="non"`` is supported, as for
     cuSPARSE's SELL SpMV entry the delivery list names.
+
+    ``prepared`` (from ``prepare_spmv_sell``) replaces the matrix arguments; the
+    call then only checks ``x`` / ``out`` and launches the prepared kernel.
     """
     if str(op).strip().lower() not in ("non", "n", "non_trans"):
         raise NotImplementedError("SELL SpMV supports op='non' only")
+    if prepared is not None:
+        if any(a is not None for a in (values, col_indices, slice_offsets, shape, slice_size)):
+            raise ValueError("pass either a prepared SELL plan or the SELL arrays, not both")
+        if out_dtype is not None and out_dtype != prepared.out_dtype:
+            raise ValueError("out_dtype does not match the prepared SELL plan")
+        return spmv_sell_prepared(prepared, x, out=out, return_time=return_time)
+    if any(a is None for a in (values, col_indices, slice_offsets, x, shape, slice_size)):
+        raise TypeError(
+            "flagsparse_spmv_sell needs values, col_indices, slice_offsets, x, shape "
+            "and slice_size (or prepared=)"
+        )
     musa = _is_mthreads_runtime()
     cached_musa = (
         musa and torch.is_tensor(values)
@@ -608,6 +639,496 @@ def flagsparse_spmv_sell(
     if out is not None:
         if y is not out:
             out.copy_(y)
+        y = out
+    if return_time:
+        _ACCEL.synchronize()
+        return y, (time.perf_counter() - t0) * 1000.0
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Prepared SELL-C-sigma
+# ---------------------------------------------------------------------------
+
+# 64-lane warps (BI-V150, C550, gfx936). On BI-V150 (2026-10-25, 10 matrices) real
+# SELL was best at c=32, group=1, 1 warp with sigma=4096 (0.69-0.70x of the scaled
+# H800 baseline); c=64 and group=2 both lost. Complex keeps c=64 for an explicit
+# sigma route, but "auto" sends complex back to the native path there. Grouping
+# slices makes the shorter one wait for the wider (5090: complex GROUP=2 doubled
+# ASIC_680ks's time).
+_SELL_PREP_WARP64 = _is_iluvatar_runtime() or _is_maca_runtime() or _is_rocm_runtime()
+
+
+def _sell_prep_defaults(complex_values):
+    """(c, group, num_warps) before overrides: 5090-measured for CUDA, BI-V150 for 64-lane."""
+    if _SELL_PREP_WARP64:
+        return (64 if complex_values else 32), 1, 1
+    return (32, 1, 1) if complex_values else (32, 4, 4)
+_SELL_PREP_ROUTES = ("auto", "sigma", "call")
+# sigma="auto": the smallest window (c, 2c, 4c, ... up to this) whose padding is
+# within _SELL_AUTO_PADDING of nnz. Sorting rows reorders the x reads, which on a
+# 5090 with the matrix L2-resident cost NACA0015 15% (39 -> 45 us at sigma=1024)
+# for 1.30x -> 1.01x padding, so low-padding matrices keep (nearly) their order.
+_SELL_AUTO_MAX_SIGMA = 4096
+_SELL_AUTO_PADDING = 1.10
+# reorder="auto": use reverse Cuthill-McKee only when it shrinks the median
+# |col - row| at least this much from at least _SELL_RCM_MIN_SPREAD. On a 5090,
+# RCM plus the per-call x permutation ran auto.mtx 2.17x and NACA0015 1.58x faster
+# (median spread 35468 -> 2903 and 191584 -> 773); amazon0601 and ASIC_680ks
+# (where RCM widens the spread) gained nothing.
+_SELL_RCM_MIN_SPREAD = 4096
+_SELL_RCM_MIN_GAIN = 4.0
+_SELL_PREP_REORDERS = ("none", "rcm", "auto")
+
+
+class PreparedSellSpmv:
+    """Plan from ``prepare_spmv_sell``; run it with ``flagsparse_spmv_sell(prepared=...)``.
+
+    ``route == "sigma"``: the caller's SELL arrays are re-encoded once into
+    SELL-C-sigma -- rows sorted by length (descending) inside windows of ``sigma``
+    rows, then cut into slices of ``c`` rows, stored slot-major like cuSPARSE -- so
+    padding nearly disappears (ASIC_680ks 3.98x -> 1.17x of nnz at sigma=1024).
+    Every load is masked by its lane's row length, so padding is never read (an
+    inf/nan in ``x`` cannot leak through a padded zero), and ``perm`` writes each
+    result back to its original row. ``route == "call"`` keeps the backend's own
+    SELL path on the caller's arrays.
+
+    ``reorder == "rcm"`` additionally relabels rows and columns of a square matrix
+    by reverse Cuthill-McKee, so neighbouring rows read neighbouring ``x``; each run
+    then permutes ``x`` into a plan-owned buffer first (one extra launch, timed), so
+    one plan must not be run concurrently from several streams.
+
+    The plan copies the values: when the source values change in place (torch's
+    version counter), the next run refreshes them; when ``col_indices`` or
+    ``slice_offsets`` change, it rebuilds the layout. Inference tensors have no
+    version counter, so in-place changes to them are not seen -- prepare again.
+    """
+
+    __slots__ = (
+        "shape", "n_rows", "n_cols", "slice_size", "device", "value_dtype", "out_dtype",
+        "acc_dtype", "route", "sigma", "sigma_request", "c", "group", "num_warps", "paired",
+        "reorder", "reorder_request", "x_order", "x_buf",
+        "values", "cols", "offsets", "versions",
+        "sell_values", "kernel_values", "sell_cols", "sell_offsets", "row_len", "perm",
+        "gather", "n_slices", "n_values", "grid", "constants",
+    )
+
+    def __repr__(self):
+        return (
+            f"PreparedSellSpmv(route={self.route!r}, shape={self.shape}, "
+            f"dtype={self.value_dtype}->{self.out_dtype}, sigma={self.sigma}, c={self.c}, "
+            f"group={self.group}, num_warps={self.num_warps}, reorder={self.reorder!r}, "
+            f"n_values={self.n_values})"
+        )
+
+
+def _tensor_version(t):
+    try:
+        return t._version
+    except RuntimeError:  # inference tensors carry no version counter
+        return None
+
+
+def _sell_prep_option(explicit, env, default, parse=int):
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(env)
+    return parse(raw) if raw not in (None, "") else default
+
+
+def _sell_window_order(lengths, sigma):
+    """Row order: lengths descending inside consecutive windows of ``sigma`` rows."""
+    n_rows = lengths.numel()
+    longest = int(lengths.max().item()) if n_rows else 0
+    window = torch.arange(n_rows, device=lengths.device, dtype=torch.int64) // sigma
+    return torch.argsort(window * (longest + 1) + (longest - lengths), stable=True)
+
+
+def _sell_padded_slots(sorted_lengths, c):
+    n_slices = (sorted_lengths.numel() + c - 1) // c
+    lane_len = torch.zeros(n_slices * c, dtype=torch.int64, device=sorted_lengths.device)
+    lane_len[: sorted_lengths.numel()] = sorted_lengths
+    return int(lane_len.view(n_slices, c).amax(dim=1).sum().item()) * c if n_slices else 0
+
+
+def _sell_auto_sigma(lengths, c):
+    nnz = max(1, int(lengths.sum().item()))
+    sigma = c
+    while True:
+        order = (
+            _sell_window_order(lengths, sigma) if sigma > c
+            else torch.arange(lengths.numel(), device=lengths.device)
+        )
+        if (
+            _sell_padded_slots(lengths[order], c) <= _SELL_AUTO_PADDING * nnz
+            or sigma >= _SELL_AUTO_MAX_SIGMA
+            or sigma >= lengths.numel()
+        ):
+            return sigma
+        sigma *= 2
+
+
+def _rcm_order(rows, cols, n):
+    """Reverse Cuthill-McKee order (new -> old) of the symmetrised pattern, or None.
+
+    The package does not depend on SciPy; only this opt-in step uses it.
+    """
+    try:
+        import numpy as np
+        import scipy.sparse as sp
+        from scipy.sparse.csgraph import reverse_cuthill_mckee
+    except ImportError:
+        return None
+    r, c = rows.cpu().numpy(), cols.cpu().numpy()
+    pattern = sp.csr_matrix((np.ones(r.size, dtype=np.int8), (r, c)), shape=(n, n))
+    order = reverse_cuthill_mckee((pattern + pattern.T).tocsr(), symmetric_mode=True)
+    return torch.from_numpy(order.astype(np.int64)).to(rows.device)
+
+
+def _median_spread(rows, cols):
+    return float((cols - rows).abs().float().median().item()) if rows.numel() else 0.0
+
+
+def _sell_sigma_layout(values, cols, offsets, n_rows, n_cols, slice_size, c, sigma, reorder):
+    """Re-encode cuSPARSE SELL arrays as SELL-C-sigma (all on the device).
+
+    ``sigma`` is a row count, or ``"auto"`` (see ``_SELL_AUTO_PADDING``); ``reorder``
+    is ``"none"``, ``"rcm"`` or ``"auto"`` (see ``_SELL_RCM_MIN_GAIN``).
+    """
+    device = values.device
+    n_in = int(cols.numel())
+    widths = (offsets[1:] - offsets[:-1]).to(torch.int64)
+    slice_ids = torch.repeat_interleave(
+        torch.arange(widths.numel(), device=device, dtype=torch.int64), widths, output_size=n_in
+    )
+    starts = torch.repeat_interleave(offsets[:-1].to(torch.int64), widths, output_size=n_in)
+    local = torch.arange(n_in, device=device, dtype=torch.int64) - starts
+    rows = slice_ids * slice_size + local.remainder(slice_size)
+    slots = local // slice_size
+    src = torch.nonzero((cols >= 0) & (rows < n_rows)).flatten()
+    rows, slots = rows[src], slots[src]
+    # Row-major order of the stored entries, keeping each row's slot order.
+    span = int(slots.max().item()) + 1 if src.numel() else 1
+    order = torch.argsort(rows * span + slots)
+    src, rows, slots = src[order], rows[order], slots[order]
+    entry_cols = cols[src].to(torch.int64)
+    nnz = int(src.numel())
+
+    x_order = None
+    if reorder != "none" and n_rows == n_cols and n_rows > 1 and nnz:
+        rcm = _rcm_order(rows, entry_cols, n_rows)
+        if rcm is None and reorder == "rcm":
+            raise RuntimeError("reorder='rcm' needs SciPy (scipy.sparse.csgraph)")
+        if rcm is not None:
+            new_label = torch.empty_like(rcm)
+            new_label[rcm] = torch.arange(n_rows, device=device, dtype=torch.int64)
+            new_rows, new_cols = new_label[rows], new_label[entry_cols]
+            before = _median_spread(rows, entry_cols)
+            after = _median_spread(new_rows, new_cols)
+            if reorder == "rcm" or (
+                before >= _SELL_RCM_MIN_SPREAD and after * _SELL_RCM_MIN_GAIN <= before
+            ):
+                # Same per-row summation order, relabelled rows and columns.
+                again = torch.argsort(new_rows * span + slots)
+                src, rows, entry_cols = src[again], new_rows[again], new_cols[again]
+                x_order = rcm
+    lengths = torch.bincount(rows, minlength=n_rows)
+    row_ptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    row_ptr[1:] = torch.cumsum(lengths, 0)
+    within = torch.arange(nnz, device=device, dtype=torch.int64) - row_ptr[rows]
+
+    if sigma == "auto":
+        sigma = _sell_auto_sigma(lengths, c) if n_rows else c
+    if sigma > c and n_rows:
+        row_order = _sell_window_order(lengths, sigma)
+    else:
+        row_order = torch.arange(n_rows, device=device, dtype=torch.int64)
+    position = torch.empty(n_rows, dtype=torch.int64, device=device)
+    position[row_order] = torch.arange(n_rows, device=device, dtype=torch.int64)
+
+    n_slices = (n_rows + c - 1) // c
+    lane_len = torch.zeros(n_slices * c, dtype=torch.int64, device=device)
+    lane_len[:n_rows] = lengths[row_order]
+    slice_width = lane_len.view(n_slices, c).amax(dim=1) if n_slices else lane_len[:0]
+    sell_offsets = torch.zeros(n_slices + 1, dtype=torch.int64, device=device)
+    sell_offsets[1:] = torch.cumsum(slice_width * c, 0)
+    total = int(sell_offsets[-1].item()) if n_slices else 0
+
+    lane = position[rows]
+    dest = sell_offsets[lane // c] + within * c + lane.remainder(c)
+    gather_dtype = torch.int32 if n_in < 2**31 else torch.int64
+    gather = torch.zeros(total, dtype=gather_dtype, device=device)
+    gather[dest] = src.to(gather_dtype)
+    sell_cols = torch.zeros(total, dtype=torch.int32, device=device)
+    sell_cols[dest] = entry_cols.to(torch.int32)
+    sell_values = torch.zeros(total, dtype=values.dtype, device=device)
+    if values.is_complex():
+        # Index on the real planes: some backends reject complex index_put.
+        torch.view_as_real(sell_values)[dest] = torch.view_as_real(values)[src]
+    else:
+        sell_values[dest] = values[src]
+    perm = torch.full((n_slices * c,), -1, dtype=torch.int32, device=device)
+    # lane -> original row (through the RCM relabelling when there is one)
+    perm[:n_rows] = (row_order if x_order is None else x_order[row_order]).to(torch.int32)
+    offset_dtype = torch.int32 if total < 2**31 else torch.int64
+    return {
+        "sell_values": sell_values,
+        "sell_cols": sell_cols,
+        "sell_offsets": sell_offsets.to(offset_dtype),
+        "row_len": lane_len.to(torch.int32),
+        "perm": perm,
+        "gather": gather,
+        "n_slices": n_slices,
+        "n_values": total,
+        "sigma": sigma,
+        "x_order": x_order,
+        "reorder": "none" if x_order is None else "rcm",
+    }
+
+
+def _install_sell_sigma(p):
+    layout = _sell_sigma_layout(
+        p.values, p.cols, p.offsets, p.n_rows, p.n_cols, p.slice_size, p.c,
+        p.sigma_request, p.reorder_request,
+    )
+    for name, value in layout.items():
+        setattr(p, name, value)
+    p.x_buf = (
+        None if p.x_order is None
+        else torch.empty(p.n_cols, dtype=p.value_dtype, device=p.device)
+    )
+    p.kernel_values = (
+        torch.view_as_real(p.sell_values) if p.sell_values.is_complex() else p.sell_values
+    )
+    p.grid = (triton.cdiv(p.n_slices, p.group),)
+    p.versions = tuple(_tensor_version(t) for t in (p.values, p.cols, p.offsets))
+
+
+def prepare_spmv_sell(
+    values,
+    col_indices,
+    slice_offsets,
+    shape,
+    *,
+    slice_size,
+    out_dtype=None,
+    route="auto",
+    sigma=None,
+    c=None,
+    group=None,
+    num_warps=None,
+    paired=None,
+    reorder=None,
+    validate=True,
+):
+    """Plan ``y = A @ x`` for cuSPARSE SELL arrays once; all re-encoding happens here.
+
+    ``route``: ``"sigma"`` re-encodes as SELL-C-sigma (see ``PreparedSellSpmv``),
+    ``"call"`` keeps the backend's own SELL path, ``"auto"`` picks ``"sigma"`` on CUDA
+    and Iluvatar and ``"call"`` elsewhere (Ascend has no Triton path for it).
+    ``sigma`` is a window in rows or ``"auto"`` (the smallest window, doubling from
+    ``c``, whose padding is within 10% of nnz; ``prepared.sigma`` reports it).
+    ``reorder``: ``"none"`` (default), ``"rcm"`` (reverse Cuthill-McKee relabelling of
+    a square matrix; needs SciPy) or ``"auto"`` (RCM only where it shrinks the median
+    ``|col - row|`` 4x; ``prepared.reorder`` reports what was done).
+    Tuning (``sigma``, ``c`` rows per slice, ``group`` slices per program,
+    ``num_warps``, ``paired`` complex loads, ``reorder``) falls back to the environment
+    variables ``FLAGSPARSE_SELL_PREP_SIGMA / _C / _GROUP / _WARPS / _PAIRED / _REORDER``
+    read here, then to backend defaults. Preparation synchronizes; time
+    ``flagsparse_spmv_sell(prepared=...)``.
+    """
+    n_rows, n_cols, slice_size, _ = _validate_sell_arrays(
+        values, col_indices, slice_offsets, shape, slice_size, validate
+    )
+    allowed = _SPMV_SELL_OUT_DTYPES[values.dtype]
+    out_dtype = allowed[0] if out_dtype is None else out_dtype
+    if out_dtype not in allowed:
+        names = ", ".join(str(d).replace("torch.", "") for d in allowed)
+        raise TypeError(f"{values.dtype} SELL SpMV can write: {names}")
+    route = str(route or "auto").strip().lower()
+    if route not in _SELL_PREP_ROUTES:
+        raise ValueError(f"route must be one of {', '.join(_SELL_PREP_ROUTES)}")
+    if route == "auto":
+        route = "sigma" if (
+            _backend_name() == "cuda"
+            or (_is_iluvatar_runtime() and not _is_complex_dtype(values.dtype))
+        ) else "call"
+    if route == "sigma" and _is_ascend_runtime():
+        raise ValueError("the SELL-C-sigma route needs Triton; Ascend keeps its torch_npu path")
+
+    p = PreparedSellSpmv()
+    p.shape, p.n_rows, p.n_cols, p.slice_size = (n_rows, n_cols), n_rows, n_cols, slice_size
+    p.device, p.value_dtype, p.out_dtype = values.device, values.dtype, out_dtype
+    p.acc_dtype = _sell_acc_dtype(values.dtype, out_dtype)
+    p.route = route
+    p.values = values.contiguous()
+    p.cols = col_indices.contiguous()
+    p.offsets = slice_offsets.contiguous()
+    p.n_values = int(values.numel())
+    for name in ("sigma", "sigma_request", "c", "group", "num_warps", "paired", "reorder",
+                 "reorder_request", "x_order", "x_buf", "sell_values", "kernel_values",
+                 "sell_cols", "sell_offsets", "row_len", "perm", "gather", "n_slices", "grid",
+                 "constants", "versions"):
+        setattr(p, name, None)
+    if route == "call":
+        return p
+
+    complex_values = _is_complex_dtype(values.dtype)
+    default_c, default_group, default_warps = _sell_prep_defaults(complex_values)
+    p.c = int(_sell_prep_option(c, "FLAGSPARSE_SELL_PREP_C", default_c))
+    p.group = int(_sell_prep_option(group, "FLAGSPARSE_SELL_PREP_GROUP", default_group))
+    p.num_warps = int(_sell_prep_option(num_warps, "FLAGSPARSE_SELL_PREP_WARPS", default_warps))
+    p.paired = bool(_sell_prep_option(paired, "FLAGSPARSE_SELL_PREP_PAIRED", False, lambda v: v != "0"))
+    p.reorder_request = str(_sell_prep_option(reorder, "FLAGSPARSE_SELL_PREP_REORDER", "none", str)).lower()
+    if p.reorder_request not in _SELL_PREP_REORDERS:
+        raise ValueError(f"reorder must be one of {', '.join(_SELL_PREP_REORDERS)}")
+    if p.reorder_request == "rcm" and n_rows != n_cols:
+        raise ValueError("reorder='rcm' relabels rows and columns together: square matrices only")
+    sigma_default = 4096 if _is_iluvatar_runtime() and not complex_values else "auto"
+    sigma = _sell_prep_option(sigma, "FLAGSPARSE_SELL_PREP_SIGMA", sigma_default, str)
+    for name, value in (("c", p.c), ("group", p.group)):
+        if value <= 0 or value & (value - 1) or value > 1024:
+            raise ValueError(f"{name} must be a power of two in [1, 1024]")
+    if p.num_warps not in (1, 2, 4, 8, 16):
+        raise ValueError("num_warps must be 1, 2, 4, 8 or 16")
+    if str(sigma).strip().lower() == "auto":
+        p.sigma_request = "auto"
+    else:
+        sigma = int(sigma)
+        if sigma <= 0:
+            raise ValueError("sigma must be positive or 'auto'")
+        # Windows of whole slices; sigma <= c keeps the caller's row order.
+        p.sigma_request = sigma if sigma <= p.c else -(-sigma // p.c) * p.c
+    if complex_values:
+        acc = tl.float64 if values.dtype == torch.complex128 else tl.float32
+    else:
+        acc = _TL[p.acc_dtype]
+    p.constants = (p.c, p.group, acc, complex_values, p.paired and complex_values)
+    _install_sell_sigma(p)
+    return p
+
+
+@triton.jit
+def _spmv_sell_sigma_kernel(
+    y_ptr, v_ptr, c_ptr, off_ptr, len_ptr, perm_ptr, x_ptr, n_slices,
+    C: tl.constexpr, GROUP: tl.constexpr, ACC: tl.constexpr,
+    COMPLEX: tl.constexpr, PAIRED: tl.constexpr,
+):
+    s = tl.program_id(0) * GROUP + tl.arange(0, GROUP)[:, None]
+    lane = tl.arange(0, C)[None, :]
+    smask = s < n_slices
+    start = tl.load(off_ptr + s, mask=smask, other=0)
+    width = (tl.load(off_ptr + s + 1, mask=smask, other=0) - start) // C
+    slot = s * C + lane
+    # Each lane's row length masks every load: padding is never read, and the
+    # value load does not wait for the column load.
+    row_len = tl.load(len_ptr + slot, mask=smask, other=0)
+    steps = tl.max(tl.max(width, 0), 0)
+    row = tl.load(perm_ptr + slot, mask=smask, other=-1)
+    if COMPLEX:
+        re = tl.zeros((GROUP, C), dtype=ACC)
+        im = tl.zeros((GROUP, C), dtype=ACC)
+        if PAIRED:
+            comp = tl.arange(0, 2)[None, None, :]
+            sign = tl.where(comp == 0, 1.0, -1.0).to(ACC)
+            for j in range(0, steps):
+                m = j < row_len
+                pos = start + j * C + lane
+                col = tl.load(c_ptr + pos, mask=m, other=0)
+                m3 = m[:, :, None]
+                v = tl.load(v_ptr + 2 * pos[:, :, None] + comp, mask=m3, other=0.0)
+                xv = tl.load(x_ptr + 2 * col[:, :, None] + comp, mask=m3, other=0.0)
+                xs = tl.load(x_ptr + 2 * col[:, :, None] + (1 - comp), mask=m3, other=0.0)
+                re += tl.sum(v * xv * sign, axis=2)
+                im += tl.sum(v * xs, axis=2)
+        else:
+            for j in range(0, steps):
+                m = j < row_len
+                pos = start + j * C + lane
+                col = tl.load(c_ptr + pos, mask=m, other=0)
+                vr = tl.load(v_ptr + 2 * pos, mask=m, other=0.0)
+                vi = tl.load(v_ptr + 2 * pos + 1, mask=m, other=0.0)
+                xr = tl.load(x_ptr + 2 * col, mask=m, other=0.0)
+                xi = tl.load(x_ptr + 2 * col + 1, mask=m, other=0.0)
+                re += vr * xr - vi * xi
+                im += vr * xi + vi * xr
+        tl.store(y_ptr + 2 * row, re, mask=row >= 0)
+        tl.store(y_ptr + 2 * row + 1, im, mask=row >= 0)
+    else:
+        acc = tl.zeros((GROUP, C), dtype=ACC)
+        for j in range(0, steps):
+            m = j < row_len
+            pos = start + j * C + lane
+            col = tl.load(c_ptr + pos, mask=m, other=0)
+            v = tl.load(v_ptr + pos, mask=m, other=0).to(ACC)
+            acc += v * tl.load(x_ptr + col, mask=m, other=0).to(ACC)
+        tl.store(y_ptr + row, acc.to(y_ptr.dtype.element_ty), mask=row >= 0)
+
+
+def _refresh_sell_sigma(p):
+    versions = tuple(_tensor_version(t) for t in (p.values, p.cols, p.offsets))
+    if versions == p.versions:
+        return
+    if versions[1:] != p.versions[1:]:
+        _install_sell_sigma(p)  # structure changed: rebuild the layout
+        return
+    if p.n_values:
+        p.sell_values.copy_(p.values.index_select(0, p.gather))
+    p.versions = versions
+
+
+def spmv_sell_prepared(prepared, x, *, out=None, return_time=False):
+    """Run a ``prepare_spmv_sell`` plan: check ``x`` / ``out``, launch one kernel."""
+    if not isinstance(prepared, PreparedSellSpmv):
+        raise TypeError("prepared must be a PreparedSellSpmv from prepare_spmv_sell")
+    p = prepared
+    if not torch.is_tensor(x):
+        raise TypeError("x must be a torch.Tensor")
+    if x.ndim != 1:
+        raise ValueError("x must be a 1D tensor")
+    if x.dtype != p.value_dtype:
+        raise TypeError("x dtype must match values dtype")
+    if x.numel() != p.n_cols or x.device != p.device:
+        raise ValueError(f"x must have n_cols={p.n_cols} entries on the plan's device")
+    if out is not None and (
+        out.shape != (p.n_rows,) or out.dtype != p.out_dtype or out.device != x.device
+    ):
+        raise ValueError("out shape/dtype/device must match the prepared SELL result")
+    if p.route == "call":
+        return flagsparse_spmv_sell(
+            p.values, p.cols, p.offsets, x, p.shape, slice_size=p.slice_size,
+            out=out, out_dtype=p.out_dtype, validate=False, return_time=return_time,
+        )
+    _refresh_sell_sigma(p)
+    complex_values = p.sell_values.is_complex()
+    x = (x.resolve_conj() if complex_values else x).contiguous()
+    # A strided out cannot be indexed densely by the kernel; fill it by a copy.
+    y = out if out is not None and out.is_contiguous() else torch.empty(
+        p.n_rows, dtype=p.out_dtype, device=x.device
+    )
+    t0 = None
+    if return_time:
+        _ACCEL.synchronize()
+        t0 = time.perf_counter()
+    if p.x_order is not None:
+        x = torch.index_select(x, 0, p.x_order, out=p.x_buf)
+    if p.n_slices:
+        tensors = (
+            torch.view_as_real(y) if complex_values else y,
+            p.kernel_values, p.sell_cols, p.sell_offsets, p.row_len, p.perm,
+            torch.view_as_real(x) if complex_values else x,
+        )
+        if _CUDA_DIRECT_LAUNCH:
+            _launch_musa_spmv(
+                _spmv_sell_sigma_kernel, p.grid, tensors, (p.n_slices,), p.constants,
+                num_warps=p.num_warps, cuda=True,
+            )
+        else:
+            _spmv_sell_sigma_kernel[p.grid](
+                *tensors, p.n_slices, *p.constants, num_warps=p.num_warps
+            )
+    if out is not None and y is not out:
+        out.copy_(y)
         y = out
     if return_time:
         _ACCEL.synchronize()

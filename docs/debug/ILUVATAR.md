@@ -3,6 +3,9 @@
 `FLAGSPARSE_BACKEND=iluvatar`（通常能自动识别）。环境搭建、交付复现见 [`../ILUVATAR.md`](../ILUVATAR.md)，
 上机排查记录见 [`../ILUVATAR_DEBUG.md`](../ILUVATAR_DEBUG.md)。背景见本目录 [`README.md`](README.md)。
 
+> SELL / COO 的优化任务（瓶颈探针 `tools/biv_spmv_probe.py`、`prepare_spmv_sell` 的 A/B 命令和交给 Codex 的 prompt）
+> 见 [`ILUVATAR_SELL_COO_PLAN.md`](ILUVATAR_SELL_COO_PLAN.md) 第 9 节。
+
 ## 要做的事
 
 环境按 `../ILUVATAR.md` 第 1 节配好后（**一定要显式设 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`，
