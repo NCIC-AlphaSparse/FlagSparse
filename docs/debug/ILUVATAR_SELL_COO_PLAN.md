@@ -1,0 +1,539 @@
+# 天数 BI-V150：SpMV SELL / COO 优化计划（2026-10-25）
+
+SELL 五项和 COO 五项是天数上最难的两组：参数已经扫过多轮（见 `ILUVATAR.md` 10-21/10-22 和 `LOW_SPEEDUP.md`
+"已验证的调优进展"），单纯调 tile 已经没有空间。本计划按天数的实测数据重新拆解瓶颈，并利用一条新放宽的前提：
+
+> **较重的预处理可以放进 prepare，只统计 run 阶段的 kernel 时间**（和 cuSPARSE 提前建描述符、分配 buffer 对等）。
+
+这意味着可以在 prepare 里把用户给的 SELL / COO **重新编码成更适合天数的内部格式**，运行时只跑一次 kernel。
+
+> **2026-10-25 更新**：第 0 步的探针脚本 `tools/biv_spmv_probe.py` 和 5.1/5.2 的 `prepare_spmv_sell` 已经实现，
+> 交付 benchmark 可以用环境变量切到 prepared 路径。天数上要跑什么、怎么判断，直接看**第 9 节**。
+
+数据来源：10-24 全量结果 `results_biv_65_20261024_final`（逐矩阵耗时用 `折算基线 ÷ 加速比` 反推）、`tests/data`
+的结构统计、当前代码，以及 2026-10-25 在 5090 上做的原型验证（标"CUDA 原型"，**只证明格式和正确性，不代表天数性能**）。
+
+---
+
+## 1. 现状
+
+| 变体 | 10 矩阵平均 | 最差的矩阵 | 现在走的路径 |
+|---|---:|---|---|
+| `spmv_sell_f32_int_non` | 0.630 | NACA0015 0.48、filter3D/roadNet/amazon 0.51 | `_spmv_sell_real_kernel` |
+| `spmv_sell_f16_int_non` | 0.621 | filter3D 0.45、NACA 0.48、ASIC/amazon 0.50 | 同上 |
+| `spmv_sell_i8i32_int_non` | 0.654 | NACA/GL7d14/amazon 0.48–0.49 | 同上 |
+| `spmv_sell_c32_int_non` | 0.516 | NACA 0.35、amazon 0.39、GL7d14 0.47 | `_spmv_sell_complex_kernel` |
+| `spmv_coo_c32_int_non` | 0.472（天数改 ASIC 后报告 0.522） | roadNet 0.29、auto 0.44、NACA 0.48 | `_spmv_csr_transpose.gather`（复数） |
+| `spmv_coo_f16f32_int_non` | 0.730 | ASIC 0.30、auto 0.66、NACA/roadNet 0.67 | COO→CSR + 混合精度 row-tile |
+| `spmv_coo_f16_int_non` | 0.762 | ASIC 0.32、filter3D 0.48、NACA 0.69 | 同上 |
+| `spmv_coo_i8i32_int_non` | 0.771 | ASIC 0.28、GL7d14 0.54、NACA 0.67 | 同上 |
+| `spmv_coo_f32_int_trans` | 0.776 | ASIC 0.12、amazon 0.44、roadNet 0.62 | 转置 gather（`transpose_csr_plan`） |
+
+（SELL 的 f16→f32 也测了，0.623，和 f16 基本一样，下文不单列。）
+
+## 2. 天数上的硬约束和已知数据（做计划的前提）
+
+**硬件和软件**
+- warp 64 宽；多轮扫描下来，大多数 kernel 在 `num_warps=1`、小 tile 时最好（f32c32 复数表 16×8×1，SELL 单 warp）。
+- CoreX Triton 3.6.0；TLE 共享内存不可用；`torch.sparse` 会静默算错（不能当参考）。
+- 计时：`_benchmark_cuda_op` 在天数上用设备 event 包住整个循环。主机比 GPU 慢时，GPU 的空闲间隙也会算进去；
+  天数每次调用的固定开销约 22–30 µs（spvv 在 nnz 1k–64k 之间一直是 23–30 µs）。SELL benchmark 用
+  `validate=False`，每次调用没有同步。
+
+**现有 kernel 在天数上的带宽利用率**（大矩阵；字节数按该路径实际读的数组算）
+
+| kernel | 有效带宽 | 占实测 1150 GB/s |
+|---|---:|---:|
+| SELL f32（含填充） | 316–355 GB/s | 27–31% |
+| SELL f16 / i8 | 267–295 / 250–285 GB/s | 22–26% |
+| CSR 混合精度 row-tile（COO 实数混合精度也走它） | 220–280 GB/s | 19–24% |
+| 复数 gather（COO / CSR c32） | 250–330 GB/s | 22–29% |
+| nnz 均分 `_nnz_kernel`（f32c32） | auto 约 185 GB/s（431.6 µs）；ASIC 81.8 µs | — |
+
+cage12、wave、cfd2 这几个小矩阵能跑到 450–600 GB/s，很可能整个装进了 L2；**丢分集中在大矩阵**
+（NACA0015、auto、amazon0601、GL7d14、ASIC_680ks、roadNet-TX、filter3D）。
+
+**要达到 0.8 需要多少带宽**：按"我们的路径要读的字节数 ÷（折算基线 ÷ 0.8）"算，所有变体、所有矩阵都**不超过
+800 GB/s**（实测带宽的 70%）。COO 实数混合精度在大矩阵上只需要 240–335 GB/s（现在 220–280，差 15–25%，
+ASIC 除外）；SELL 需要 337–574 GB/s；COO c32 需要 450–650 GB/s，是最难的一项。
+
+**结构统计**（`tests/data`）
+- ASIC_680ks：行、列都是平均 3.4、P99 16、最长 210、变异系数 1.25——长尾。
+- amazon0601：行很均匀（最长 10），**列是幂律分布**（平均 8.4、P99 53、最长 2751）——只在转置方向长尾。
+- SELL（slice=32，不排序）的填充率：ASIC 3.98、filter3D 2.48、roadNet 1.48、NACA/GL7d14 1.30、auto 1.27、wave 1.26、
+  amazon 1.19、cfd2 1.08、cage12 1.07。
+
+**天数已经试过、不要重复的**
+- SELL：slot 并行、行×slot tile（32×4、64×4、128×2）、CSR 压缩后 row-tile、CSR 轻量 row-tile、complex slot=8、
+  双 warp、compiled launcher、循环流水化、统一 `group=1, block_r=32`。
+- COO c32：gather 的 batch×lanes（4×128、8×64、16×16），ASIC 上最好只快 1.04 倍；双行串行累加、成对加载、K 归约 tile。
+- COO f32 转置：ASIC 上扫 lanes×batch（4×128、8×64、16×16、32×8），无收益；prepare 已缓存转置结构，不是每次重建。
+- f32c32（同一类 row-tile kernel）：rows/block 扫描、warp-per-row、cache modifier 开关、单 kernel 分桶，都不如默认。
+
+## 3. 总体思路：prepare 里统一编码成两种内部格式
+
+SELL、COO 非转置、COO 转置在数学上都是"按行（或按 Aᵀ 的行）求和"。既然 prepare 不计时，就不必在运行时迁就
+用户给的格式，而是统一编码成两种格式之一，把调优精力集中在两个 kernel 上：
+
+- **格式 A：SELL-C-σ**（规则结构）。在 σ 行的窗口内按行长降序排序，再每 C 行切一个 slice，按列主序存放。
+  σ=1024 时 C=32 的填充率降到 1.01–1.07（ASIC 1.17），C=64 降到 1.02–1.11（ASIC 1.39）。y 按原始行号写回（存一个
+  `perm` 数组，每行写一次）。
+- **格式 B：nnz 均分的分段扫描**（长尾结构）。每个 program 处理固定数量的 nnz，COO 自带行号，转置时用排好序的
+  列号当行号，几乎不需要额外元数据。
+- **选择规则**（prepare 时按结构算一次）：`最长 ≥ 128 且 最长 ≥ 32 × 平均` 走 B，否则走 A。10 个矩阵里只有 ASIC
+  的行/列、amazon 的列命中 B。天数数据支持这个划分：nnz kernel 在 ASIC 上 81.8 µs（row-tile 约 129 µs），在 auto 上
+  431.6 µs（row-tile 266.6 µs）。
+
+**这改变了比较的内容，报告里必须写明**：cuSPARSE 读的是用户给的带填充 SELL / 原始 COO；我们读的是 prepare 时
+重排过的数据。和已有的 `timed=prepared` 一样，在 CSV 里标出 `layout=sell_c_sigma` / `layout=nnz_balanced`。
+
+## 4. 第 0 步：先在天数上把瓶颈测清楚（半天到一天，后面的取舍都依赖它）
+
+在 NACA0015、auto（大而规则）和 ASIC（长尾）上，用 f32 跑下面几个探针 kernel，每个都同一进程交替测、取 3 轮中位数：
+
+| 探针 | 做什么 | 回答的问题 |
+|---|---|---|
+| P1 连续读 | Triton 连续读 + 求和，扫 BLOCK、`num_warps` 1/2/4 | Triton 在天数上能跑到的带宽上限 |
+| P2 现行 SELL | 现在的 `_spmv_sell_real_kernel` | 基准 |
+| P3 去掉 x 的间接访问 | 同一个 kernel，把 `x[col]` 换成 `x[row]` | x 随机读的代价 |
+| P4 去掉列号依赖 | 填充位置存 `col=0, val=0`，值的读取不再等列号（`mask` 只看 slot 是否在 slice 宽度内） | 列号→值这条依赖链的代价 |
+| P5 占用率 | P2 在 `GROUP`/`num_warps` 不同组合下，program 数为 SM 数的 1/4/16/64 倍 | 是不是并发度不够、延迟没藏住 |
+| P6 σ 重编码 | `prepare_spmv_sell` 扫 σ 和 (c, group, warps)，复数加成对读取 | 5.1/5.2 在天数上的实际收益 |
+| P7 RCM 重排 | 方阵在 prepare 里按 RCM 重新编号，计时含每次调用的 x 重排 | x 局部性能换回多少（见 5.6） |
+
+再用天数的 profiler 看 P2 在 auto 上的显存吞吐、L2 命中率、achieved occupancy 和访存 stall 占比。
+
+**怎么用结果做决定**
+
+- P1 本身只有 300–400 GB/s → Triton 在天数上就到顶了，SELL/COO 很难再翻倍，后面以减少字节数（σ 排序、压缩）为主，
+  并在报告里写明上限。
+- P3 明显快于 P2 → 瓶颈在 x 的随机读：σ 窗口取小一些保局部性，看 P7 的 RCM 重排（见 5.6）。
+  注意 P3 里的 x 读取**不带掩码**：5090 上带掩码读"每个 lane 固定的地址"在 ASIC 上反而比真实 gather 慢 3 倍，
+  会把这个探针的结论弄反；地址总在范围内、填充位置的值已是 0，所以去掉掩码不影响含义。
+- P4 明显快于 P2 → 依赖链没被藏住：格式 A 统一按 P4 的方式存填充。
+- P5 里 program 越多越快 → 并发度不够：减小 tile、增加 program 数，或者每个 program 同时处理多个 slice。
+
+> **CUDA 原型的对照**：5090 上（kernel 时间，每次清空 L2）P4 的写法没有收益——ASIC 上 98.3 µs 对 84.0 µs，因为
+> 原来用 `col >= 0` 遮掉了填充位置的值，少读了字节；σ 排序后填充很少，两种写法差别会变小。天数是否受益，以 P4 为准。
+
+## 5. SELL 计划
+
+### 5.1 σ 排序重编码（确定的收益，先做）
+
+- **为什么**：填充位置的列号一定要读，cuSPARSE 也一样。σ 排序后填充率从 1.07–3.98 降到 1.01–1.17，字节数直接减少。
+- **CUDA 原型**（5090，f32，kernel 时间，每次清空 L2；"现行"和"σ 排序后"都用 CUDA 默认配置 `GROUP=4, num_warps=4`）：
+
+  | 矩阵 | cuSPARSE SELL | 现行 kernel | σ=1024 排序后 | 填充率变化 |
+  |---|---:|---:|---:|---|
+  | ASIC_680ks | 75.8 µs | 84.0 µs | **63.5 µs** | 3.98 → 1.17 |
+  | filter3D | 47.1 µs | 49.2 µs | **38.9 µs** | 2.48 → 1.05 |
+  | roadNet-TX | 45.1 µs | 43.0 µs | **41.0 µs** | 1.48 → 1.03 |
+  | NACA0015 | 59.4 µs | 63.5 µs | 59.4 µs | 1.30 → 1.01 |
+  | auto | 88.1 µs | 63.5 µs | 61.4 µs | 1.27 → 1.02 |
+  | amazon0601 | 34.8 µs | 32.8 µs | 32.8 µs（持平） | 1.19 → 1.02 |
+
+  结果全部正确。amazon 没有收益，而且比现行 kernel 的最好配置（`GROUP=1`，30.7 µs）慢 7%：σ 太大会打乱 x 的
+  局部性，**σ 要扫**（256 / 1024 / 4096）。
+- **天数上的预期**（假设耗时和读取字节数成正比，下限按"填充位置的值被跳过"、上限按"填充位置的值也被读"）：
+
+  | 变体 | 现在 | σ 排序后（10 矩阵平均） | 排序后仍然最低的三个矩阵 |
+  |---|---:|---:|---|
+  | sell_f32 | 0.630 | 0.80–0.96 | NACA 0.55–0.62、amazon 0.56–0.60、roadNet 0.62–0.73 |
+  | sell_f16 | 0.621 | 0.82–0.91 | amazon 0.56–0.59、NACA 0.58–0.62、GL7d14 0.66–0.71 |
+  | sell_i8i32 | 0.654 | 0.92–0.98 | amazon 0.56–0.57、NACA 0.59–0.62、GL7d14 0.60–0.63 |
+  | sell_c32 | 0.516 | 0.63–0.83 | NACA 0.39–0.46、amazon 0.41–0.45、GL7d14 0.51–0.60 |
+
+  平均值主要被 ASIC 和 filter3D 拉高（这两个的填充最多），**NACA、amazon、GL7d14 仍然在 0.55–0.7**，要靠 5.2–5.4。
+- **怎么做**：
+  1. 新增 `prepare_spmv_sell(values, cols, offsets, shape, slice_size, *, sigma=1024, c=None)`：从用户的 SELL 数组恢复每行的
+     元素（有效位是 `cols >= 0`），按 σ 窗口排序后重新切 slice，产出 `vals / cols / slice_offsets / perm`。全部用 torch
+     在设备上做（参考 `csr_to_sell` 的向量化写法），prepare 里可以同步。
+  2. `flagsparse_spmv_sell(prepared=..., x=..., out=...)` 只做 x/out 检查和一次 kernel 启动。
+  3. `tests/test_spmv_sell.py` 的天数分支改为计时 prepared 调用，CSV 增加 `layout` 和 `sigma` 两列。
+  4. 正确性：σ 排序后 y 必须按原始行号写回；补"空行在 slice 末尾""行数不是 C 的倍数""只有一行"的测试。
+
+### 5.2 让 64 宽的 warp 吃满
+
+- **代码现状**：实数路径 `slice_size <= 32` 时 `BLOCK_R=64`、`num_warps=1`，slice 数 ≤ 32768 时 `GROUP=1`。SLICE 是 32，
+  `r < SLICE` 的掩码让一半 lane 常年空着；`GROUP=2` 时 tile 是 2×64=128 个元素，同样一半被遮掉。
+- **重编码后可以直接选 slice 高度**：
+  - 方案 a：`C=64, GROUP=1, num_warps=1`。一个 warp 正好一个 slice、每个 lane 一行。代价是填充率比 C=32 略高
+    （σ=1024 时 1.02–1.11，ASIC 1.39；σ=8192 时 1.00–1.02，ASIC 1.14）。
+  - 方案 b：`C=32, GROUP=2, BLOCK_R=32, num_warps=1`。两个 slice 共用一个 warp；σ 排序后相邻 slice 宽度接近，
+    `GROUP` 带来的"按较宽的 slice 循环"代价很小（这正是原来 `GROUP=2` 在高填充矩阵上吃亏的原因）。
+- **旁证**：roadNet 有 43544 个 slice，超过 32768 走 `GROUP=2`，跑到 554 GB/s；NACA0015 有 32475 个 slice，正好低于
+  阈值走 `GROUP=1`，只有 362 GB/s。roadNet 的 slice 更窄，这只是线索。
+- 覆盖开关已加（2026-10-25）：`FLAGSPARSE_SELL_PREP_C / _GROUP / _WARPS / _SIGMA / _PAIRED / _REORDER`，prepare 时读取。
+  64 宽 warp 的后端默认取方案 a（`C=64, GROUP=1, num_warps=1`）：5090 上复数用 `GROUP=2` 时 ASIC 从 73.8 µs 变成
+  145 µs，同一个 program 里较窄的 slice 要等较宽的那个；方案 b 留给天数用 P6 对比。
+
+### 5.3 复数（sell_c32）
+
+- 现状：`_spmv_sell_complex_kernel`，tile 1×32、`num_warps=1`（半个 warp），实部、虚部、x 的实部、x 的虚部是 4 次分开的
+  4 字节读取。
+- 改法：在 5.1/5.2 的基础上，值和 x 都按 `(…, 2)` 成对读取（每次 8 字节），参考
+  `mixed_spmx._csr_spmv_real_by_complex_cached_kernel` 的写法；累加用两个 fp32 通道。
+- c32 是本组最难的一项：即使 σ 排序上限估算为 0.83，NACA/amazon 仍在 0.4 左右。成对读取能不能把效率从 ~300 GB/s
+  提到 ~450 GB/s，要看第 0 步 P1/P3 的结果。
+
+### 5.4 窄类型（f16 / i8）的打包读取（看第 0 步结果再做）
+
+- 现象：f16、i8 SELL 的时间没有随字节数同比例下降。NACA 上 f16/f32 = 0.91（字节比 0.75），i8/f32 = 0.86（字节比
+  0.625）。说明窄类型每次读取的字节太少（一个 warp 一次只读 64×2 B 或 64×1 B），受指令数或延迟限制。
+- 改法：prepare 时按"每个 lane 连续存 K 个 slot"排布（`[slice][j // K][lane][K]`），kernel 用 `(C, K)` 的 tile 一次读
+  K 个值：f16 取 K=2 或 4（4/8 字节）、i8 取 K=4 或 8。列号是 int32，也可以按 K 打包。slice 宽度要补到 K 的倍数，
+  对平均行长 3 左右的矩阵（ASIC、roadNet）会多出不少填充，K 要按矩阵选。
+- 只有当第 0 步显示"指令/延迟受限"而不是"带宽受限"时才值得做。
+
+### 5.6 RCM 重排：在 prepare 里换 x 的局部性（2026-10-25 新增）
+
+- **CUDA 上的发现**（5090，探针 P3/P7，不是天数数据）：把 `x[col]` 换成不随机的读取（P3），NACA0015 快 2.5 倍、auto
+  快 3.4 倍、amazon 快 1.8 倍、ASIC 只快 1.07 倍——这几个矩阵的行号顺序很差（NACA 列号与行号之差的中位数 191584，
+  auto 35468）。
+- **做法**：prepare 时对方阵的对称化结构做逆 Cuthill-McKee（RCM），行、列一起重新编号，每行内部的求和顺序不变
+  （结果和不重排逐位一致）；每次调用先把 x 按新顺序排到 plan 自带的缓冲区（多一次启动，算在计时里），y 由 `perm`
+  直接写回原始行号。`prepare_spmv_sell(reorder="rcm" | "auto")` 已实现，`auto` 只在中位数缩小 4 倍以上且原来不小于
+  4096 时启用（10 个矩阵里只选中 NACA、auto）。
+- **CUDA 实测**（交付 benchmark 计时，含 x 重排）：f32 的 NACA 39.8 → 29.6 µs、auto 49.6 → 29.2 µs；f16、i8 类似；
+  **复数没有收益**（NACA 0.81 倍、auto 0.93 倍）：复数每个元素要读 8 字节值，x 局部性占比小，多出的 x 重排又更贵。
+- **天数上**：x 随机读在缓存更小的卡上通常更贵，NACA 和 auto 又正好是天数最差的两个大矩阵，所以这一项值得优先 A/B
+  （第 9 节命令里的 `FLAGSPARSE_SELL_PREP_REORDER=auto`）。它需要 SciPy（库本身不依赖 SciPy，只有这个可选步骤用）。
+- 同样的重排以后可以用到 COO、CSR：在 prepare 里把 COO 转成 SELL-C-σ 并重排，直接复用这个 kernel。
+
+### 5.5 列号压缩（可选，收益不覆盖最差的矩阵）
+
+- 每行存一个 int32 基址、每个元素存 uint16 偏移，f32 每个元素从 8 字节降到约 6 字节。按行跨度 < 65536 统计：
+  GL7d14、cfd2、filter3D 100%，roadNet 98.6%，cage12 97.9%，wave 94.9%，ASIC 84.5%；**但 NACA 0.7%、auto 20.5%、
+  amazon 22.7%**——正好是最差的三个矩阵。不重排列号（需要每次调用重排 x）就用不上，优先级放最后。
+
+## 6. COO 计划
+
+### 6.1 先整理 prepare / run 的分工（所有 COO 混合精度变体）
+
+- 现在 `spmv_coo_mixed` 的天数分支在**运行时**懒构建 COO→CSR（挂在 `_ROCM_COO_CSR_CACHE` 这个 TensorPlanCache 上），
+  每次调用还要查缓存、新分配 y、最后 `out.copy_(y)`。
+- 改为在 `prepare_spmv_coo` 里一次构建内部格式（第 3 节的 A 或 B），`PreparedCoo` 持有它；运行时直接写进 `out`；
+  q4 bench 的 COO prepared 路径传预分配的 `out`。天数上这几项在 GPU 侧受限，单这一步收益不大（只对 cage12、wave 这类
+  小矩阵有意义），但它是后面所有改动的地基，也去掉了 TensorPlanCache 的那几条局限。
+
+### 6.2 长尾矩阵（ASIC）走 nnz 均分，COO 的行号现成
+
+- **数据**：三项实数混合精度在 ASIC 上都是最差的（0.28–0.32），耗时约 122 µs；同一个 nnz kernel 在天数上跑 f32c32 的
+  ASIC 只要 81.8 µs，而 f32c32 读的字节更多（复数 x）。
+- **怎么做**：`prepare_spmv_coo` 默认 `sort_by_row=True`，按 (行, 列) 排好序，行号数组就是 `_nnz_kernel` 的 `ROW`，
+  只需额外一个空行列表。选择规则用第 3 节的结构条件。
+- **（已核实，不是问题）**：曾担心 `_nnz_kernel` 非 MUSA 分支的浮点字面量 `0.` 会把 int32 累加提升成 float32。
+  2026-10-25 在 CUDA 机上用一行和为 32257873（大于 2^24 的奇数）的 i8→i32 COO 实测，改动前后都逐位精确：Triton 的
+  Python 标量是弱类型，会跟随张量类型。天数这次把两处字面量统一成 `0`，只是写法一致。
+  另外 `NE`、`NNZ` 是 `tl.constexpr`，每个矩阵都会重新编译一次——不影响计时（编译发生在 warmup），但第一次调用很慢，
+  可以改成运行时参数。
+- **预期**：ASIC 从 0.28–0.32 提到约 0.5，三项均值约 +0.02：i8i32 0.771 → 约 0.79，f16 0.762 → 约 0.785，f16f32 0.730 → 约 0.75。
+
+### 6.3 filter3D 上 COO f16→f16 的异常（先复测）
+
+- COO f16→f16 在 filter3D 上 99 µs、0.48，而 COO f16→f32 和 CSR f16→f16 都是 49 µs，三者是同一个 kernel。
+- 先复测；能复现就打印实际路由。如果修好到 f16→f32 的水平（约 0.80），f16 这一项均值再 +0.03，可以过 0.8。
+
+### 6.4 转置 f32（coo_f32_trans）：长尾列走 nnz 均分
+
+- **数据**：ASIC 转置 538 µs（非转置 163 µs），amazon 转置 312 µs（非转置 179 µs）；amazon 的列长最长 2751。
+- **原因**：转置 plan 经 `_spmv_csr_transpose.make_plan()`，ASIC 的转置结构触发按长度排序的行顺序；amazon 的一批列里
+  只要有一条长列，整批都要等它。天数扫 lanes×batch 无收益，和这个判断一致。
+- **CUDA 实测**（5090，GPU 时间，在转置结构上跑现有 `_nnz_kernel`）：ASIC 29.7 → 7.8 µs（cuSPARSE 21.9），amazon
+  64.4 → 27.1 µs（cuSPARSE 39.1）；roadNet、auto 持平或变慢，所以必须按结构条件启用。
+- **怎么做**：COO 转置时 prepare 已经按列排好序（`col_trans`），它就是 Aᵀ 的行号；值用 `data_trans`。规则矩阵的转置
+  （NACA 0.66、roadNet 0.62、auto 0.72）可以在 prepare 里直接构建 Aᵀ 的格式 A，和 SELL 共用 kernel。
+- **预期**：如果天数上 nnz kernel 在长尾矩阵上能维持 ASIC 那样的效率（f32c32 81.8 µs 约合 350 GB/s），ASIC 0.12 → 0.4–0.8，
+  amazon 0.44 → 0.6–1.0，这一项均值 0.776 → 0.82–0.90。
+
+### 6.5 规则矩阵上的实数混合精度（NACA、auto、amazon、GL7d14 在 0.66–0.74）
+
+- 需要的提升不大：这些矩阵要到 0.8 只需带宽提升 10–25%。
+- 但**格式 A 本身不一定比 row-tile 快**：天数上 SELL f16 在 NACA 上 272 GB/s，COO f16 走 row-tile 也有 269–280 GB/s；
+  i8 两者都是约 245–250 GB/s。也就是说，在窄类型上 SELL 和 row-tile 的效率差不多，只有 f32 时 SELL 明显更高。
+- 所以这里的收益要看第 0 步的结论，以及 5.4 的打包读取能不能用到格式 A 上。方案是：COO 规则矩阵统一走格式 A，
+  这样 SELL 做出的任何改进（5.2–5.4）自动对 COO 生效。
+
+### 6.6 复数（coo_c32）：最难
+
+- 天数改过 ASIC 之后报告是 0.522；其余 9 个矩阵在 0.43–0.66，大矩阵需要把带宽从约 250–330 GB/s 提到 450–650 GB/s，
+  相当于 1.6–1.8 倍。目前天数上**没有任何一个复数 kernel 达到过这个效率**（SELL c32 在 NACA 上也只有 317 GB/s）。
+- 路线：走格式 A + 5.3 的成对读取。按 σ 排序和成对读取的预期，NACA 大约能从 COO 现在的 291 µs 降到 250–280 µs，
+  对应 0.48 → 0.5–0.55。
+- **诚实的预期**：不出现新的发现的话，这一项均值约 0.6–0.65；要到 0.8 必须先在第 0 步找到天数复数访存的瓶颈。
+  如果 P1 显示 Triton 的上限本身就不够，就在报告里写明。
+
+## 7. 排期和验收
+
+| 步骤 | 工作量 | 涉及变体 | 预期 | 验收 |
+|---|---|---|---|---|
+| 第 0 步：瓶颈探针 | 0.5–1 天 | 全部 | 决定 5.3/5.4/6.5/6.6 怎么做 | 5 个探针在 3 个矩阵上的数据 + profiler 指标 |
+| 5.1 σ 排序 + `prepare_spmv_sell` | 1–2 天 | SELL 五项 | 均值 0.80–0.96（c32 0.63–0.83） | 精度全过；同轮交错 A/B；扫 σ |
+| 5.2 吃满 warp | 0.5 天 | SELL 五项 | NACA/amazon/GL7d14 提升 | 方案 a/b 各自逐矩阵数据 |
+| 6.1 + 6.2 + 6.3 | 1–2 天 | COO 实数混合精度三项 | 约 0.75–0.8，f16 有望过 0.8 | ASIC 走 nnz；逐矩阵不回退 |
+| 6.4 转置长尾 | 1 天 | coo_f32_trans（csr 转置、c32 conj 顺带受益） | 0.82–0.90 | ASIC/amazon 逐矩阵；规则矩阵不回退 |
+| 5.3 / 5.4 / 6.5 / 6.6 | 视第 0 步 | SELL c32、窄类型、COO c32 | 见各节 | — |
+
+每一步都要：同一进程交替 A/B、每个矩阵至少 3 轮取中位数、报**逐矩阵**数字；精度用 `ILUVATAR.md` 命令里的 `-k`
+重跑；改到 `spmv_csr.py` 的调度函数时在无 torch 环境下跑一遍 `tests/ci`（`test_spmv_csr_policy.py` 用桩环境执行这些函数）。
+
+## 8. 风险和注意事项
+
+- **比较口径**：重编码后我们读的数据和 cuSPARSE 不同（更少的填充）。这在"只计 kernel、prepare 不计时"的前提下是
+  合理的，但报告里必须写明格式和 σ，不能让人以为是同一份数据上的比较。
+- **x 的局部性**：σ 太大打乱 x 的访问顺序（CUDA 原型上 amazon 没有收益，比现行最好配置慢 7%）。σ 必须扫，必要时按矩阵选。
+- **内存**：prepare 会复制一份矩阵（值、列号、perm）。超大矩阵上要注意显存占用。
+- **用户原地改值**：重编码后的副本看不到用户对原数组的修改。参照 gather 现有做法：记录源张量的 `_version`，运行时发现
+  变化就重新填充值（结构不变时只需一次 scatter）；结构变化必须重新 prepare，在文档里写明。
+- **y 的散写**：σ 排序后按 `perm` 写回，同一个窗口内的行在 L2 里合并，影响不大；σ 越小越安全。
+- **小矩阵和主机开销**：天数上每次调用约 22–30 µs 的固定开销会盖住小矩阵的 kernel 时间。prepared 运行路径要尽量薄
+  （不做 `.item()`、不新分配输出）。
+
+## 附：CUDA 原型（只验证格式和正确性）
+
+prepare（全部 torch，设备上执行）：
+
+```python
+def prepare_sellcs(data, indices, indptr, n_rows, C=32, sigma=1024):
+    L = (indptr[1:] - indptr[:-1]).long()
+    win = torch.arange(n_rows, device=data.device) // sigma
+    order = torch.argsort(win * (L.max() + 1) + (L.max() - L), stable=True)   # 窗口内按行长降序
+    n_slices = (n_rows + C - 1) // C
+    Ls = torch.zeros(n_slices * C, dtype=torch.long, device=data.device); Ls[:n_rows] = L[order]
+    width = Ls.view(n_slices, C).amax(1)
+    off = torch.zeros(n_slices + 1, dtype=torch.long, device=data.device); off[1:] = torch.cumsum(width * C, 0)
+    vals = torch.zeros(int(off[-1]), dtype=data.dtype, device=data.device)
+    cols = torch.zeros(int(off[-1]), dtype=torch.int32, device=data.device)   # 填充：列 0、值 0
+    inv = torch.empty_like(order); inv[order] = torch.arange(n_rows, device=data.device)
+    rows = torch.repeat_interleave(torch.arange(n_rows, device=data.device), L, output_size=data.numel())
+    p = inv[rows]
+    pos = off[p // C] + (torch.arange(data.numel(), device=data.device) - indptr.long()[rows]) * C + p % C
+    vals[pos] = data; cols[pos] = indices.to(torch.int32)
+    perm = torch.full((n_slices * C,), -1, dtype=torch.int32, device=data.device); perm[:n_rows] = order.to(torch.int32)
+    return vals, cols, off.to(torch.int32), perm, n_slices
+```
+
+kernel（每个 program 处理 `GROUP` 个 slice，y 按 `perm` 写回原始行号）：
+
+```python
+@triton.jit
+def sellcs_kernel(y_ptr, v_ptr, c_ptr, off_ptr, perm_ptr, x_ptr, n_slices,
+                  C: tl.constexpr, GROUP: tl.constexpr, ACC: tl.constexpr):
+    s = tl.program_id(0) * GROUP + tl.arange(0, GROUP)[:, None]
+    r = tl.arange(0, C)[None, :]
+    smask = s < n_slices
+    start = tl.load(off_ptr + s, mask=smask, other=0)
+    width = (tl.load(off_ptr + s + 1, mask=smask, other=0) - start) // C
+    acc = tl.zeros((GROUP, C), dtype=ACC)
+    for j in range(0, tl.max(tl.max(width, 0), 0)):
+        m = smask & (j < width)
+        pos = start + j * C + r
+        col = tl.load(c_ptr + pos, mask=m, other=0)
+        v = tl.load(v_ptr + pos, mask=m, other=0).to(ACC)
+        acc += v * tl.load(x_ptr + col, mask=m, other=0).to(ACC)
+    row = tl.load(perm_ptr + s * C + r, mask=smask, other=-1)
+    tl.store(y_ptr + row, acc.to(y_ptr.dtype.element_ty), mask=row >= 0)
+```
+
+在 5090 上对 ASIC、NACA、auto、amazon、filter3D、roadNet 六个矩阵（f32）验证结果正确；性能见 5.1。天数上应按 5.2 把
+`C` 改成 64，或者保持 32 并设 `GROUP=2`。
+
+## 9. 已实现，交给天数实测（2026-10-25）
+
+### 9.1 `prepare_spmv_sell`（`src/flagsparse/sparse_operations/spmv_sell.py`）
+
+```python
+plan = fs.prepare_spmv_sell(values, col_indices, slice_offsets, (m, n), slice_size=32,
+                            out_dtype=None, route="auto", sigma=None, c=None, group=None,
+                            num_warps=None, paired=None, reorder=None)
+y = fs.flagsparse_spmv_sell(prepared=plan, x=x, out=y)   # 或 fs.spmv_sell_prepared(plan, x, out=y)
+```
+
+- **route**：`auto` 在 CUDA 上走 `sigma`；天数仅实数走 `sigma`，复数回到原生 `call` 路径；其他后端走 `call`
+  （原样交回各后端已有的 SELL 路径）；Ascend 不能用 `sigma`。
+- **prepare 做的事**（会同步，不计时）：从用户的 SELL 数组恢复每行元素，在 σ 行窗口内按行长降序排序后重新切 slice；
+  `sigma="auto"` 取"从 c 开始翻倍、填充率 ≤ 1.10 的最小窗口"（上限 4096），10 个矩阵的选择：ASIC 4096、filter3D 512、
+  amazon/roadNet 256、NACA/auto/GL7d14/wave 128、cage12/cfd2 不排序。可选 RCM 重排（5.6）。
+- **kernel**：每个 lane 用自己的行长做掩码——填充位置永远不读，值的读取不等列号，`x` 里的 inf/NaN 也不会透过填充
+  的 0 混进结果；结果按 `perm` 写回原始行号；CUDA 上直接发射。
+- **默认参数**（显式参数 > 环境变量 > 默认）：
+
+  | 后端 | 实数 (c, group, warps) | 复数 (c, group, warps) | σ | 成对读取 | 重排 |
+  |---|---|---|---|---|---|
+  | CUDA | 32, 4, 4 | 32, 1, 1 | auto | 关 | none |
+  | 天数（64 宽 warp） | 32, 1, 1 | 64, 1, 1（显式 sigma） | 实数 4096 / 复数 auto | 关 | none |
+  | MACA / DCU（64 宽 warp） | 32, 1, 1 | 64, 1, 1 | auto | 关 | none |
+
+  （MACA / DCU 的 `route="auto"` 本来就走 `call`，上表只在显式 `route="sigma"` 时生效。）
+
+  环境变量：`FLAGSPARSE_SELL_PREP_SIGMA`（行数或 `auto`）、`_C`、`_GROUP`、`_WARPS`、`_PAIRED`（`1`/`0`）、
+  `_REORDER`（`none`/`rcm`/`auto`）。
+- **语义**：plan 复制了一份值。用户原地改值（`_version` 变化）下次运行自动刷新；改了列号或 slice 偏移会自动重建；
+  inference 张量没有版本计数，改了看不到，需重新 prepare。开了重排的 plan 有自己的 x 缓冲区，不要在多个 stream 上
+  并发使用同一个 plan。
+- **正确性**：测试覆盖 f32/f64/f16/bf16→f32/i8→i32/i8→f32/c64/c128、空行、长行、行数不是 c 的倍数、strided out、x 含
+  inf、原地改值/改结构、RCM、环境变量和错误用法。2026-10-25 本机完整测试结果为 153 passed、16 failed：
+  `test_auto_sigma_sorts_only_padded_structures` 已显式指定 `sigma="auto"`，单测复测通过；其余 16 项是 BI-V double/complex128
+  strided `copy_` canary 失败，与 SpMV 数值结果无关，需作为已知问题跟进，不能记作全通过。合入 main 时（CUDA 机）这 16 项
+  在天数上改为跳过（天数交付本来就用 `-k` 排除 fp64），原因写在测试里。
+
+### 9.2 交付 benchmark 的开关
+
+`tests/test_spmv_sell.py` 读 `FLAGSPARSE_SELL_PREPARED`：不设置时和以前完全一样；设成 `1`/`auto`/`sigma`/`call` 时每个
+矩阵先 prepare（不计时），再计时 prepared 调用，CSV 记 `timed=prepared`，并增加 `layout`、`sell_sigma`、`sell_c`、
+`sell_group`、`sell_warps`、`sell_paired`、`sell_reorder`、`prepared_values` 列。runner 会把环境变量传给子进程，
+所以 `benchmark_biv.py` 直接可用。
+
+### 9.3 CUDA 参考数据（5090，交付 benchmark 计时；不代表天数）
+
+| 矩阵 | 变体 | 原路径 | prepared（默认） | prepared + RCM | cuSPARSE |
+|---|---|---:|---:|---:|---:|
+| ASIC_680ks | f32 | 32.6 µs | 23.1 µs | — | 60.2 µs |
+| ASIC_680ks | c32 | 60.1 µs | 28.5 µs | — | 87.7 µs |
+| filter3D | f32 | 23.7 µs | 18.0 µs | — | 38.7 µs |
+| filter3D | c32 | 36.6 µs | 21.7 µs | — | 53.4 µs |
+| NACA0015 | f32 | 39.8 µs | 41.2 µs | 29.6 µs | 47.7 µs |
+| auto | f32 | 49.6 µs | 49.5 µs | 29.2 µs | 86.0 µs |
+| cage12 | f32 | 27.6 µs | 17.5 µs | —（auto 不重排） | 6.7 µs |
+
+cage12 这类小矩阵在 CUDA 上受主机开销限制：原路径每次调用约 27 µs，prepared 路径约 15–17 µs。
+
+### 9.4 天数上怎么跑（历史探索流程）
+
+1. **探针**（约 20–40 分钟）：
+
+   ```bash
+   setsid timeout -s KILL 7200 env FLAGSPARSE_BACKEND=iluvatar \
+     python3 -u tools/biv_spmv_probe.py tests/data \
+       --matrices NACA0015,auto,ASIC_680ks,amazon0601,filter3D \
+       --dtypes float32,float16,int8,complex64 \
+       --csv results_biv_probe_<日期>.csv \
+     > results_biv_probe_<日期>.log 2>&1 < /dev/null &
+   ```
+
+   每个矩阵、dtype 的结尾都有 `->` 开头的提示行，对应第 4 节的决策表。
+2. **SELL 交付 A/B**（三轮，每轮一个新结果目录；只跑 `spmv_sell`）：
+
+   ```bash
+   # a) 现状
+   python3 benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_call_<日期>
+   # b) prepared 默认（按当前 dtype/backend 默认值选择）
+   env FLAGSPARSE_SELL_PREPARED=1 python3 benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_prep_<日期>
+   # c) b) 再加 RCM 自动重排
+   env FLAGSPARSE_SELL_PREPARED=1 FLAGSPARSE_SELL_PREP_REORDER=auto \
+     python3 benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_rcm_<日期>
+   ```
+
+   每轮之后 `python3 tools/delivery_table.py <结果目录>`。如果探针 P6 里有比默认更好的 (c, group, warps) 或 σ，用对应的
+   `FLAGSPARSE_SELL_PREP_C/_GROUP/_WARPS/_SIGMA` 再跑一轮 d)。
+3. **怎么判断**：
+   - b) 每个矩阵都不慢于 a)：再考虑把天数 benchmark 的默认切到 prepared；复数若 sigma 有回退，应保留 call 路径。
+   - c) 在 NACA/auto 上比 b) 快 15% 以上且其余矩阵不回退：天数默认打开 `reorder="auto"`。
+   - 复数单独看：CUDA 上 RCM 对复数没有收益，天数如果也一样，复数保持不重排。
+
+### 9.5 天数 BI-V150 实测结论（2026-10-25）
+
+对照目录为 `results_biv_sell_call_20261025/`、`results_biv_sell_prep_20261025/`、
+`results_biv_sell_rcm_20261025/`、`results_biv_sell_c32_20261025/`、
+`results_biv_sell_c32g2_20261025/`、`results_biv_sell_c32s4096_20261025/`；最终配置完整复测在
+`results_biv_sell_auto_final_20261025/spmv_sell/performance.csv`（50 行，5 变体 × 10 矩阵，全部 `PASS`）。
+加速比按每矩阵 `speedup_vs_h800_scaled` 求 10 矩阵算术平均；基线是 H800 cuSPARSE 折算到 BI-V150 的时间，并非 BI-V150
+同机厂商实测基线。
+
+| 变体 | 最终选择 | 相对 H800 折算基线平均加速比 |
+|---|---|---:|
+| `spmv_sell_f32_int_non` | prepared sigma，C=32/GROUP=1/WARPS=1/σ=4096 | 0.694x |
+| `spmv_sell_f16_int_non` | 同上 | 0.699x |
+| `spmv_sell_f16f32_int_non` | 同上 | 0.695x |
+| `spmv_sell_i8i32_int_non` | 同上 | 0.700x |
+| `spmv_sell_c32_int_non` | `route=auto` 回原生 call | 0.518x |
+
+RCM 和 `GROUP=2` 未带来整体收益；C=32、σ=4096 的实数配置胜出。复数 sigma prepared 在 NACA、amazon、auto 等矩阵明显回退，
+所以复数 `auto` 路由恢复原生 call。实数 SELL 相比先前天数路径有所改善，但五项平均加速比仍未达到 0.8x。
+
+Prepared 测试集复测：定向测试 `test_auto_sigma_sorts_only_padded_structures` 通过；完整集为 153 passed、16 failed，16 项均为
+BI-V double/complex128 strided `copy_` canary 失败（stride 输出的间隔元素被改写），不是普通 SpMV 结果精度失败；该问题仍需单独跟进。
+
+### 9.6 交给天数 Codex 的 prompt
+
+````text
+你在天数智芯 BI-V150 实机上为 FlagSparse 的 SELL SpMV 收集优化数据。仓库在当前目录，main 分支。主要目的是收集数据，不是修代码。
+
+1. git pull --ff-only origin main，确认 tools/biv_spmv_probe.py 存在、python3 -c "import flagsparse as fs; print(fs.prepare_spmv_sell)" 能导入，
+   且 python3 -c "import flagsparse; print(flagsparse.__file__)" 指向当前目录的 src/。
+2. 完整读一遍 docs/debug/ILUVATAR_SELL_COO_PLAN.md，重点是第 4 节和第 9 节。
+3. 按第 9.4 节第 1 步跑探针，跑完把 results_biv_probe_<日期>.log 里每个矩阵/dtype 的表格和 "->" 提示行原样带回。
+4. 按第 9.4 节第 2 步跑 a)/b)/c) 三轮（每轮新的 --results-dir），每轮跑完执行 python3 tools/delivery_table.py <结果目录>。
+   如果第 3 步的 P6 显示别的 (c, group, warps) 或 sigma 明显更好（快 10% 以上），用对应的 FLAGSPARSE_SELL_PREP_* 环境变量再跑一轮 d)。
+5. 不要改 src/ 或 tests/ 下的代码；确实需要改时按 docs/debug/ILUVATAR.md 末尾"实机改动记录"的格式记录。
+6. 遇到报错给出完整原文，不要猜根因。
+
+汇报：
+1. 探针日志里 5 个矩阵 × 4 个 dtype 的表格和提示行。
+2. a)/b)/c)（以及 d)）四轮的 delivery_table.py 输出，以及 spmv_sell 各变体逐矩阵的加速比（各结果目录下 spmv_sell/performance.csv
+   的 matrix、variant、triton_ms、sell_sigma、sell_c、sell_group、sell_warps、sell_reorder、status 列）。
+3. 环境指纹：torch、triton 版本，设备名，git log -1 --oneline。
+````
+
+### 9.7 COO 建议复核与 mixed NNZ A/B（2026-10-25）
+
+计划里 COO→CSR / prepare 缓存的建议在工程上可取，但本身主要是把排序、分桶和索引构建移出重复调用，不应预期显著降低 kernel 时间。短行长尾矩阵改用 NNZ 均分值得实测；结果支持只对结构符合条件的矩阵启用，不能普遍替代 row-tile。复数 COO 的 NNZ 分段扫描仍只是候选方向，本轮没有实现或验证，不能把实数×复数的既有 `_nnz_kernel` 结果直接外推到复数×复数。
+
+在 BI-V150 对 10 个矩阵、三种 mixed COO（`f16f32`、`f16`、`i8i32`）做 plain/NNZ 同进程 A/B，计时用 `triton.testing.do_bench(warmup=30, rep=100)`；每次切换路由重建缓存，准备的行号计划不在重复调用中生成。A/B 数据记录于 `results_coo_mixed_nnz_ab_20261025.csv`。仅 ASIC_680ks 满足平均行长 ≤4 且最长行 >128：
+
+| 算子 | plain | NNZ | NNZ 相对 plain | 10 矩阵平均加速比估算* |
+|---|---:|---:|---:|---:|
+| `spmv_coo_f16f32_int_non` | 149.78 µs | 115.01 µs | 1.302x | 0.739x（原 0.730x） |
+| `spmv_coo_f16_int_non` | 135.05 µs | 106.27 µs | 1.271x | 0.770x（原 0.762x） |
+| `spmv_coo_i8i32_int_non` | 143.76 µs | 111.54 µs | 1.289x | 0.779x（原 0.771x） |
+
+*估算只把本轮 ASIC 的配对加速比应用于 10-24 全量测试的 ASIC 项，其余 9 项沿用原值；不是新一轮统一基准的全量平均值。每个矩阵 plain/NNZ 输出均一致；ASIC half 输出的差异最大 `3.81e-6`，i8 输出逐元素完全相等。half 的既有非有限输出在两条路径位置一致，属于输入矩阵/向量产生的溢出，不是 NNZ 路由新增。
+
+根据以上结构性 A/B，`FLAGSPARSE_ILUVATAR_COO_MIXED_NNZ` 默认 `auto`：仅 Iluvatar、平均行长 ≤4 且最长行 >128 时建立 NNZ 行计划并发射 `_nnz_kernel`；设为 `0` 可回退 row-tile。ASIC 的预处理计划由缓存保留，调用期不重复生成。所有其余矩阵的 A/B 比值在约 `0.99–1.01x`，没有证据支持在那里切换。
+
+`spmv_coo_c32_int_non` 另有此前自然行序/row-tile A/B：基于 H800 cuSPARSE 折算基线，10 矩阵算术平均由原始 `0.472x` 提至 `0.522x`（修复 ASIC 行序后 `0.526x`）；ASIC 单项从 `0.061x` 提至约 `0.37x`，但整体仍远低于 `0.8x`。见 `results_coo_c32_rowtile_20261024.csv` 和 `results_coo_c32_adaptive_fixed_20261024.csv`。本轮未复测这项。此前报告里 `spmv_coo_f32_int_trans` 的平均值已更新到约 `0.897x`，因此本轮“四项”按 c32 与上述三项 mixed 计算。
+
+当前结论：短行长尾 NNZ 路由是三项 mixed 的有效 ASIC 局部优化，但不足以令任何一项整体达到 `0.8x`；继续追这三项应转向 CSR row-tile 参数/访存优化（COO 复用该 kernel）。c32 的下一条结构性实验是复数×复数 NNZ 分段 kernel，先做 ASIC、roadNet、auto 的正确性和 A/B，再决定是否推广；现有实数 NNZ 结果不构成它的性能证据。
+
+### 9.8 四项低分 COO 的 tile 扫描与全量复测（2026-10-25）
+
+在 BI-V150 上进一步实测了 `spmv_coo_c32_int_non` 与三项 mixed COO。三项 mixed 扫描了 ASIC、auto、amazon0601、NACA0015 的 `ROWS={8,16,32}`、`BLOCK={4,8,16,32}`；另扫 `num_warps={1,2,4}`、`num_stages={1,2,3}`。复数 c32 在 ASIC 上扫 NNZ kernel 的 block/warps。逐配置原始数据分别见 `results_coo_mixed_tile_sweep_20261025.csv`、`results_coo_mixed_stage_sweep_20261025.csv`、`results_coo_c32_nnz_tile_sweep_20261025.csv`。
+
+扫描结论：mixed kernel 的 `num_warps=1` 稳定优于更多 warps，`num_stages=1/2/3` 没有稳定的大幅收益；不同矩阵的最佳 ROWS/BLOCK 不一致，未找到能稳健替换默认配置的统一 tile，因此不增加按矩阵名特判。复数 NNZ ASIC 扫描中 `BLOCK=128, warps=1` 最佳或接近最佳，与当前默认相同，也不改参数。COO tile 扫描结论仅针对实际扫描的四个矩阵，不代表其它六个矩阵都穷尽搜索。
+
+之后对四项、10 个矩阵做 prepared 路径全量复测，`results_coo_four_low_final_20261025.csv` 共 40 行、全部 `PASS`。逐矩阵加速比使用本轮 `ours_ms` 除法的倒数，即 `results_biv_65_20261024_final/spmv_coo/performance.csv` 中对应 `h800_scaled_ms / ours_ms`，再对 10 个矩阵作算术平均：
+
+| 算子 | 10 矩阵平均加速比 | 当前结论 |
+|---|---:|---|
+| `spmv_coo_c32_int_non` | 0.542x | 未达 0.8x |
+| `spmv_coo_f16f32_int_non` | 0.708x | 未达 0.8x |
+| `spmv_coo_f16_int_non` | 0.831x | 达到 0.8x |
+| `spmv_coo_i8i32_int_non` | 0.805x | 达到 0.8x |
+
+该结果是本轮 q4 `run_variants` 的 prepared 计时与已有 H800 折算基线组合，不是同一轮完整 delivery runner 生成的认证加速比；本机 Iluvatar 没有可用的 vendor/PyTorch 基线，故本轮 `PASS` 指精度校验通过。mixed NNZ 路由、c32 NNZ 路由在本次复测中均为 `auto`。因此按“算子 10 矩阵平均是否达到 0.8x”衡量，当前仍需继续优化的是 c32 和 f16f32 两项；f16、i8i32 不应再列为低于 0.8 的算子。
+
+定向路由测试 `tests/ci/test_spmv_coo_iluvatar_route.py` 首次运行发现原测试仍断言 ASIC 长尾 c32 走 row-tile，与已启用的 `FLAGSPARSE_ILUVATAR_COO_C32_NNZ=auto` 路由不符；测试现已更新为检查 NNZ 计划及其行号/空行计划。复数×复数 NNZ 路径目前有 ASIC 单矩阵 A/B 和 tile 扫描，不等于全矩阵推广已验证；推广前仍应在其余矩阵做准确性与同轮 A/B。
+
+### 9.9 f16f32 cached 读取与行长排序原型（2026-10-25）
+
+为继续找 f16f32 的访存收益，在 BI-V150 直接对 `_csr_spmv_mixed_kernel`（默认 cache policy）和当前生产使用的 `_csr_spmv_mixed_cached_kernel`（values/columns `.cg`、x `.ca`）做 10 矩阵 A/B。基准通过 `triton.testing.do_bench(warmup=10, rep=40)` 测 kernel 本身，values 缩放后转 half，两个输出逐元素相同。数据见 `results_coo_f16f32_cache_ab_20261025.csv`。cached 路径在 10 个矩阵上均更快，`plain_us / cached_us` 算术平均为 `1.067x`；GL7d14 提升约 `1.238x`、amazon0601 `1.097x`、auto `1.063x`、NACA0015 `1.040x`。生产路径已经是较快的 cached 版本，故不改缓存修饰符。
+
+另做了按 CSR 行长排序的 row-bucket kernel 原型：prepare 生成长度排序的 row id，kernel 按重排行号取 indptr 并写回原行。十个矩阵精度差均为 0，但速度全部变慢，数据见 `results_coo_f16f32_rowbucket_ab_20261025.csv`；如 `base_over_bucket < 1` 表示排序分桶更慢。推测额外 row-id gather 和跨行的非连续 CSR 访问抵消了同一 CTA 行长更接近的好处，因此不接入生产代码。该实验说明简单的全局行长排序不是可行方案；若继续尝试，应使用 prepare 阶段构建真正连续的桶内 CSR 数据布局，并把重排和 scatter 成本留在 prepare/输出路径评估中。
+
+本轮没有发现 c32 的新 tile/caching 收益：已有 ASIC NNZ A/B 只带来局部改善，且 c32 ASIC NNZ `BLOCK=128, warps=1` 已是扫描中的最优附近；十矩阵平均仍是 `0.542x`。目前不应把复数 NNZ kernel 扩展到其余矩阵，除非另有针对性 A/B 证据。f16f32 当前 `0.708x`，row-bucket 原型失败、cached 读取已在用；下一个结构性方向是 prepare 时构造连续的长度分桶 CSR（并和现有 NNZ 路由、row-tile 做同轮全量 A/B），而不是继续重复扫 tile。
+
+### 9.10 复数 NNZ 强制路由全矩阵 A/B（2026-10-25）
+
+为判断复数×复数 NNZ 扫描能否推广，在 BI-V150 对 10 个矩阵直接比较当前结构自适应路由（`FLAGSPARSE_ILUVATAR_COO_C32_NNZ=0`）和强制 NNZ（`=1`），使用 `triton.testing.do_bench(warmup=10, rep=40)`，计 kernel 时间且每个矩阵对照输出最大相对误差不超过 `1.8e-7`。逐矩阵数据见 `results_coo_c32_nnz_force_ab_20261025.csv`。ASIC 由 `156.40` 降至 `124.94 µs`（`1.252x`）；另外九个矩阵全部变慢，`baseline_us / forced_nnz_us` 在 `0.707–0.936x`，十矩阵比值算术平均 `0.867x`。因此将 c32 NNZ 保持在当前 ASIC 长尾条件，不推广到其它矩阵。此 A/B 是 kernel 级同进程诊断数据，不用于替代 9.8 节完整 prepared 复测的平均加速比。
+
+### 9.11 f16f32 连续重排原型复核（2026-10-25）
+
+尝试在 prepare 阶段按行长排序，并将 CSR 的 values/columns 真正按新行序连续重排，再用混合精度 row-tile kernel 执行。首轮结果见 `results_coo_f16f32_repacked_bucket_ab_20261025.csv`，但该原型的输出与原 kernel 不一致（多个矩阵最大误差显著，不能通过正确性校验），且记录的耗时也普遍更慢。由于正确性失败，这批性能数字不作为有效 A/B 结论；原型不接入生产代码，也不能据此断言正确实现的连续重排一定变慢。后续若重做，须先逐行验证重排后的 CSR 行指针、列和值与原矩阵一致，再计时，并把 prepare 成本与 prepared kernel 时间分别记录。
+
+本轮可采信的优化结论仍限于：f16f32 的 cached 读取已在生产路径中，10 矩阵 kernel A/B 平均约 `1.067x`；mixed NNZ 路由在长尾 ASIC 上有效，其他矩阵没有稳定收益；c32 强制 NNZ 仅 ASIC 获益，不能全局推广。四算子全量 prepared 复测中，c32 与 f16f32 的平均加速比分别为 `0.542x` 和 `0.708x`（相对 H800 折算基线；非本机 vendor 基线）。截至本节所述实验，尚无新的生产改动通过正确性与性能双重验证。
+
+### 9.12 f16f32 ASIC NNZ tile 调优（2026-10-25）
+
+针对 mixed NNZ 已命中的 ASIC 长尾矩阵，在 BI-V150 同进程扫描 `_nnz_kernel` 的 `BLOCK={64,128,256,512,1024}`、`num_warps={1,2,4}`。输入为 f16 values、f32 x / accumulator；每个候选相对当前 cached row-tile 输出最大绝对误差均为 `2.38e-7`。`BLOCK=128, warps=2` 最快，为 `89.21 µs`；原 NNZ 配置 `BLOCK=256, warps=2` 为 `100.48 µs`，候选快 `1.126x`。当前 cached row-tile 同轮为 `123.67 µs`，所以候选 NNZ 比 row-tile 快 `1.386x`。参数表见 `results_coo_f16f32_nnz_tile_ab_20261025.csv`。据此只对 Iluvatar COO f16→f32 路径采用 `128/2`，不改其它混合精度 dtype，也不改变路由条件。
+
+随后两轮对 c32 与 f16f32 各 10 个矩阵做 q4 prepared 复测，结果分别在 `results_coo_c32_f16f32_retest_20261025.csv` 和 `results_coo_c32_f16f32_retest2_20261025.csv`，20/20 均 `PASS`。由于两轮间计时波动明显，且本机没有 vendor 基线，不能把与旧 H800 折算基线计算出的平均比值变化当成这次 tile 调整带来的确定收益；这轮调优结论仅为 ASIC 上 NNZ kernel 本身的同轮参数 A/B。c32 仍保持原 ASIC 条件路由，未发现可推广到其它矩阵的安全 kernel 变体。

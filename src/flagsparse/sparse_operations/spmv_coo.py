@@ -26,6 +26,7 @@ gather routes additionally store row pointers; callers still provide COO arrays.
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
 
+import os
 import time
 from functools import lru_cache
 
@@ -182,9 +183,38 @@ class PreparedCoo:
                     cols, plan_ptr, order, rows, _lanes, _batch, cache = (
                         self.non_csr_plan
                     )
-                    self.non_csr_plan = (
-                        cols, plan_ptr, order, rows, 16, 16, cache
+                    mean = self.nnz / max(1, self.n_rows)
+                    maximum = int((plan_ptr[1:] - plan_ptr[:-1]).max().item()) if self.n_rows else 0
+                    nnz_route = os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ", "auto").lower()
+                    use_nnz = nnz_route == "1" or (
+                        nnz_route == "auto" and mean <= 4.0 and maximum > 128
                     )
+                    if nnz_route not in ("auto", "0", "1"):
+                        raise ValueError("FLAGSPARSE_ILUVATAR_COO_C32_NNZ must be auto, 0, or 1")
+                    if use_nnz:
+                        row_ids = torch.repeat_interleave(
+                            torch.arange(self.n_rows, device=plan_ptr.device, dtype=torch.int32),
+                            plan_ptr[1:] - plan_ptr[:-1],
+                            output_size=self.nnz,
+                        )
+                        empty = torch.nonzero(plan_ptr[1:] == plan_ptr[:-1]).flatten().to(torch.int32)
+                        self.non_csr_plan = _CooNnzPlan(
+                            self.data_non, cols, plan_ptr, row_ids, empty, self.n_rows,
+                        )
+                    elif mean <= 4.0 and maximum <= 512:
+                        self.non_csr_plan = _CooCsrRowTilePlan(
+                            self.data_non, cols, plan_ptr, self.n_rows, maximum,
+                        )
+                    else:
+                        if mean <= 4.0:
+                            rows = torch.arange(
+                                self.n_rows,
+                                device=plan_ptr.device,
+                                dtype=rows.dtype,
+                            )
+                        self.non_csr_plan = (
+                            cols, plan_ptr, order, rows, 16, 16, cache
+                        )
                 if _is_rocm_runtime():
                     # gfx936's wave64 complex gather is register-pressure
                     # bound at the default 8-lane row tile. Four lanes and a
@@ -199,9 +229,42 @@ class PreparedCoo:
                 ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
                     self.row_non.dtype
                 )
-                self.non_csr_plan = _spmv_csr_transpose.make_plan(
-                    self.col_non, ptr, None, self.n_rows
+                mean = self.nnz / max(1, self.n_rows)
+                maximum = int((ptr[1:] - ptr[:-1]).max().item()) if self.n_rows else 0
+                nnz_route = os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ", "auto").lower()
+                use_nnz = nnz_route == "1" or (
+                    nnz_route == "auto" and mean <= 4.0 and maximum > 128
                 )
+                if nnz_route not in ("auto", "0", "1"):
+                    raise ValueError("FLAGSPARSE_ILUVATAR_COO_C32_NNZ must be auto, 0, or 1")
+                if use_nnz:
+                    row_ids = torch.repeat_interleave(
+                        torch.arange(self.n_rows, device=ptr.device, dtype=torch.int32),
+                        ptr[1:] - ptr[:-1],
+                        output_size=self.nnz,
+                    )
+                    empty = torch.nonzero(ptr[1:] == ptr[:-1]).flatten().to(torch.int32)
+                    self.non_csr_plan = _CooNnzPlan(
+                        self.data_non, self.col_non, ptr, row_ids, empty, self.n_rows,
+                    )
+                elif mean <= 4.0 and maximum <= 512:
+                    self.non_csr_plan = _CooCsrRowTilePlan(
+                        self.data_non, self.col_non, ptr, self.n_rows, maximum,
+                    )
+                else:
+                    plan = _spmv_csr_transpose.make_plan(
+                        self.col_non, ptr, None, self.n_rows
+                    )
+                    cols, plan_ptr, order, rows, _lanes, _batch, cache = plan
+                    if mean <= 4.0:
+                        rows = torch.arange(
+                            self.n_rows,
+                            device=plan_ptr.device,
+                            dtype=rows.dtype,
+                        )
+                    self.non_csr_plan = (
+                        cols, plan_ptr, order, rows, 16, 16, cache
+                    )
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -261,6 +324,49 @@ class _PreparedCooLaunch:
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
         self.csr_plan = csr_plan
+
+
+class _CooCsrRowTilePlan:
+    __slots__ = ("data", "cols", "ptr", "n_rows", "max_row_nnz")
+
+    def __init__(self, data, cols, ptr, n_rows, max_row_nnz):
+        self.data = data
+        self.cols = cols
+        self.ptr = ptr
+        self.n_rows = int(n_rows)
+        self.max_row_nnz = int(max_row_nnz)
+
+
+class _CooNnzPlan:
+    __slots__ = ("data", "cols", "ptr", "rows", "empty", "n_rows")
+
+    def __init__(self, data, cols, ptr, rows, empty, n_rows):
+        self.data = data
+        self.cols = cols
+        self.ptr = ptr
+        self.rows = rows
+        self.empty = empty
+        self.n_rows = int(n_rows)
+
+
+def _iluvatar_coo_c32_row_tile(nnz, n_rows, max_row_nnz=0):
+    mean = nnz / max(1, n_rows)
+    if mean <= 4.0:
+        if max_row_nnz > 128:
+            rows, block, stages = 16, 8, 2
+        else:
+            rows, block, stages = 32, 2, 1
+    elif mean <= 8.0:
+        rows, block, stages = 8, 8, 2
+    elif mean <= 16.0:
+        rows, block, stages = 8, 16, 2
+    else:
+        rows, block, stages = 4, 16, 2
+    rows = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_ROWS", rows)))
+    block = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_BLOCK", block)))
+    warps = max(1, min(8, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_WARPS", 1))))
+    stages = max(1, min(3, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_STAGES", stages))))
+    return rows, block, warps, stages
 
 
 @triton.jit
@@ -772,6 +878,56 @@ def _validate_x_coo(x, prepared):
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     if prepared.csr_plan is not None:
+        if isinstance(prepared.csr_plan, _CooNnzPlan):
+            from ._spmv_csr_nnz import _complex_nnz_kernel
+
+            plan = prepared.csr_plan
+            block = max(32, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ_BLOCK", "128")))
+            warps = max(1, min(8, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ_WARPS", "1"))))
+            y = torch.empty(plan.n_rows, dtype=prepared.data.dtype, device=prepared.data.device)
+            _complex_nnz_kernel[(triton.cdiv(max(plan.data.numel(), plan.empty.numel()), block),)](
+                torch.view_as_real(plan.data).reshape(-1),
+                plan.cols,
+                plan.ptr,
+                plan.rows,
+                torch.view_as_real(x),
+                torch.view_as_real(y),
+                plan.empty,
+                plan.empty.numel(),
+                plan.data.numel(),
+                block,
+                num_warps=warps,
+            )
+            return y
+        if isinstance(prepared.csr_plan, _CooCsrRowTilePlan):
+            from .spmv_csr import _spmv_csr_complex_row_tile_kernel
+
+            rows_per, block_nnz, num_warps, num_stages = _iluvatar_coo_c32_row_tile(
+                prepared.csr_plan.data.numel(),
+                prepared.csr_plan.n_rows,
+                prepared.csr_plan.max_row_nnz,
+            )
+            y = torch.empty(
+                prepared.n_rows,
+                dtype=prepared.data.dtype,
+                device=prepared.data.device,
+            )
+            y_ri = torch.view_as_real(y).reshape(-1)
+            _spmv_csr_complex_row_tile_kernel[
+                (triton.cdiv(prepared.n_rows, rows_per),)
+            ](
+                torch.view_as_real(prepared.csr_plan.data).reshape(-1),
+                prepared.csr_plan.cols,
+                prepared.csr_plan.ptr,
+                torch.view_as_real(x).reshape(-1),
+                y_ri,
+                prepared.n_rows,
+                ROWS=rows_per,
+                BLOCK_NNZ=block_nnz,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            return y
         from . import _spmv_csr_transpose
 
         return _spmv_csr_transpose.gather(

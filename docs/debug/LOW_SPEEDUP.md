@@ -56,6 +56,9 @@ nnz 的行上，大部分 lane 是空转的。
 
 ## 按优先级的建议
 
+> 本节是 2026-10-24 调优前的假设。天数已实测的结果见文末"已验证的调优进展"，下一轮的具体方向见
+> "下一轮天数优化方向（2026-10-25）"；三者冲突时以后两节为准。
+
 ### P0 `spgemm_csr`：换掉 ESC（预计收益最大）
 
 - 现状：天数的 FlagTree 编不出 TLE 共享内存哈希表，`_spgemm_compute` 让天数走 `_spgemm_esc_compute_safe`
@@ -222,3 +225,163 @@ nnz 的行上，大部分 lane 是空转的。
 
 - 第 5–7 项仍待完成：SELL 变体逐项调参、COO mixed 短行的新路由思路、以及 Iluvatar 兼容的 `spgemm_csr` 实现。
 - 本轮保留的 tracked 源码优化还包括既有工作区改动 `src/flagsparse/sparse_operations/spmv_csr.py` 的 Iluvatar complex64 短行路由与 tile 参数。修改前后性能结论应使用对应同机基线和同一计时配置复测。
+
+## 下一轮天数优化方向（2026-10-25，CUDA 机上分析）
+
+> SELL 和 COO 两组的详细计划（瓶颈探针、prepare 时重编码成 SELL-C-σ / nnz 均分、逐项预期和排期）见
+> [`ILUVATAR_SELL_COO_PLAN.md`](ILUVATAR_SELL_COO_PLAN.md)；本节的方向 1、2、4、5 在那里展开。
+
+依据：10-24 全量结果 `results_biv_65_20261024_final` 的逐矩阵数据（我们的耗时用 `折算基线 ÷ 加速比` 反推）、
+`tests/data` 的行/列长分布、当前代码，以及在 5090 上补测的两组数据（下文标"CUDA 实测"）。上文"已验证的调优进展"
+里天数已经试过且回退的做法，这里不再建议。
+
+从数据里看出三类问题，下面的方向都落在其中一类：
+
+1. **长尾结构走进了按行切分的 gather**：按行长排序的行顺序，或一批行里有一条极长的行，整批都要等它。
+   ASIC_680ks 的行和列都是"平均 3.4、最长 210"；amazon0601 的行很均匀（最长 10），**列却是幂律分布**
+   （平均 8.4、P99 53、最长 2751、变异系数 1.82），所以 amazon 只在转置/共轭方向上慢。
+2. **天数的 warp 是 64 宽，有的 kernel tile 只有 32 宽**：一半 lane 常年被 mask 掉（SELL）。
+3. **按行的 gather / row-tile 类 kernel 带宽利用率只有 17–25%**（auto 上约 200–240 GB/s，实测带宽 1150 GB/s）；
+   SELL 按含填充的存储量算是 324–597 GB/s，是目前天数上利用率最高的 kernel。
+
+| 优先级 | 方向 | 涉及变体（10-24 加速比） | 改动量 | 前置条件 |
+|---|---|---|---|---|
+| 1 | 转置/共轭方向的长尾走 nnz 均分 | coo_f32_trans 0.776、csr_f32_trans 0.894、coo/csr_c32_conj 的 ASIC/amazon | 小（kernel 现成，实数可直接用） | 无 |
+| 2 | COO / CSR 实数混合精度的 ASIC 走 nnz 均分 | coo_f16f32 0.730、coo_f16 0.762、coo_i8i32 0.771 | 小（COO 自带行号） | 无 |
+| 3 | SpGEMM 改用 MACA 的无 TLE 实现 | spgemm 0.064 | 小（放开两处门控） | 先过精度 |
+| 4 | SELL 让 64 宽 warp 吃满 | sell 五项 0.52–0.65 | 中（加覆盖开关后扫参） | 无 |
+| 5 | 复数 gather：先测带宽上限 | csr_c32 0.606、coo_c32 0.522 | 先测量，后决定 | 无 |
+| 6 | 原生 f32 CSR 换 row-tile | csr_f32（0.929，不在名单） | 小 | 无 |
+| 7 | 主机固定开销（约 22–30 µs） | spvv f32、小矩阵 | 先测量 | Triton 3.6 的启动器签名 |
+
+### 方向 1：转置/共轭方向的长尾改走 nnz 均分（优先做）
+
+- **数据**：同一个矩阵，非转置快、转置慢。ASIC 上 `spmv_coo_f32` 非转置 163 µs，转置 538 µs；CSR 转置 494 µs。
+  c32 的共轭（COO 835 µs、CSR 820 µs）和修复前的 COO c32 非转置（843 µs）几乎一样——这三条走的都是按行长
+  排序的行顺序；而用自然行顺序的 CSR c32 非转置只要 134.8 µs。amazon 上转置 312 µs，非转置 179 µs。各变体在这两个矩阵上的加速比：
+  coo_f32_trans ASIC 0.12 / amazon 0.44，csr_f32_trans 0.17 / 0.46，coo_c32_conj 0.149 / 0.735，csr_c32_conj 0.173 / 0.809。
+- **原因**：转置 plan 由 `_spmv_csr_transpose.prepare()` → `make_plan()` 生成。ASIC 的转置结构满足
+  `avg <= 4 and maximum > 128`，于是行顺序变成 `argsort(counts)`（按长度排序）。CSR c32 非转置在天数上专门
+  去掉了这个排序（`spmv_csr.py` 约第 1126 行，平均行长 ≤4 时把 `plan[3]` 换成 `arange`），它是这几条里唯一快的。
+  amazon 平均列长 8.4，不触发排序，但一批 32–64 列里只要有一条长达 2751 的列，整批就要循环几百次。
+  天数在"第 2 项"里扫过实数转置的 lanes/batch，没有收益——这和"问题在顺序和拖尾，不在 lane 数"一致。
+- **CUDA 实测**（5090，GPU 时间，`op=trans` 的 f32 CSR；nnz 均分 = 在转置结构上跑现有 `_nnz_kernel`）：
+
+  | 矩阵 | cuSPARSE | 当前转置路径 | nnz 均分（BLOCK=256, 1 warp） |
+  |---|---:|---:|---:|
+  | ASIC_680ks | 21.9 µs | 29.7 µs | **7.8 µs** |
+  | amazon0601 | 39.1 µs | 64.4 µs | **27.1 µs** |
+  | roadNet-TX | 34.1 µs | 13.6 µs | 13.5 µs |
+  | auto | 73.5 µs | 51.7 µs | 56.2 µs（变慢） |
+
+  长尾矩阵快 2.4–3.8 倍，均匀矩阵持平或变慢，所以**只能按结构条件启用**。
+- **怎么做**：
+  1. 先做一个零成本 A/B：天数上让 `make_plan` 对 ASIC 这类结构也用 `arange`（和 CSR c32 非转置同样的处理），
+     测 coo_f32_trans、csr_f32_trans、两个 c32 conj 在 ASIC 上的耗时。
+  2. 再做 nnz 均分：`_spmv_csr_transpose.prepare()` 已经算出 `order`（按列排序）和 `source_rows`。在 plan 里
+     多存一份 `indices[order]`（排好序的列号，就是 Aᵀ 每个 nnz 的"行号"）和空列列表，run 时调用
+     `_nnz_kernel(values[order], source_rows[order], ptr, indices[order], x, y, empty, ...)`。values 的重排已经
+     由 gather 的缓存做了（`cache["values"]`），不额外增加每次调用的开销。COO 转置更简单：prepare 里排好序的
+     `col_trans` 本身就是行号。
+  3. 启用条件不要沿用 `mean <= 4 and max > 128`（会漏掉 amazon），建议
+     `max_len >= 128 and max_len >= 32 * mean_len`：10 个矩阵里只命中 ASIC（210 ≥ 109）和 amazon 的列（2751 ≥ 269），
+     GL7d14（列最长/平均 4.1）、filter3D、wave、roadNet 都不命中。
+  4. 实数 f32 可以直接用现有 kernel；c32 conj 需要第 5 节的"复数 × 复数"扩展，再加共轭标志。
+- **预期**：如果天数上的提升倍数接近 f32c32 在 ASIC 上的经验（0.44 → 0.676），ASIC 的转置能从 0.12–0.17 提到
+  0.3–0.5，amazon 从 0.44 提到 0.7 以上；coo_f32_trans 这一项的 10 矩阵均值有望过 0.8。
+
+### 方向 2：COO / CSR 实数混合精度在 ASIC 上走 nnz 均分
+
+- **数据**：f16f32、f16、i8i32 这三项 COO 在天数上走 "COO 转 CSR + 和 CSR 混合精度同一个 row-tile kernel"，
+  耗时和 CSR 完全一样（ASIC 上都是约 122 µs）；COO 比值更低只是因为 H800 上 cuSPARSE 的 COO 比它自己的 CSR 快
+  10–30%。三项里 ASIC 都是最差的（0.28–0.32），CSR 的同类项在 ASIC 上也只有 0.39–0.41。
+- **怎么做**：`prepare_spmv_coo` 默认 `sort_by_row=True`，按 (行, 列) 排好序，**行号数组现成**，nnz 均分只需要额外一个空行列表。把
+  `spmv_coo_mixed` 天数分支里懒构建的 CSR 转换（现在挂在 `_ROCM_COO_CSR_CACHE` 上）挪进 `prepare_spmv_coo`，
+  对满足方向 1 第 3 条结构条件的矩阵走 `_nnz_kernel`。CSR 混合精度则沿用 `prepare_spmv_csr_mixed` 已有的 nnz 计划，
+  把 dtype 门控从 f32×c64 放宽到实数 f16/i8。
+- ~~坑：非 MUSA 分支的浮点字面量会把 int32 累加提升成 float32~~ ——**2026-10-25 已核实不是问题**：一行和为 32257873
+  （大于 2^24 的奇数）的 i8→i32 实测逐位精确，Triton 的 Python 标量是弱类型（详见 `ILUVATAR_SELL_COO_PLAN.md` 6.2）。
+- **另外复测一次**：filter3D 上 COO f16→f16 是 99 µs，而 COO f16→f32、CSR f16→f16 都是 49 µs，三者是同一个 kernel。
+  先确认能不能复现，能复现再打印实际走的路由。
+
+### 方向 3：SpGEMM 改用 MACA 的无 TLE 实现
+
+- **数据**：天数上 SpGEMM 全走 ESC，耗时几乎都在 count 阶段：55–360 ms，折算基线 1.9–31 ms，慢 10–30 倍。
+- **CUDA 实测**（5090，A·A，float32）：MACA 的纯 Triton 实现 `_spgemm_maca.compute`（全局内存 `atomic_cas` 哈希）
+  结果正确（相对误差 ≤ 3.5e-7），并且明显快于 ESC：
+
+  | 矩阵 | MACA 实现 | ESC | TLE（天数用不了） |
+  |---|---:|---:|---:|
+  | cage12 | 4.8 ms | 27.0 ms | 3.2 ms |
+  | roadNet-TX | 6.9 ms | 9.3 ms | 2.8 ms |
+  | ASIC_680ks | 4.3 ms | 14.0 ms | 3.0 ms |
+
+- **怎么做**：`spgemm_csr.py` 里两处 `_is_maca_runtime()` 门控——`prepare_spgemm_csr` 的 `build_metadata`，以及
+  `_spgemm_compute` 开头的 `_maca_triton_spgemm_compute`——先用环境变量开关（例如
+  `FLAGSPARSE_ILUVATAR_SPGEMM=maca`）对天数放开，精度通过后再改默认。
+- **风险**：依赖全局内存的 `tl.atomic_cas` 和 `atomic_add(sem="relaxed")`；MACA 代码注释写着 C550 上"多 warp 的
+  128 元素布局会丢 lane，所以 `_hash_rows` 固定 `num_warps=1`"。天数的 warp 也是 64 宽，保持 `num_warps=1`，
+  并且先跑 spgemm 的全部精度用例再看性能。
+- **预期**：如果天数上 ESC → MACA 的倍数和 CUDA 上相近（1.3–5.6 倍），0.064 能提到 0.15–0.3。离 0.8 仍远，
+  但这是从"换算法"开始，下一步才是在天数上调它的 block 和哈希上限（`limit=4096`）。
+
+### 方向 4：SELL 五项让 64 宽 warp 吃满
+
+- **数据**：按含填充的存储量（`sell_values × (值 + 列号)`）算，f32 SELL 跑到 324–597 GB/s，已经是天数上带宽
+  利用率最高的 kernel。cuSPARSE 用的是同一份带填充的数据，读的字节数一样，差距在效率上。填充率：ASIC 3.98 倍、
+  filter3D 2.48 倍、roadNet 1.48 倍，其余 1.07–1.30 倍。
+- **代码现状**：实数路径在 `slice_size <= 32` 时设 `BLOCK_R=64`、`num_warps=1`，n_slices ≤ 32768 时 `GROUP=1`。
+  SLICE 是 32，`r < SLICE` 的掩码让 64 个 lane 里有 32 个一直空着；`GROUP=2` 时 tile 是 2×64=128 个元素，同样
+  一半被 mask。复数路径用 `_spmv_sell_complex_kernel`，tile 是 1×32，`num_warps=1`，也是半个 warp；而且实部、
+  虚部是 4 次分开的标量读取。
+- **已经试过、不要重复**：slot 并行、行×slot tile（32×4、64×4、128×2）、CSR 压缩后 row-tile、complex slot=8、
+  双 warp、统一 `group=1, block_r=32`（见 `ILUVATAR.md` 10-21/10-22 和上文 P1 SELL 复测）。
+- **没试过的**：
+  1. **刚好填满的 tile**：`GROUP=2, BLOCK_R=32, num_warps=1`（两个 slice × 32 行 = 64 lane，每个 lane 一行，没有
+     被 mask 的 lane），以及 `GROUP=4, BLOCK_R=32, num_warps=2`。代价是同一个 program 的循环次数取两个 slice
+     宽度的较大值，ASIC、filter3D 这两个填充多的矩阵要单独看。旁证：roadNet 有 43544 个 slice，超过 32768
+     走 `GROUP=2`，跑到 554 GB/s；NACA0015 有 32475 个 slice，正好低于阈值走 `GROUP=1`，只有 362 GB/s。
+     roadNet 的 slice 更窄，这只是线索，不是结论；最便宜的验证是把阈值调低后 A/B。
+  2. **复数**：同样用 2 个 slice 填满 warp，并把值和 x 都按 `(…, 2)` 成对读取（8 字节一次），参考
+     `_csr_spmv_real_by_complex_cached_kernel` 的写法。
+  3. **先加覆盖开关**：现在只有 ROCm 有 `FLAGSPARSE_SELL_ROCM_GROUP/WARPS`。给天数加
+     `FLAGSPARSE_SELL_ILUVATAR_GROUP/BLOCK_R/WARPS`，扫参就不用每次改代码。
+- **另外**：H800 上 SELL 对 cuSPARSE 也只有 0.42–0.66，说明 kernel 本身偏弱，不只是天数的问题；CUDA 这边可以
+  对着真实 cuSPARSE 同步调。
+
+### 方向 5：复数 gather（csr_c32 0.606、coo_c32 0.522）：先测带宽上限
+
+- 除 ASIC 外，COO c32 和 CSR c32 每个矩阵的耗时都一样（auto 都是约 360 µs），走的是同一个已经调得很细的复数
+  gather。以 auto 为例，要到 0.8 需要 196 µs，相当于有效带宽从约 240 GB/s 提到约 440 GB/s，调 batch/lanes 补不上。
+- **先测**：在天数上用 Triton 写一个纯连续读的 kernel（copy 或 axpby），量出能达到的带宽；再用天数的 profiler 看
+  gather kernel 在 auto 上的显存吞吐和 L2 命中率。连续读也只有 300 GB/s 左右，就说明 Triton 在天数上本身到顶，
+  在报告里写明；能到 800 GB/s 以上，问题在 gather 的访存方式。
+- **结构性改动**：把 `_nnz_kernel` 扩展成"复数 × 复数"（每个 nnz 4 次乘法、实部虚部两个分段扫描、共轭标志），
+  COO 直接用自带的行号。每个 nnz 多读 4 字节行号（12 → 16 字节），所以只有效率提高 1.5 倍以上才划算；
+  CUDA 上它在规则矩阵上输给 row-tile（f32c32 的 cage12：11.5 µs 对 7.9 µs），天数上要对 10 个矩阵逐个 A/B。
+  方向 1 的 c32 conj 也需要这个扩展。
+- roadNet 的 c32（0.357 / 0.292）等天数刚加的复数短行路由（平均 ≤3 且最长 ≤16 走 row-tile 32×4）的复测结果。
+
+### 方向 6：原生 f32 CSR 换成 row-tile（不在 0.8 名单里，但绝对收益大）
+
+- 天数上 `spmv_csr_f32_int_non` 走 `legacy_segbin`，auto 上 592 µs；同一矩阵上混合精度的 row-tile kernel 读的数据
+  更多（x 是复数），只要 266.6 µs。它现在 0.929，是因为分母是本机 legacy `cusparseScsrmv`（auto 上 512.7 µs，同样很慢）。
+- 把天数 f32 非转置路由到 row-tile（或直接复用 `prepare_spmv_csr_mixed` 的实数路径），绝对耗时有望减半，这一项
+  对本机厂商基线的比值相应翻倍。
+
+### 方向 7：主机固定开销（天数上约 22–30 µs）
+
+- spvv 在 nnz 从 1k 到 64k 之间一直是 23–30 µs，SELL i8 在 cage12 上 22 µs，CSR i8 在 cage12 上 25 µs，说明天数上一次
+  调用的固定开销在 22–30 µs，小规模用例会被它卡住（spvv f32 有两档是 0.96）。
+- **先测**：天数上一个空 Triton kernel 走 JIT 和走 `CompiledKernel.run` 各要多少 µs（5090 上是 12 µs 对 7 µs，
+  脚本思路见上文 f32c32 一节）。如果直接发射在天数的 Triton 3.6 上能用，就把 `mixed_spmx._CUDA_DIRECT_LAUNCH`
+  的条件扩展到天数（签名对不上会在第一次 TypeError 时自动退回 JIT），再把 spvv 接到同一个 launcher。
+
+### 测量和验收
+
+- 每个方向都要同一进程交替 A/B，每个矩阵至少 3 轮取中位数，报**逐矩阵**数字，不只报均值；结构条件命中了哪些
+  矩阵要写出来。
+- 新路由要补 pytest：长尾列、空列、空行、int32 大整数和、strided `out`；转置/共轭的 nnz 路由要覆盖 COO 未排序输入。
+- 改到 `spmv_csr.py` 的调度函数（`flagsparse_spmv_csr`、`_execute_spmv_route` 等）时，在无 torch 环境下跑一遍
+  `tests/ci`：`test_spmv_csr_policy.py` 把这些函数单独抽出来、放进手工列出依赖的桩环境里执行，新引用的名字
+  要补进桩环境，否则只在 CI 上报 `NameError`。
