@@ -40,6 +40,21 @@ device-event timing the BI-V delivery uses:
                 Does clustering the gather help on this card, and up to what working set?
      y_scatter the same plan with perm = identity vs a random permutation: what a
                 scattered y store costs (RCM makes perm a global permutation)
+  P9a stream    (once per run, next to P1) the same contiguous read in the shapes the
+                SpMV kernels use: one BLOCK per program for BLOCK = 32 .. 2048 (32 is a
+                C=32 SELL step: half of a 64-wide warp idle), a program looping over
+                BLOCK-sized steps (exactly how a SELL kernel walks one slice), the .cg
+                load, and torch.sum / copy_ for the rate the vendor's own kernels reach
+  P9b wide      SELL-C-sigma with a [K, C] tile per step: the K x C slots one step
+                reads are one contiguous block (slices are stored column by column), so
+                a program has K x C loads in flight instead of C. K = 1 is today's kernel
+                (_spmv_sell_sigma_kernel at GROUP = 1); real and complex
+
+P9 tests the 2026-10-26 reading of P1-P5: Triton streams 655-678 GB/s here once a program
+reads >= 512 elements, the SpMV kernels reach 260-330 GB/s, a SELL step reads only C = 32
+elements, and removing the gather (P3), the col -> value dependency (P4) or changing the
+tile (P5) gained 1.00-1.11x. If the loop rows of P9a fall far below the flat ones and P9b
+gains, the limit is loads in flight per program, and the fix is a wider step.
 
 P8 needs no .mtx file and answers the two questions BI-V left open on 2026-10-25: the
 x permutation was cheap (23-83 us) but the RCM *kernel* ran 1.1-4.8x slower there, and on
@@ -50,6 +65,10 @@ stored slot instead of nnz. The closing hints follow section 4 of the plan.
 
   python3 tools/biv_spmv_probe.py tests/data --matrices NACA0015,auto,ASIC_680ks \\
       --dtypes float32,float16,int8,complex64 --csv results_biv_probe.csv
+
+  # P9 alone on every delivery matrix (P9a once, then P9b per matrix and dtype):
+  python3 tools/biv_spmv_probe.py tests/data --matrices '' --skip P2,P3,P4,P5,P6,P7,P8 \\
+      --dtypes float32,float16,float16:float32,int8,complex64 --csv results_biv_p9.csv
 
   # P8 alone (no .mtx needed; raise --synthetic-rows until x exceeds the card's cache):
   python3 tools/biv_spmv_probe.py --matrices none --dtypes float32,complex64 \\
@@ -106,6 +125,64 @@ def _stream_kernel(src, partial, n, BLOCK: tl.constexpr):
     offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     v = tl.load(src + offs, mask=offs < n, other=0.0)
     tl.store(partial + pid, tl.sum(v, axis=0))
+
+
+@triton.jit
+def _stream_loop_kernel(src, partial, n, BLOCK: tl.constexpr, STEPS: tl.constexpr,
+                        CG: tl.constexpr):
+    # One program walks STEPS consecutive BLOCK-sized steps, as a SELL kernel walks a
+    # slice: only BLOCK loads are issued per step.
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * (BLOCK * STEPS)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for j in range(0, STEPS):
+        offs = base + j * BLOCK + tl.arange(0, BLOCK)
+        if CG:
+            acc += tl.load(src + offs, mask=offs < n, other=0.0, cache_modifier=".cg")
+        else:
+            acc += tl.load(src + offs, mask=offs < n, other=0.0)
+    tl.store(partial + pid, tl.sum(acc, axis=0))
+
+
+@triton.jit
+def _probe_sell_wide_kernel(
+    y_ptr, v_ptr, c_ptr, off_ptr, len_ptr, perm_ptr, x_ptr,
+    C: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr, COMPLEX: tl.constexpr,
+):
+    # _spmv_sell_sigma_kernel at GROUP = 1, but a step covers K slice columns: slot
+    # (j + k, lane) sits at start + (j + k) * C + lane, so the K x C tile is contiguous.
+    s = tl.program_id(0)
+    lane = tl.arange(0, C)[None, :]
+    k = tl.arange(0, K)[:, None]
+    start = tl.load(off_ptr + s)
+    width = (tl.load(off_ptr + s + 1) - start) // C
+    row_len = tl.load(len_ptr + s * C + lane)
+    row = tl.load(perm_ptr + s * C + lane)
+    if COMPLEX:
+        re = tl.zeros((K, C), dtype=ACC)
+        im = tl.zeros((K, C), dtype=ACC)
+        for j in range(0, width, K):
+            m = (j + k) < row_len
+            pos = start + (j + k) * C + lane
+            col = tl.load(c_ptr + pos, mask=m, other=0)
+            vr = tl.load(v_ptr + 2 * pos, mask=m, other=0.0)
+            vi = tl.load(v_ptr + 2 * pos + 1, mask=m, other=0.0)
+            xr = tl.load(x_ptr + 2 * col, mask=m, other=0.0)
+            xi = tl.load(x_ptr + 2 * col + 1, mask=m, other=0.0)
+            re += vr * xr - vi * xi
+            im += vr * xi + vi * xr
+        tl.store(y_ptr + 2 * row, tl.sum(re, axis=0)[None, :], mask=row >= 0)
+        tl.store(y_ptr + 2 * row + 1, tl.sum(im, axis=0)[None, :], mask=row >= 0)
+    else:
+        acc = tl.zeros((K, C), dtype=ACC)
+        for j in range(0, width, K):
+            m = (j + k) < row_len
+            pos = start + (j + k) * C + lane
+            col = tl.load(c_ptr + pos, mask=m, other=0)
+            v = tl.load(v_ptr + pos, mask=m, other=0).to(ACC)
+            acc += v * tl.load(x_ptr + col, mask=m, other=0).to(ACC)
+        out = tl.sum(acc, axis=0)[None, :]
+        tl.store(y_ptr + row, out.to(y_ptr.dtype.element_ty), mask=row >= 0)
 
 
 @triton.jit
@@ -191,6 +268,15 @@ def _error(got, ref):
     return float(np.abs(_wide(got) - ref).max() / max(1.0, float(np.abs(ref).max())))
 
 
+def _poison(out):
+    # Probes share one output: without this a kernel that writes nothing would pass on
+    # the previous probe's result.
+    if out.is_floating_point() or out.is_complex():
+        out.fill_(float("nan"))
+    else:
+        out.fill_(torch.iinfo(out.dtype).min)
+
+
 def _passes(out_dtype, err):
     if not (out_dtype.is_floating_point or out_dtype.is_complex):
         return err == 0.0
@@ -249,6 +335,83 @@ def _stream_probes(dev, mb):
     return probes
 
 
+def _stream_shape_probes(dev, mb, sm):
+    """P9a: the P1 read in the shapes the SpMV kernels issue it."""
+    n = (mb << 20) // 4
+    src = torch.ones(n, dtype=torch.float32, device=dev)
+    probes = []
+
+    def flat(block, warps):
+        partial = torch.empty(triton.cdiv(n, block), dtype=torch.float32, device=dev)
+        grid = (triton.cdiv(n, block),)
+        return lambda: _stream_kernel[grid](src, partial, n, BLOCK=block, num_warps=warps)
+
+    def loop(block, steps, warps, cg=False):
+        partial = torch.empty(triton.cdiv(n, block * steps), dtype=torch.float32, device=dev)
+        grid = (triton.cdiv(n, block * steps),)
+        return lambda: _stream_loop_kernel[grid](src, partial, n, BLOCK=block, STEPS=steps,
+                                                 CG=cg, num_warps=warps)
+
+    def per_sm(programs):
+        return f"{programs / sm:.0f} programs per SM" if sm else ""
+
+    for block in (32, 64, 128, 256, 512, 2048):
+        probes.append(Probe("P9a flat", f"BLOCK={block} warps=1", flat(block, 1), n * 4, n * 4, n,
+                            note=per_sm(triton.cdiv(n, block))))
+    for block, steps in ((32, 16), (32, 128), (64, 16), (64, 128), (256, 16), (2048, 16)):
+        probes.append(Probe("P9a loop", f"BLOCK={block} steps={steps} warps=1",
+                            loop(block, steps, 1), n * 4, n * 4, n,
+                            note=per_sm(triton.cdiv(n, block * steps))))
+    probes.append(Probe("P9a loop", "BLOCK=2048 steps=16 warps=1 .cg", loop(2048, 16, 1, cg=True),
+                        n * 4, n * 4, n))
+    probes.append(Probe("P9a loop", "BLOCK=32 steps=128 warps=1 .cg", loop(32, 128, 1, cg=True),
+                        n * 4, n * 4, n))
+    total = torch.empty((), dtype=torch.float32, device=dev)
+    probes.append(Probe("P9a torch", "torch.sum", lambda: torch.sum(src, dim=0, out=total), n * 4, n * 4, n,
+                        note="the vendor's own reduction"))
+    dst = torch.empty_like(src)
+    probes.append(Probe("P9a torch", "dst.copy_(src)", lambda: dst.copy_(src), 2 * n * 4, 2 * n * 4, n,
+                        note="read + write bytes"))
+    return probes
+
+
+def _wide_probes(values, sell_cols, offsets, x, y, m, n, odt, useful, stored, check, args):
+    """P9b: one sigma plan per C, launched bare with K columns per step."""
+    probes = []
+    plans = {}
+    for c, k, w in _parse_configs(args.wide):
+        if c not in plans:
+            plans[c] = fs.prepare_spmv_sell(
+                values, sell_cols, offsets, (m, n), slice_size=args.slice_size, out_dtype=odt,
+                route="sigma", sigma=args.wide_sigma, c=c, group=1, num_warps=1,
+            )
+            plan = plans[c]
+            probes.append(Probe(
+                "P9b wide", f"c={c} api (flagsparse_spmv_sell(prepared=...)) sigma={plan.sigma}",
+                lambda plan=plan: fs.flagsparse_spmv_sell(prepared=plan, x=x, out=y),
+                useful, stored(plan.n_values), plan.n_values, check,
+                "same plan through the API: this row minus the K=1 row is launch overhead",
+            ))
+        plan = plans[c]
+        if not plan.n_slices:
+            continue
+        cplx = plan.sell_values.is_complex()
+        yk = torch.view_as_real(y) if cplx else y
+        xk = torch.view_as_real(x) if cplx else x
+
+        def op(plan=plan, k=k, w=w, yk=yk, xk=xk, cplx=cplx):
+            _probe_sell_wide_kernel[(plan.n_slices,)](
+                yk, plan.kernel_values, plan.sell_cols, plan.sell_offsets, plan.row_len,
+                plan.perm, xk, C=plan.c, K=k, ACC=plan.constants[2], COMPLEX=cplx, num_warps=w,
+            )
+        probes.append(Probe(
+            "P9b wide", f"c={c} K={k} warps={w} sigma={plan.sigma}", op, useful,
+            stored(plan.n_values), plan.n_values, check,
+            f"{c * k} slots per step" + (" = today's kernel" if k == 1 else ""),
+        ))
+    return probes
+
+
 def _matrix_probes(path, csr, vdt, odt, args, dev, sm):
     rng = np.random.default_rng(args.seed)
     m, n = csr.shape
@@ -270,6 +433,7 @@ def _matrix_probes(path, csr, vdt, odt, args, dev, sm):
 
     def check():
         return _error(y, ref)
+    check.out = y
 
     out_arg = None if odt == _DEFAULT_OUT.get(vdt, vdt) else odt
     probes = [Probe(
@@ -325,6 +489,9 @@ def _matrix_probes(path, csr, vdt, odt, args, dev, sm):
                         useful, stored(plan.n_values), plan.n_values, check,
                         f"stored/nnz {plan.n_values / max(1, nnz):.2f}",
                     ))
+    if "P9" not in args.skip and "P9B" not in args.skip:
+        probes += _wide_probes(values, sell_cols, offsets, x, y, m, n, odt, useful, stored,
+                               check, args)
     if "P7" not in args.skip and m == n and m > 1:
         probes += _rcm_probes(csr, data, x, y, ref, odt, out_arg, stored, check, args, dev,
                               (values, sell_cols, offsets))
@@ -359,6 +526,7 @@ def _rcm_probes(csr, data, x, y, ref, odt, out_arg, stored, check, args, dev, se
 
     def check_perm():
         return _error(y, ref_perm)
+    check_perm.out = y
 
     nnz = int(csr.nnz)
     probes = [Probe(
@@ -486,6 +654,35 @@ def _span_hints(rows, n):
     return out
 
 
+def _stream_shape_hints(rows, stream_peak):
+    rate = {(r["probe"], r["config"]): r["useful_gbps"] for r in rows}
+    out = []
+    flat = {c: v for (p, c), v in rate.items() if p == "P9a flat"}
+    best_flat = max(flat.values()) if flat else 0.0
+    narrow = flat.get("BLOCK=32 warps=1")
+    loop32 = rate.get(("P9a loop", "BLOCK=32 steps=128 warps=1"))
+    loop2k = rate.get(("P9a loop", "BLOCK=2048 steps=16 warps=1"))
+    if narrow and best_flat:
+        out.append(f"P9a: one 32-element step per program reaches {narrow:.0f} GB/s, "
+                   f"{narrow / best_flat:.2f}x of the best flat block ({best_flat:.0f} GB/s)")
+    if loop32 and loop2k:
+        # 2048 x 16 leaves few programs per SM on a small buffer, so it alone is no
+        # reference: compare with the better of it and the best flat block.
+        wide_ref = max(loop2k, best_flat)
+        out.append(f"P9a: looping over 32-element steps (a C=32 SELL slice) reaches {loop32:.0f} GB/s"
+                   f" vs {wide_ref:.0f} GB/s for wide steps"
+                   + (" -- the per-step width limits the rate: widen the SELL / row-tile step"
+                      if loop32 < 0.75 * wide_ref else " -- the step width is not the limit"))
+    vendor = max((v for (p, c), v in rate.items() if p == "P9a torch"), default=0.0)
+    triton_best = max([best_flat] + [v for (p, c), v in rate.items() if p == "P9a loop"]
+                      + ([stream_peak] if stream_peak else []))
+    if vendor:
+        out.append(f"P9a: vendor kernels {vendor:.0f} GB/s vs best Triton read {triton_best:.0f} GB/s"
+                   + (" -- Triton codegen leaves bandwidth on the table: report this to the "
+                      "FlagTree / CoreX Triton side" if vendor > 1.25 * triton_best else ""))
+    return out
+
+
 def _run_probes(probes, args):
     for _ in range(args.rounds):
         for p in probes:
@@ -497,6 +694,8 @@ def _run_probes(probes, args):
                "useful_gbps": p.useful / ms / 1e6, "stored_gbps": p.stored / ms / 1e6,
                "stored_slots": p.slots, "note": p.note, "status": "n/a"}
         if p.check is not None:
+            if getattr(p.check, "out", None) is not None:
+                _poison(p.check.out)
             p.op()
             _ACCEL.synchronize()
             err = p.check()
@@ -533,6 +732,21 @@ def _hints(rows, stream_peak):
     if api and best6:
         out.append(f"P6: best {best6['config']} at {best6['ms'] * 1e3:.1f} us = "
                    f"{api['ms'] / best6['ms']:.2f}x of the delivered path ({api['ms'] * 1e3:.1f} us)")
+    wide = [r for r in rows if r["probe"] == "P9b wide" and " K=" in r["config"]
+            and r["status"] != "FAIL"]
+    for c in sorted({r["config"].split()[0] for r in wide}):
+        same = [r for r in wide if r["config"].startswith(c + " ")]
+        today = [r for r in same if " K=1 " in r["config"]]
+        best = min(same, key=lambda r: r["ms"])
+        if today and best is not today[0]:
+            gain = today[0]["ms"] / best["ms"]
+            out.append(f"P9b: {best['config']} {best['ms'] * 1e3:.1f} us = {gain:.2f}x of K=1 "
+                       f"({today[0]['ms'] * 1e3:.1f} us, {best['stored_gbps']:.0f} GB/s stored)"
+                       + (" -- loads in flight were the limit: adopt the K-wide step"
+                          if gain >= 1.15 else ""))
+    failed = [r["config"] for r in rows if r["probe"] == "P9b wide" and r["status"] == "FAIL"]
+    if failed:
+        out.append(f"P9b: FAIL in {', '.join(failed)} -- report it, the timing of those rows is void")
     rcm = [r for r in rows if r["probe"] == "P7 rcm" and r["config"].startswith("prepare_spmv_sell")]
     if rcm and rcm[0]["status"] != "FAIL" and (best6 or api):
         # The question is whether to reorder on top of the prepared path, so compare
@@ -566,7 +780,12 @@ def main(argv=None):
                         help="P8 gather band widths in x elements ('full' = the whole vector)")
     parser.add_argument("--synthetic-rows", type=int, default=1 << 20, help="P8 rows (= columns)")
     parser.add_argument("--synthetic-length", type=int, default=6, help="P8 entries per row")
-    parser.add_argument("--skip", default="", help="probes to skip, e.g. P1,P5,P8")
+    parser.add_argument("--wide", default="32x1x1,32x2x1,32x4x1,32x8x1,32x16x1,64x1x1,64x2x1,"
+                                          "64x4x1,64x8x1,64x16x1,32x8x2,64x8x2",
+                        help="P9b c x K x num_warps list (K = slice columns per step)")
+    parser.add_argument("--wide-sigma", default="4096",
+                        help="P9b sigma (4096 = the delivered real SELL setting; or 'auto')")
+    parser.add_argument("--skip", default="", help="probes to skip, e.g. P1,P5,P8 (P9 = P9A+P9B)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", required=True)
     args = parser.parse_args(argv)
@@ -592,6 +811,15 @@ def main(argv=None):
         stream_peak = max(r["useful_gbps"] for r in rows)
         best = max(rows, key=lambda r: r["useful_gbps"])
         print(f"P1 stream: peak {stream_peak:.0f} GB/s ({best['config']})", flush=True)
+    if not ({"P9", "P9A"} & args.skip) and args.matrices.strip().lower() != "none":
+        args._out_dtype = torch.float32
+        shaped = _run_probes(_stream_shape_probes(dev, args.stream_mb, sm), args)
+        for r in shaped:
+            print(f"   {r['probe']:10s} {r['ms'] * 1e3:9.1f} us  {r['useful_gbps']:6.0f} GB/s  "
+                  f"{r['config']}" + (f"  [{r['note']}]" if r['note'] else ""), flush=True)
+        for line in _stream_shape_hints(shaped, stream_peak):
+            print(f"   -> {line}", flush=True)
+        rows += [{**meta, **r, "matrix": "-", "dtype": "float32", "status": "n/a"} for r in shaped]
 
     paths = _matrix_paths(args.mtx, args.matrices)
     if not paths and args.matrices.strip().lower() != "none":
