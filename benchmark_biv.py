@@ -13,6 +13,9 @@ from run_flagsparse_pytest import main
 def run() -> int:
     os.environ.setdefault("FLAGSPARSE_BACKEND", "iluvatar")
     os.environ.setdefault("FLAGSPARSE_ILUVATAR_VENDOR", "cupy_cusparse")
+    # Time spmv_sell through prepare_spmv_sell, like spmv_csr / spmv_coo: unset, the
+    # delivered number depended on whoever launched the run (0.81 vs 0.62 on 10-26/27).
+    os.environ.setdefault("FLAGSPARSE_SELL_PREPARED", "auto")
     os.environ["FLAGSPARSE_BASELINE_POLICY"] = "biv"
     if "--help" not in sys.argv and "-h" not in sys.argv:
         defaults = [
