@@ -128,6 +128,33 @@ def load_baselines(paths):
     return table
 
 
+def load_current(paths):
+    """{(variant, matrix): ms} from re-measurements newer than the delivery run.
+
+    Each csv names the variant in ``variant`` or ``operator`` and the time in
+    ``ours_ms`` (the q4 run_variants / prepared re-test files of 2026-10-25).
+    """
+    out = {}
+    for path in paths:
+        for row in _csv(path):
+            variant = row.get("variant") or row.get("operator") or ""
+            ms = _float(row.get("ours_ms"))
+            if OTHER.match(variant) and ms and row.get("status", "PASS") == "PASS":
+                out[(variant, _stem(row["matrix"]))] = ms
+    return out
+
+
+def apply_current(baselines, current):
+    replaced = 0
+    for variant, cells in baselines.items():
+        for matrix, (base, _now) in cells.items():
+            ms = current.get((variant, matrix))
+            if ms:
+                cells[matrix] = (base, ms)
+                replaced += 1
+    return replaced
+
+
 def project(p9, baselines):
     lines = []
     for variant in sorted(baselines):
@@ -159,6 +186,9 @@ def main(argv=None):
                         help="SELL results dir or performance.csv (baseline + current time)")
     parser.add_argument("--delivery", default="results_biv_65_20261024_final",
                         help="delivery results dir (spmv_csr / spmv_coo performance.csv)")
+    parser.add_argument("--current", action="append", default=[],
+                        help="csv of newer re-measured times (variant|operator, matrix, ours_ms) that "
+                             "replace the delivery time; repeatable")
     parser.add_argument("--verbose", action="store_true", help="also print the per-matrix choice")
     args = parser.parse_args(argv)
 
@@ -169,6 +199,9 @@ def main(argv=None):
     delivery = Path(args.delivery)
     paths += [delivery / op for op in ("spmv_csr", "spmv_coo") if (delivery / op).is_dir()]
     baselines = load_baselines(paths)
+    if args.current:
+        replaced = apply_current(baselines, load_current(args.current))
+        print(f"current times: {replaced} cells replaced from {', '.join(args.current)}")
     print(f"{'variant':26s} {'matrices':>8s} {'now':>7s} {'projected':>9s}  P9b used / missing")
     for variant, count, now, proj, used, missing in project(p9, baselines):
         if proj is None:

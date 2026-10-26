@@ -6,7 +6,7 @@
 
 ## 1. 为什么跑 P9
 
-| 变体（10 矩阵算术平均，相对 H800 折算基线） | 现在 | 要到 1.0 需整体提速 |
+| 变体（10 矩阵算术平均，相对 H800 折算基线；COO / CSR c32 取 10-25 prepared 复测，见 `ILUVATAR_SELL_COO_PLAN.md` 9.8 节） | 现在 | 要到 1.0 需整体提速 |
 |---|---:|---:|
 | SELL f32 / f16 / f16f32 / i8i32 | 约 0.70 | 1.43x |
 | SELL c32 / COO c32 / CSR c32 | 0.52 / 0.54 / 0.65 | 1.5–1.9x |
@@ -68,8 +68,12 @@ setsid timeout -s KILL 7200 env FLAGSPARSE_BACKEND=iluvatar \
 python3 tools/biv_p9_project.py results_biv_p9_20261026.csv \
   --sell results_biv_sell_auto_final_20261025 \
   --delivery results_biv_65_20261024_final --verbose \
+  --current results_coo_four_low_final_20261025.csv \
+  --current results_coo_csr_c32_nnz_auto_speedup_20261025.csv \
   > results_biv_p9_project_20261026.txt
 ```
+
+`--current` 用 10-25 的复测时间（列 `variant`/`operator`、`matrix`、`ours_ms`）替换 10-24 交付目录里的当前耗时：10-24 之后没有新的 65 变体全量，而 COO 四项和 CSR c32 的代码在 10-25 改过，不替换的话 `now` 会偏低（例如 COO c32 0.472 而非 0.542）。
 
 投影的算法：P9b 最快配置的裸 kernel 时间，加上同一份 plan 上测到的 API 开销（`api` 行减 `K=1` 行），作为交付调用的估计耗时；分母用各变体已有的 `h800_scaled_ms`，和交付报告的口径一致。**这是估计值，不是交付数字**，只用来决定值不值得实现。
 
@@ -105,6 +109,8 @@ log 里每个矩阵末尾的 `->` 行已经给了判断，下面是依据。
 投影文件里任何一个变体出现 `>= 1.0`，就说明"转格式 + K-wide kernel"这条路能让它的平均过 1。
 
 ## 6. P9 之后的计划（在 CUDA 机上实现，再交回 BI-V 复测）
+
+> 2026-10-26 P9 结果出来后，第 1、2 条已细化为 [`ILUVATAR_SELL_KWIDE_PLAN.md`](ILUVATAR_SELL_KWIDE_PLAN.md)，交给 BI-V 侧实现。
 
 1. **K-wide SELL-C-σ kernel**（P9b 成立时做）：把 K 作为 `PreparedSellSpmv` 的参数，各后端各自选默认值。
 2. **prepare 时按结构选格式**：同一 dtype 用 COO、CSR、SELL 中最快的 kernel。用现有数据推算，各变体平均能提高 0.06–0.15，例如 SELL c32 0.52→0.67，CSR f16f32 0.92→1.00。选择规则按行长统计来定，**不按矩阵名**。
