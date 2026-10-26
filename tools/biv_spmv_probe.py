@@ -186,6 +186,32 @@ def _probe_sell_wide_kernel(
 
 
 @triton.jit
+def _probe_sell_group_wide_kernel(
+    y_ptr, v_ptr, c_ptr, off_ptr, len_ptr, perm_ptr, x_ptr,
+    n_slices,
+    C: tl.constexpr, GROUP: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr,
+):
+    s = tl.program_id(0) * GROUP + tl.arange(0, GROUP)[:, None]
+    lane = tl.arange(0, C)[None, :]
+    wide = tl.arange(0, K)[None, :, None]
+    smask = s < n_slices
+    start = tl.load(off_ptr + s, mask=smask, other=0)
+    width = (tl.load(off_ptr + s + 1, mask=smask, other=0) - start) // C
+    row_len = tl.load(len_ptr + s * C + lane, mask=smask, other=0)
+    row = tl.load(perm_ptr + s * C + lane, mask=smask, other=-1)
+    acc = tl.zeros((GROUP, K, C), dtype=ACC)
+    for j in range(0, tl.max(width), K):
+        m = (j + wide) < row_len[:, None, :]
+        pos = start[:, None, :] + (j + wide) * C + lane[None, :, :]
+        col = tl.load(c_ptr + pos, mask=m, other=0)
+        value = tl.load(v_ptr + pos, mask=m, other=0).to(ACC)
+        vector = tl.load(x_ptr + col, mask=m, other=0).to(ACC)
+        acc += value * vector
+    out = tl.sum(acc, axis=1)
+    tl.store(y_ptr + row, out, mask=row >= 0)
+
+
+@triton.jit
 def _probe_sell_kernel(
     y_ptr, v_ptr, c_ptr, off_ptr, x_ptr, n_rows, n_cols,
     SLICE: tl.constexpr, BLOCK_R: tl.constexpr, ACC: tl.constexpr, GROUP: tl.constexpr,
@@ -412,6 +438,31 @@ def _wide_probes(values, sell_cols, offsets, x, y, m, n, odt, useful, stored, ch
     return probes
 
 
+def _p10_probes(values, sell_cols, offsets, x, y, m, n, odt, useful, stored, check, args):
+    """P10: one program processes GROUP slices and K columns per step."""
+    probes = []
+    for c, group, k in _parse_configs(args.p10_configs):
+        plan = fs.prepare_spmv_sell(
+            values, sell_cols, offsets, (m, n), slice_size=args.slice_size,
+            out_dtype=odt, route="sigma", sigma=args.wide_sigma, c=c,
+            group=group, num_warps=1, k=1,
+        )
+        if not plan.n_slices:
+            continue
+        def op(plan=plan, c=c, group=group, k=k):
+            _probe_sell_group_wide_kernel[(triton.cdiv(plan.n_slices, group),)](
+                y, plan.kernel_values, plan.sell_cols, plan.sell_offsets, plan.row_len,
+                plan.perm, x, plan.n_slices, C=c, GROUP=group, K=k,
+                ACC=plan.constants[2], num_warps=1,
+            )
+        probes.append(Probe(
+            "P10 group-wide", f"c={c} GROUP={group} K={k}", op, useful,
+            stored(plan.n_values), plan.n_values, check,
+            "one program walks GROUP slices; each step reads K columns",
+        ))
+    return probes
+
+
 def _matrix_probes(path, csr, vdt, odt, args, dev, sm):
     rng = np.random.default_rng(args.seed)
     m, n = csr.shape
@@ -492,6 +543,9 @@ def _matrix_probes(path, csr, vdt, odt, args, dev, sm):
     if "P9" not in args.skip and "P9B" not in args.skip:
         probes += _wide_probes(values, sell_cols, offsets, x, y, m, n, odt, useful, stored,
                                check, args)
+    if args.p10 and "P10" not in args.skip and real:
+        probes += _p10_probes(values, sell_cols, offsets, x, y, m, n, odt, useful, stored,
+                              check, args)
     if "P7" not in args.skip and m == n and m > 1:
         probes += _rcm_probes(csr, data, x, y, ref, odt, out_arg, stored, check, args, dev,
                               (values, sell_cols, offsets))
@@ -785,6 +839,9 @@ def main(argv=None):
                         help="P9b c x K x num_warps list (K = slice columns per step)")
     parser.add_argument("--wide-sigma", default="4096",
                         help="P9b sigma (4096 = the delivered real SELL setting; or 'auto')")
+    parser.add_argument("--p10", action="store_true", help="run the GROUP x K P10 probe")
+    parser.add_argument("--p10-configs", default="32x1x1,32x2x1,32x4x1,64x1x1,64x2x1,64x4x1",
+                        help="P10 c x GROUP x K list")
     parser.add_argument("--skip", default="", help="probes to skip, e.g. P1,P5,P8 (P9 = P9A+P9B)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", required=True)

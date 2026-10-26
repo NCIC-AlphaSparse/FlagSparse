@@ -632,3 +632,160 @@ CSV：`results_biv_span_20261025_retest.csv`（f32/f16/i8）与 `results_biv_spa
 - **实验路径 `P7 prepared RCM`**：只对 9 个方阵有效，非方阵 GL7d14 不执行 RCM。相对同一厂商基线，开启连续输出后的几何平均为 f32 `0.400x`、complex64 `0.259x`；关闭时分别为 `0.432x`、`0.235x`。f32 反而下降，complex64 仅相对 RCM 实验路径改善约 `1.102x`，仍远低于 `0.8x` 目标。
 
 因此，**本轮没有确认 SELL 算子相对厂商基线的性能提升**，也不能把 `FLAGSPARSE_SELL_CONTIGUOUS_OUTPUT=1` 设为默认。完整逐矩阵、逐 dtype 的基线加速比见 `results_biv_sell_contig_speedup_20261025.csv`；原始 A/B 见 `results_biv_sell_contig_ab_off_20261025.csv` 和 `results_biv_sell_contig_ab_on_20261025.csv`。
+### 2026-10-26 BI-V150 K-wide SELL/COO 实现与验证结果
+
+基线 HEAD：`494ebee60b780e85d947fd591671ecdea2e7d986`。实现文件为 `src/flagsparse/sparse_operations/spmv_sell.py`、`src/flagsparse/sparse_operations/spmv_coo.py`、`tools/biv_spmv_probe.py`，新增正确性测试为 `tests/pytest/test_spmv_sell_kwide.py`。
+
+A/B 每个矩阵同一进程交错 5 轮、每种配置取中位数，整个 A/B 独立重复两遍；表中为 `old_ms/new_ms (speedup)`，单位 ms。
+
+#### `spmv_coo_f16_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.0886/0.0879 (1.008x) | 0.0886/0.0880 (1.006x) |
+| GL7d14.mtx | 0.0605/0.0448 (1.351x) | 0.0606/0.0448 (1.353x) |
+| NACA0015.mtx | 0.1809/0.1809 (1.000x) | 0.1810/0.1809 (1.000x) |
+| amazon0601.mtx | 0.0963/0.0836 (1.152x) | 0.0962/0.0835 (1.152x) |
+| auto.mtx | 0.2089/0.1880 (1.111x) | 0.2088/0.1880 (1.111x) |
+| cage12.mtx | 0.0331/0.0199 (1.665x) | 0.0331/0.0200 (1.658x) |
+| cfd2.mtx | 0.0548/0.0305 (1.796x) | 0.0549/0.0305 (1.799x) |
+| filter3D.mtx | 0.0538/0.0536 (1.003x) | 0.0538/0.0536 (1.003x) |
+| roadNet-TX.mtx | 0.0951/0.0957 (0.994x) | 0.0952/0.0956 (0.996x) |
+| wave.mtx | 0.0363/0.0242 (1.499x) | 0.0363/0.0242 (1.498x) |
+平均：old `0.090842` ms，new `0.080911` ms，加速 `1.1227x`。
+
+#### `spmv_coo_f16f32_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.0958/0.0951 (1.008x) | 0.0956/0.0952 (1.004x) |
+| GL7d14.mtx | 0.0624/0.0449 (1.391x) | 0.0624/0.0447 (1.396x) |
+| NACA0015.mtx | 0.1877/0.1882 (0.998x) | 0.1875/0.1883 (0.996x) |
+| amazon0601.mtx | 0.1006/0.0853 (1.180x) | 0.1005/0.0853 (1.178x) |
+| auto.mtx | 0.2129/0.1904 (1.118x) | 0.2130/0.1903 (1.119x) |
+| cage12.mtx | 0.0354/0.0199 (1.774x) | 0.0354/0.0200 (1.769x) |
+| cfd2.mtx | 0.0567/0.0341 (1.665x) | 0.0566/0.0329 (1.721x) |
+| filter3D.mtx | 0.0564/0.0561 (1.005x) | 0.0564/0.0563 (1.003x) |
+| roadNet-TX.mtx | 0.1119/0.1126 (0.994x) | 0.1119/0.1126 (0.994x) |
+| wave.mtx | 0.0379/0.0243 (1.561x) | 0.0379/0.0241 (1.573x) |
+平均：old `0.095749` ms，new `0.085027` ms，加速 `1.1261x`。
+
+#### `spmv_coo_i8i32_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.0936/0.0916 (1.023x) | 0.0937/0.0918 (1.021x) |
+| GL7d14.mtx | 0.0625/0.0430 (1.452x) | 0.0624/0.0431 (1.447x) |
+| NACA0015.mtx | 0.1844/0.1752 (1.052x) | 0.1844/0.1751 (1.053x) |
+| amazon0601.mtx | 0.0912/0.0755 (1.207x) | 0.0914/0.0755 (1.211x) |
+| auto.mtx | 0.1715/0.1543 (1.112x) | 0.1717/0.1544 (1.112x) |
+| cage12.mtx | 0.0328/0.0188 (1.742x) | 0.0329/0.0188 (1.745x) |
+| cfd2.mtx | 0.0500/0.0244 (2.047x) | 0.0500/0.0244 (2.046x) |
+| filter3D.mtx | 0.0519/0.0451 (1.151x) | 0.0519/0.0451 (1.151x) |
+| roadNet-TX.mtx | 0.1015/0.1003 (1.012x) | 0.1016/0.1002 (1.013x) |
+| wave.mtx | 0.0365/0.0224 (1.625x) | 0.0365/0.0225 (1.626x) |
+平均：old `0.087617` ms，new `0.075079` ms，加速 `1.1670x`。
+
+#### `spmv_sell_f16_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.1384/0.0928 (1.491x) | 0.1384/0.0930 (1.488x) |
+| GL7d14.mtx | 0.0502/0.0458 (1.098x) | 0.0502/0.0457 (1.099x) |
+| NACA0015.mtx | 0.2106/0.1841 (1.144x) | 0.2106/0.1841 (1.144x) |
+| amazon0601.mtx | 0.0979/0.0836 (1.172x) | 0.0978/0.0835 (1.171x) |
+| auto.mtx | 0.1949/0.1847 (1.055x) | 0.1949/0.1849 (1.054x) |
+| cage12.mtx | 0.0222/0.0219 (1.016x) | 0.0222/0.0219 (1.014x) |
+| cfd2.mtx | 0.0370/0.0327 (1.133x) | 0.0370/0.0327 (1.131x) |
+| filter3D.mtx | 0.0757/0.0564 (1.342x) | 0.0757/0.0564 (1.342x) |
+| roadNet-TX.mtx | 0.1131/0.1123 (1.007x) | 0.1130/0.1124 (1.006x) |
+| wave.mtx | 0.0311/0.0242 (1.284x) | 0.0312/0.0242 (1.286x) |
+平均：old `0.097115` ms，new `0.083867` ms，加速 `1.1580x`。
+
+#### `spmv_sell_f16f32_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.1402/0.0919 (1.525x) | 0.1401/0.0919 (1.524x) |
+| GL7d14.mtx | 0.0504/0.0457 (1.105x) | 0.0504/0.0457 (1.102x) |
+| NACA0015.mtx | 0.2133/0.1879 (1.135x) | 0.2132/0.1879 (1.134x) |
+| amazon0601.mtx | 0.0991/0.0856 (1.159x) | 0.0991/0.0856 (1.158x) |
+| auto.mtx | 0.1969/0.1866 (1.055x) | 0.1970/0.1869 (1.054x) |
+| cage12.mtx | 0.0222/0.0219 (1.013x) | 0.0222/0.0218 (1.016x) |
+| cfd2.mtx | 0.0386/0.0347 (1.110x) | 0.0386/0.0348 (1.109x) |
+| filter3D.mtx | 0.0760/0.0564 (1.348x) | 0.0756/0.0564 (1.340x) |
+| roadNet-TX.mtx | 0.1134/0.1127 (1.006x) | 0.1134/0.1129 (1.004x) |
+| wave.mtx | 0.0312/0.0243 (1.284x) | 0.0313/0.0243 (1.286x) |
+平均：old `0.098107` ms，new `0.084805` ms，加速 `1.1569x`。
+
+#### `spmv_sell_f32_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.1536/0.0946 (1.625x) | 0.1535/0.0947 (1.620x) |
+| GL7d14.mtx | 0.0522/0.0500 (1.045x) | 0.0523/0.0499 (1.048x) |
+| NACA0015.mtx | 0.2322/0.2036 (1.140x) | 0.2322/0.2036 (1.141x) |
+| amazon0601.mtx | 0.1115/0.0954 (1.169x) | 0.1115/0.0953 (1.169x) |
+| auto.mtx | 0.2299/0.2167 (1.061x) | 0.2302/0.2168 (1.062x) |
+| cage12.mtx | 0.0296/0.0277 (1.068x) | 0.0296/0.0276 (1.072x) |
+| cfd2.mtx | 0.0489/0.0468 (1.044x) | 0.0490/0.0468 (1.046x) |
+| filter3D.mtx | 0.1005/0.0733 (1.371x) | 0.1001/0.0734 (1.365x) |
+| roadNet-TX.mtx | 0.1138/0.1129 (1.008x) | 0.1138/0.1128 (1.009x) |
+| wave.mtx | 0.0492/0.0358 (1.371x) | 0.0491/0.0357 (1.374x) |
+平均：old `0.112133` ms，new `0.095681` ms，加速 `1.1720x`。
+
+#### `spmv_sell_i8i32_int_non`
+| matrix | run 1 | run 2 |
+|---|---:|---:|
+| ASIC_680ks.mtx | 0.1347/0.0907 (1.485x) | 0.1343/0.0904 (1.485x) |
+| GL7d14.mtx | 0.0478/0.0453 (1.054x) | 0.0479/0.0454 (1.056x) |
+| NACA0015.mtx | 0.2007/0.1755 (1.144x) | 0.2008/0.1753 (1.145x) |
+| amazon0601.mtx | 0.0872/0.0760 (1.148x) | 0.0872/0.0759 (1.148x) |
+| auto.mtx | 0.1614/0.1528 (1.057x) | 0.1614/0.1527 (1.057x) |
+| cage12.mtx | 0.0202/0.0210 (0.962x) | 0.0201/0.0209 (0.963x) |
+| cfd2.mtx | 0.0258/0.0262 (0.988x) | 0.0259/0.0262 (0.990x) |
+| filter3D.mtx | 0.0635/0.0467 (1.362x) | 0.0639/0.0468 (1.365x) |
+| roadNet-TX.mtx | 0.1127/0.1122 (1.004x) | 0.1127/0.1122 (1.005x) |
+| wave.mtx | 0.0281/0.0232 (1.209x) | 0.0281/0.0232 (1.210x) |
+平均：old `0.088215` ms，new `0.076921` ms，加速 `1.1468x`。
+
+#### COO choice 与 prepare
+
+`spmv_coo_f16_int_non`：
+ASIC_680ks.mtx: existing / existing；GL7d14.mtx: sell_k2 / sell_k2；NACA0015.mtx: existing / existing；amazon0601.mtx: sell_k4 / sell_k4；auto.mtx: sell_k2 / sell_k2；cage12.mtx: sell_k2 / sell_k2；cfd2.mtx: sell_k2 / sell_k2；filter3D.mtx: existing / existing；roadNet-TX.mtx: existing / existing；wave.mtx: sell_k4 / sell_k4
+prepare old 平均 `24.372` ms。
+prepare new 平均 `127.735` ms。
+ASIC_680ks.mtx: existing / existing；GL7d14.mtx: sell_k2 / sell_k2；NACA0015.mtx: existing / existing；amazon0601.mtx: sell_k4 / sell_k4；auto.mtx: sell_k2 / sell_k2；cage12.mtx: sell_k2 / sell_k2；cfd2.mtx: sell_k2 / sell_k4；filter3D.mtx: existing / existing；roadNet-TX.mtx: existing / existing；wave.mtx: sell_k4 / sell_k4
+prepare old 平均 `24.152` ms。
+prepare new 平均 `109.258` ms。
+ASIC_680ks.mtx: existing / existing；GL7d14.mtx: sell_k2 / sell_k2；NACA0015.mtx: sell_k4 / sell_k4；amazon0601.mtx: sell_k4 / sell_k4；auto.mtx: sell_k2 / sell_k2；cage12.mtx: sell_k2 / sell_k2；cfd2.mtx: sell_k2 / sell_k2；filter3D.mtx: sell_k2 / sell_k2；roadNet-TX.mtx: existing / existing；wave.mtx: sell_k2 / sell_k2
+prepare old 平均 `24.069` ms。
+prepare new 平均 `138.095` ms。
+
+COO 两遍只有一个 choice 不一致：`spmv_coo_f16f32_int_non/cfd2.mtx` 为 `sell_k2` / `sell_k4`，少于计划第 6 节的 2 个停止阈值。
+
+原始 A/B：`results_biv_kwide_ab_run1_20261026.csv`、`results_biv_kwide_ab_run2_20261026.csv`；投影：`results_biv_kwide_project_20261026.txt`。
+
+#### 全量 65 变体、P10 与异常记录
+
+- 全量输出目录为 `results_biv_65_20261026_kwide_final/`，包含 65 个注册变体、13 个算子目录；`delivery_table.py` 报告为 56 个已配置变体 accuracy/performance `Passed`，9 个 fp64/c64 变体 `NotFound`（未配置）。
+- 相对 `results_biv_65_20261024_final` 逐变体、逐矩阵比较可测的 performance CSV 后，除上述 7 个目标变体外，没有平均耗时上升超过 3% 的变体；因此该项为空。目标 7 项的 A/B 平均改善分别为 SELL f32 `1.1720x`、SELL f16 `1.1580x`、SELL f16→f32 `1.1569x`、SELL i8→i32 `1.1468x`、COO f16 `1.1227x`、COO i8→i32 `1.1670x`、COO f16→f32 `1.1261x`（两遍平均口径）。
+- P10 输出为 `results_biv_p10_20261026_kwide.csv`，4 个矩阵/3 个数据类型/6 个配置共 84 行，全部 `PASS`。`GROUP=2,K=2,C=32` 在 f32/f16 的 8 个组合和 int8 的 3 个组合中最快；int8 `roadNet-TX.mtx` 由 `C=64,GROUP=1,K=1` 略快。P10 只作为探针数据，不改变生产代码。
+- 正确性新增测试 `tests/pytest/test_spmv_sell_kwide.py`：30 passed；`test_spmv_sell_prepared.py`：151 passed、18 skipped；`test_spmv_coo_iluvatar_route.py`：5 passed；q4 SELL/COO：20 passed；complex SELL prepared：8 passed。
+- `tests/pytest/test_spmv_sell_out_accuracy.py`：Iluvatar float64 两个用例失败，输出全零；基线 HEAD 复跑同样失败，确认是既有基线/平台问题。
+- `tests/pytest/test_spmv_coo_accuracy.py`：Iluvatar float64/complex128 相关 39 个用例失败，输出全零或错误；属于已知 BI-V150 fp64/complex128 平台问题。
+- 第一次 65 runner `results_biv_65_20261026_kwide/` 因 complex SELL `route="call"` 错误采用 `k=4`，10 个 complex SELL 行报 `ValueError: k > 1 requires group=1 and real-valued SELL data`；该问题已修复。该次 runner 后续 `spmm_csc` 长时间停滞并手动终止，不作为最终结果。
+- `make pre-commit-check` 未完成：pre-commit 初始化网络拉取失败，`CalledProcessError`、`git fetch origin --tags`、`GnuTLS recv error (-110)`。
+- 直接工具检查：`black --check` 报以下 4 个文件会被重排：`src/flagsparse/sparse_operations/spmv_sell.py`、`src/flagsparse/sparse_operations/spmv_coo.py`、`tools/biv_spmv_probe.py`、`tests/pytest/test_spmv_sell_kwide.py`；`isort`、`flake8` 命令当前不存在。
+
+#### 合入前审查修复（2026-10-26，CUDA 机）
+
+上面的数据来自 BI-V 侧原始改动包。合入前在 CUDA 机上（`FLAGSPARSE_BACKEND=iluvatar` 模拟 + CUDA 原生）审查，修了 5 处，性能路径的 kernel 和默认配置不变：
+
+1. **未排序 COO 算错**：`prepare_spmv_coo(..., sort_by_row=False)` 收到行未排序的 COO 时，转 SELL 用 bincount 构造 CSR，默认假设行已排序；auto 模式选中 SELL 后 f16 / int8 的 max_err 达 36–38。prepare 时的实测只比速度、不检查结果，所以会选中算错的路径。现在先按行稳定排序再转换。交付测试全用 `sort_by_row=True`，所以没覆盖到。
+2. **`FLAGSPARSE_SELL_PREP_K>1` 让复数 SELL 的 prepare 抛错**，`route="auto"` / `"call"` 也一样。第一次 65 runner 就是因为这个失败，当时只修了默认值的情况。现在显式传入的 `k` 仍严格校验；环境变量和默认值只在 K-wide 能运行的地方生效（实数、`group == 1`），其他情况用 1。`route="call"` 显式传 `k > 1` 时报错。
+3. **非 Iluvatar 后端显式传 `k > 1` 被静默忽略**：`prepared.k` 显示 4，实际跑的是 K=1。运行时的 Iluvatar 判断已去掉（kernel 是纯 Triton），CUDA 上显式传 `k` 现在真正生效；默认仍是 1，CUDA 的默认行为不变。
+4. **COO prepare 冗余**：原来为 2 种输出 dtype × K∈{2,4} 做 4 次完整的重新布局，没选中的计划也全部保留。现在只编码一次，各候选由 `_sell_plan_variant` 共享这份布局，最后只保留选中的那份（`prepared.sell_plans[out_dtype]` 是 `_CooSellPlan`）；`FLAGSPARSE_ILUVATAR_COO_SELL=1` 时不再做实测。5090 模拟下 prepare 从约 14 ms 降到约 7 ms。BI-V 上的耗时需要复测。
+   另外，`sort_by_row=False` 时 `data_non` 就是调用方的张量，原路径每次调用都会读到就地修改；SELL 路径现在按版本号检测修改并重新编码数值，语义和原路径一致。
+5. **测试**：`tests/pytest/test_spmv_sell_kwide.py` 重写为 78 个用例。新增：随机矩阵（含空行、行宽大于 K）、SELL f16→f32 与 int8→f32、未排序 COO × `sort_by_row`、显式非法 k、环境变量 K 加复数 / group、共享布局、只保留选中计划、强制 K、就地修改语义、非法模式。原来 auto 模式那条断言永远成立，已改为实际检查。SELL 用例在 CUDA 上也会运行，不再整体跳过。用原改动包的代码跑这套测试，Iluvatar 模拟和 CUDA 下都有失败，说明测试能抓到上面这些问题。
+
+验证结果：
+- `make format-check`、`lint`、`lint-src`、`pre-commit-check` 全部通过。
+- `tests/ci` 476 passed；唯一失败是 `test_installed_wheel`，干净的 HEAD 上同样失败，是本机没装 wheel 的环境问题。
+- SELL / COO 的 pytest 在 Iluvatar 模拟和 CUDA 下都通过。
+
+P10 的网格把 GROUP 和 K 绑在一起变（G1K1 / G2K2 / G4K4），没有生产用的 G1K4 作对照。跨文件对比，G2K2 只在 roadNet-TX 上比 K=4 快（f16 82.9 vs 112.3 µs），其他矩阵都更慢，和"roadNet 受 program 数量限制"的判断一致。下一轮要单独扫 GROUP × K。

@@ -657,6 +657,7 @@ def flagsparse_spmv_sell(
 # slices makes the shorter one wait for the wider (5090: complex GROUP=2 doubled
 # ASIC_680ks's time).
 _SELL_PREP_WARP64 = _is_iluvatar_runtime() or _is_maca_runtime() or _is_rocm_runtime()
+_SELL_PREP_K_DEFAULT = 4 if _is_iluvatar_runtime() else 1
 
 
 def _sell_prep_defaults(complex_values):
@@ -707,7 +708,7 @@ class PreparedSellSpmv:
     __slots__ = (
         "shape", "n_rows", "n_cols", "slice_size", "device", "value_dtype", "out_dtype",
         "acc_dtype", "route", "sigma", "sigma_request", "c", "group", "num_warps", "paired",
-        "reorder", "reorder_request", "x_order", "x_buf", "y_buf", "y_order",
+        "reorder", "reorder_request", "k", "x_order", "x_buf", "y_buf", "y_order",
         "values", "cols", "offsets", "versions",
         "sell_values", "kernel_values", "sell_cols", "sell_offsets", "row_len", "perm", "kernel_perm",
         "gather", "n_slices", "n_values", "grid", "constants",
@@ -717,7 +718,7 @@ class PreparedSellSpmv:
         return (
             f"PreparedSellSpmv(route={self.route!r}, shape={self.shape}, "
             f"dtype={self.value_dtype}->{self.out_dtype}, sigma={self.sigma}, c={self.c}, "
-            f"group={self.group}, num_warps={self.num_warps}, reorder={self.reorder!r}, "
+            f"group={self.group}, num_warps={self.num_warps}, k={self.k}, reorder={self.reorder!r}, "
             f"n_values={self.n_values})"
         )
 
@@ -734,6 +735,48 @@ def _sell_prep_option(explicit, env, default, parse=int):
         return explicit
     raw = os.environ.get(env)
     return parse(raw) if raw not in (None, "") else default
+
+
+def _sell_prep_k(explicit, complex_values, group):
+    """Slice columns per sigma-kernel step (see ``prepare_spmv_sell``)."""
+    if explicit is None:
+        raw = os.environ.get("FLAGSPARSE_SELL_PREP_K")
+        k = int(raw) if raw not in (None, "") else _SELL_PREP_K_DEFAULT
+    else:
+        k = int(explicit)
+    if k < 1 or k > 16 or k & (k - 1):
+        raise ValueError("k must be a power of two in [1, 16]")
+    if k > 1 and (group > 1 or complex_values):
+        if explicit is not None:
+            raise ValueError("k > 1 requires group=1 and real-valued SELL data")
+        # A process-wide FLAGSPARSE_SELL_PREP_K must not break complex / grouped plans.
+        return 1
+    return k
+
+
+def _sell_plan_variant(p, *, k, out_dtype):
+    """A sigma plan sharing ``p``'s layout, with another ``k`` and / or ``out_dtype``.
+
+    K and the output dtype do not change the layout, so a caller choosing between
+    them (``prepare_spmv_coo`` on Iluvatar) re-encodes the matrix once.
+    """
+    if p.route != "sigma":
+        raise ValueError("only sigma plans can be varied")
+    allowed = _SPMV_SELL_OUT_DTYPES[p.value_dtype]
+    if out_dtype not in allowed:
+        names = ", ".join(str(d).replace("torch.", "") for d in allowed)
+        raise TypeError(f"{p.value_dtype} SELL SpMV can write: {names}")
+    q = PreparedSellSpmv()
+    for name in PreparedSellSpmv.__slots__:
+        setattr(q, name, getattr(p, name))
+    q.k = _sell_prep_k(k, _is_complex_dtype(p.value_dtype), p.group)
+    q.out_dtype = out_dtype
+    q.acc_dtype = _sell_acc_dtype(p.value_dtype, out_dtype)
+    if not _is_complex_dtype(p.value_dtype):
+        q.constants = (p.c, p.group, _TL[q.acc_dtype]) + tuple(p.constants[3:])
+    if p.x_order is not None:
+        q.y_buf = torch.empty(p.n_rows, dtype=out_dtype, device=p.device)
+    return q
 
 
 def _sell_window_order(lengths, sigma):
@@ -930,6 +973,7 @@ def prepare_spmv_sell(
     c=None,
     group=None,
     num_warps=None,
+    k=None,
     paired=None,
     reorder=None,
     validate=True,
@@ -941,13 +985,19 @@ def prepare_spmv_sell(
     and Iluvatar and ``"call"`` elsewhere (Ascend has no Triton path for it).
     ``sigma`` is a window in rows or ``"auto"`` (the smallest window, doubling from
     ``c``, whose padding is within 10% of nnz; ``prepared.sigma`` reports it).
+    ``k``: slice columns read per step of the sigma kernel -- the ``[k, c]`` tile is
+    contiguous, so a program has ``k * c`` loads in flight instead of ``c``. A power of
+    two in [1, 16]; ``k > 1`` needs real values and ``group == 1`` (an explicit value
+    that breaks this raises; ``FLAGSPARSE_SELL_PREP_K`` and the default apply only
+    where it holds). Defaults to 4 on Iluvatar (BI-V150 P9: 1.15-1.6x on most of the
+    delivery matrices) and 1 elsewhere.
     ``reorder``: ``"none"`` (default), ``"rcm"`` (reverse Cuthill-McKee relabelling of
     a square matrix; needs SciPy) or ``"auto"`` (RCM only where it shrinks the median
     ``|col - row|`` 4x; ``prepared.reorder`` reports what was done).
     Tuning (``sigma``, ``c`` rows per slice, ``group`` slices per program,
-    ``num_warps``, ``paired`` complex loads, ``reorder``) falls back to the environment
-    variables ``FLAGSPARSE_SELL_PREP_SIGMA / _C / _GROUP / _WARPS / _PAIRED / _REORDER``
-    read here, then to backend defaults. Preparation synchronizes; time
+    ``num_warps``, ``k``, ``paired`` complex loads, ``reorder``) falls back to the
+    environment variables ``FLAGSPARSE_SELL_PREP_SIGMA / _C / _GROUP / _WARPS / _K /
+    _PAIRED / _REORDER`` read here, then to backend defaults. Preparation synchronizes; time
     ``flagsparse_spmv_sell(prepared=...)``.
     """
     n_rows, n_cols, slice_size, _ = _validate_sell_arrays(
@@ -978,12 +1028,15 @@ def prepare_spmv_sell(
     p.cols = col_indices.contiguous()
     p.offsets = slice_offsets.contiguous()
     p.n_values = int(values.numel())
-    for name in ("sigma", "sigma_request", "c", "group", "num_warps", "paired", "reorder",
+    for name in ("sigma", "sigma_request", "c", "group", "num_warps", "k", "paired", "reorder",
                  "reorder_request", "x_order", "x_buf", "y_buf", "y_order", "sell_values", "kernel_values",
                  "sell_cols", "sell_offsets", "row_len", "perm", "kernel_perm", "gather", "n_slices", "grid",
                  "constants", "versions"):
         setattr(p, name, None)
     if route == "call":
+        if k is not None and int(k) != 1:
+            raise ValueError("k > 1 needs route='sigma'")
+        p.k = 1
         return p
 
     complex_values = _is_complex_dtype(values.dtype)
@@ -991,6 +1044,7 @@ def prepare_spmv_sell(
     p.c = int(_sell_prep_option(c, "FLAGSPARSE_SELL_PREP_C", default_c))
     p.group = int(_sell_prep_option(group, "FLAGSPARSE_SELL_PREP_GROUP", default_group))
     p.num_warps = int(_sell_prep_option(num_warps, "FLAGSPARSE_SELL_PREP_WARPS", default_warps))
+    p.k = _sell_prep_k(k, complex_values, p.group)
     p.paired = bool(_sell_prep_option(paired, "FLAGSPARSE_SELL_PREP_PAIRED", False, lambda v: v != "0"))
     p.reorder_request = str(_sell_prep_option(reorder, "FLAGSPARSE_SELL_PREP_REORDER", "none", str)).lower()
     if p.reorder_request not in _SELL_PREP_REORDERS:
@@ -1078,6 +1132,30 @@ def _spmv_sell_sigma_kernel(
         tl.store(y_ptr + row, acc.to(y_ptr.dtype.element_ty), mask=row >= 0)
 
 
+@triton.jit
+def _spmv_sell_sigma_wide_kernel(
+    y_ptr, v_ptr, c_ptr, off_ptr, len_ptr, perm_ptr, x_ptr, n_slices,
+    C: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr,
+):
+    s = tl.program_id(0)
+    lane = tl.arange(0, C)[None, :]
+    wide = tl.arange(0, K)[:, None]
+    smask = s < n_slices
+    start = tl.load(off_ptr + s, mask=smask, other=0)
+    width = (tl.load(off_ptr + s + 1, mask=smask, other=0) - start) // C
+    row_len = tl.load(len_ptr + s * C + lane, mask=smask, other=0)
+    row = tl.load(perm_ptr + s * C + lane, mask=smask, other=-1)
+    acc = tl.zeros((K, C), dtype=ACC)
+    for j in range(0, width, K):
+        m = (j + wide) < row_len
+        pos = start + (j + wide) * C + lane
+        col = tl.load(c_ptr + pos, mask=m, other=0)
+        value = tl.load(v_ptr + pos, mask=m, other=0).to(ACC)
+        vector = tl.load(x_ptr + col, mask=m, other=0).to(ACC)
+        acc += value * vector
+    tl.store(y_ptr + row, tl.sum(acc, axis=0)[None, :].to(y_ptr.dtype.element_ty), mask=row >= 0)
+
+
 def _refresh_sell_sigma(p):
     versions = tuple(_tensor_version(t) for t in (p.values, p.cols, p.offsets))
     if versions == p.versions:
@@ -1136,15 +1214,23 @@ def spmv_sell_prepared(prepared, x, *, out=None, return_time=False):
             p.kernel_perm if contiguous_output else p.perm,
             torch.view_as_real(x) if complex_values else x,
         )
+        use_wide = p.k > 1  # prepare keeps k == 1 for complex / grouped plans
         if _CUDA_DIRECT_LAUNCH:
             _launch_musa_spmv(
-                _spmv_sell_sigma_kernel, p.grid, tensors, (p.n_slices,), p.constants,
+                _spmv_sell_sigma_wide_kernel if use_wide else _spmv_sell_sigma_kernel,
+                p.grid, tensors, (p.n_slices,),
+                (p.c, p.k, p.constants[2]) if use_wide else p.constants,
                 num_warps=p.num_warps, cuda=True,
             )
         else:
-            _spmv_sell_sigma_kernel[p.grid](
-                *tensors, p.n_slices, *p.constants, num_warps=p.num_warps
-            )
+            if use_wide:
+                _spmv_sell_sigma_wide_kernel[p.grid](
+                    *tensors, p.n_slices, p.c, p.k, p.constants[2], num_warps=p.num_warps
+                )
+            else:
+                _spmv_sell_sigma_kernel[p.grid](
+                    *tensors, p.n_slices, *p.constants, num_warps=p.num_warps
+                )
     if contiguous_output:
         torch.index_select(kernel_y, 0, p.y_order, out=y)
     if out is not None and y is not out:
