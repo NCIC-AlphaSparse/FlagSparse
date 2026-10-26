@@ -1046,10 +1046,12 @@ def _run_spmm_csr_base_route_impl(
         end = _ACCEL.Event(enable_timing=True)
         start.record()
     use_batched_short_rows = (
-        (_spmm_is_hip_device(device_props) or _backend_name() == "cuda")
-        # The batched kernels accumulate in the value dtype, so they cannot serve
-        # the accuracy route -- csr_base_accuracy exists to accumulate wider.
-        and not accuracy
+        (_spmm_is_hip_device(device_props) or _backend_name() == "cuda"
+         or _is_iluvatar_runtime())
+        # The batched kernels accumulate in the value dtype. BI-V float32 keeps
+        # that precision for the accuracy route; wider-precision routes remain
+        # on the scalar accuracy kernel.
+        and (not accuracy or (_is_iluvatar_runtime() and prepared.data.dtype == torch.float32))
         and dense_layout == "row"
         and (prepared.data.dtype in (torch.float32, torch.float64)
              or (_backend_name() == "cuda" and prepared.data.dtype == torch.float16))
@@ -2737,7 +2739,13 @@ SPMM_CSR_ALGORITHMS = {
 def resolve_spmm_csr_algorithm(alg, op, dtype):
     token = _normalize_spmm_csr_alg(alg)
     if token == "auto":
-        token = "csr_base"
+        token = (
+            "csr_base_accuracy"
+            if _is_iluvatar_runtime()
+            and _spmm_op_to_name(op) == "trans"
+            and dtype == torch.float32
+            else "csr_base"
+        )
     if token not in SPMM_CSR_ALGORITHMS:
         supported = ", ".join(sorted(SPMM_CSR_ALGORITHMS))
         raise ValueError(
@@ -2792,13 +2800,11 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         op=op_name,
         alg=resolved_alg,
     )
-    if op_name != "non" and _backend_name() == "cuda":
-        # Materialise A.T (A.conj().T for conj) here instead of on every run.  The
-        # transpose is a sort + bincount + cumsum over nnz, and it used to run inside
-        # flagsparse_spmm_csr_run -- i.e. once per timed iteration -- while the cuSPARSE
-        # baseline materialises ``A_csr.transpose().tocsr()`` once outside its timed
-        # window (see tests/test_spmm.py).  Caching it here makes the two sides
-        # symmetric; a run-time ``op=`` override still re-materialises below.
+    if op_name != "non" and (_backend_name() == "cuda" or _is_iluvatar_runtime()):
+        # Materialise A.T (A.conj().T for conj) here instead of on every run. The
+        # transpose is a sort + bincount + cumsum over nnz; caching it matches the
+        # vendor benchmark's one-time materialization on CUDA and Iluvatar. A
+        # run-time ``op=`` override still materializes the requested route below.
         t_data, t_indices, t_indptr, t_shape = _materialize_spmm_csr_op(
             data,
             kernel_indices,
@@ -2862,6 +2868,47 @@ def flagsparse_spmm_csr_run(
         raise ValueError("B must be on the same CUDA device as sparse matrix data")
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
+
+    if (
+        _is_iluvatar_runtime()
+        and prepared.data.dtype in (torch.float16, torch.complex64, torch.complex128)
+        and op_name == "non"
+        and dense_layout in ("auto", "row")
+        and not return_meta
+        and not timing
+    ):
+        from . import mixed_spmx
+
+        return mixed_spmx.spmm_csr_mixed(
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            B,
+            prepared.shape,
+            return_time=return_time,
+        )
+
+    if (
+        _is_iluvatar_runtime()
+        and prepared.data.dtype == torch.float32
+        and op_name in ("trans", "conj")
+        and dense_layout in ("auto", "row")
+        and not return_meta
+        and not timing
+    ):
+        from . import mixed_spmx
+
+        runtime_prepared, _ = _materialize_spmm_csr_route_op(
+            prepared, op_name, timing=False
+        )
+        return mixed_spmx.spmm_csr_mixed(
+            runtime_prepared.data,
+            runtime_prepared.kernel_indices,
+            runtime_prepared.kernel_indptr,
+            B,
+            runtime_prepared.shape,
+            return_time=return_time,
+        )
 
     start = (
         _ACCEL.Event(enable_timing=True) if (return_time or return_meta) else None
@@ -4444,7 +4491,16 @@ def flagsparse_spmm_csr(
     float32 run in ``mixed_spmx``.
     """
     B = _apply_spmm_op_b(B, op_b)
-    if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
+    if torch.is_tensor(data) and (
+        _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype)
+        or (
+            _is_iluvatar_runtime()
+            and data.dtype == torch.float16
+            and B is not None
+            and B.dtype == data.dtype
+            and _mixed_spmx._requested_out_dtype(out, out_dtype) in (None, data.dtype)
+        )
+    ):
         C = _mixed_spmx.spmm_csr_mixed(
             data, indices, indptr, B, shape, op=op, transpose=transpose,
             out=out, out_dtype=out_dtype, return_time=bool(return_time or return_meta),

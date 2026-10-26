@@ -1044,6 +1044,8 @@ def _accel_fallback_reason():
 
 def _is_accel_tensor(t):
     """Backend-neutral replacement for Tensor.is_cuda."""
+    if _ACCEL_DEVICE_TYPE == "cuda" and isinstance(t, torch.Tensor):
+        return t.is_cuda  # same answer without building a torch.device
     return getattr(t, "device", None) is not None and t.device.type == _ACCEL_DEVICE_TYPE
 
 
@@ -3584,6 +3586,17 @@ def _benchmark_cuda_op(op, warmup, iters):
     _ACCEL.synchronize()
     if cp is not None:
         cp.cuda.runtime.deviceSynchronize()
+    if _is_iluvatar_runtime():
+        start_event = _ACCEL.Event(enable_timing=True)
+        end_event = _ACCEL.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(iters):
+            output = op()
+        end_event.record()
+        _ACCEL.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event) / iters
+        if elapsed_ms > 0:
+            return output, elapsed_ms
     start_time = time.perf_counter()
     for _ in range(iters):
         output = op()

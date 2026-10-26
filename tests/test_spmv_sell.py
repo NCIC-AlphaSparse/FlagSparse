@@ -25,6 +25,14 @@ outside the timed window, like cuSPARSE's own descriptor setup), and timed as:
 ``--dtypes`` takes ``value[:out]`` tokens: ``float16:float32`` is f16 in, f32 out,
 ``int8`` is int8 in, int32 out. Accuracy is checked against a CPU float64 /
 complex128 SpMV; ``status`` is PASS / FAIL per row, ERROR when FlagSparse raised.
+
+``FLAGSPARSE_SELL_PREPARED`` (``1``/``auto``, ``sigma`` or ``call``) times
+``flagsparse_spmv_sell(prepared=...)`` instead: ``prepare_spmv_sell`` runs once per
+matrix outside the timed window (like cuSPARSE's descriptor), and the row records
+``timed=prepared`` plus the layout it chose (``layout``, ``sell_sigma``, ``sell_c``,
+``sell_group``, ``sell_warps``, ``sell_paired``, ``sell_reorder``, ``prepared_values``).
+Tuning comes from ``FLAGSPARSE_SELL_PREP_SIGMA / _C / _GROUP / _WARPS / _PAIRED /
+_REORDER``.
 """
 
 import argparse
@@ -85,6 +93,15 @@ FIELDS = [
     "nnz",
     "slice_size",
     "sell_values",
+    "timed",
+    "layout",
+    "sell_sigma",
+    "sell_c",
+    "sell_group",
+    "sell_warps",
+    "sell_paired",
+    "sell_reorder",
+    "prepared_values",
     "triton_ms",
     "cusparse_ms",
     "pytorch_ms",
@@ -198,8 +215,28 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
     row["sell_values"] = int(values.numel())
     out_arg = None if odt == _DEFAULT_OUT.get(vdt, vdt) else odt
     out = torch.empty(m, dtype=odt, device=dev)
+    prepared_route = os.environ.get("FLAGSPARSE_SELL_PREPARED", "").strip().lower()
+    if prepared_route in ("1", "true", "yes"):
+        prepared_route = "auto"
+    row["timed"] = "prepared" if prepared_route not in ("", "0") else "call"
 
-    if _is_rocm_runtime() and not vdt.is_complex:
+    if row["timed"] == "prepared":
+        # Re-encoding happens here, outside the timed window; only the run is timed.
+        plan = fs.prepare_spmv_sell(
+            values, sell_cols, offsets, (m, k), slice_size=slice_size, out_dtype=odt,
+            route=prepared_route,
+        )
+        row["layout"] = "sell_c_sigma" if plan.route == "sigma" else "sell"
+        if plan.route == "sigma":
+            row.update(sell_sigma=plan.sigma, sell_c=plan.c, sell_group=plan.group,
+                       sell_warps=plan.num_warps, sell_paired=int(plan.paired),
+                       sell_reorder=plan.reorder, prepared_values=plan.n_values)
+
+        def ours():
+            return fs.flagsparse_spmv_sell(prepared=plan, x=x, out=out)
+
+        first = ours().clone()
+    elif _is_rocm_runtime() and not vdt.is_complex:
         # The conversion and row-major plan are prepared once, like the
         # vendor descriptor.  Time the bound ROCm launch directly so wrapper
         # validation and cache lookup are not charged to every short-row run.
@@ -219,10 +256,11 @@ def _run(path, csr, vdt, odt, slice_size, warmup, iters, gen):
                 out=out, out_dtype=out_arg, validate=False,
             )
 
-    first = fs.flagsparse_spmv_sell(
-        values, sell_cols, offsets, x, (m, k), slice_size=slice_size,
-        out=out, out_dtype=out_arg,
-    )
+    if row["timed"] == "call":
+        first = fs.flagsparse_spmv_sell(
+            values, sell_cols, offsets, x, (m, k), slice_size=slice_size,
+            out=out, out_dtype=out_arg,
+        )
     row["triton_max_error"] = _error(first, ref)
     _, row["triton_ms"] = _benchmark_cuda_op(ours, warmup, iters)
 

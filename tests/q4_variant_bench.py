@@ -435,9 +435,31 @@ def _spmv(v, mat, gen, warmup, iters, row):
     if mixed or _is_ascend_runtime():
         row["timed"] = "call"
         if v.fmt == "csr":
-            ours = lambda: fs.flagsparse_spmv_csr(vals, mat.cols, mat.ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
+            if v.name == "spmv_csr_f32c32_int_non" and not _is_ascend_runtime():
+                prepared = mixed_spmx.prepare_spmv_csr_mixed(
+                    vals, mat.cols, mat.ptr, x.dtype, mat.shape,
+                    out_dtype=v.out, route=os.environ.get(
+                        "FLAGSPARSE_ILUVATAR_CSR_COMPLEX_ROUTE", "auto"
+                    ),
+                )
+                target = torch.empty(y_len, dtype=v.out, device=mat.dev)
+                # MUSA keeps its own call route; there the plan only holds the inputs.
+                row["timed"] = "call" if prepared.route == "call" else "prepared"
+                ours = lambda: fs.flagsparse_spmv_csr(  # noqa: E731
+                    prepared=prepared, x=x, out=target
+                )
+            else:
+                if mixed and not _is_ascend_runtime():
+                    # The vendor writes a preallocated y; so does the prepared path below.
+                    kw["out"] = torch.empty(y_len, dtype=v.out, device=mat.dev)
+                ours = lambda: fs.flagsparse_spmv_csr(vals, mat.cols, mat.ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
         elif v.fmt == "coo":
-            ours = lambda: fs.flagsparse_spmv_coo(vals, mat.rows, mat.cols, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
+            if v.op_a == "non" and not _is_ascend_runtime():
+                prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape)
+                row["timed"] = "prepared"
+                ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x, **kw)  # noqa: E731
+            else:
+                ours = lambda: fs.flagsparse_spmv_coo(vals, mat.rows, mat.cols, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
         else:
             ours = lambda: fs.flagsparse_spmv_csc(csc_vals, mat.csc_rows, mat.csc_ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
     else:
@@ -462,7 +484,10 @@ def _spmv(v, mat, gen, warmup, iters, row):
                 target = torch.empty(m, dtype=v.out, device=mat.dev)
                 ours = _prepared_row_tile_op(prepared, x, target)
             else:
-                ours = lambda: fs.flagsparse_spmv_csr(prepared=prepared, x=x)  # noqa: E731
+                target = torch.empty(y_len, dtype=v.out, device=mat.dev)
+                ours = lambda: fs.flagsparse_spmv_csr(  # noqa: E731
+                    prepared=prepared, x=x, out=target
+                )
         elif v.fmt == "coo":
             prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
             ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x)  # noqa: E731

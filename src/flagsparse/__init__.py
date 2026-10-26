@@ -46,12 +46,15 @@ __all__ = [
     "PreparedCscSpmm",
     "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
+    "PreparedCsrMixedSpmv",
     "PreparedCsrSpmmOpt",
     "PreparedCsrSpmmRoute",
     "PreparedCsrSpmmOptAlg2",
     "SpGEMMPrepared",
     "SDDMMPrepared",
     "prepare_spmv_csr",
+    "prepare_spmv_csr_mixed",
+    "spmv_csr_mixed_prepared",
     "prepare_alpha_spmm_alg1",
     "build_alpha_spmm_alg1_tle_opt_meta",
     "build_alpha_spmm_alg1_tle_opt2_meta",
@@ -93,6 +96,9 @@ __all__ = [
     "flagsparse_spmv_sell",
     "dense_to_sell",
     "csr_to_sell",
+    "PreparedSellSpmv",
+    "prepare_spmv_sell",
+    "spmv_sell_prepared",
     "flagsparse_axpby",
     "flagsparse_spvv",
     "flagsparse_spmm_csr_opt",
@@ -224,12 +230,15 @@ _OPS_EXPORTS = {
     "PreparedCscSpmm",
     "PreparedAlphaSpmmAlg1",
     "PreparedCsrSpmv",
+    "PreparedCsrMixedSpmv",
     "PreparedCsrSpmmOpt",
     "PreparedCsrSpmmRoute",
     "PreparedCsrSpmmOptAlg2",
     "SpGEMMPrepared",
     "SDDMMPrepared",
     "prepare_spmv_csr",
+    "prepare_spmv_csr_mixed",
+    "spmv_csr_mixed_prepared",
     "prepare_alpha_spmm_alg1",
     "build_alpha_spmm_alg1_tle_opt_meta",
     "build_alpha_spmm_alg1_tle_opt2_meta",
@@ -271,6 +280,9 @@ _OPS_EXPORTS = {
     "flagsparse_spmv_sell",
     "dense_to_sell",
     "csr_to_sell",
+    "PreparedSellSpmv",
+    "prepare_spmv_sell",
+    "spmv_sell_prepared",
     "flagsparse_axpby",
     "flagsparse_spvv",
     "flagsparse_spmm_csr_opt",
@@ -384,12 +396,17 @@ def __getattr__(name):
     if name in _OPS_EXPORTS:
         from . import sparse_operations as _ops
 
-        return getattr(_ops, name)
-    if name in _FORMAT_EXPORTS:
+        value = getattr(_ops, name)
+    elif name in _FORMAT_EXPORTS:
         from . import sparse_formats as _formats
 
-        return getattr(_formats, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        value = getattr(_formats, name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    # Cache it: an uncached lookup re-runs this on every fs.<name> access,
+    # 3-6 us per call of a microsecond-scale operator.
+    globals()[name] = value
+    return value
 
 
 def __dir__():

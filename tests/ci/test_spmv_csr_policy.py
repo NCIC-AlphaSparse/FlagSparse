@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import os
 import sys
 import types
 import unittest
@@ -250,6 +251,12 @@ def runtime_namespace():
         "_spmv_uses_int64_indices": lambda p: True,
         "_is_ascend_runtime": lambda: False,
         "_is_rocm_runtime": lambda: False,
+        "_is_iluvatar_runtime": lambda: False,
+        "os": os,
+        # A plan type no test passes, so the mixed-precision branch never fires.
+        "_mixed_spmx": types.SimpleNamespace(
+            PreparedCsrMixedSpmv=type("PreparedCsrMixedSpmv", (), {})
+        ),
     }
     exec(
         compile(

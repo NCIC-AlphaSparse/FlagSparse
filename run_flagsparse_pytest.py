@@ -237,6 +237,7 @@ PERFORMANCE_METRIC_COLUMNS = {
 # pytorch_ms/ms -- so each layout is listed and _performance_schema prefers the
 # entry whose measurement columns the row actually carries.
 PERFORMANCE_SPEEDUP_SCHEMAS = (
+    ("biv_speedup", "biv_baseline_ms", "biv_flagsparse_ms"),
     # benchmark_ascend.py names its ratio plainly `speedup` over pytorch_ms/triton_ms.
     # Ahead of the generic `speedup` entry below: without a schema of its own every
     # Ascend row fell through to latency_base/latency, which that CSV does not carry,
@@ -2450,6 +2451,11 @@ def _performance_metric_record(row: dict[str, str]) -> dict[str, object]:
 
 
 def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | None]:
+    if _BIV_BASELINE_POLICY:
+        if _to_float(row.get("biv_speedup")) is not None:
+            return "biv_speedup", "biv_baseline_ms", "biv_flagsparse_ms"
+        if _to_float(row.get(_SCALED_SPEEDUP_KEY)) is not None:
+            return _SCALED_SPEEDUP_KEY, "h800_scaled_ms", "h800_scaled_fs_ms"
     # Two passes.  A speedup name can appear more than once with different column
     # layouts -- spmm_coo reports triton_speedup_vs_pytorch over torch_ms/ms while
     # spmm_csc reports it over pytorch_ms/ms -- so prefer an entry whose measurement
@@ -2676,6 +2682,7 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
     totals: dict[str, list[float]] = {}
     scaled: dict[str, int] = {}
     scaled_pytorch: set[str] = set()
+    baseline_labels: dict[str, list[str]] = {}
     seen_by_dtype: dict[str, set[str]] = {}
     for index, row in enumerate(rows):
         dtype = _row_dtype(row)
@@ -2701,7 +2708,10 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         dtype_entry["details"][shape] = detail  # type: ignore[index]
         if _performance_row_has_complete_speedup(row):
             totals.setdefault(dtype, []).append(speedup)
-            if speedup_key == _SCALED_SPEEDUP_KEY:
+            if speedup_key == "biv_speedup":
+                label = str(row.get("biv_baseline_kind") or "local")
+                baseline_labels.setdefault(dtype, []).append(label)
+            elif speedup_key == _SCALED_SPEEDUP_KEY:
                 scaled[dtype] = scaled.get(dtype, 0) + 1
                 if row.get("h800_baseline_kind") == "pytorch":
                     scaled_pytorch.add(dtype)
@@ -2709,9 +2719,23 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
     for dtype, values in totals.items():
         if values:
             grouped[dtype]["speedup"] = statistics.mean(values)
+        labels = set(baseline_labels.get(dtype, ()))
+        if scaled.get(dtype):
+            labels.add(
+                "h800_pytorch_scaled"
+                if dtype in scaled_pytorch
+                else _SCALED_BASELINE_LABEL
+            )
+        if labels:
+            if len(labels) == 1:
+                grouped[dtype]["baseline"] = next(iter(labels))
+            elif any(label.startswith("h800_") for label in labels):
+                grouped[dtype]["baseline"] = "partly_local_h800_scaled"
+            else:
+                grouped[dtype]["baseline"] = "partly_local"
         # An estimate against the rescaled H800 cuSPARSE time, not a measured
         # baseline: say so, so a report can never pass it off as one.
-        if scaled.get(dtype):
+        if scaled.get(dtype) and dtype not in baseline_labels:
             # h800_pytorch_scaled: H800 had no vendor time for these cases (cuSPARSE
             # SDDMM has no fp16), so the rescaled baseline is H800 PyTorch's.
             label = (
@@ -2719,9 +2743,7 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
                 if dtype in scaled_pytorch
                 else _SCALED_BASELINE_LABEL
             )
-            grouped[dtype]["baseline"] = (
-                label if scaled[dtype] == len(values) else f"partly_{label}"
-            )
+            grouped[dtype]["baseline"] = label if scaled[dtype] == len(values) else f"partly_{label}"
     return grouped
 
 
@@ -2904,9 +2926,108 @@ def summarize_performance_csv(
 
 _SCALED_SPEEDUP_KEY = "speedup_vs_h800_scaled"
 _SCALED_BASELINE_LABEL = "h800_scaled"
+_BIV_BASELINE_COLUMNS = (
+    "biv_baseline_ms",
+    "biv_flagsparse_ms",
+    "biv_speedup",
+    "biv_baseline_kind",
+    "biv_baseline_source",
+    "biv_baseline_status",
+)
 
 # Set by main() from --h800-reference; None leaves every report exactly as before.
 _SCALED_BASELINE: dict[str, str] | None = None
+_BIV_BASELINE_POLICY = False
+
+
+def _biv_baseline_status_is_usable(row: dict[str, str], kind: str) -> bool:
+    status_keys = (
+        ("vendor_status", "cusparse_status", "cu_status")
+        if kind == "vendor"
+        else ("pytorch_status", "pt_status")
+    )
+    reason_keys = (
+        ("vendor_reason", "cusparse_reason", "cupy_reason", "vendor_error")
+        if kind == "vendor"
+        else ("pytorch_reason", "pytorch_error")
+    )
+    bad_tokens = ("FAIL", "ERROR", "MISMATCH", "UNAVAILABLE", "NOT FOUND")
+    for key in (*status_keys, *reason_keys):
+        value = str(_row_value(row, key) or "").strip().upper()
+        if value and any(token in value for token in bad_tokens):
+            return False
+    if kind == "pytorch":
+        error = _to_float(_row_value(row, "pytorch_max_error"))
+        if error is not None and error > 1e-2:
+            return False
+    return True
+
+
+def _biv_baseline_candidates(row: dict[str, str]):
+    vendor_columns = {"vendor_ms", "cusparse_ms", "cupy_ms"}
+    pytorch_columns = {"pytorch_ms", "pytorch_api_ms", "torch_ms"}
+    for kind, columns in (("vendor", vendor_columns), ("pytorch", pytorch_columns)):
+        for _, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
+            if base_key is None or latency_key is None:
+                continue
+            if base_key.lower() not in columns:
+                continue
+            baseline = _to_float(_row_value(row, base_key))
+            flagsparse = _to_float(_row_value(row, latency_key))
+            if (
+                baseline is not None
+                and baseline > 0
+                and flagsparse is not None
+                and flagsparse > 0
+                and _biv_baseline_status_is_usable(row, kind)
+            ):
+                yield kind, base_key, latency_key, baseline, flagsparse
+
+
+def _apply_biv_local_baseline(
+    rows: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], dict[str, object]]:
+    info: dict[str, object] = {
+        "policy": "biv",
+        "rows": len(rows),
+        "local_vendor": 0,
+        "local_pytorch": 0,
+        "no_local_baseline": 0,
+    }
+    out = [dict(row) for row in rows]
+    for row in out:
+        for column in _BIV_BASELINE_COLUMNS:
+            row.setdefault(column, "")
+        for column in _BIV_BASELINE_COLUMNS:
+            row[column] = ""
+        if not _performance_row_status_is_usable(row):
+            info["no_local_baseline"] += 1
+            continue
+        candidate = next(_biv_baseline_candidates(row), None)
+        if candidate is None:
+            info["no_local_baseline"] += 1
+            continue
+        kind, base_key, latency_key, baseline, flagsparse = candidate
+        row["biv_baseline_ms"] = repr(baseline)
+        row["biv_flagsparse_ms"] = repr(flagsparse)
+        row["biv_speedup"] = repr(baseline / flagsparse)
+        row["biv_baseline_kind"] = f"local_{kind}"
+        row["biv_baseline_source"] = base_key
+        row["biv_baseline_status"] = "PASS"
+        info[f"local_{kind}"] += 1
+    return out, info
+
+
+def _write_performance_rows(csv_path: Path, rows: list[dict[str, str]]) -> None:
+    fields: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _apply_scaled_baseline(
@@ -2919,9 +3040,17 @@ def _apply_scaled_baseline(
     (tools.baseline_bound.SCALED_COLUMNS), which is what carries the number into
     summary.json / summary.csv through PERFORMANCE_SPEEDUP_SCHEMAS.
     """
+    local_info = None
+    local_changed = False
+    if _BIV_BASELINE_POLICY and rows:
+        original = rows
+        rows, local_info = _apply_biv_local_baseline(rows)
+        local_changed = rows != original
     config = _SCALED_BASELINE
     if not config or not rows:
-        return rows, None
+        if local_changed:
+            _write_performance_rows(csv_path, rows)
+        return rows, local_info
     fields = list(rows[0].keys())
     new_rows, info = _baseline_bound.scaled_baseline_rows(
         op,
@@ -2932,12 +3061,10 @@ def _apply_scaled_baseline(
         reference=config["reference_peaks"],
         needs_baseline=lambda row: not _performance_row_has_complete_speedup(row),
     )
-    if info.get("filled"):
-        header = fields + [c for c in _baseline_bound.SCALED_COLUMNS if c not in fields]
-        with csv_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(new_rows)
+    if local_info is not None:
+        info["local_baseline"] = local_info
+    if info.get("filled") or local_changed:
+        _write_performance_rows(csv_path, new_rows)
     return new_rows, info
 
 
@@ -4780,7 +4907,8 @@ def _configure_scaled_baseline(
     env_info: dict[str, object],
 ) -> None:
     """Resolve --h800-reference / --vendor-card into the module-level setting."""
-    global _SCALED_BASELINE
+    global _SCALED_BASELINE, _BIV_BASELINE_POLICY
+    _BIV_BASELINE_POLICY = getattr(args, "baseline_policy", "legacy") == "biv"
     _SCALED_BASELINE = None
     reference = getattr(args, "h800_reference", None)
     if not reference:
@@ -4936,6 +5064,15 @@ def main(
             default="h800-sxm",
             choices=sorted(_baseline_bound.REFERENCE_PEAKS),
             help="Peak table of the reference card for --h800-reference.",
+        )
+        parser.add_argument(
+            "--baseline-policy",
+            choices=("legacy", "biv"),
+            default=os.environ.get("FLAGSPARSE_BASELINE_POLICY", "legacy"),
+            help=(
+                "Baseline selection policy; biv uses a verified local vendor or "
+                "PyTorch baseline per row before H800 scaling."
+            ),
         )
     parser.add_argument(
         "--timeout",

@@ -41,6 +41,7 @@ SPMV_CSC_OP_NAMES = {
     SPMV_CSC_OP_CONJ_TRANS: "conj",
 }
 _SPMV_CSC_OP_NAME_TO_CODE = {name: code for code, name in SPMV_CSC_OP_NAMES.items()}
+_ILUVATAR_CSC_GATHER_CACHE = TensorPlanCache(maxsize=16)
 
 
 def _spmv_csc_dtype_error_message():
@@ -810,6 +811,39 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
     if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
         raise ValueError("invalid CSC dimensions")
     timed = bool(return_time or return_meta)
+    if (
+        _is_iluvatar_runtime()
+        and data.dtype == torch.float16
+        and not _spmv_csc_op_transposes(op_code)
+    ):
+        from . import _spmv_csr_transpose
+
+        _mixed_spmx._check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"), (x, "x"))
+        if x.numel() != n_cols:
+            raise ValueError("x shape does not match CSC operation")
+        if x.device != data.device or indices.device != data.device or indptr.device != data.device:
+            raise ValueError("CSC inputs must be on the same device")
+        result_dtype, _ = _mixed_spmx._resolve_types(data.dtype, x.dtype, out, out_dtype, False)
+        if out is not None and (out.shape != (n_rows,) or out.device != data.device):
+            raise ValueError("out shape/device must match the CSC SpMV result")
+        sources, options = (indices, indptr), (n_rows, n_cols, data.device)
+        plan = _ILUVATAR_CSC_GATHER_CACHE.get(sources, options)
+        if plan is None:
+            plan = _spmv_csr_transpose.prepare(indices, indptr, (n_cols, n_rows))
+            _ILUVATAR_CSC_GATHER_CACHE.put(sources, options, plan)
+        target = out
+        if target is None and result_dtype != data.dtype:
+            target = torch.empty(n_rows, dtype=result_dtype, device=data.device)
+        t0 = _mixed_spmx._start(timed)
+        y = _spmv_csr_transpose.gather(data, x, plan, n_rows, out=target)
+        y = _mixed_spmx._finish(y, out, t0, timed)
+        if not timed:
+            return y
+        y, elapsed = y
+        if return_meta:
+            meta = {"route": "iluvatar_csc_gather", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     if (_is_rocm_runtime() and not _is_ascend_runtime()
             and data.dtype == torch.float16 and not _spmv_csc_op_transposes(op_code)):
         # CSC(A) is CSR(A.T).  A prepared gather plan computes A @ x by

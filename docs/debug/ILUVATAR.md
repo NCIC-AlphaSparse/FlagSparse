@@ -3,6 +3,9 @@
 `FLAGSPARSE_BACKEND=iluvatar`（通常能自动识别）。环境搭建、交付复现见 [`../ILUVATAR.md`](../ILUVATAR.md)，
 上机排查记录见 [`../ILUVATAR_DEBUG.md`](../ILUVATAR_DEBUG.md)。背景见本目录 [`README.md`](README.md)。
 
+> SELL / COO 的优化任务（瓶颈探针 `tools/biv_spmv_probe.py`、`prepare_spmv_sell` 的 A/B 命令和交给 Codex 的 prompt）
+> 见 [`ILUVATAR_SELL_COO_PLAN.md`](ILUVATAR_SELL_COO_PLAN.md) 第 9 节。
+
 ## 要做的事
 
 环境按 `../ILUVATAR.md` 第 1 节配好后（**一定要显式设 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`，
@@ -162,3 +165,65 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
   `tests/pytest -m spgemm_csr` 11 passed；`tests/ci/test_spgemm_tle_gate.py`（旧代码上失败）。**未在 BI-V150 实测**，
   ESC 在天数上的性能也还没有数。
 - 其他后端是否也需要：否（MUSA、XPU 早已排除）。
+
+### 2026-10-21 src/flagsparse/sparse_operations/sddmm_csr.py::_run_sddmm_prepared
+- 改了什么：仅 BI-V 的 float32、K=32、平均行长 >4，且两个 dense 操作数的 K 维均不连续时，在计算窗口内将输入转为连续布局。每次读取当前输入，不缓存 dense 数值；其余后端和配置保持原路由。
+- 为什么改：`sddmm_csr_f32_int_trans_non_row` 的跨步 gather 很慢；同轮 10 矩阵平均耗时 5.9473 ms，打包后的最终路线为 1.1552 ms。短行 ASIC_680ks / roadNet-TX 的打包试验退化，保留零拷贝路径。complex64 扫参没有稳定收益，未保留其试验改动。
+- 怎么验证：`tests/data` 的 10 个矩阵、warmup=5、iters=20，q4 CPU 参考全部 PASS。5 个 SDDMM q4 变体共 50 行 PASS，调整短行阈值后额外复测受影响的 f32 转置变体 10/10 PASS。新增 prepared 重复调用、输入原地更新、alpha/beta、out 复用和 int32/int64 行指针精度回归。
+- 性能口径：沿用 `results_iluvatar_65_1014_spgemm_f32/sddmm_csr/performance.csv` 的 `h800_scaled_ms`，逐矩阵加速比算术均值约 0.757 → 1.480；7/10 矩阵达到 0.8，cage12/cfd2/wave 仍分别约 0.721/0.480/0.650。这是 H800 带宽折算估计，不是本机厂商基线；尚未重跑全 65 变体 runner。
+- 实测数据：`/tmp/biv_sddmm_layout_all_1021_False.csv`（同轮修改前），`/tmp/biv_sddmm_final_trans_1021.csv`（最终路线），`/tmp/biv_sddmm_final_1021.csv`（阈值调整前 50 行）。
+- 其他后端是否也需要：否，本次仅验证和启用 BI-V。
+
+### 2026-10-21 BI-V 的 COO SpMM f16 与 SDDMM complex64 后续优化
+- 改了什么：`spmm_coo.py::_run_spmm_coo_rowrun_route` 为 BI-V prepared f16 路线使用 8 行、32 列、单 warp 的现有 mixed rows kernel；保留 fp32 稀疏值和重复坐标合并，但 dense B 不再整块转 fp32，kernel 内 fp32 累加并直接写 f16。原子路线和其他后端不变。`sddmm_csr.py::_run_sddmm_prepared` 为 BI-V complex64、K=32 每次打包当前 dense 输入，采用 8/32/1 tile；不缓存计算结果或 dense 数值。
+- 为什么改：COO f16 的 B 升精度、C 降精度和单行 grid 开销较高；complex64 SDDMM 的跨步访存和大 tile 寄存器压力共同限制性能。此次未修改基线或计时窗口，打包成本包括在调用时间内。
+- 怎么验证：最终源代码按 warmup=5、iters=20 在 `tests/data` 的 10 个矩阵上验证 COO c32/f16/i8 和 SDDMM c32/f32-trans 共 50 行，CPU 参考全部 PASS；新增输入原地修改、alpha/beta、out、空行、重复坐标消去、N=0/17/32/65 和 row/col 布局回归，相关 pytest 28 passed。`py_compile` 和 `git diff --check` 通过。
+- 最终加速比（逐矩阵比值算术均值，沿用 10-14 的 H800 带宽折算基线）：COO f16 1.4322，SDDMM c32 0.9693，均超过 0.8。未改路径对照 COO c32 0.6502、COO i8 1.2341；此前优化的 SDDMM f32-trans 1.4525。
+- 原始结果：`/tmp/biv_eight_final_spmm_coo.csv`、`/tmp/biv_eight_final_sddmm_csr.csv`；精度日志 `/tmp/biv_eight_accuracy.log`。尚未全量重跑 65 变体。
+- 未保留的试验：SELL 行/slot tile（32x4、64x4、128x2）、CSR 紧凑重排、compiled launcher、循环流水化均未达到目标，正式 SELL 路径未进一步修改。COO c32 的双行串行累加约 0.781，成对加载与 K 归约 tile 均未超过 0.8，流水化降至约 0.128，未保留。SDDMM 分离实虚平面、沿 nonzero 维向量化、成对加载均不如最终小 tile。
+- 剩余：SELL 的 f32/f16/f16f32/i8i32/c32 五项仍约 0.434/0.408/0.403/0.396/0.393，COO c32 约 0.650，共 6 项未达标；未宣称 8 项全部完成。
+- 其他后端是否也需要：否，所有新分派仅 BI-V。
+
+### 2026-10-22 BI-V SELL 后续调优
+- 改了什么：`spmv_sell.py` 的 BI-V 实数 SELL 路径在 `slice_size <= 32` 时使用 `BLOCK_R=64`，仍保持单 warp；当 slice 数量很大时合并两个 slice。complex64 路径不改。
+- 怎么验证：`tests/test_spmv_sell.py tests/data --dtypes float32,float16,complex64,int8,float16:float32 --slice-size 32 --warmup 5 --iters 20`，10 个矩阵共 50 行全部 PASS；对应日志为 `/tmp/biv_sell_final_1022.log`。
+- 结果：相对 `results_iluvatar_65_1014_rerun/spmv_sell/performance.csv` 的 H800 折算基线，10 矩阵逐矩阵加速比平均为 f32 `0.431`、f16 `0.396`、f16→f32 `0.395`、int8→int32 `0.390`、complex64 `0.402`。仍未达到 `0.8x`，因此没有宣称 SELL 完成。
+- 未保留的试验：slot 并行、CSR 压缩后 row-tile、CSR 轻量 row-tile、complex slot=8 和双 warp 均低于当前实现，已撤回。
+
+### 2026-10-22 BI-V CSR SpMM 转置 f32 后续调优
+- 核对结论：`results_iluvatar_65_1014_spgemm_f32` 是修改前的全量报告，未达标项不止 SELL；后续已单项覆盖 COO f16/c32 和 SDDMM c32/f32-trans。当前继续处理 `spmm_csr_f32_int_trans_non_row`。
+- 改了什么：BI-V 的 CSR SpMM f32 accuracy 路径允许使用现有短行批处理 kernel；只对 f32 放宽精度路线限制，其他 accuracy dtype 仍走原标量 kernel。BI-V 转置 CSR 的 materialized route 仍在 prepared 阶段缓存。
+- 怎么验证：`tests/test_spmm.py tests/data --dtypes float32 --warmup 5 --iters 20`，70 个 q4 行全部 PASS；`spmm_csr_f32_int_trans_non_row` 的 10 矩阵平均加速比由约 `0.591` 提升到约 `0.696`。
+- 当前状态：转置 f32 仍未达到 `0.8x`，后续继续优化该项及其他旧报告中仍低于目标的 CSR/CSC 算子；SELL 五项也仍未完成。
+
+### BI-V mixed-baseline runner
+
+`benchmark_biv.py` is the dedicated 65-variant entry point. It invokes the shared
+`run_flagsparse_pytest.py` runner with the BI-V profile and selects a baseline per
+matrix row: a correctness-passing local vendor sparse-library measurement first,
+then a correctness-passing local PyTorch measurement, and finally the H800
+reference scaled to BI-V. The generated performance CSV carries
+`biv_baseline_kind`/`biv_baseline_source`; `delivery_table.py --show-baseline`
+reports `local_vendor`, `local_pytorch`, `h800_scaled`, or a mixed label.
+
+```bash
+python3 -u benchmark_biv.py --results-dir results_biv_65_$(date +%Y%m%d)
+```
+
+### 2026-10-24 合入 `flagsparse_changes_and_results_20261024`（在 CUDA 机器上合并时补的两处）
+- 合入：天数侧 15 个文件的改动（补丁可干净应用到 `c814047`）、`benchmark_biv.py`、两个天数精度测试。
+  `sweep_spmv_real_complex.py`（根目录的调参草稿，写死 `torch.cuda` 与矩阵路径）**没有合入**。
+- 修了什么（补丁引入，`FLAGSPARSE_BACKEND=iluvatar` 模拟下 15 个用例失败，干净的 main 上为 0）：
+  1. `mixed_spmx.spmv_needs_mixed`：天数 f16 SpMV 一律走 mixed，但 mixed 只支持 `op='non'`，
+     `test_spmv_csr_matches_dense_reference[trans|conj-*-float16-*]` 12 个用例报
+     `NotImplementedError: mixed-precision/int8 paths support op='non' only`。**这 12 个在 10-24 真机结果的 spmv_csr
+     精度里同样是 failed**（交付表看不出，因为不归到任何交付变体）。现在只在 `op='non'`、不转置、未显式指定
+     `alg/config/use_opt` 时启用（新增关键字参数 `op`/`transpose`/`explicit_route`，其他调用方不变）。
+  2. `spmm_csc.flagsparse_spmm_csc` 的天数 CSC→CSR 快速路径：没有检查 B（报错文字和原路由不一致）、
+     绕过了 int64 索引的回退与 `index_fallback_policy="strict"`。现在只在 int32 索引且策略为 `auto` 时启用，
+     并先用 `_validate_spmm_csc_B` 检查 B。交付用 int32，不受影响。
+- 怎么验证的：CUDA 上 13 个交付算子精度 1787 passed；模拟天数 1136 passed（合并前 15 failed）、MACA 1137、MUSA 1068
+  全过；`tests/ci` 468 passed（唯一失败为已知的 `test_installed_wheel`），无 torch 的 CI 模拟、`make pre-commit-check`
+  通过。**未在 BI-V150 上重跑。**
+- 低于 0.8 的 13 个变体的分析与建议见 [`LOW_SPEEDUP.md`](LOW_SPEEDUP.md)。
+- 其他后端是否也需要：否（两处修复都只影响天数分支）。

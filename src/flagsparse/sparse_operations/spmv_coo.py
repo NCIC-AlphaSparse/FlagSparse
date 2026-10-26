@@ -26,6 +26,7 @@ gather routes additionally store row pointers; callers still provide COO arrays.
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
 
+import os
 import time
 from functools import lru_cache
 
@@ -110,7 +111,11 @@ class PreparedCoo:
         "op",
         "transpose",
         "transpose_csr_plan",
+        "transpose_torch_plan",
         "non_csr_plan",
+        "sell_plans",
+        "sell_choices",
+        "sell_times",
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
@@ -149,7 +154,11 @@ class PreparedCoo:
         self.op = _normalize_spmv_coo_op(op, transpose=transpose)
         self.transpose = _spmv_coo_op_transposes(self.op)
         self.transpose_csr_plan = None
+        self.transpose_torch_plan = None
         self.non_csr_plan = None
+        self.sell_plans = {}
+        self.sell_choices = {}
+        self.sell_times = {}
         if self.sort_by_row and self.data_trans.dtype in (
             torch.float32,
             torch.complex64,
@@ -178,6 +187,42 @@ class PreparedCoo:
                 self.non_csr_plan = _spmv_csr_transpose.make_plan(
                     self.col_non, ptr, None, self.n_rows
                 )
+                if _is_iluvatar_runtime():
+                    cols, plan_ptr, order, rows, _lanes, _batch, cache = (
+                        self.non_csr_plan
+                    )
+                    mean = self.nnz / max(1, self.n_rows)
+                    maximum = int((plan_ptr[1:] - plan_ptr[:-1]).max().item()) if self.n_rows else 0
+                    nnz_route = os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ", "auto").lower()
+                    use_nnz = nnz_route == "1" or (
+                        nnz_route == "auto" and mean <= 4.0 and maximum > 128
+                    )
+                    if nnz_route not in ("auto", "0", "1"):
+                        raise ValueError("FLAGSPARSE_ILUVATAR_COO_C32_NNZ must be auto, 0, or 1")
+                    if use_nnz:
+                        row_ids = torch.repeat_interleave(
+                            torch.arange(self.n_rows, device=plan_ptr.device, dtype=torch.int32),
+                            plan_ptr[1:] - plan_ptr[:-1],
+                            output_size=self.nnz,
+                        )
+                        empty = torch.nonzero(plan_ptr[1:] == plan_ptr[:-1]).flatten().to(torch.int32)
+                        self.non_csr_plan = _CooNnzPlan(
+                            self.data_non, cols, plan_ptr, row_ids, empty, self.n_rows,
+                        )
+                    elif mean <= 4.0 and maximum <= 512:
+                        self.non_csr_plan = _CooCsrRowTilePlan(
+                            self.data_non, cols, plan_ptr, self.n_rows, maximum,
+                        )
+                    else:
+                        if mean <= 4.0:
+                            rows = torch.arange(
+                                self.n_rows,
+                                device=plan_ptr.device,
+                                dtype=rows.dtype,
+                            )
+                        self.non_csr_plan = (
+                            cols, plan_ptr, order, rows, 16, 16, cache
+                        )
                 if _is_rocm_runtime():
                     # gfx936's wave64 complex gather is register-pressure
                     # bound at the default 8-lane row tile. Four lanes and a
@@ -187,6 +232,74 @@ class PreparedCoo:
                         self.non_csr_plan
                     )
                     self.non_csr_plan = (cols, plan_ptr, order, rows, 4, 128, cache)
+            elif _is_iluvatar_runtime() and self.data_non.dtype == torch.complex64:
+                counts = torch.bincount(self.row_non.long(), minlength=self.n_rows)
+                ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
+                    self.row_non.dtype
+                )
+                mean = self.nnz / max(1, self.n_rows)
+                maximum = int((ptr[1:] - ptr[:-1]).max().item()) if self.n_rows else 0
+                nnz_route = os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ", "auto").lower()
+                use_nnz = nnz_route == "1" or (
+                    nnz_route == "auto" and mean <= 4.0 and maximum > 128
+                )
+                if nnz_route not in ("auto", "0", "1"):
+                    raise ValueError("FLAGSPARSE_ILUVATAR_COO_C32_NNZ must be auto, 0, or 1")
+                if use_nnz:
+                    row_ids = torch.repeat_interleave(
+                        torch.arange(self.n_rows, device=ptr.device, dtype=torch.int32),
+                        ptr[1:] - ptr[:-1],
+                        output_size=self.nnz,
+                    )
+                    empty = torch.nonzero(ptr[1:] == ptr[:-1]).flatten().to(torch.int32)
+                    self.non_csr_plan = _CooNnzPlan(
+                        self.data_non, self.col_non, ptr, row_ids, empty, self.n_rows,
+                    )
+                elif mean <= 4.0 and maximum <= 512:
+                    self.non_csr_plan = _CooCsrRowTilePlan(
+                        self.data_non, self.col_non, ptr, self.n_rows, maximum,
+                    )
+                else:
+                    plan = _spmv_csr_transpose.make_plan(
+                        self.col_non, ptr, None, self.n_rows
+                    )
+                    cols, plan_ptr, order, rows, _lanes, _batch, cache = plan
+                    if mean <= 4.0:
+                        rows = torch.arange(
+                            self.n_rows,
+                            device=plan_ptr.device,
+                            dtype=rows.dtype,
+                        )
+                    self.non_csr_plan = (
+                        cols, plan_ptr, order, rows, 16, 16, cache
+                    )
+            if (
+                _is_iluvatar_runtime()
+                and self.transpose
+                and self.data_trans.dtype == torch.float32
+                and self.sort_by_row
+            ):
+                scatter_route = os.environ.get(
+                    "FLAGSPARSE_ILUVATAR_COO_TRANS_TORCH", "auto"
+                ).strip().lower()
+                if scatter_route not in ("auto", "0", "1"):
+                    raise ValueError(
+                        "FLAGSPARSE_ILUVATAR_COO_TRANS_TORCH must be auto, 0, or 1"
+                    )
+                trans_lengths = torch.bincount(
+                    self.row_trans.long(), minlength=self.n_cols
+                )
+                mean = self.nnz / max(1, self.n_cols)
+                maximum = int(trans_lengths.max().item()) if self.n_cols else 0
+                use_scatter = scatter_route == "1" or (
+                    scatter_route == "auto" and mean <= 4.0 and maximum > 128
+                )
+                if use_scatter:
+                    self.transpose_torch_plan = _CooTorchScatterPlan(
+                        self.row_trans.to(torch.int64).contiguous(),
+                        self.col_trans.to(torch.int64).contiguous(),
+                        self.n_cols,
+                    )
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -246,6 +359,196 @@ class _PreparedCooLaunch:
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
         self.csr_plan = csr_plan
+
+
+class _CooCsrRowTilePlan:
+    __slots__ = ("data", "cols", "ptr", "n_rows", "max_row_nnz")
+
+    def __init__(self, data, cols, ptr, n_rows, max_row_nnz):
+        self.data = data
+        self.cols = cols
+        self.ptr = ptr
+        self.n_rows = int(n_rows)
+        self.max_row_nnz = int(max_row_nnz)
+
+
+class _CooNnzPlan:
+    __slots__ = ("data", "cols", "ptr", "rows", "empty", "n_rows")
+
+    def __init__(self, data, cols, ptr, rows, empty, n_rows):
+        self.data = data
+        self.cols = cols
+        self.ptr = ptr
+        self.rows = rows
+        self.empty = empty
+        self.n_rows = int(n_rows)
+
+
+class _CooTorchScatterPlan:
+    __slots__ = ("rows", "cols", "n_rows")
+
+    def __init__(self, rows, cols, n_rows):
+        self.rows = rows
+        self.cols = cols
+        self.n_rows = int(n_rows)
+
+
+def _iluvatar_coo_sell_mode():
+    mode = os.environ.get("FLAGSPARSE_ILUVATAR_COO_SELL", "auto").strip().lower()
+    if mode not in ("auto", "0", "1"):
+        raise ValueError("FLAGSPARSE_ILUVATAR_COO_SELL must be auto, 0, or 1")
+    return mode
+
+
+def _benchmark_coo_sell_candidate(fn):
+    for _ in range(2):
+        fn()
+    _ACCEL.synchronize()
+    start = _ACCEL.Event(enable_timing=True)
+    end = _ACCEL.Event(enable_timing=True)
+    start.record()
+    for _ in range(5):
+        fn()
+    end.record()
+    _ACCEL.synchronize()
+    return start.elapsed_time(end) / 5.0
+
+
+class _CooSellPlan:
+    """The SELL-C-sigma plan a prepared Iluvatar f16 / int8 COO runs on.
+
+    With ``sort_by_row=False`` ``data_non`` is the caller's tensor; the existing path
+    reads it on every call, so an in-place value update is re-encoded here too.
+    """
+
+    __slots__ = ("sell", "plan", "data", "order", "cols", "ptr", "n_rows", "version")
+
+    def __init__(self, sell, plan, data, order, cols, ptr, n_rows):
+        self.sell, self.plan, self.data, self.order = sell, plan, data, order
+        self.cols, self.ptr, self.n_rows = cols, ptr, n_rows
+        self.version = _coo_tensor_version(data)
+
+    def run(self, x, out, return_time):
+        version = _coo_tensor_version(self.data)
+        if version != self.version:
+            data = self.data if self.order is None else self.data.index_select(0, self.order)
+            values, _, _ = self.sell.csr_to_sell(
+                data.contiguous(), self.cols, self.ptr, self.n_rows, 32, index_dtype=torch.int32
+            )
+            self.plan.values.copy_(values)  # the plan refreshes on its next run
+            self.version = version
+        return self.sell.spmv_sell_prepared(self.plan, x, out=out, return_time=return_time)
+
+
+def _coo_tensor_version(t):
+    try:
+        return t._version
+    except RuntimeError:  # inference tensors carry no version counter
+        return None
+
+
+def _prepare_iluvatar_coo_sell(prepared):
+    """Prepare-time choice between the existing f16 / int8 path and SELL-C-sigma.
+
+    On BI-V150 the SELL kernel wins on most delivery matrices but loses up to 0.62x
+    on others (ASIC_680ks, roadNet-TX, NACA0015, filter3D) that row-length
+    statistics do not separate, so each output dtype is timed here, as cuSPARSE's
+    analysis step would. SELL needs a 5% win; between K=2 and K=4 the smaller K is
+    kept unless K=4 is 3% faster.
+    """
+    if not _is_iluvatar_runtime() or prepared.op != SPMV_COO_OP_NON:
+        return
+    if prepared.data_non.dtype not in (torch.float16, torch.int8):
+        return
+    mode = _iluvatar_coo_sell_mode()
+    if mode == "0" or not prepared.nnz or not prepared.n_rows:
+        return
+
+    from . import spmv_sell as _spmv_sell
+
+    output_dtypes = (
+        (torch.float16, torch.float32)
+        if prepared.data_non.dtype == torch.float16
+        else (torch.int32, torch.float32)
+    )
+    rows = prepared.row_non.to(torch.int64)
+    order = None
+    # sort_by_row=False keeps the caller's entry order; CSR needs the rows grouped.
+    if not prepared.sort_by_row and rows.numel() > 1 and not bool(torch.all(rows[1:] >= rows[:-1]).item()):
+        order = torch.argsort(rows, stable=True)
+    data = prepared.data_non if order is None else prepared.data_non.index_select(0, order)
+    cols = prepared.col_non if order is None else prepared.col_non.index_select(0, order)
+    cols = cols.to(torch.int32).contiguous()
+    counts = torch.bincount(rows, minlength=prepared.n_rows)
+    ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32)
+    sell_values, sell_cols, sell_offsets = _spmv_sell.csr_to_sell(
+        data.contiguous(), cols, ptr, prepared.n_rows, 32, index_dtype=torch.int32
+    )
+    # One re-encoding; every (out dtype, K) candidate shares its layout.
+    base = _spmv_sell.prepare_spmv_sell(
+        sell_values, sell_cols, sell_offsets, prepared.shape, slice_size=32,
+        out_dtype=output_dtypes[0], route="sigma", c=32, group=1, num_warps=1, k=1,
+    )
+    if mode == "1":
+        forced = os.environ.get("FLAGSPARSE_SELL_PREP_K", "")
+        candidate_ks = (int(forced) if forced else 4,)
+    else:
+        candidate_ks = (2, 4)
+
+    x = torch.ones(prepared.n_cols, dtype=prepared.data_non.dtype, device=prepared.data_non.device)
+    for output_dtype in output_dtypes:
+        plans = {
+            k: _spmv_sell._sell_plan_variant(base, k=k, out_dtype=output_dtype)
+            for k in candidate_ks
+        }
+        if mode == "1":
+            choice = f"sell_k{candidate_ks[0]}"
+            times = {}
+        else:
+            y = torch.empty(prepared.n_rows, dtype=output_dtype, device=prepared.data_non.device)
+
+            def existing(output_dtype=output_dtype, y=y):
+                return _mixed_spmx.spmv_coo_mixed(
+                    prepared.data_non, prepared.row_non, prepared.col_non, x,
+                    prepared.shape, out=y, out_dtype=output_dtype,
+                )
+
+            times = {"existing": _benchmark_coo_sell_candidate(existing)}
+            for k, plan in plans.items():
+                times[f"sell_k{k}"] = _benchmark_coo_sell_candidate(
+                    lambda plan=plan, y=y: _spmv_sell.spmv_sell_prepared(plan, x, out=y)
+                )
+            choice = "sell_k2" if times["sell_k2"] <= times["sell_k4"] * 1.03 else "sell_k4"
+            if times[choice] >= times["existing"] * 0.95:
+                choice = "existing"
+        prepared.sell_choices[output_dtype] = choice
+        prepared.sell_times[output_dtype] = times
+        if choice != "existing":
+            # Keep only the chosen plan: the others would hold the layout's memory.
+            prepared.sell_plans[output_dtype] = _CooSellPlan(
+                _spmv_sell, plans[int(choice.rsplit("k", 1)[1])], prepared.data_non, order,
+                cols, ptr, prepared.n_rows,
+            )
+
+
+def _iluvatar_coo_c32_row_tile(nnz, n_rows, max_row_nnz=0):
+    mean = nnz / max(1, n_rows)
+    if mean <= 4.0:
+        if max_row_nnz > 128:
+            rows, block, stages = 16, 8, 2
+        else:
+            rows, block, stages = 32, 2, 1
+    elif mean <= 8.0:
+        rows, block, stages = 8, 8, 2
+    elif mean <= 16.0:
+        rows, block, stages = 8, 16, 2
+    else:
+        rows, block, stages = 4, 16, 2
+    rows = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_ROWS", rows)))
+    block = max(1, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_BLOCK", block)))
+    warps = max(1, min(8, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_WARPS", 1))))
+    stages = max(1, min(3, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_STAGES", stages))))
+    return rows, block, warps, stages
 
 
 @triton.jit
@@ -564,7 +867,12 @@ def _prepare_coo_tensors(data, row, col, shape, sort_by_row):
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.numel() != row.numel() or data.numel() != col.numel():
         raise ValueError("data, row, col must have the same length")
-    if data.dtype not in SUPPORTED_SPMV_COO_VALUE_DTYPES:
+    prepare_value_dtypes = SUPPORTED_SPMV_COO_VALUE_DTYPES + (
+        torch.float16,
+        torch.bfloat16,
+        torch.int8,
+    )
+    if data.dtype not in prepare_value_dtypes:
         raise TypeError(_spmv_coo_dtype_error_message())
     if row.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("row dtype must be torch.int32 or torch.int64")
@@ -624,7 +932,7 @@ def prepare_spmv_coo(
         row_trans = col_non
         col_trans = row_non
         seg_trans = None
-    return PreparedCoo(
+    prepared = PreparedCoo(
         data_non,
         row_non,
         col_non,
@@ -639,6 +947,8 @@ def prepare_spmv_coo(
         op=op_code,
         index_fallback_policy=index_fallback_policy,
     )
+    _prepare_iluvatar_coo_sell(prepared)
+    return prepared
 
 
 def _prepare_spmv_coo_launch_from_raw(
@@ -730,7 +1040,11 @@ def _resolve_spmv_coo_launch(prepared, op):
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=prepared.index_fallback_applied,
         index_fallback_reason=prepared.index_fallback_reason,
-        csr_plan=prepared.transpose_csr_plan,
+        csr_plan=(
+            prepared.transpose_torch_plan
+            if prepared.transpose_torch_plan is not None
+            else prepared.transpose_csr_plan
+        ),
     )
 
 
@@ -752,6 +1066,65 @@ def _validate_x_coo(x, prepared):
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     if prepared.csr_plan is not None:
+        if isinstance(prepared.csr_plan, _CooTorchScatterPlan):
+            plan = prepared.csr_plan
+            y = torch.zeros(
+                plan.n_rows, dtype=prepared.data.dtype, device=prepared.data.device
+            )
+            if prepared.nnz:
+                product = prepared.data * x.index_select(0, plan.cols)
+                y.scatter_add_(0, plan.rows, product)
+            return y
+        if isinstance(prepared.csr_plan, _CooNnzPlan):
+            from ._spmv_csr_nnz import _complex_nnz_kernel
+
+            plan = prepared.csr_plan
+            block = max(32, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ_BLOCK", "128")))
+            warps = max(1, min(8, int(os.environ.get("FLAGSPARSE_ILUVATAR_COO_C32_NNZ_WARPS", "1"))))
+            y = torch.empty(plan.n_rows, dtype=prepared.data.dtype, device=prepared.data.device)
+            _complex_nnz_kernel[(triton.cdiv(max(plan.data.numel(), plan.empty.numel()), block),)](
+                torch.view_as_real(plan.data).reshape(-1),
+                plan.cols,
+                plan.ptr,
+                plan.rows,
+                torch.view_as_real(x),
+                torch.view_as_real(y),
+                plan.empty,
+                plan.empty.numel(),
+                plan.data.numel(),
+                block,
+                num_warps=warps,
+            )
+            return y
+        if isinstance(prepared.csr_plan, _CooCsrRowTilePlan):
+            from .spmv_csr import _spmv_csr_complex_row_tile_kernel
+
+            rows_per, block_nnz, num_warps, num_stages = _iluvatar_coo_c32_row_tile(
+                prepared.csr_plan.data.numel(),
+                prepared.csr_plan.n_rows,
+                prepared.csr_plan.max_row_nnz,
+            )
+            y = torch.empty(
+                prepared.n_rows,
+                dtype=prepared.data.dtype,
+                device=prepared.data.device,
+            )
+            y_ri = torch.view_as_real(y).reshape(-1)
+            _spmv_csr_complex_row_tile_kernel[
+                (triton.cdiv(prepared.n_rows, rows_per),)
+            ](
+                torch.view_as_real(prepared.csr_plan.data).reshape(-1),
+                prepared.csr_plan.cols,
+                prepared.csr_plan.ptr,
+                torch.view_as_real(x).reshape(-1),
+                y_ri,
+                prepared.n_rows,
+                ROWS=rows_per,
+                BLOCK_NNZ=block_nnz,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            return y
         from . import _spmv_csr_transpose
 
         return _spmv_csr_transpose.gather(
@@ -1033,6 +1406,36 @@ def flagsparse_spmv_coo(
     float16 / bfloat16 / int8 matrices and widened outputs (``out_dtype`` or
     ``out.dtype``: half -> float32, int8 -> int32 / float32) run in ``mixed_spmx``.
     """
+    if prepared is not None and torch.is_tensor(x):
+        mixed_data = prepared.data_non
+        if _mixed_spmx.spmv_needs_mixed(
+            mixed_data.dtype, x.dtype, out, out_dtype, coo=True
+        ):
+            transpose_flag = False if transpose is None else bool(transpose)
+            op_code = _normalize_spmv_coo_op(
+                op if op is not None else prepared.op,
+                transpose=transpose_flag if op is None else False,
+            )
+            if _is_iluvatar_runtime() and op_code == SPMV_COO_OP_NON:
+                result_dtype, _ = _mixed_spmx._resolve_types(
+                    mixed_data.dtype, x.dtype, out, out_dtype, False
+                )
+                plan = prepared.sell_plans.get(result_dtype)
+                if plan is not None:
+                    return plan.run(x, out, return_time)
+            launch = _resolve_spmv_coo_launch(prepared, op_code)
+            return _mixed_spmx.spmv_coo_mixed(
+                launch.data,
+                launch.row,
+                launch.col,
+                x,
+                launch.shape,
+                op=None,
+                transpose=False,
+                out=out,
+                out_dtype=out_dtype,
+                return_time=return_time,
+            )
     if (
         prepared is None
         and torch.is_tensor(data)

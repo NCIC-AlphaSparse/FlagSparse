@@ -116,6 +116,8 @@ class PreparedCsrSpmv:
         "transpose",
         "transpose_plan",
         "non_gather_plan",
+        "iluvatar_c32_nnz_plan",
+        "iluvatar_f32_row_tile",
         "op",
         "index_fallback_policy",
         "index_fallback_applied",
@@ -169,6 +171,8 @@ class PreparedCsrSpmv:
         self.transpose = _spmv_op_transposes(self.op)
         self.transpose_plan = None
         self.non_gather_plan = None
+        self.iluvatar_c32_nnz_plan = None
+        self.iluvatar_f32_row_tile = None
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
         self.index_fallback_reason = index_fallback_reason
@@ -452,6 +456,64 @@ def _spmv_csr_complex_kernel(
         out_im = out_im + beta_re * prev_im + beta_im * prev_re
     tl.store(y_ri_ptr + row * 2, out_re)
     tl.store(y_ri_ptr + row * 2 + 1, out_im)
+
+
+@triton.jit
+def _spmv_csr_complex_row_tile_kernel(
+    data_ri_ptr,
+    indices_ptr,
+    indptr_ptr,
+    x_ri_ptr,
+    y_ri_ptr,
+    n_rows,
+    ROWS: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
+):
+    """Compute several CSR rows per program using interleaved complex values."""
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    row_mask = rows < n_rows
+    starts = tl.load(indptr_ptr + rows, mask=row_mask, other=0).to(tl.int64)
+    ends = tl.load(indptr_ptr + rows + 1, mask=row_mask, other=0).to(tl.int64)
+    max_length = tl.max(ends - starts, axis=0)
+    lanes = tl.arange(0, BLOCK_NNZ)
+    acc_re = tl.zeros((ROWS, BLOCK_NNZ), dtype=tl.float32)
+    acc_im = tl.zeros((ROWS, BLOCK_NNZ), dtype=tl.float32)
+    for offset in range(0, max_length, BLOCK_NNZ):
+        positions = starts[:, None] + offset + lanes[None, :]
+        valid = row_mask[:, None] & (positions < ends[:, None])
+        columns = tl.load(
+            indices_ptr + positions, mask=valid, other=0, cache_modifier=".cg"
+        ).to(tl.int64)
+        value_re = tl.load(
+            data_ri_ptr + positions * 2,
+            mask=valid,
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        value_im = tl.load(
+            data_ri_ptr + positions * 2 + 1,
+            mask=valid,
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        vector_re = tl.load(
+            x_ri_ptr + columns * 2,
+            mask=valid,
+            other=0.0,
+            cache_modifier=".ca",
+        ).to(tl.float32)
+        vector_im = tl.load(
+            x_ri_ptr + columns * 2 + 1,
+            mask=valid,
+            other=0.0,
+            cache_modifier=".ca",
+        ).to(tl.float32)
+        acc_re += value_re * vector_re - value_im * vector_im
+        acc_im += value_re * vector_im + value_im * vector_re
+    result_re = tl.sum(acc_re, axis=1)
+    result_im = tl.sum(acc_im, axis=1)
+    tl.store(y_ri_ptr + rows * 2, result_re, mask=row_mask)
+    tl.store(y_ri_ptr + rows * 2 + 1, result_im, mask=row_mask)
 
 
 # ── Optimised SpMV (CSR-Vector, perf-oriented, no CuPy) ─────────────
@@ -980,6 +1042,34 @@ def _validate_spmv_x(x, prepared):
     return x
 
 
+def _iluvatar_f32_row_tile_config(max_row_nnz):
+    """Read the BI-V f32 row-tile route once per prepare: (R, V, warps, stages, steps) or None."""
+    route = os.environ.get("FLAGSPARSE_ILUVATAR_SPMV_F32_ROUTE", "row_tile").strip().lower()
+    if route not in ("row_tile", "rowtile"):
+        return None
+
+    def _positive_env(name, default):
+        value = int(os.environ.get(name, str(default)))
+        if value <= 0 or value & (value - 1):
+            raise ValueError(f"{name} must be a positive power of two")
+        return value
+
+    rows = _positive_env("FLAGSPARSE_ILUVATAR_F32_ROWS", 16)
+    lanes = _positive_env("FLAGSPARSE_ILUVATAR_F32_LANES", 8)
+    warps = _positive_env("FLAGSPARSE_ILUVATAR_F32_WARPS", 1)
+    stages = int(os.environ.get("FLAGSPARSE_ILUVATAR_F32_STAGES", "1"))
+    if stages <= 0:
+        raise ValueError("FLAGSPARSE_ILUVATAR_F32_STAGES must be positive")
+    if lanes > 32:
+        raise ValueError("FLAGSPARSE_ILUVATAR_F32_LANES must be <= 32")
+    fixed_steps = 0
+    if max_row_nnz <= lanes:
+        fixed_steps = 1
+    elif max_row_nnz <= 2 * lanes:
+        fixed_steps = 2
+    return rows, lanes, warps, stages, fixed_steps
+
+
 def prepare_spmv_csr(
     data,
     indices,
@@ -1047,6 +1137,13 @@ def prepare_spmv_csr(
         index_fallback_policy=index_fallback_policy,
     )
     prepared = _configure_spmv_route(prepared, requested_alg, config)
+    if (
+        _is_iluvatar_runtime()
+        and prepared.data.dtype == torch.float32
+        and not prepared.transpose
+        and prepared.alg_requested == "auto"
+    ):
+        prepared.iluvatar_f32_row_tile = _iluvatar_f32_row_tile_config(prepared.max_row_nnz)
     if _spmv_transpose_scatter_enabled(prepared):
         from . import _spmv_csr_transpose
         prepared.transpose_plan = _spmv_csr_transpose.prepare(
@@ -1058,12 +1155,64 @@ def prepare_spmv_csr(
     elif (not transpose and requested_alg == "auto" and config is None
           and data.dtype in (torch.float16, torch.complex64)
           and (_backend_name() == "cuda" or
+               (_is_iluvatar_runtime() and data.dtype in (torch.float16, torch.complex64)) or
                (_is_mthreads_runtime() and data.dtype == torch.float16) or
                (_is_maca_runtime() and
                 (data.dtype == torch.float16 or data.numel() > 4 * n_rows)))):
         from . import _spmv_csr_transpose
-        prepared.non_gather_plan = _spmv_csr_transpose.make_plan(
+        plan = _spmv_csr_transpose.make_plan(
             kernel_indices, kernel_indptr, None, n_rows)
+        if (
+            _is_iluvatar_runtime()
+            and data.dtype == torch.complex64
+            and data.numel() / max(1, n_rows) <= 4.0
+        ):
+            plan = (
+                plan[0],
+                plan[1],
+                plan[2],
+                torch.arange(n_rows, device=kernel_indices.device, dtype=plan[3].dtype),
+                *plan[4:],
+            )
+        if _is_iluvatar_runtime() and data.dtype == torch.complex64:
+            cache = plan[6]
+            try:
+                split_version = data._version
+            except RuntimeError:
+                split_version = None
+            cache.update(
+                split_source=data,
+                split_version=split_version,
+                split_real=data.real.contiguous(),
+                split_imag=data.imag.contiguous(),
+            )
+        prepared.non_gather_plan = plan
+        if _is_iluvatar_runtime() and data.dtype == torch.complex64:
+            nnz_route = os.environ.get(
+                "FLAGSPARSE_SPMV_CSR_COMPLEX_NNZ", "auto"
+            ).strip().lower()
+            if nnz_route not in ("auto", "0", "1"):
+                raise ValueError(
+                    "FLAGSPARSE_SPMV_CSR_COMPLEX_NNZ must be auto, 0, or 1"
+                )
+            mean_nnz = data.numel() / max(1, n_rows)
+            maximum = max_row_nnz
+            use_nnz = nnz_route == "1" or (
+                nnz_route == "auto" and mean_nnz <= 4.0 and maximum > 128
+            )
+            if use_nnz:
+                row_ids = torch.repeat_interleave(
+                    torch.arange(
+                        n_rows, device=kernel_indptr.device, dtype=torch.int32
+                    ),
+                    row_lengths,
+                    output_size=data.numel(),
+                )
+                empty = torch.nonzero(row_lengths == 0).flatten().to(torch.int32)
+                prepared.iluvatar_c32_nnz_plan = (
+                    row_ids.contiguous(),
+                    empty.contiguous(),
+                )
     return prepared
 
 
@@ -1273,6 +1422,38 @@ def _triton_spmv_csr_impl_prepared(prepared, x, out=None):
         prepared.alg is None and _spmv_csr_default_backend() == "rowpar"
     ):
         return _triton_spmv_csr_impl_rowpar(prepared, x, compute_dtype, out=out)
+    row_tile = prepared.iluvatar_f32_row_tile
+    if row_tile is not None and prepared.alg_requested == "auto":
+        from ._spmv_csr_kernels import row_tile_real_kernel
+
+        rows, lanes, warps, stages, fixed_steps = row_tile
+        y_out = (
+            out
+            if out is not None and out.dtype == torch.float32
+            else torch.empty(prepared.n_rows, dtype=torch.float32, device=device)
+        )
+        row_tile_real_kernel[(triton.cdiv(prepared.n_rows, rows),)](
+            prepared.data,
+            prepared.kernel_indices,
+            prepared.kernel_indptr,
+            x,
+            y_out,
+            prepared.kernel_indptr,
+            prepared.n_rows,
+            INDEXED=False,
+            R=rows,
+            V=lanes,
+            STAGES=stages,
+            ACC=tl.float32,
+            POSITION_64=prepared.kernel_indptr.dtype != torch.int32,
+            FIXED_STEPS=fixed_steps,
+            num_warps=warps,
+            enable_fp_fusion=True,
+        )
+        if out is not None and y_out is not out:
+            out.copy_(y_out)
+            return out
+        return y_out
     # Fast path: preprocessing-free, load-balanced segmented nnz-split. Real dtype
     # only; native fp32/fp64 accumulation (fp16/bf16 accumulate in fp32). No
     # per-nonzero row-id or long-row metadata is needed — the row is found by an
@@ -1312,7 +1493,10 @@ def _triton_spmv_csr_impl_prepared(prepared, x, out=None):
                 out.copy_(y_out)
             return out
         return y_out if acc_dtype == dtype else y_out.to(dtype)
-    # Complex path: same preprocessing-free segmented nnz-split on interleaved
+    # Complex path: use a row-tiled launch for regular short/medium rows on
+    # Iluvatar.  The feature gate is deliberately structural: highly skewed
+    # matrices retain segbin because one long row would otherwise make every
+    # row in its tile execute the long-row loop.
     # real/imag values, accumulating in native component precision (fp32 for
     # complex64, fp64 for complex128). complex64 therefore carries standard fp32
     # SpMV error, like the real fp32 path.
@@ -1320,6 +1504,56 @@ def _triton_spmv_csr_impl_prepared(prepared, x, out=None):
     x_ri = torch.view_as_real(x.contiguous()).reshape(-1)
     comp_dtype = data_ri.dtype
     nnz = int(prepared.data.numel())
+    if (
+        _is_iluvatar_runtime()
+        and comp_dtype == torch.float32
+        and not prepared.transpose
+        and nnz > 0
+    ):
+        mean_row_nnz = nnz / max(1, prepared.n_rows)
+        max_row_nnz = max(1, int(prepared.max_row_nnz))
+        route_override = os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto")
+        use_row_tile = route_override == "row_tile" or (
+            route_override == "auto"
+            and mean_row_nnz <= 32.0
+            and max_row_nnz <= 512
+        )
+        if route_override not in ("auto", "row_tile", "segbin"):
+            raise ValueError(
+                "FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE must be 'auto', 'row_tile', or 'segbin'"
+            )
+        if use_row_tile:
+            if mean_row_nnz <= 4.0:
+                rows_per, block_nnz = 32, 4
+            elif mean_row_nnz <= 8.0:
+                rows_per, block_nnz = 8, 8
+            elif mean_row_nnz <= 16.0:
+                rows_per, block_nnz = 8, 16
+            else:
+                rows_per, block_nnz = 4, 16
+            grid = (triton.cdiv(prepared.n_rows, rows_per),)
+            y_ri = (
+                torch.view_as_real(out).reshape(-1).zero_()
+                if out is not None
+                else torch.zeros(
+                    prepared.n_rows * 2, dtype=comp_dtype, device=device
+                )
+            )
+            _spmv_csr_complex_row_tile_kernel[grid](
+                data_ri,
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                x_ri,
+                y_ri,
+                prepared.n_rows,
+                ROWS=rows_per,
+                BLOCK_NNZ=block_nnz,
+                num_warps=1,
+                num_stages=2,
+            )
+            return out if out is not None else torch.view_as_complex(
+                y_ri.reshape(prepared.n_rows, 2)
+            )
     y_ri = (
         torch.view_as_real(out).reshape(-1).zero_()
         if out is not None
@@ -1423,6 +1657,8 @@ def _spmv_prepared_with_int32_indices(prepared, reason):
         result.non_gather_plan = _spmv_csr_transpose.make_plan(kernel_indices, kernel_indptr, None, prepared.n_rows)
     if _is_rocm_runtime():
         result.rocm_nnz_plan = prepared.rocm_nnz_plan
+    result.iluvatar_c32_nnz_plan = prepared.iluvatar_c32_nnz_plan
+    result.iluvatar_f32_row_tile = prepared.iluvatar_f32_row_tile
     return result
 
 
@@ -1715,7 +1951,84 @@ def _spmv_execution_matrix(prepared):
 
 
 def _execute_spmv_route(prepared, x, out=None, timing=False):
-    if prepared.non_gather_plan is not None and prepared.alg_requested == "auto":
+    complex_short_rows = (
+        _is_iluvatar_runtime()
+        and prepared.data.dtype == torch.complex64
+        and prepared.data.numel() / max(1, prepared.n_rows) <= 3.0
+        and prepared.max_row_nnz <= 16
+    )
+    complex_nnz_plan = getattr(prepared, "iluvatar_c32_nnz_plan", None)
+    complex_route = os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto")
+    if (
+        complex_nnz_plan is not None
+        and prepared.alg_requested == "auto"
+        and complex_route == "auto"
+    ):
+        from ._spmv_csr_nnz import _complex_nnz_kernel
+
+        row_ids, empty = complex_nnz_plan
+        result = out if out is not None and out.is_contiguous() else torch.empty(
+            prepared.n_rows, dtype=prepared.data.dtype, device=prepared.data.device
+        )
+        data_ri = torch.view_as_real(prepared.data).reshape(-1)
+        x_ri = torch.view_as_real(x.contiguous())
+        y_ri = torch.view_as_real(result).reshape(-1)
+        block = max(
+            32,
+            int(os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_NNZ_BLOCK", "128")),
+        )
+        warps = max(
+            1,
+            min(
+                8,
+                int(os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_NNZ_WARPS", "1")),
+            ),
+        )
+        nnz = prepared.data.numel()
+        grid = (triton.cdiv(max(nnz, empty.numel()), block),)
+
+        def run_kernel():
+            _complex_nnz_kernel[grid](
+                data_ri,
+                prepared.kernel_indices,
+                prepared.kernel_indptr,
+                row_ids,
+                x_ri,
+                y_ri,
+                empty,
+                empty.numel(),
+                nnz,
+                block,
+                num_warps=warps,
+            )
+            return result
+
+        result, compute_ms = _spmv_phase(run_kernel, timing)
+        if result is not out and out is not None:
+            out.copy_(result)
+            result = out
+        return result, {
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": compute_ms,
+            "execution_indices_dtype": str(prepared.kernel_indices.dtype).removeprefix("torch."),
+            "execution_indptr_dtype": str(prepared.kernel_indptr.dtype).removeprefix("torch."),
+        }
+    if (
+        prepared.non_gather_plan is not None
+        and prepared.alg_requested == "auto"
+        and not (
+            _is_iluvatar_runtime()
+            and prepared.data.dtype == torch.complex64
+            and (
+                os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE") == "row_tile"
+                or (
+                    os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto") == "auto"
+                    and complex_short_rows
+                )
+            )
+        )
+    ):
         from . import _spmv_csr_transpose
         y, compute_ms = _spmv_phase(
             lambda: _spmv_csr_transpose.gather(prepared.data, x, prepared.non_gather_plan,
@@ -1874,11 +2187,22 @@ def flagsparse_spmv_csr_run(
         spec = get_spmv_csr_algorithm_spec(actual.alg)
         compute_dtype = _csr_config.compute_dtype(actual.alg, actual.data.dtype)
         scatter = _spmv_transpose_scatter_enabled(actual)
-        non_gather = actual.non_gather_plan is not None and actual.alg_requested == "auto"
+        nnz_balanced = (
+            getattr(actual, "iluvatar_c32_nnz_plan", None) is not None
+            and actual.alg_requested == "auto"
+            and os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto") == "auto"
+        )
+        non_gather = (
+            actual.non_gather_plan is not None
+            and actual.alg_requested == "auto"
+            and not nnz_balanced
+        )
         if scatter:
             compute_dtype = str(actual.data.dtype).removeprefix("torch.")
         if non_gather:
             compute_dtype = "complex64" if actual.data.is_complex() else "float32"
+        if nnz_balanced:
+            compute_dtype = "complex64"
         if _is_rocm_runtime() and actual.rocm_nnz_plan is not None:
             compute_dtype = str(actual.data.dtype).removeprefix("torch.")
         ms = phases["process_cpu_ms"] + gpu_ms
@@ -1886,8 +2210,8 @@ def flagsparse_spmv_csr_run(
             "alg_requested": prepared.alg_requested,
             "alg_resolved": actual.alg,
             "alg": actual.alg,
-            "implementation": "transpose_gather" if scatter else "batched_gather" if non_gather else actual.alg,
-            "implementation_version": "1" if scatter or non_gather else spec["implementation_version"],
+            "implementation": "transpose_gather" if scatter else "nnz_balanced" if nnz_balanced else "batched_gather" if non_gather else actual.alg,
+            "implementation_version": "1" if scatter or non_gather or nnz_balanced else spec["implementation_version"],
             "config": deepcopy(actual.config),
             "config_source": actual.config_source,
             "config_rejections": deepcopy(actual.config_rejections),
@@ -1927,6 +2251,14 @@ def flagsparse_spmv_csr_run(
                 nnz_prepare_ms=actual.rocm_nnz_plan["prepare_ms"],
                 nnz_metadata_bytes=actual.rocm_nnz_plan["metadata_bytes"],
             )
+        if nnz_balanced:
+            meta["execution_kernel"] = "iluvatar_c32_nnz_balanced"
+        if (
+            getattr(actual, "iluvatar_f32_row_tile", None) is not None
+            and actual.alg_requested == "auto"
+        ):
+            meta["execution_kernel"] = "iluvatar_f32_row_tile"
+            meta["implementation"] = "iluvatar_f32_row_tile"
         if return_meta:
             return (y, ms, meta) if return_time else (y, meta)
         return (y, ms) if return_time else y
@@ -1960,11 +2292,29 @@ def flagsparse_spmv_csr(
     bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
     ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
     """
+    if isinstance(prepared, _mixed_spmx.PreparedCsrMixedSpmv):
+        if any(value is not None for value in (data, indices, indptr, shape)):
+            raise ValueError("prepared mixed CSR calls must not also pass raw CSR arguments")
+        if any(value is not None for value in (alg, config, use_opt, op, transpose)):
+            raise ValueError("algorithm options do not apply to a prepared mixed CSR plan")
+        result = _mixed_spmx.spmv_csr_mixed_prepared(
+            prepared, x=x,
+            out=out, return_time=bool(return_time or return_meta),
+        )
+        if not (return_time or return_meta):
+            return result
+        y, elapsed = result
+        if return_meta:
+            meta = {"route": "mixed_prepared", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     if (
         prepared is None
         and torch.is_tensor(data)
         and _mixed_spmx.spmv_needs_mixed(
-            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype
+            data.dtype, x.dtype if torch.is_tensor(x) else None, out, out_dtype,
+            op=op, transpose=bool(transpose),
+            explicit_route=alg is not None or config is not None or use_opt is not None,
         )
     ):
         if alg is not None or config is not None or use_opt is not None:
