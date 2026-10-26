@@ -43,3 +43,42 @@ def test_iluvatar_coo_c32_row_tile_overrides(monkeypatch):
 def test_iluvatar_coo_c32_row_tile_adapts_to_long_tail():
     assert spmv_coo._iluvatar_coo_c32_row_tile(900, 256, 210)[:2] == (16, 8)
     assert spmv_coo._iluvatar_coo_c32_row_tile(700, 256, 12)[:2] == (32, 2)
+
+
+def test_iluvatar_f32_transpose_uses_torch_scatter_for_long_tail(monkeypatch):
+    monkeypatch.setattr(spmv_coo, "_is_iluvatar_runtime", lambda: True)
+    monkeypatch.setattr(spmv_coo, "_backend_name", lambda: "iluvatar")
+
+    n_rows = 256
+    row_lengths = torch.ones(n_rows, dtype=torch.long)
+    row_lengths[37] = 210
+    row = torch.repeat_interleave(torch.arange(n_rows, dtype=torch.int32), row_lengths)
+    col = torch.arange(row.numel(), dtype=torch.int32) % n_rows
+    data = torch.ones(row.numel(), dtype=torch.float32)
+    prepared = spmv_coo.PreparedCoo(
+        data,
+        row,
+        col,
+        (n_rows, n_rows),
+        data_trans=data,
+        row_trans=row,
+        col_trans=col,
+        transpose=True,
+        op="trans",
+    )
+
+    assert isinstance(prepared.transpose_torch_plan, spmv_coo._CooTorchScatterPlan)
+    assert prepared.transpose_torch_plan.rows.dtype == torch.int64
+    assert prepared.transpose_torch_plan.cols.dtype == torch.int64
+
+
+def test_iluvatar_f32_non_transpose_does_not_use_complex_plan(monkeypatch):
+    monkeypatch.setattr(spmv_coo, "_is_iluvatar_runtime", lambda: True)
+    monkeypatch.setattr(spmv_coo, "_backend_name", lambda: "iluvatar")
+
+    row = torch.arange(8, dtype=torch.int32)
+    col = torch.arange(8, dtype=torch.int32)
+    data = torch.ones(8, dtype=torch.float32)
+    prepared = spmv_coo.PreparedCoo(data, row, col, (8, 8))
+
+    assert prepared.non_csr_plan is None

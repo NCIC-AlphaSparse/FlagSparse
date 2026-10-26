@@ -32,13 +32,28 @@ device-event timing the BI-V delivery uses:
                 prepare_spmv_sell(reorder="rcm") with the x permutation inside the timed
                 call, plus today's SELL call on the reordered matrix and the bare x
                 permutation (x_perm) for the breakdown
+  P8 span       synthetic matrices, constant row length (so padding is 1.00 and sigma
+                cannot reorder): byte-for-byte the same layout and the same kernel, only
+                the x addresses differ -- every row's columns are confined to a band of
+                `--spans` elements around the diagonal, from tightly clustered (what RCM
+                produces) to the full range (what NACA0015 / auto look like naturally).
+                Does clustering the gather help on this card, and up to what working set?
+     y_scatter the same plan with perm = identity vs a random permutation: what a
+                scattered y store costs (RCM makes perm a global permutation)
 
-P3-P5 are real-valued (complex runs P2 sell_api and P6). Rates: ``useful`` counts
+P8 needs no .mtx file and answers the two questions BI-V left open on 2026-10-25: the
+x permutation was cheap (23-83 us) but the RCM *kernel* ran 1.1-4.8x slower there, and on
+CUDA a scattered y store costs under 6%, so neither explains it. P3-P5 are real-valued
+(complex runs P2 sell_api and P6). Rates: ``useful`` counts
 nnz * (value + int32 index) + rows * out + cols * x bytes; ``stored`` counts every
 stored slot instead of nnz. The closing hints follow section 4 of the plan.
 
   python3 tools/biv_spmv_probe.py tests/data --matrices NACA0015,auto,ASIC_680ks \\
       --dtypes float32,float16,int8,complex64 --csv results_biv_probe.csv
+
+  # P8 alone (no .mtx needed; raise --synthetic-rows until x exceeds the card's cache):
+  python3 tools/biv_spmv_probe.py --matrices none --dtypes float32,complex64 \\
+      --synthetic-rows 2097152 --rounds 5 --csv results_biv_span.csv
 """
 
 import argparse
@@ -196,6 +211,8 @@ def _parse_configs(raw):
 
 
 def _matrix_paths(inputs, names):
+    if names.strip().lower() == "none":
+        return []
     paths = []
     for item in inputs or [str(ROOT / "tests" / "data")]:
         paths += sorted(glob.glob(os.path.join(item, "*.mtx"))) if os.path.isdir(item) else [item]
@@ -369,6 +386,106 @@ def _rcm_probes(csr, data, x, y, ref, odt, out_arg, stored, check, args, dev, se
     return probes
 
 
+def _synthetic_csr(n, length, band, dev):
+    """CSR with exactly ``length`` entries per row, all inside a band of ``band`` columns.
+
+    Constant row lengths keep the SELL layout identical for every band: padding is
+    1.00 and the sigma sort cannot move a row, so only the column values differ.
+    """
+    rows = torch.arange(n, device=dev, dtype=torch.int64)
+    offsets = torch.randint(0, max(1, band), (n, length), device=dev, dtype=torch.int64)
+    cols = (rows[:, None] - band // 2 + offsets) % n
+    cols = cols.sort(dim=1).values.reshape(-1).to(torch.int32)
+    indptr = torch.arange(0, n * length + 1, length, device=dev, dtype=torch.int32)
+    return cols.contiguous(), indptr
+
+
+def _span_probes(args, dev, vdt, odt):
+    """P8: identical layout and kernel, only the gather span changes."""
+    n, length = args.synthetic_rows, args.synthetic_length
+    spans = []
+    for token in (t.strip().lower() for t in args.spans.split(",") if t.strip()):
+        spans.append(n if token in ("full", "0", "n") else min(n, int(token)))
+    nnz = n * length
+    vb, ob = torch.empty((), dtype=vdt).element_size(), torch.empty((), dtype=odt).element_size()
+    useful = nnz * (vb + 4) + n * ob + n * vb
+    x = _random(n, vdt, np.random.default_rng(args.seed)).to(dev)
+    values = _random(nnz, vdt, np.random.default_rng(args.seed + 1)).to(dev)
+    y = torch.empty(n, dtype=odt, device=dev)
+    probes, plans = [], []
+    for band in spans:
+        cols, indptr = _synthetic_csr(n, length, band, dev)
+        sv, sc, so = fs.csr_to_sell(values, cols, indptr, n, args.slice_size)
+        del cols, indptr
+        plan = fs.prepare_spmv_sell(sv, sc, so, (n, n), slice_size=args.slice_size,
+                                    out_dtype=odt, route="sigma", sigma=args.slice_size)
+        # The probe is only meaningful while every band shares one layout.
+        assert plan.n_values == nnz, f"band {band}: padding {plan.n_values / nnz:.3f} != 1.00"
+        plans.append((band, plan, sv))
+        label = "full" if band >= n else str(band)
+        probes.append(Probe("P8 span", f"band={label}",
+                            lambda plan=plan: fs.flagsparse_spmv_sell(prepared=plan, x=x, out=y),
+                            useful, useful, nnz,
+                            note=f"{band} of {n} x elements" if band < n else "the whole vector"))
+    if "P8B" not in args.skip and plans:
+        band, plan, _ = plans[-1]
+        shuffled = torch.randperm(n, device=dev).to(plan.perm.dtype)
+        shuffled_plan = fs.prepare_spmv_sell(
+            plan.values, plan.cols, plan.offsets, (n, n),
+            slice_size=args.slice_size, out_dtype=odt, route="sigma", sigma=args.slice_size,
+            c=plan.c, group=plan.group, num_warps=plan.num_warps, paired=plan.paired,
+        )
+        shuffled_plan.perm = shuffled.clone()
+        probes.append(Probe(
+            "P8 y_scatter", "perm=identity",
+            lambda plan=plan: fs.flagsparse_spmv_sell(prepared=plan, x=x, out=y),
+            useful, useful, nnz, note="y stores land in row order",
+        ))
+        probes.append(Probe(
+            "P8 y_scatter", "perm=shuffled",
+            lambda plan=shuffled_plan: fs.flagsparse_spmv_sell(prepared=plan, x=x, out=y),
+            useful, useful, nnz,
+            note="y stores scatter over the whole output, as RCM makes them",
+        ))
+        plans.append((band, shuffled_plan, None))
+    return probes, plans
+
+
+def _span_hints(rows, n):
+    out = []
+    span = [r for r in rows if r["probe"] == "P8 span"]
+    if span:
+        wide = max(span, key=lambda r: r["ms"] if r["config"] == "band=full" else -1)
+        narrow = min(span, key=lambda r: int(r["config"].split("=")[1])
+                     if r["config"] != "band=full" else n)
+        if wide["config"] == "band=full":
+            gain = wide["ms"] / narrow["ms"]
+            verdict = (
+                "clustering the gather HELPS here: RCM / cache blocking is the right "
+                "direction, so the BI-V RCM regression is in the plan, not the idea"
+                if gain >= 1.15 else
+                "clustering the gather does NOT help on this card: drop RCM-style "
+                "reordering and judge cache blocking against this, not against CUDA"
+                if gain <= 1.05 else "inconclusive (within noise); widen --rounds")
+            out.append(f"P8: {narrow['config']} is {gain:.3f}x of band=full "
+                       f"({narrow['ms'] * 1e3:.1f} vs {wide['ms'] * 1e3:.1f} us) -- {verdict}")
+            best = min(span, key=lambda r: r["ms"])
+            knee = max((r for r in span if r["ms"] <= 1.10 * best["ms"]),
+                       key=lambda r: int(r["config"].split("=")[1])
+                       if r["config"] != "band=full" else n)
+            out.append(f"P8: within 10% of the best up to {knee['config']} -- a cache-blocked "
+                       f"kernel needs its x block at or below that many elements")
+    pair = {r["config"]: r for r in rows if r["probe"] == "P8 y_scatter"}
+    if len(pair) == 2:
+        cost = pair["perm=shuffled"]["ms"] / pair["perm=identity"]["ms"]
+        out.append(f"P8: a scattered y store costs {cost:.3f}x "
+                   f"({pair['perm=identity']['ms'] * 1e3:.1f} -> "
+                   f"{pair['perm=shuffled']['ms'] * 1e3:.1f} us)"
+                   + (" -- this alone can explain the RCM regression; write y contiguously "
+                      "and permute it back once" if cost >= 1.25 else ""))
+    return out
+
+
 def _run_probes(probes, args):
     for _ in range(args.rounds):
         for p in probes:
@@ -433,7 +550,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("mtx", nargs="*", help=".mtx files or directories (default tests/data)")
     parser.add_argument("--matrices", default="NACA0015,auto,ASIC_680ks",
-                        help="comma-separated matrix names to keep ('' = all)")
+                        help="comma-separated matrix names to keep ('' = all, 'none' = P8 only)")
     parser.add_argument("--dtypes", default="float32,float16,int8,complex64", help="value[:out],...")
     parser.add_argument("--slice-size", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=3)
@@ -445,11 +562,17 @@ def main(argv=None):
                         help="P6 c x group x num_warps list")
     parser.add_argument("--tiles", default="1x32x1,1x64x1,2x32x1,2x64x1,4x32x1,4x32x2,4x32x4,8x32x4",
                         help="P5 GROUP x BLOCK_R x num_warps list")
-    parser.add_argument("--skip", default="", help="probes to skip, e.g. P1,P5")
+    parser.add_argument("--spans", default="32,256,2048,16384,131072,full",
+                        help="P8 gather band widths in x elements ('full' = the whole vector)")
+    parser.add_argument("--synthetic-rows", type=int, default=1 << 20, help="P8 rows (= columns)")
+    parser.add_argument("--synthetic-length", type=int, default=6, help="P8 entries per row")
+    parser.add_argument("--skip", default="", help="probes to skip, e.g. P1,P5,P8")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", required=True)
     args = parser.parse_args(argv)
     args.skip = {s.strip().upper() for s in args.skip.split(",") if s.strip()}
+    if args.matrices.strip().lower() == "none":
+        args.skip.add("P1")
 
     dev = accelerator_device()
     sm = _sm_count(dev)
@@ -471,7 +594,7 @@ def main(argv=None):
         print(f"P1 stream: peak {stream_peak:.0f} GB/s ({best['config']})", flush=True)
 
     paths = _matrix_paths(args.mtx, args.matrices)
-    if not paths:
+    if not paths and args.matrices.strip().lower() != "none":
         parser.error("no matching .mtx files")
     for path in paths:
         csr = read_scipy_csr(path)
@@ -496,6 +619,33 @@ def main(argv=None):
                 rows.append({**meta, **r, "matrix": Path(path).name, "n_rows": csr.shape[0],
                              "n_cols": csr.shape[1], "nnz": csr.nnz, "dtype": str(vdt)[6:],
                              "out_dtype": str(odt)[6:]})
+    if "P8" not in args.skip:
+        n, length = args.synthetic_rows, args.synthetic_length
+        for vdt, odt in _parse_dtypes(args.dtypes):
+            args._out_dtype = odt
+            x_mb = n * torch.empty((), dtype=vdt).element_size() / 2**20
+            label = (f"P8 synthetic {n}x{n} length={length} {str(vdt)[6:]}->{str(odt)[6:]}"
+                     f" (x is {x_mb:.1f} MiB -- raise --synthetic-rows until this"
+                     f" clearly exceeds the card's cache)")
+            try:
+                probes, plans = _span_probes(args, dev, vdt, odt)
+                results = _run_probes(probes, args)
+            except Exception as exc:
+                print(f"== {label}: ERROR {type(exc).__name__}: {exc}", flush=True)
+                rows.append({**meta, "matrix": "synthetic", "dtype": str(vdt)[6:],
+                             "status": "ERROR", "note": f"{type(exc).__name__}: {exc}"})
+                continue
+            print(f"== {label} (nnz={n * length}, padding 1.00 by construction)", flush=True)
+            for r in results:
+                print(f"   {r['probe']:12s} {r['ms'] * 1e3:9.1f} us  useful {r['useful_gbps']:6.0f} GB/s"
+                      f"  {r['config']}" + (f"  [{r['note']}]" if r['note'] else ""), flush=True)
+            for line in _span_hints(results, n):
+                print(f"   -> {line}", flush=True)
+            for r in results:
+                rows.append({**meta, **r, "matrix": "synthetic", "n_rows": n, "n_cols": n,
+                             "nnz": n * length, "dtype": str(vdt)[6:], "out_dtype": str(odt)[6:]})
+            del probes, plans
+
     os.makedirs(os.path.dirname(os.path.abspath(args.csv)) or ".", exist_ok=True)
     with open(args.csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS, extrasaction="ignore")

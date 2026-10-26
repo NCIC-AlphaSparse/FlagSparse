@@ -492,6 +492,30 @@ def prepare_spmv_csr_mixed(data, indices, indptr, x_dtype, shape, *,
             nnz_plan = _iluvatar_csr_complex_nnz_plan(indptr, n_rows)
         elif selected not in ("plain", "cached"):
             raise ValueError("route must be auto, cached, plain, bucket, or nnz")
+    elif _is_iluvatar_runtime() and data.dtype in (torch.float16, torch.int8):
+        nnz_route = os.environ.get(
+            "FLAGSPARSE_ILUVATAR_CSR_MIXED_NNZ", "auto"
+        ).strip().lower()
+        if nnz_route not in ("auto", "0", "1"):
+            raise ValueError(
+                "FLAGSPARSE_ILUVATAR_CSR_MIXED_NNZ must be auto, 0, or 1"
+            )
+        if selected in ("auto", "adaptive"):
+            lengths = indptr[1:] - indptr[:-1]
+            mean = float(data.numel()) / max(1, n_rows)
+            maximum = int(lengths.max().item()) if n_rows else 0
+            if nnz_route != "0" and (
+                nnz_route == "1" or (mean <= 4.0 and maximum > 128)
+            ):
+                selected = "nnz"
+            else:
+                selected = "cached"
+        if selected == "nnz":
+            if int(indptr[0].item()) != 0 or int(indptr[-1].item()) != data.numel():
+                raise ValueError("indptr must start at 0 and end at nnz")
+            nnz_plan = _iluvatar_csr_complex_nnz_plan(indptr, n_rows)
+        elif selected not in ("plain", "cached"):
+            raise ValueError("route must be auto, cached, plain, or nnz")
     elif selected not in ("auto", "cached", "plain"):
         raise ValueError("route is unsupported for this mixed CSR dtype combination")
     if selected == "auto":
@@ -535,10 +559,33 @@ def spmv_csr_mixed_prepared(prepared, x, *, out=None, return_time=False):
                 x, prepared.n_rows, prepared.bucket_plan,
             )
         elif prepared.route == "nnz":
-            _iluvatar_csr_complex_nnz_run(
-                y, prepared.data, prepared.indices, prepared.indptr,
-                x, prepared.nnz_plan,
-            )
+            if _is_complex_dtype(prepared.result_dtype):
+                _iluvatar_csr_complex_nnz_run(
+                    y, prepared.data, prepared.indices, prepared.indptr,
+                    x, prepared.nnz_plan,
+                )
+            else:
+                from ._spmv_csr_nnz import _nnz_kernel
+
+                row_ids, empty = prepared.nnz_plan
+                block = max(
+                    32,
+                    int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_MIXED_NNZ_BLOCK", "128")),
+                )
+                warps = max(
+                    1,
+                    min(
+                        8,
+                        int(os.environ.get("FLAGSPARSE_ILUVATAR_CSR_MIXED_NNZ_WARPS", "1")),
+                    ),
+                )
+                nnz = prepared.data.numel()
+                grid = (triton.cdiv(max(nnz, empty.numel()), block),)
+                _nnz_kernel[grid](
+                    prepared.data, prepared.indices, prepared.indptr,
+                    row_ids, x, y, empty, empty.numel(), nnz, block,
+                    _TL_ACC[prepared.acc_dtype], num_warps=warps,
+                )
         elif _is_complex_dtype(prepared.result_dtype):
             cached = prepared.route == "cached"
             kernel = (

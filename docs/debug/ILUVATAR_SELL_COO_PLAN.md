@@ -537,3 +537,98 @@ BI-V double/complex128 strided `copy_` canary 失败（stride 输出的间隔元
 针对 mixed NNZ 已命中的 ASIC 长尾矩阵，在 BI-V150 同进程扫描 `_nnz_kernel` 的 `BLOCK={64,128,256,512,1024}`、`num_warps={1,2,4}`。输入为 f16 values、f32 x / accumulator；每个候选相对当前 cached row-tile 输出最大绝对误差均为 `2.38e-7`。`BLOCK=128, warps=2` 最快，为 `89.21 µs`；原 NNZ 配置 `BLOCK=256, warps=2` 为 `100.48 µs`，候选快 `1.126x`。当前 cached row-tile 同轮为 `123.67 µs`，所以候选 NNZ 比 row-tile 快 `1.386x`。参数表见 `results_coo_f16f32_nnz_tile_ab_20261025.csv`。据此只对 Iluvatar COO f16→f32 路径采用 `128/2`，不改其它混合精度 dtype，也不改变路由条件。
 
 随后两轮对 c32 与 f16f32 各 10 个矩阵做 q4 prepared 复测，结果分别在 `results_coo_c32_f16f32_retest_20261025.csv` 和 `results_coo_c32_f16f32_retest2_20261025.csv`，20/20 均 `PASS`。由于两轮间计时波动明显，且本机没有 vendor 基线，不能把与旧 H800 折算基线计算出的平均比值变化当成这次 tile 调整带来的确定收益；这轮调优结论仅为 ASIC 上 NNZ kernel 本身的同轮参数 A/B。c32 仍保持原 ASIC 条件路由，未发现可推广到其它矩阵的安全 kernel 变体。
+
+### 9.13 SELL c32 prepared 与 legacy CSR 交错复测（2026-10-25）
+
+为复核此前 c32 SELL→CSR A/B 的稳定性，在 BI-V150 对 10 个矩阵重新构建 prepared 计划：SELL 固定为 `route="sigma", sigma=4096, C=32, GROUP=1, num_warps=1, paired=false`；CSR 固定为 `alg="legacy_segbin"`。两条路径均在计时前完成 prepare 和首次调用（排除准备与首轮编译），之后每个矩阵各测 5 轮，轮间交替 SELL/CSR 的先后顺序；单次计时使用 `triton.testing.do_bench(warmup=20, rep=35)`。每轮分别记录 kernel 时间，并检查两路输出相互误差及 SELL 对 CPU complex128 参考的误差。逐轮数据见 `results_biv_sell_c32_csr_route_alternating_20261025.csv`。
+
+| 矩阵 | 中位数 SELL/CSR | 较快路径 |
+|---|---:|---|
+| ASIC_680ks | 1.486x | CSR |
+| GL7d14 | 0.926x | SELL |
+| NACA0015 | 1.110x | CSR |
+| amazon0601 | 0.995x | 基本持平（SELL 略快） |
+| auto | 0.961x | SELL |
+| cage12 | 0.903x | SELL |
+| cfd2 | 0.944x | SELL |
+| filter3D | 1.627x | CSR |
+| roadNet-TX | 0.972x | SELL |
+| wave | 1.075x | CSR |
+
+以每矩阵 5 轮中位数计算，`SELL 时间 / CSR 时间` 的 10 矩阵几何平均为 `1.078x`；CSR 在 4/10 个矩阵更快，SELL 在 5/10 个矩阵更快，amazon0601 近似持平。全部 50 组输出检查通过：相对 CPU 参考误差约 `8.3e-8–2.6e-7`，SELL 与 CSR 输出间误差约 `6.6e-8–2.9e-7`。因此本轮不支持将 c32 全局切换到 CSR；此前 A/B 曾报告的约 `1.28x` 几何平均优势未在本次交错复测中复现，不能据其作为路由切换依据。该比值仅用于本机两种 prepared kernel 的相对比较，不是相对厂商基线的加速比，也不含 prepare 成本。
+
+本轮只新增复测 CSV 与本节记录，没有修改生产 kernel 或默认路由。后续继续从 SELL kernel / 存储布局寻找适用于低于 `0.8x` 变体的优化；CSR 只保留为矩阵结构条件路由的候选，须先有可复现的结构指标收益，并在完整 10 矩阵与精度复测中验证。
+
+合入 main 时的两点补充（2026-10-25，CUDA 机）：
+
+- 本节引用的 `results_biv_sell_c32_csr_route_alternating_20261025.csv` 没有随这次更新一起给过来，表里的数字无法逐轮核对；
+  表内 10 个比值的几何平均 `1.078x` 已核算无误（4 个矩阵 CSR 更快、amazon0601 近似持平、其余 5 个 SELL 更快）。
+- **SELL 一侧用的不是交付路径**：本节固定 `route="sigma", σ=4096, C=32`，它在 10-25 全量里是 `0.497`（见
+  `results_biv_sell_c32s4096_20261025`），而 c32 交付默认走 `route=auto`→`call`（原生复数 kernel）是 `0.518`，比它快约 4%。
+  所以这轮是"CSR 对一个比交付更慢的 SELL 配置"。结论（不切 CSR）仍然成立，但要作为切换依据，应把 SELL 一侧换成
+  `route="call"` 再测一轮。
+
+### 9.14 P8 探针：gather 聚集度与 y 散写（2026-10-25，待天数实测）
+
+之前 SELL 的 tile、σ、C、GROUP、warps 和 cache modifier 扫描没有稳定赢家；而 RCM 在天数上出现 kernel 回退，尚不清楚是 gather 局部性没有收益，还是 SELL 重排实现本身有额外代价。因此先用合成矩阵分离列访问局部性和 y 写入散布，不据 CUDA 数据预判天数结果。
+
+`tools/biv_spmv_probe.py` 的 P8 不需要 `.mtx`：
+
+- **P8 span**：每行固定相同行数，SELL 填充率为 `1.00`，σ 排序不改变行序；各组复用同一组 values，布局、kernel 和读写字节数相同，只改变列号。列索引限制在对角线附近 `--spans` 个 x 元素内，从局部带宽到全向量。
+- **P8 y_scatter**：固定同一份 SELL 计划，分别使用自然顺序与随机 `perm`，隔离输出散写成本。
+
+```bash
+setsid timeout -s KILL 7200 env FLAGSPARSE_BACKEND=iluvatar \
+  python3 -u tools/biv_spmv_probe.py --matrices none \
+    --dtypes float32,float16,int8,complex64 \
+    --synthetic-rows 8388608 --rounds 5 \
+    --csv results_biv_span_20261025.csv \
+  > results_biv_span_20261025.log 2>&1 < /dev/null &
+```
+
+`--matrices none` 只执行 P8（跳过 P1 与真实矩阵探针）。本机 BI-V150 L2 为 16 MiB；因此建议用 `--synthetic-rows 8388608`（f32 x 32 MiB、complex64 x 64 MiB），而不是 2,097,152（f32 x 只有 8 MiB）。大规模前先以较小行数 smoke test，确认内存余量及 prepared kernel 正确执行。
+
+5090 上的参考测试曾观察到 f32 聚集/全散列约 `1.72x`、complex64 约 `2.30x`，但这些是 CUDA 参考值，不是 BI-V 实测结论。BI-V 的结果按脚本输出判读：聚集收益 `>=1.15x` 支持继续查 RCM / cache blocking 的实现；`<=1.05x` 则优先转向减少字节数；中间值需扩大轮数和工作集复测。随机 y scatter 若明显变慢，再单独评估连续写临时输出及最终置换的总成本。
+
+#### 9.14.1 BI-V150 P8 实测结果（2026-10-25）
+
+BI-V150 的 L2 为 `16 MiB`，因此使用 `--synthetic-rows 8388608`，使 f32 x 为 `32 MiB`、f16 x 为 `16 MiB`、int8 x 为 `8 MiB`、complex64 x 为 `64 MiB`。首轮脚本曾因 y-scatter 探针复用了同一个 plan 而污染后续 span 组；修正为两个独立 prepared plan 后，以下结果才作为有效数据。
+
+| dtype | band=32 | band=full | 聚集/全散列 | y scatter shuffled/identity |
+|---|---:|---:|---:|---:|
+| f32 | `892.2 µs` | `10824.2 µs` | `12.13x` | `5.38x` |
+| f16 | `765.5 µs` | `4850.6 µs` | `6.34x` | `10.44x` |
+| i8→i32 | `661.1 µs` | `1961.9 µs` | `2.97x` | `22.30x` |
+| complex64 | `1441.3 µs` | `13244.6 µs` | `9.19x` | `4.71x` |
+
+中间带宽组的共同 knee 在 `band=256`（complex64 为 `band=32`）；因此这张卡上列访问聚集明确有效，不能放弃 RCM / cache blocking。更重要的是，随机 y 写比自然连续写慢 `4.7–22.3x`，验证了此前 RCM 回退主要来自 `perm` 直接散写的判断。下一步优先做“kernel 连续写临时 y，再单独做一次置换回原行序”的 A/B，并把置换成本计入 prepared kernel 总时间；不能只比较临时 y 的 kernel 时间。
+
+CSV：`results_biv_span_20261025_retest.csv`（f32/f16/i8）与 `results_biv_span_complex64_20261025.csv`（complex64）。
+
+#### 9.14.2 连续 y 输出 A/B（2026-10-25）
+
+依据 P8，新增实验开关 `FLAGSPARSE_SELL_CONTIGUOUS_OUTPUT=1`：启用 RCM 的 prepared SELL 时，kernel 先按重排后的行号连续写到 prepared 临时缓冲，再用一次 `index_copy_` 置回原行序；该置换成本包含在计时内。默认值为 `0`，因此不改变交付路径。
+
+| 矩阵 | 开关关闭 | 开关开启 | 开启/关闭 | 输出检查 |
+|---|---:|---:|---:|---|
+| ASIC_680ks f32 | `202.5 µs` | `214.1 µs` | `0.946x` | PASS |
+| NACA0015 f32 | `474.7 µs` | `274.8 µs` | `1.727x` | PASS |
+| amazon0601 f32 | `132.0 µs` | `152.0 µs` | `0.869x` | PASS |
+| auto f32 | `255.4 µs` | `262.4 µs` | `0.973x` | PASS |
+
+这里的比值是“关闭耗时 / 开启耗时”的加速比；NACA0015 开启后约 `1.73x`，其余三个矩阵没有收益。与当前交付 SELL API 比较时，NACA0015 的 RCM 路径仍为 `0.78x`（`274.8/214.0`），不能宣称算子达标。因此暂不默认开启，只保留给后续按结构条件路由的候选；下一步需要在真实低于 `0.8x` 的 SELL 算子上验证该结构条件是否能改善相对厂商基线，而不是只改善 RCM 子路径。
+
+#### 9.14.3 改为逆置换 gather 后连续写回（2026-10-25）
+
+前一版实验路径用 `index_copy_` 将临时结果散写到最终 `y`，并没有满足“最终输出连续写”的目标。现改为 prepare 阶段生成逆置换 `y_order`，kernel 按重排行连续写 `y_buf`，运行阶段执行 `torch.index_select(y_buf, 0, y_order, out=y)`；因此最终 `y` 是连续写入，且整个操作仍计入 kernel/调用侧计时。新增的 `y_buf`、`y_order` 均在 prepare 阶段分配，不计入运行计时。
+
+该版本 f32 复测：NACA0015 RCM prepared 为 `293.7 µs`，auto 为 `272.2 µs`；两者输出检查均 PASS。complex64 auto 输出检查 PASS，RCM prepared 为 `642.7 µs`。由于复测有波动且连续回写仍包含一次完整输出重排，当前只保留 `FLAGSPARSE_SELL_CONTIGUOUS_OUTPUT=1` 实验开关，不默认启用；是否能提升最终算子，仍须在完整 10 矩阵、各 dtype 和相对厂商基线口径下复测。
+
+#### 9.14.4 10 矩阵基线口径复测（2026-10-25）
+
+为避免只看绝对时间，本轮将 A/B 结果与 `results_biv_sell_call_20261025/spmv_sell/performance.csv` 中的 `h800_scaled_ms` 厂商基线折算值合并计算加速比，定义为 `baseline_ms / measured_ms`。需要区分两条口径：
+
+- **默认交付路径 `P2 sell_api`**：连续输出开关不参与该路径，10 个矩阵几何平均加速比为 f32 `0.616x`、complex64 `0.505x`；开启前后没有算子级变化。
+- **实验路径 `P7 prepared RCM`**：只对 9 个方阵有效，非方阵 GL7d14 不执行 RCM。相对同一厂商基线，开启连续输出后的几何平均为 f32 `0.400x`、complex64 `0.259x`；关闭时分别为 `0.432x`、`0.235x`。f32 反而下降，complex64 仅相对 RCM 实验路径改善约 `1.102x`，仍远低于 `0.8x` 目标。
+
+因此，**本轮没有确认 SELL 算子相对厂商基线的性能提升**，也不能把 `FLAGSPARSE_SELL_CONTIGUOUS_OUTPUT=1` 设为默认。完整逐矩阵、逐 dtype 的基线加速比见 `results_biv_sell_contig_speedup_20261025.csv`；原始 A/B 见 `results_biv_sell_contig_ab_off_20261025.csv` 和 `results_biv_sell_contig_ab_on_20261025.csv`。

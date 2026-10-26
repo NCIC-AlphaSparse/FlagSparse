@@ -369,6 +369,72 @@ nnz 的行上，大部分 lane 是空转的。
 - 把天数 f32 非转置路由到 row-tile（或直接复用 `prepare_spmv_csr_mixed` 的实数路径），绝对耗时有望减半，这一项
   对本机厂商基线的比值相应翻倍。
 
+#### 2026-10-26 真机验证
+
+- 先验证 PyTorch CSR：BI-V150 上 `torch.sparse.mm(torch.sparse_csr_tensor(...), x)` 在
+  `auto/NACA0015/ASIC_680ks` 等矩阵上返回全零或明显错误结果，不能作为生产路由；本轮只保留其失败记录，
+  没有把 PyTorch CSR 的时间写入加速比。
+- 新增 Iluvatar `float32` 非转置 CSR 的 row-tile 开关，默认走
+  `FLAGSPARSE_ILUVATAR_SPMV_F32_ROUTE=row_tile`，并保留 `=segbin` 回退。默认参数为
+  `ROWS=16, LANES=8, WARPS=1, STAGES=1`；显式 `alg` 请求仍不被覆盖。
+  （合入 main 时改为在 `prepare_spmv_csr` 里读取这 5 个环境变量并存进 plan，运行阶段不再读环境变量；
+  prepare 之后再改环境变量对已有 plan 不生效。模拟 Iluvatar 后端的小矩阵上每次调用主机开销约 40→34 µs。）
+- 真机扫描在 `ASIC_680ks/NACA0015/amazon0601/auto` 上均通过精度，最优共同配置为
+  `16×8, 1 warp, 1 stage`。全量 10 矩阵 `warmup=20, iters=50` 复测精度 `10/10 PASS`：
+
+  | 矩阵 | row-tile ms | H800 折算基线 ms | 相对基线加速比 |
+  |---|---:|---:|---:|
+  | ASIC_680ks | 0.143067 | 0.167077 | 1.1678x |
+  | GL7d14 | 0.061605 | 0.182708 | 2.9658x |
+  | NACA0015 | 0.185692 | 0.232703 | 1.2532x |
+  | amazon0601 | 0.107460 | 0.186378 | 1.7344x |
+  | auto | 0.252582 | 0.257248 | 1.0185x |
+  | cage12 | 0.039748 | 0.169550 | 4.2657x |
+  | cfd2 | 0.070357 | 0.144585 | 2.0550x |
+  | filter3D | 0.076246 | 0.149654 | 1.9628x |
+  | roadNet-TX | 0.220851 | 1.061870 | 4.8081x |
+  | wave | 0.043240 | 0.166623 | 3.8535x |
+
+- 算术平均加速比为 **2.5085x**，几何平均为 **2.1818x**；所有误差均在现有 FP32
+  正确性门限内。结果文件为 `results_csr_f32_rowtile_default_20261026.csv`，参数扫描为
+  `results_csr_f32_rowtile_smoke_20261026.csv`。
+- 另外用 `int64/int64` 索引全量复测，精度 `10/10 PASS`；结果文件为
+  `results_csr_f32_rowtile_int64_20261026.csv`。强制 complex row-tile 和 COO mixed tile
+  的后续 A/B 没有稳定收益，因此没有改变它们的默认路由。
+
+### 2026-10-26 PyTorch 原生聚合探针
+
+- 在 BI-V150 上对低速算子试了 PyTorch `scatter_add_`、`index_add_`、`segment_reduce`，并对
+  SELL 预处理布局做了缓存行号后的聚合 A/B。`torch.sparse.mm` 没有重新接入：本机对 CSR/COO
+  稀疏 GPU 矩阵仍报 `addmm/addmv requires compiling PyTorch with CUDA 11+`，此前 CSR 还出现过
+  全零结果。
+- SELL 的 PyTorch 聚合在 10 个矩阵上均慢于现有 SELL kernel；COO mixed、CSR mixed 和
+  `spvv_c32_int_conj` 也没有稳定收益。不能用这些路径替换默认 kernel。
+- 唯一稳定候选是 `spmv_coo_f32_int_trans`：转置后的输出行平均长度不超过 4 且最大行长超过
+  128 时，prepare 阶段缓存 int64 行/列索引，运行阶段用 PyTorch `scatter_add_`。这正好命中
+  `ASIC_680ks`，并避开每次调用的 int32→int64 转换；开关为
+  `FLAGSPARSE_ILUVATAR_COO_TRANS_TORCH=auto/0/1`，默认 `auto`，其余结构自动回到原 Triton
+  转置路径。
+- 同进程交替 A/B、`warmup=4/15`、`iters=40` 的 10 矩阵结果见
+  `results_coo_f32_trans_torch_ab_20261026.csv`。相对 H800 cuSPARSE 带宽折算基线，算术平均由
+  `0.7622x` 提到 `0.7723x`，几何平均由 `0.6420x` 提到 `0.6837x`；ASIC 单项由 `0.1261x`
+  提到 `0.2396x`，输出与原路径误差在 FP32 容差内。
+- 本轮还修正了 Iluvatar COO f32 非转置误将 `_CooNnzPlan`（复数 kernel）作为默认计划的问题；
+  该修正没有把 PyTorch 路径扩展到其他 dtype。路由单测为 `5 passed`。
+
+### 2026-10-26 索引宽度 A/B
+
+- 对 `spmv_coo_f32_int_trans` 在同一进程交替复测了原 Triton 转置路径的 `int32`/`int64` 索引；
+  10 个矩阵全部精度一致，`int32` 相对 `int64` 的算术平均加速比为 **`1.446x`**，几何平均为
+  **`1.440x`**，逐矩阵范围为 `1.268x–1.668x`。明细见
+  `results_coo_f32_trans_index_dtype_ab_20261026.csv`。
+- 当前交付数据本来就使用 `int32` 的 row/col/indptr；因此这不是新增默认优化，而是确认不能在
+  热路径中把索引无条件 `.long()`。`int64` 仍需保留给 API 兼容和超出 int32 范围的回退。
+- PyTorch `scatter_add_` 在 BI-V150 上要求索引为 `int64`（`int32` 会报
+  `scatter(): Expected dtype int64 for index`），所以刚加的 PyTorch 长尾路径必须在 prepare
+  阶段缓存 `int64` 索引；不能靠“只用 int32”进一步提速。原 Triton 路径仍由
+  `FLAGSPARSE_ILUVATAR_COO_TRANS_TORCH=0` 回退。
+
 ### 方向 7：主机固定开销（天数上约 22–30 µs）
 
 - spvv 在 nnz 从 1k 到 64k 之间一直是 23–30 µs，SELL i8 在 cage12 上 22 µs，CSR i8 在 cage12 上 25 µs，说明天数上一次

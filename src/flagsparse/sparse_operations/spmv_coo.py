@@ -111,6 +111,7 @@ class PreparedCoo:
         "op",
         "transpose",
         "transpose_csr_plan",
+        "transpose_torch_plan",
         "non_csr_plan",
         "index_fallback_policy",
         "index_fallback_applied",
@@ -150,6 +151,7 @@ class PreparedCoo:
         self.op = _normalize_spmv_coo_op(op, transpose=transpose)
         self.transpose = _spmv_coo_op_transposes(self.op)
         self.transpose_csr_plan = None
+        self.transpose_torch_plan = None
         self.non_csr_plan = None
         if self.sort_by_row and self.data_trans.dtype in (
             torch.float32,
@@ -224,7 +226,7 @@ class PreparedCoo:
                         self.non_csr_plan
                     )
                     self.non_csr_plan = (cols, plan_ptr, order, rows, 4, 128, cache)
-            elif _is_iluvatar_runtime():
+            elif _is_iluvatar_runtime() and self.data_non.dtype == torch.complex64:
                 counts = torch.bincount(self.row_non.long(), minlength=self.n_rows)
                 ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(
                     self.row_non.dtype
@@ -264,6 +266,33 @@ class PreparedCoo:
                         )
                     self.non_csr_plan = (
                         cols, plan_ptr, order, rows, 16, 16, cache
+                    )
+            if (
+                _is_iluvatar_runtime()
+                and self.transpose
+                and self.data_trans.dtype == torch.float32
+                and self.sort_by_row
+            ):
+                scatter_route = os.environ.get(
+                    "FLAGSPARSE_ILUVATAR_COO_TRANS_TORCH", "auto"
+                ).strip().lower()
+                if scatter_route not in ("auto", "0", "1"):
+                    raise ValueError(
+                        "FLAGSPARSE_ILUVATAR_COO_TRANS_TORCH must be auto, 0, or 1"
+                    )
+                trans_lengths = torch.bincount(
+                    self.row_trans.long(), minlength=self.n_cols
+                )
+                mean = self.nnz / max(1, self.n_cols)
+                maximum = int(trans_lengths.max().item()) if self.n_cols else 0
+                use_scatter = scatter_route == "1" or (
+                    scatter_route == "auto" and mean <= 4.0 and maximum > 128
+                )
+                if use_scatter:
+                    self.transpose_torch_plan = _CooTorchScatterPlan(
+                        self.row_trans.to(torch.int64).contiguous(),
+                        self.col_trans.to(torch.int64).contiguous(),
+                        self.n_cols,
                     )
         self.index_fallback_policy = str(index_fallback_policy).lower()
         self.index_fallback_applied = bool(index_fallback_applied)
@@ -346,6 +375,15 @@ class _CooNnzPlan:
         self.ptr = ptr
         self.rows = rows
         self.empty = empty
+        self.n_rows = int(n_rows)
+
+
+class _CooTorchScatterPlan:
+    __slots__ = ("rows", "cols", "n_rows")
+
+    def __init__(self, rows, cols, n_rows):
+        self.rows = rows
+        self.cols = cols
         self.n_rows = int(n_rows)
 
 
@@ -856,7 +894,11 @@ def _resolve_spmv_coo_launch(prepared, op):
         index_fallback_policy=prepared.index_fallback_policy,
         index_fallback_applied=prepared.index_fallback_applied,
         index_fallback_reason=prepared.index_fallback_reason,
-        csr_plan=prepared.transpose_csr_plan,
+        csr_plan=(
+            prepared.transpose_torch_plan
+            if prepared.transpose_torch_plan is not None
+            else prepared.transpose_csr_plan
+        ),
     )
 
 
@@ -878,6 +920,15 @@ def _validate_x_coo(x, prepared):
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
     if prepared.csr_plan is not None:
+        if isinstance(prepared.csr_plan, _CooTorchScatterPlan):
+            plan = prepared.csr_plan
+            y = torch.zeros(
+                plan.n_rows, dtype=prepared.data.dtype, device=prepared.data.device
+            )
+            if prepared.nnz:
+                product = prepared.data * x.index_select(0, plan.cols)
+                y.scatter_add_(0, plan.rows, product)
+            return y
         if isinstance(prepared.csr_plan, _CooNnzPlan):
             from ._spmv_csr_nnz import _complex_nnz_kernel
 

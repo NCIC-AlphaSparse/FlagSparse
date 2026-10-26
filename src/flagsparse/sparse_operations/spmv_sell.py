@@ -707,9 +707,9 @@ class PreparedSellSpmv:
     __slots__ = (
         "shape", "n_rows", "n_cols", "slice_size", "device", "value_dtype", "out_dtype",
         "acc_dtype", "route", "sigma", "sigma_request", "c", "group", "num_warps", "paired",
-        "reorder", "reorder_request", "x_order", "x_buf",
+        "reorder", "reorder_request", "x_order", "x_buf", "y_buf", "y_order",
         "values", "cols", "offsets", "versions",
-        "sell_values", "kernel_values", "sell_cols", "sell_offsets", "row_len", "perm",
+        "sell_values", "kernel_values", "sell_cols", "sell_offsets", "row_len", "perm", "kernel_perm",
         "gather", "n_slices", "n_values", "grid", "constants",
     )
 
@@ -868,8 +868,10 @@ def _sell_sigma_layout(values, cols, offsets, n_rows, n_cols, slice_size, c, sig
     else:
         sell_values[dest] = values[src]
     perm = torch.full((n_slices * c,), -1, dtype=torch.int32, device=device)
+    kernel_perm = torch.full((n_slices * c,), -1, dtype=torch.int32, device=device)
     # lane -> original row (through the RCM relabelling when there is one)
     perm[:n_rows] = (row_order if x_order is None else x_order[row_order]).to(torch.int32)
+    kernel_perm[:n_rows] = row_order.to(torch.int32)
     offset_dtype = torch.int32 if total < 2**31 else torch.int64
     return {
         "sell_values": sell_values,
@@ -877,6 +879,7 @@ def _sell_sigma_layout(values, cols, offsets, n_rows, n_cols, slice_size, c, sig
         "sell_offsets": sell_offsets.to(offset_dtype),
         "row_len": lane_len.to(torch.int32),
         "perm": perm,
+        "kernel_perm": kernel_perm,
         "gather": gather,
         "n_slices": n_slices,
         "n_values": total,
@@ -897,6 +900,16 @@ def _install_sell_sigma(p):
         None if p.x_order is None
         else torch.empty(p.n_cols, dtype=p.value_dtype, device=p.device)
     )
+    p.y_buf = (
+        None if p.x_order is None
+        else torch.empty(p.n_rows, dtype=p.out_dtype, device=p.device)
+    )
+    p.y_order = (
+        None if p.x_order is None
+        else torch.empty_like(p.x_order)
+    )
+    if p.y_order is not None:
+        p.y_order[p.x_order] = torch.arange(p.n_rows, device=p.device, dtype=p.x_order.dtype)
     p.kernel_values = (
         torch.view_as_real(p.sell_values) if p.sell_values.is_complex() else p.sell_values
     )
@@ -966,8 +979,8 @@ def prepare_spmv_sell(
     p.offsets = slice_offsets.contiguous()
     p.n_values = int(values.numel())
     for name in ("sigma", "sigma_request", "c", "group", "num_warps", "paired", "reorder",
-                 "reorder_request", "x_order", "x_buf", "sell_values", "kernel_values",
-                 "sell_cols", "sell_offsets", "row_len", "perm", "gather", "n_slices", "grid",
+                 "reorder_request", "x_order", "x_buf", "y_buf", "y_order", "sell_values", "kernel_values",
+                 "sell_cols", "sell_offsets", "row_len", "perm", "kernel_perm", "gather", "n_slices", "grid",
                  "constants", "versions"):
         setattr(p, name, None)
     if route == "call":
@@ -1112,10 +1125,15 @@ def spmv_sell_prepared(prepared, x, *, out=None, return_time=False):
         t0 = time.perf_counter()
     if p.x_order is not None:
         x = torch.index_select(x, 0, p.x_order, out=p.x_buf)
+    contiguous_output = p.x_order is not None and os.environ.get(
+        "FLAGSPARSE_SELL_CONTIGUOUS_OUTPUT", "0"
+    ) == "1"
+    kernel_y = p.y_buf if contiguous_output else y
     if p.n_slices:
         tensors = (
-            torch.view_as_real(y) if complex_values else y,
-            p.kernel_values, p.sell_cols, p.sell_offsets, p.row_len, p.perm,
+            torch.view_as_real(kernel_y) if complex_values else kernel_y,
+            p.kernel_values, p.sell_cols, p.sell_offsets, p.row_len,
+            p.kernel_perm if contiguous_output else p.perm,
             torch.view_as_real(x) if complex_values else x,
         )
         if _CUDA_DIRECT_LAUNCH:
@@ -1127,6 +1145,8 @@ def spmv_sell_prepared(prepared, x, *, out=None, return_time=False):
             _spmv_sell_sigma_kernel[p.grid](
                 *tensors, p.n_slices, *p.constants, num_warps=p.num_warps
             )
+    if contiguous_output:
+        torch.index_select(kernel_y, 0, p.y_order, out=y)
     if out is not None and y is not out:
         out.copy_(y)
         y = out

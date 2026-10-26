@@ -279,6 +279,25 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
             gather_warps = max(1, min(8, int(warps_override)))
         if stages_override:
             gather_stages = max(1, min(8, int(stages_override)))
+    elif _is_iluvatar_runtime():
+        mean = float(cache.get("avg_row_nnz", values.numel() / max(1, n_rows)))
+        max_row_nnz = int(cache.get("max_row_nnz", 0))
+        if mean <= 4.0 and max_row_nnz > 128:
+            batch, lanes, gather_warps, gather_stages = 32, 8, 4, 1
+        elif 4.0 < mean <= 16.0 and max_row_nnz <= 128:
+            batch, lanes, gather_warps, gather_stages = 32, 8, 2, 1
+        batch_override = os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_BATCH")
+        lanes_override = os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_LANES")
+        warps_override = os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_WARPS")
+        stages_override = os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_STAGES")
+        if batch_override:
+            batch = max(1, int(batch_override))
+        if lanes_override:
+            lanes = max(1, int(lanes_override))
+        if warps_override:
+            gather_warps = max(1, min(8, int(warps_override)))
+        if stages_override:
+            gather_stages = max(1, min(8, int(stages_override)))
     fixed_steps = None
     if _is_iluvatar_runtime() and complex_values:
         max_row_nnz = int(cache.get("max_row_nnz", 0))
