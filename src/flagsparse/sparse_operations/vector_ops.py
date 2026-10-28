@@ -53,6 +53,125 @@ _MUSA_AXPBY_INDEX_CACHE = TensorPlanCache()
 _ILUVATAR_AXPBY_INDEX_CACHE = TensorPlanCache()
 
 
+class PreparedAxpby:
+    """Prepared Ascend Axpby operands for repeated in-place updates."""
+
+    __slots__ = (
+        "values",
+        "indices",
+        "compute_values",
+        "workspace",
+        "n",
+        "compute_dtype",
+        "value_dtype",
+        "device",
+        "alpha",
+        "beta",
+    )
+
+    def __init__(self, values, indices, y, alpha, beta):
+        self.values = values
+        self.indices = indices
+        self.compute_dtype = _vector_compute_dtype(values.dtype)
+        self.compute_values = (
+            values.to(self.compute_dtype)
+            if self.compute_dtype != values.dtype
+            else values
+        )
+        self.workspace = (
+            torch.empty(y.shape, dtype=self.compute_dtype, device=y.device)
+            if self.compute_dtype != values.dtype or _is_complex_dtype(values.dtype)
+            else None
+        )
+        self.n = int(y.numel())
+        self.value_dtype = values.dtype
+        self.device = values.device
+        self.alpha = alpha
+        self.beta = beta
+
+
+class PreparedSpvv:
+    """Prepared Ascend SpVV operands for repeated sparse dot products."""
+
+    __slots__ = (
+        "values",
+        "indices",
+        "compute_values",
+        "value_dtype",
+        "compute_dtype",
+        "device",
+        "nnz",
+        "op",
+    )
+
+    def __init__(self, values, indices, op):
+        self.values = values
+        self.indices = indices
+        self.value_dtype = values.dtype
+        self.compute_dtype = _vector_compute_dtype(values.dtype)
+        self.compute_values = values.to(self.compute_dtype) if self.compute_dtype != values.dtype else values
+        self.device = values.device
+        self.nnz = int(values.numel())
+        self.op = op
+
+
+def prepare_axpby(values, indices, y, alpha=1.0, beta=1.0, *, validate=True):
+    """Prepare Ascend Axpby metadata and reusable compute buffers."""
+    if not _is_ascend_runtime():
+        raise ValueError("prepared Axpby is currently supported on Ascend only")
+    kernel_idx = _validate_sparse_vector(
+        values, indices, y, AXPBY_VALUE_DTYPES, "axpby", check_range=validate
+    )
+    if not y.is_contiguous():
+        raise ValueError("axpby: y must be contiguous (it is updated in place)")
+    return PreparedAxpby(
+        values.contiguous(),
+        kernel_idx.to(torch.int64).contiguous(),
+        y,
+        alpha,
+        beta,
+    )
+
+
+def prepare_spvv(values, indices, y, op="non", *, validate=True):
+    """Prepare Ascend SpVV metadata and reusable compute operands."""
+    if not _is_ascend_runtime():
+        raise ValueError("prepared SpVV is currently supported on Ascend only")
+    op = _normalize_vector_op(op)
+    kernel_idx = _validate_sparse_vector(
+        values, indices, y, SPVV_VALUE_DTYPES, "spvv", check_range=validate
+    )
+    return PreparedSpvv(values.contiguous(), kernel_idx.to(torch.int64).contiguous(), op)
+
+
+def _run_prepared_axpby(prepared, y, alpha=None, beta=None):
+    if y.device != prepared.device or y.dtype != prepared.value_dtype:
+        raise ValueError("y must match the prepared Axpby operands")
+    if y.ndim != 1 or y.numel() != prepared.n or not y.is_contiguous():
+        raise ValueError("y must be a contiguous vector matching the prepared Axpby plan")
+    values = prepared.compute_values
+    compute = prepared.compute_dtype
+    alpha = prepared.alpha if alpha is None else alpha
+    beta = prepared.beta if beta is None else beta
+    if prepared.workspace is None:
+        y.mul_(beta)
+        if values.numel():
+            y.index_add_(0, prepared.indices, values * alpha)
+        return y
+    workspace = prepared.workspace
+    workspace.copy_(y)
+    workspace.mul_(beta)
+    update = values * alpha
+    if _is_complex_dtype(compute):
+        torch.view_as_real(workspace).index_add_(
+            0, prepared.indices, torch.view_as_real(update)
+        )
+    else:
+        workspace.index_add_(0, prepared.indices, update)
+    y.copy_(workspace)
+    return y
+
+
 def _vector_compute_dtype(value_dtype):
     if value_dtype in (torch.float16, torch.bfloat16):
         return torch.float32
@@ -216,9 +335,14 @@ def _iluvatar_axpby(values, indices, y, alpha, beta):
 def _torch_axpby(values, indices, y, alpha, beta):
     """Ascend path, also the reference shape of the Triton path."""
     compute = _vector_compute_dtype(y.dtype)
+    idx = indices.to(torch.int64)
+    if _is_ascend_runtime() and compute == y.dtype and not _is_complex_dtype(y.dtype):
+        y.mul_(beta)
+        if values.numel():
+            y.index_add_(0, idx, values * alpha)
+        return y
     acc = y.to(compute) if compute != y.dtype else y.clone()
     acc.mul_(beta)
-    idx = indices.to(torch.int64)
     update = values.to(compute) * alpha
     if _is_complex_dtype(compute):
         # index_add_ on complex has no NPU/MUSA kernel; add the two real planes.
@@ -230,7 +354,15 @@ def _torch_axpby(values, indices, y, alpha, beta):
 
 
 def flagsparse_axpby(
-    values, indices, y, alpha=1.0, beta=1.0, return_time=False, *, validate=True
+    values=None,
+    indices=None,
+    y=None,
+    alpha=None,
+    beta=None,
+    return_time=False,
+    *,
+    validate=True,
+    prepared=None,
 ):
     """In-place ``y = alpha * x + beta * y`` for sparse ``x = (values, indices)``.
 
@@ -238,6 +370,27 @@ def flagsparse_axpby(
     (and the elapsed milliseconds when ``return_time``). ``validate=False`` skips the
     index range check, a host sync that cuSPARSE does not perform either.
     """
+    if prepared is not None:
+        if not _is_ascend_runtime():
+            raise ValueError("prepared Axpby is currently supported on Ascend only")
+        if not isinstance(prepared, PreparedAxpby):
+            raise TypeError("prepared must be a PreparedAxpby")
+        if values is not None or indices is not None:
+            raise ValueError("pass either prepared or values/indices, not both")
+        if y is None:
+            raise ValueError("y is required when using a prepared Axpby plan")
+        if return_time:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        result = _run_prepared_axpby(prepared, y, alpha=alpha, beta=beta)
+        if return_time:
+            _ACCEL.synchronize()
+            return result, (time.perf_counter() - t0) * 1000.0
+        return result
+    if any(v is None for v in (values, indices, y)):
+        raise ValueError("values, indices and y are required when prepared is not provided")
+    alpha = 1.0 if alpha is None else alpha
+    beta = 1.0 if beta is None else beta
     kernel_idx = _validate_sparse_vector(
         values, indices, y, AXPBY_VALUE_DTYPES, "axpby", check_range=validate
     )
@@ -348,6 +501,10 @@ def _torch_spvv(values, indices, y, op):
     compute = _vector_compute_dtype(values.dtype)
     idx = indices.to(torch.int64)
     if _is_complex_dtype(compute):
+        if _is_ascend_runtime():
+            gathered = y.index_select(0, idx)
+            lhs = values.conj() if op == "conj" else values
+            return (lhs * gathered).sum()
         # Real-plane gathers and sums: no complex index/sum kernel needed.
         x_ri = torch.view_as_real(values)
         y_ri = torch.view_as_real(y).index_select(0, idx)
@@ -356,17 +513,59 @@ def _torch_spvv(values, indices, y, op):
             xi = -xi
         yr, yi = y_ri[:, 0], y_ri[:, 1]
         return torch.complex((xr * yr - xi * yi).sum(), (xr * yi + xi * yr).sum())
-    prod = values.to(compute) * y.index_select(0, idx).to(compute)
-    return prod.sum(dtype=compute)
+    gathered = y.index_select(0, idx).to(compute)
+    lhs = values.to(compute)
+    if _is_ascend_runtime() and compute == torch.float32:
+        return torch.dot(lhs, gathered)
+    return (lhs * gathered).sum(dtype=compute)
 
 
-def flagsparse_spvv(values, indices, y, op="non", return_time=False, *, validate=True):
+def _run_prepared_spvv(prepared, y):
+    if y.device != prepared.device or y.dtype != prepared.value_dtype:
+        raise ValueError("y must match the prepared SpVV operands")
+    if y.ndim != 1:
+        raise ValueError("y must be a 1D vector")
+    values = prepared.compute_values
+    gathered = y.index_select(0, prepared.indices)
+    lhs = values.conj() if prepared.op == "conj" and values.is_complex() else values
+    return (lhs * gathered.to(prepared.compute_dtype)).sum(dtype=prepared.compute_dtype)
+
+
+def flagsparse_spvv(
+    values=None,
+    indices=None,
+    y=None,
+    op="non",
+    return_time=False,
+    *,
+    validate=True,
+    prepared=None,
+):
     """Sparse-dense dot product ``sum(op(x)[k] * y[indices[k]])`` (``cusparseSpVV``).
 
     ``op`` is ``"non"`` or ``"conj"``. Returns a 0-d tensor of the compute dtype:
     float32 for float16/bfloat16, int32 for int8, otherwise the value dtype.
     ``validate=False`` skips the index range check (a host sync).
     """
+    if prepared is not None:
+        if not _is_ascend_runtime():
+            raise ValueError("prepared SpVV is currently supported on Ascend only")
+        if not isinstance(prepared, PreparedSpvv):
+            raise TypeError("prepared must be a PreparedSpvv")
+        if values is not None or indices is not None:
+            raise ValueError("pass either prepared or values/indices, not both")
+        if y is None:
+            raise ValueError("y is required when using a prepared SpVV plan")
+        if return_time:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        result = _run_prepared_spvv(prepared, y)
+        if return_time:
+            _ACCEL.synchronize()
+            return result, (time.perf_counter() - t0) * 1000.0
+        return result
+    if any(v is None for v in (values, indices, y)):
+        raise ValueError("values, indices and y are required when prepared is not provided")
     op = _normalize_vector_op(op)
     kernel_idx = _validate_sparse_vector(
         values, indices, y, SPVV_VALUE_DTYPES, "spvv", check_range=validate
@@ -394,6 +593,8 @@ def flagsparse_spvv(values, indices, y, op="non", return_time=False, *, validate
         else:
             result = torch.dot(lhs, rhs)
     elif _is_ascend_runtime():
+        if kernel_idx.dtype != torch.int64:
+            kernel_idx = kernel_idx.to(torch.int64).contiguous()
         result = _torch_spvv(values, kernel_idx, y, op)
     else:
         nnz = values.numel()

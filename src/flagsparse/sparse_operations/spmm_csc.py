@@ -15,6 +15,7 @@
 """Native CSC SpMM kernels and route helpers."""
 
 import time
+import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -69,24 +70,151 @@ def _ascend_spmm_csc_torch(prepared, B):
     nnz = int(prepared.nnz)
     dense_cols = int(B.shape[1])
     out_rows = n_cols if _spmm_csc_op_transposes(prepared.op) else n_rows
-    C = torch.zeros((out_rows, dense_cols), dtype=prepared.data.dtype, device=B.device)
     if nnz == 0:
-        return C
+        return torch.zeros(
+            (out_rows, dense_cols), dtype=prepared.data.dtype, device=B.device
+        )
+    if prepared.data.is_complex():
+        return _ascend_spmm_csc_real_planes(prepared, B)
+    if prepared.ascend_runner is None:
+        ascend_data = prepared.data
+        ascend_kernel_indices = prepared.kernel_indices
+        ascend_col_ids = prepared.col_ids
+        ascend_op = prepared.op
+        ascend_transposes = _spmm_csc_op_transposes(ascend_op)
+
+        def ascend_spmm(dense):
+            result = torch.zeros(
+                out_rows, dense.shape[1], dtype=ascend_data.dtype, device=dense.device
+            )
+            values = ascend_data.conj() if ascend_op == "conj" else ascend_data
+            rows = ascend_kernel_indices.to(torch.int64)
+            cols = ascend_col_ids.to(torch.int64)
+            if ascend_transposes:
+                products = (
+                    _ascend_complex_products(values, dense, rows)
+                    if values.is_complex()
+                    else values[:, None] * torch.nn.functional.embedding(rows, dense)
+                )
+                target = cols
+            else:
+                products = (
+                    _ascend_complex_products(values, dense, cols)
+                    if values.is_complex()
+                    else values[:, None] * torch.nn.functional.embedding(cols, dense)
+                )
+                target = rows
+            if values.is_complex():
+                result_pair = torch.zeros(
+                    out_rows, dense.shape[1] * 2, dtype=products.dtype, device=dense.device
+                )
+                result_pair = _ascend_index_add(
+                    result_pair, 0, target, products.reshape(products.shape[0], -1)
+                )
+                return torch.view_as_complex(
+                    result_pair.reshape(out_rows, dense.shape[1], 2).contiguous()
+                )
+            else:
+                result = _ascend_index_add(result, 0, target, products)
+            return result
+
+        try:
+            prepared.ascend_runner = _ascend_compile(
+                ascend_spmm
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"CSC SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.ascend_runner = False
+    if prepared.ascend_runner:
+        try:
+            return _ascend_owned_output(prepared.ascend_runner(B))
+        except Exception as exc:
+            warnings.warn(
+                f"CSC SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.ascend_runner = False
     col_ids = getattr(prepared, "col_ids", None)
     if col_ids is None:
         col_ids = _csr_row_ids_torch(prepared.kernel_indptr, n_cols)
     rows = prepared.kernel_indices.to(torch.int64)
     cols = col_ids.to(torch.int64)
     values = prepared.data
+    C = torch.zeros((out_rows, dense_cols), dtype=values.dtype, device=B.device)
     if prepared.op == "conj":
         values = values.conj()
     if _spmm_csc_op_transposes(prepared.op):
-        products = values[:, None] * _gather_values(B, rows)
-        _index_add_values(C, 0, cols, products)
+        if values.is_complex():
+            products = _ascend_complex_products(values, B, rows)
+            result_pair = torch.zeros(
+                out_rows, dense_cols * 2, dtype=products.dtype, device=B.device
+            )
+            result_pair = _ascend_index_add(
+                result_pair, 0, cols, products.reshape(nnz, dense_cols * 2)
+            )
+            C = torch.view_as_complex(
+                result_pair.reshape(out_rows, dense_cols, 2).contiguous()
+            )
+        else:
+            products = values[:, None] * torch.nn.functional.embedding(rows, B)
+            C = _ascend_index_add(C, 0, cols, products)
     else:
-        products = values[:, None] * _gather_values(B, cols)
-        _index_add_values(C, 0, rows, products)
+        if values.is_complex():
+            products = _ascend_complex_products(values, B, cols)
+            result_pair = torch.zeros(
+                out_rows, dense_cols * 2, dtype=products.dtype, device=B.device
+            )
+            result_pair = _ascend_index_add(
+                result_pair, 0, rows, products.reshape(nnz, dense_cols * 2)
+            )
+            C = torch.view_as_complex(
+                result_pair.reshape(out_rows, dense_cols, 2).contiguous()
+            )
+        else:
+            products = values[:, None] * torch.nn.functional.embedding(cols, B)
+            C = _ascend_index_add(C, 0, rows, products)
     return C
+
+
+def _ascend_spmm_csc_real_planes(prepared, B):
+    rows = prepared.kernel_indices
+    cols = prepared.col_ids
+    transposed = _spmm_csc_op_transposes(prepared.op)
+    source, target = (rows, cols) if transposed else (cols, rows)
+    n_rows = prepared.n_cols if transposed else prepared.n_rows
+    value_real, value_imag = prepared.ascend_value_planes
+
+    def real_spmm(dense):
+        real_rhs = dense[..., 0].contiguous()
+        imag_rhs = dense[..., 1].contiguous()
+        real_gather = torch.nn.functional.embedding(source, real_rhs)
+        imag_gather = torch.nn.functional.embedding(source, imag_rhs)
+        real_product = value_real[:, None] * real_gather - value_imag[:, None] * imag_gather
+        imag_product = value_real[:, None] * imag_gather + value_imag[:, None] * real_gather
+        products = torch.cat((real_product, imag_product), dim=1)
+        result = torch.zeros(n_rows, dense.shape[1] * 2, dtype=dense.dtype, device=dense.device)
+        result = _ascend_index_add(result, 0, target, products)
+        return result.reshape(n_rows, 2, dense.shape[1]).transpose(1, 2).contiguous()
+
+    if prepared.ascend_runner is None:
+        try:
+            prepared.ascend_runner = _ascend_compile(real_spmm)
+        except Exception as exc:
+            warnings.warn(f"CSC real-plane graph compile failed; using eager: {exc}", RuntimeWarning, stacklevel=2)
+            prepared.ascend_runner = False
+    operand = torch.view_as_real(B.resolve_conj())
+    if prepared.ascend_runner:
+        try:
+            return torch.view_as_complex(prepared.ascend_runner(operand).clone())
+        except Exception as exc:
+            warnings.warn(f"CSC real-plane graph replay failed; using eager: {exc}", RuntimeWarning, stacklevel=2)
+            prepared.ascend_runner = False
+    return torch.view_as_complex(real_spmm(operand))
 
 
 def _normalize_spmm_csc_op(op=None, transpose=False):
@@ -162,6 +290,9 @@ class PreparedCscSpmm:
         "index_fallback_reason",
         "rocm_non_gather_plan",
         "musa_trans_gather",
+        "ascend_runner",
+        "ascend_meta",
+        "ascend_value_planes",
     )
 
     def __init__(
@@ -209,6 +340,12 @@ class PreparedCscSpmm:
         self.index_fallback_reason = index_fallback_reason
         self.rocm_non_gather_plan = None
         self.musa_trans_gather = bool(musa_trans_gather)
+        self.ascend_runner = None
+        self.ascend_meta = {}
+        self.ascend_value_planes = None
+        if _is_ascend_runtime() and data.is_complex():
+            planes = torch.view_as_real((data.conj() if self.op == "conj" else data).resolve_conj())
+            self.ascend_value_planes = (planes[:, 0].contiguous(), planes[:, 1].contiguous())
         if ((_is_rocm_runtime() or _is_iluvatar_runtime()) and not _is_ascend_runtime()
                 and data.dtype == torch.complex64 and self.op == "non"):
             from . import _spmv_csr_transpose
@@ -591,13 +728,20 @@ def prepare_spmm_csc_route(
         try:
             if _is_ascend_runtime():
                 # A CSC indptr runs over columns, so its "row ids" are column ids.
-                col_ids = _csr_row_ids_torch(indptr, n_cols)
+                col_ids = _csr_row_ids_torch(indptr, n_cols, cache=False)
             else:
                 from .sddmm_csr import _build_row_ids
 
                 col_ids = _build_row_ids(indptr.to(torch.int32), int(data.numel()))
         except Exception:
             col_ids = None
+    if _is_ascend_runtime():
+        # The Ascend graph consumes int64 gather/scatter indices.  Promote the
+        # structural arrays once during preparation instead of inserting a
+        # dtype conversion into every replayed kernel call.
+        indices = indices.to(torch.int64).contiguous()
+        if col_ids is not None:
+            col_ids = col_ids.to(torch.int64).contiguous()
     return PreparedCscSpmm(
         data=data,
         kernel_indices=indices,
@@ -1741,6 +1885,7 @@ def flagsparse_spmm_csc_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": op_name,
+            **(_ascend_execution_meta(prepared) if _is_ascend_runtime() else {}),
             "logical_shape": prepared.shape,
             "block_n": route_meta.get("block_n", prepared.block_n),
             "block_nnz": route_meta.get("block_nnz", prepared.block_nnz),

@@ -146,6 +146,11 @@ class PreparedCoo:
         self.data_trans = data_trans if data_trans is not None else data_non
         self.row_trans = row_trans if row_trans is not None else col_non
         self.col_trans = col_trans if col_trans is not None else row_non
+        if _is_ascend_runtime():
+            self.row_non = self.row_non.to(torch.int64).contiguous()
+            self.col_non = self.col_non.to(torch.int64).contiguous()
+            self.row_trans = self.row_trans.to(torch.int64).contiguous()
+            self.col_trans = self.col_trans.to(torch.int64).contiguous()
         self.seg_starts_trans = seg_starts_trans
         self.shape = (int(shape[0]), int(shape[1]))
         self.n_rows, self.n_cols = self.shape
@@ -1327,11 +1332,17 @@ def _ascend_spmv_coo_index_add(launch, x):
     """Run COO SpMV through torch_npu primitives instead of Triton lowering."""
     y = torch.zeros(launch.n_rows, dtype=launch.data.dtype, device=launch.data.device)
     if launch.nnz:
-        row = launch.row.to(torch.int64)
-        col = launch.col.to(torch.int64)
+        row = launch.row.to(torch.int64).contiguous()
+        col = launch.col.to(torch.int64).contiguous()
         # conj (for op=conj_trans) is already folded into launch.data by
         # _resolve_spmv_coo_launch / _prepare_spmv_coo_launch.
-        _index_add_values(y, 0, row, launch.data * _gather_values(x, col))
+        if _is_complex_dtype(x.dtype):
+            gathered = torch.view_as_complex(torch.view_as_real(x).index_select(0, col))
+        elif x.dtype == torch.float64:
+            gathered = x[col]
+        else:
+            gathered = x.index_select(0, col)
+        _index_add_values(y, 0, row, launch.data * gathered)
     return y
 
 

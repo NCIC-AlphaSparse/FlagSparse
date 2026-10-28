@@ -160,7 +160,14 @@ from .spmv_sell import (
     prepare_spmv_sell,
     spmv_sell_prepared,
 )
-from .vector_ops import flagsparse_axpby, flagsparse_spvv
+from .vector_ops import (
+    PreparedAxpby,
+    PreparedSpvv,
+    flagsparse_axpby,
+    flagsparse_spvv,
+    prepare_axpby,
+    prepare_spvv,
+)
 from .spmv_csr import (
     PreparedCsrSpmv,
     flagsparse_spmv_coo_tocsr,
@@ -309,6 +316,10 @@ __all__ = [
     "spmv_sell_prepared",
     "flagsparse_axpby",
     "flagsparse_spvv",
+    "PreparedAxpby",
+    "PreparedSpvv",
+    "prepare_axpby",
+    "prepare_spvv",
     "flagsparse_spmv_csr",
     "flagsparse_spmv_csr_run",
     "get_spmv_csr_algorithm_spec",

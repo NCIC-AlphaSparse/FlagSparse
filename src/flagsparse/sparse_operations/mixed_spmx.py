@@ -42,6 +42,7 @@ from ._common import *
 
 import os
 import time
+import warnings
 
 import triton
 import triton.language as tl
@@ -56,6 +57,12 @@ _ILUVATAR_COO_SPMM_CSR_CACHE = TensorPlanCache()
 _MUSA_COO_CSR_CACHE = TensorPlanCache()
 _MUSA_CSC_CSR_CACHE = TensorPlanCache()
 _MUSA_CSR_NNZ_CACHE = TensorPlanCache(maxsize=16)
+
+
+def _ascend_csc_gather(values, order):
+    if _is_ascend_runtime() and not values.is_complex() and values.ndim == 2:
+        return torch.nn.functional.embedding(order, values)
+    return _ascend_gather_values(values, order)
 
 # value dtype -> widened output dtypes (the first is the default for int8).
 _WIDE_OUT = {
@@ -79,7 +86,9 @@ class PreparedCsrMixedSpmv:
     __slots__ = (
         "data", "indices", "indptr", "shape", "n_rows", "n_cols",
         "result_dtype", "acc_dtype", "rows_per", "block", "num_warps",
-        "route", "bucket_plan", "nnz_plan",
+        "route", "bucket_plan", "nnz_plan", "ascend_rows",
+        "ascend_cols", "ascend_data", "rhs_source",
+        "rhs_compute", "rhs_version",
     )
 
     def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype,
@@ -98,6 +107,107 @@ class PreparedCsrMixedSpmv:
         self.route = route
         self.bucket_plan = bucket_plan
         self.nnz_plan = nnz_plan
+        if _is_ascend_runtime():
+            self.ascend_rows = _csr_row_ids(indptr, self.n_rows, data.numel())
+            self.ascend_cols = indices.to(torch.int64).contiguous()
+            self.ascend_data = data.to(acc_dtype).contiguous()
+        else:
+            self.ascend_rows = None
+            self.ascend_cols = None
+            self.ascend_data = None
+        self.rhs_source = None
+        self.rhs_compute = None
+        self.rhs_version = None
+
+
+class PreparedCsrSpmmMixed:
+    __slots__ = (
+        "data",
+        "indices",
+        "indptr",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "result_dtype",
+        "acc_dtype",
+        "rows",
+        "cols",
+        "acc_data",
+        "runner",
+        "ascend_meta",
+    )
+
+    def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype):
+        self.data = data.contiguous()
+        self.indices = indices.contiguous()
+        self.indptr = indptr.contiguous()
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows, self.n_cols = self.shape
+        self.result_dtype = result_dtype
+        self.acc_dtype = acc_dtype
+        self.rows = _csr_row_ids(indptr, self.n_rows, data.numel()).to(torch.int64)
+        self.cols = indices.to(torch.int64).contiguous()
+        self.acc_data = data.to(acc_dtype).contiguous()
+        self.runner = None
+        self.ascend_meta = {}
+
+
+class PreparedCooSpmmMixed:
+    __slots__ = (
+        "data",
+        "row",
+        "col",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "result_dtype",
+        "acc_dtype",
+        "acc_data",
+        "runner",
+        "ascend_meta",
+    )
+
+    def __init__(self, data, row, col, shape, result_dtype, acc_dtype):
+        self.data = data.contiguous()
+        self.row = row.to(torch.int64).contiguous()
+        self.col = col.to(torch.int64).contiguous()
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows, self.n_cols = self.shape
+        self.result_dtype = result_dtype
+        self.acc_dtype = acc_dtype
+        self.acc_data = data.to(acc_dtype).contiguous()
+        self.runner = None
+        self.ascend_meta = {}
+
+
+class PreparedCscSpmmMixed:
+    __slots__ = (
+        "data",
+        "indices",
+        "indptr",
+        "col_ids",
+        "shape",
+        "n_rows",
+        "n_cols",
+        "result_dtype",
+        "acc_dtype",
+        "acc_data",
+        "runner",
+        "ascend_meta",
+    )
+
+    def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype):
+        self.data = data.contiguous()
+        self.indices = indices.to(torch.int64).contiguous()
+        self.indptr = indptr.contiguous()
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.n_rows, self.n_cols = self.shape
+        self.result_dtype = result_dtype
+        self.acc_dtype = acc_dtype
+        self.col_ids = _csr_row_ids(indptr, self.n_cols, data.numel()).to(torch.int64)
+        self.acc_data = data.to(acc_dtype).contiguous()
+        self.runner = None
+        self.ascend_meta = {}
 
 
 def _requested_out_dtype(out, out_dtype):
@@ -192,10 +302,10 @@ def _index32(t):
 
 
 def _csr_row_ids(indptr, n_rows, nnz):
-    lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
-    return torch.repeat_interleave(
-        torch.arange(n_rows, device=indptr.device, dtype=torch.int64), lengths, output_size=nnz
-    )
+    row_ids = _csr_row_ids_torch(indptr, n_rows, cache=not _is_ascend_runtime())
+    if row_ids.numel() != nnz:
+        raise ValueError("CSR row-id expansion does not match nnz")
+    return row_ids
 
 
 def _finish(y, out, t0, return_time):
@@ -541,6 +651,31 @@ def spmv_csr_mixed_prepared(prepared, x, *, out=None, return_time=False):
     ):
         raise ValueError("out shape/dtype/device does not match the prepared CSR result")
     if prepared.route == "call":
+        if _is_ascend_runtime():
+            x = x.contiguous()
+            rhs = x
+            rhs_dtype = x.dtype if _is_complex_dtype(x.dtype) else prepared.acc_dtype
+            if x.dtype != rhs_dtype:
+                version = getattr(x, "_version", None)
+                if (
+                    prepared.rhs_source is not x
+                    or prepared.rhs_compute is None
+                    or prepared.rhs_version != version
+                ):
+                    prepared.rhs_source = x
+                    prepared.rhs_compute = x.to(rhs_dtype).contiguous()
+                    prepared.rhs_version = version
+                rhs = prepared.rhs_compute
+            t0 = _start(return_time)
+            y = _torch_spmv_rows(
+                prepared.ascend_data,
+                prepared.ascend_rows,
+                prepared.ascend_cols,
+                rhs,
+                prepared.n_rows,
+                prepared.acc_dtype,
+            ).to(prepared.result_dtype)
+            return _finish(y, out, t0, return_time)
         return spmv_csr_mixed(
             prepared.data, prepared.indices, prepared.indptr, x, prepared.shape,
             out=out, out_dtype=prepared.result_dtype, return_time=return_time,
@@ -1049,8 +1184,14 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     data, x = data.contiguous(), x.contiguous()
     t0 = _start(return_time)
     if _is_ascend_runtime():
-        rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
-        y = _torch_spmv_rows(data, rows.to(torch.int64), cols, x, n_rows, acc_dtype)
+        rows = _index32(row.contiguous()).to(torch.int64).contiguous()
+        cols = _index32(col.contiguous()).to(torch.int64).contiguous()
+        compute_data = data.to(acc_dtype).contiguous()
+        rhs = x
+        rhs_dtype = x.dtype if _is_complex_dtype(x.dtype) else acc_dtype
+        if x.dtype != rhs_dtype:
+            rhs = x.to(rhs_dtype).contiguous()
+        y = _torch_spmv_rows(compute_data, rows, cols, rhs, n_rows, acc_dtype)
         return _finish(y.to(result_dtype), out, t0, return_time)
     if _is_rocm_runtime() or _is_iluvatar_runtime():
         # Group sorted COO rows into CSR tiles instead of atomically updating
@@ -1430,6 +1571,274 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
         _ACCEL.synchronize()
         return C, (time.perf_counter() - t0) * 1000.0
     return C
+
+
+def prepare_spmm_csr_mixed(data, indices, indptr, shape, *, out_dtype=None):
+    _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+        raise ValueError("invalid CSR dimensions")
+    result_dtype, acc_dtype = _resolve_types(
+        data.dtype, data.dtype, None, out_dtype, False
+    )
+    return PreparedCsrSpmmMixed(
+        data, indices, indptr, shape, result_dtype, acc_dtype
+    )
+
+
+def spmm_csr_mixed_prepared(prepared, B, *, out=None):
+    if not isinstance(prepared, PreparedCsrSpmmMixed):
+        raise TypeError("prepared must be a PreparedCsrSpmmMixed instance")
+    if not torch.is_tensor(B) or B.ndim != 2 or not _is_accel_tensor(B):
+        raise ValueError("B must be a 2D accelerator tensor")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B has {B.shape[0]} rows, expected {prepared.n_cols}")
+    if B.dtype not in (prepared.data.dtype, prepared.acc_dtype):
+        raise TypeError("B dtype must match data dtype or accumulate dtype")
+    if out is not None and (
+        tuple(out.shape) != (prepared.n_rows, B.shape[1])
+        or out.dtype != prepared.result_dtype
+        or out.device != B.device
+    ):
+        raise ValueError("out shape/dtype/device must match the CSR SpMM result")
+    dense = B if B.dtype == prepared.acc_dtype else B.to(prepared.acc_dtype)
+    if _is_ascend_runtime() and prepared.runner is None:
+        ascend_n_rows = prepared.n_rows
+        ascend_acc_dtype = prepared.acc_dtype
+        ascend_rows = prepared.rows
+        ascend_cols = prepared.cols
+        ascend_data = prepared.acc_data
+
+        def ascend_spmm(rhs):
+            result = torch.zeros(
+                ascend_n_rows, rhs.shape[1], dtype=ascend_acc_dtype, device=rhs.device
+            )
+            result = _ascend_index_add(
+                result,
+                0,
+                ascend_rows,
+                ascend_data[:, None] * _ascend_gather_values(rhs, ascend_cols),
+            )
+            return result
+
+        try:
+            prepared.runner = _ascend_compile(
+                ascend_spmm
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Mixed SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.runner = False
+    if _is_ascend_runtime() and prepared.runner:
+        try:
+            result = _ascend_owned_output(prepared.runner(dense))
+        except Exception as exc:
+            warnings.warn(
+                f"Mixed SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.runner = False
+            result = None
+    else:
+        result = None
+    if result is None:
+        result = torch.zeros(
+            prepared.n_rows, B.shape[1], dtype=prepared.acc_dtype, device=B.device
+        )
+        result.index_add_(
+            0,
+            prepared.rows,
+            prepared.acc_data[:, None] * _ascend_gather_values(dense, prepared.cols),
+        )
+    if _is_ascend_runtime():
+        prepared.ascend_meta = _ascend_execution_meta(prepared, "runner")
+    result = result if result.dtype == prepared.result_dtype else result.to(prepared.result_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def prepare_spmm_coo_mixed(data, row, col, shape, *, out_dtype=None):
+    _check_1d((data, "data"), (row, "row"), (col, "col"))
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() != row.numel() or data.numel() != col.numel():
+        raise ValueError("data, row and col must have the same length")
+    result_dtype, acc_dtype = _resolve_types(
+        data.dtype, data.dtype, None, out_dtype, False
+    )
+    return PreparedCooSpmmMixed(data, row, col, shape, result_dtype, acc_dtype)
+
+
+def spmm_coo_mixed_prepared(prepared, B, *, out=None):
+    if not isinstance(prepared, PreparedCooSpmmMixed):
+        raise TypeError("prepared must be a PreparedCooSpmmMixed instance")
+    if not torch.is_tensor(B) or B.ndim != 2 or not _is_accel_tensor(B):
+        raise ValueError("B must be a 2D accelerator tensor")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B has {B.shape[0]} rows, expected {prepared.n_cols}")
+    if B.dtype not in (prepared.data.dtype, prepared.acc_dtype):
+        raise TypeError("B dtype must match data dtype or accumulate dtype")
+    if out is not None and (
+        tuple(out.shape) != (prepared.n_rows, B.shape[1])
+        or out.dtype != prepared.result_dtype
+        or out.device != B.device
+    ):
+        raise ValueError("out shape/dtype/device must match the COO SpMM result")
+    dense = B if B.dtype == prepared.acc_dtype else B.to(prepared.acc_dtype)
+    if _is_ascend_runtime() and prepared.runner is None:
+        ascend_n_rows = prepared.n_rows
+        ascend_acc_dtype = prepared.acc_dtype
+        ascend_row = prepared.row
+        ascend_col = prepared.col
+        ascend_data = prepared.acc_data
+
+        def ascend_spmm(rhs):
+            result = torch.zeros(
+                ascend_n_rows, rhs.shape[1], dtype=ascend_acc_dtype, device=rhs.device
+            )
+            result = _ascend_index_add(
+                result,
+                0,
+                ascend_row,
+                ascend_data[:, None] * _ascend_gather_values(rhs, ascend_col),
+            )
+            return result
+
+        try:
+            prepared.runner = _ascend_compile(
+                ascend_spmm
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Mixed SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.runner = False
+    if _is_ascend_runtime() and prepared.runner:
+        try:
+            result = _ascend_owned_output(prepared.runner(dense))
+        except Exception as exc:
+            warnings.warn(
+                f"Mixed SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.runner = False
+            result = None
+    else:
+        result = None
+    if result is None:
+        result = torch.zeros(
+            prepared.n_rows, B.shape[1], dtype=prepared.acc_dtype, device=B.device
+        )
+        result.index_add_(
+            0,
+            prepared.row,
+            prepared.acc_data[:, None] * _ascend_gather_values(dense, prepared.col),
+        )
+    if _is_ascend_runtime():
+        prepared.ascend_meta = _ascend_execution_meta(prepared, "runner")
+    result = result if result.dtype == prepared.result_dtype else result.to(prepared.result_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def prepare_spmm_csc_mixed(data, indices, indptr, shape, *, out_dtype=None):
+    _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if data.numel() != indices.numel() or indptr.numel() != n_cols + 1:
+        raise ValueError("invalid CSC dimensions")
+    result_dtype, acc_dtype = _resolve_types(
+        data.dtype, data.dtype, None, out_dtype, False
+    )
+    return PreparedCscSpmmMixed(
+        data, indices, indptr, shape, result_dtype, acc_dtype
+    )
+
+
+def spmm_csc_mixed_prepared(prepared, B, *, out=None):
+    if not isinstance(prepared, PreparedCscSpmmMixed):
+        raise TypeError("prepared must be a PreparedCscSpmmMixed instance")
+    if not torch.is_tensor(B) or B.ndim != 2 or not _is_accel_tensor(B):
+        raise ValueError("B must be a 2D accelerator tensor")
+    if B.shape[0] != prepared.n_cols:
+        raise ValueError(f"B has {B.shape[0]} rows, expected {prepared.n_cols}")
+    if B.dtype not in (prepared.data.dtype, prepared.acc_dtype):
+        raise TypeError("B dtype must match data dtype or accumulate dtype")
+    if out is not None and (
+        tuple(out.shape) != (prepared.n_rows, B.shape[1])
+        or out.dtype != prepared.result_dtype
+        or out.device != B.device
+    ):
+        raise ValueError("out shape/dtype/device must match the CSC SpMM result")
+    dense = B if B.dtype == prepared.acc_dtype else B.to(prepared.acc_dtype)
+    if _is_ascend_runtime() and prepared.runner is None:
+        ascend_n_rows = prepared.n_rows
+        ascend_acc_dtype = prepared.acc_dtype
+        ascend_indices = prepared.indices
+        ascend_col_ids = prepared.col_ids
+        ascend_data = prepared.acc_data
+
+        def ascend_spmm(rhs):
+            result = torch.zeros(
+                ascend_n_rows, rhs.shape[1], dtype=ascend_acc_dtype, device=rhs.device
+            )
+            result = _ascend_index_add(
+                result,
+                0,
+                ascend_indices,
+                ascend_data[:, None] * _ascend_csc_gather(rhs, ascend_col_ids),
+            )
+            return result
+
+        try:
+            prepared.runner = _ascend_compile(
+                ascend_spmm
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Mixed SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.runner = False
+    if _is_ascend_runtime() and prepared.runner:
+        try:
+            result = _ascend_owned_output(prepared.runner(dense))
+        except Exception as exc:
+            warnings.warn(
+                f"Mixed SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.runner = False
+            result = None
+    else:
+        result = None
+    if result is None:
+        result = torch.zeros(
+            prepared.n_rows, B.shape[1], dtype=prepared.acc_dtype, device=B.device
+        )
+        result.index_add_(
+            0,
+            prepared.indices,
+            prepared.acc_data[:, None] * _ascend_csc_gather(dense, prepared.col_ids),
+        )
+    if _is_ascend_runtime():
+        prepared.ascend_meta = _ascend_execution_meta(prepared, "runner")
+    result = result if result.dtype == prepared.result_dtype else result.to(prepared.result_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 # ---------------------------------------------------------------------------

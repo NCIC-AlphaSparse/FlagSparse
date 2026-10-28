@@ -382,7 +382,7 @@ y = fs.flagsparse_spmv_sell(prepared=plan, x=x, out=y)   # 或 fs.spmv_sell_prep
 `tests/test_spmv_sell.py` 读 `FLAGSPARSE_SELL_PREPARED`：不设置时和以前完全一样；设成 `1`/`auto`/`sigma`/`call` 时每个
 矩阵先 prepare（不计时），再计时 prepared 调用，CSV 记 `timed=prepared`，并增加 `layout`、`sell_sigma`、`sell_c`、
 `sell_group`、`sell_warps`、`sell_paired`、`sell_reorder`、`prepared_values` 列。runner 会把环境变量传给子进程，
-所以 `benchmark_biv.py` 直接可用。
+所以 `benchmark/benchmark_biv.py` 直接可用。
 
 ### 9.3 CUDA 参考数据（5090，交付 benchmark 计时；不代表天数）
 
@@ -416,12 +416,12 @@ cage12 这类小矩阵在 CUDA 上受主机开销限制：原路径每次调用�
 
    ```bash
    # a) 现状
-   python3 benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_call_<日期>
+   python3 benchmark/benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_call_<日期>
    # b) prepared 默认（按当前 dtype/backend 默认值选择）
-   env FLAGSPARSE_SELL_PREPARED=1 python3 benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_prep_<日期>
+   env FLAGSPARSE_SELL_PREPARED=1 python3 benchmark/benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_prep_<日期>
    # c) b) 再加 RCM 自动重排
    env FLAGSPARSE_SELL_PREPARED=1 FLAGSPARSE_SELL_PREP_REORDER=auto \
-     python3 benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_rcm_<日期>
+     python3 benchmark/benchmark_biv.py --ops spmv_sell --results-dir results_biv_sell_rcm_<日期>
    ```
 
    每轮之后 `python3 tools/delivery_table.py <结果目录>`。如果探针 P6 里有比默认更好的 (c, group, warps) 或 σ，用对应的

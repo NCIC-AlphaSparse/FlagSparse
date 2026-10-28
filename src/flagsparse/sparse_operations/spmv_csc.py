@@ -108,6 +108,7 @@ class PreparedCscSpmv:
         "index_fallback_reason",
         "launch_backend",
         "device_warp_size",
+        "ascend_state",
     )
 
     def __init__(
@@ -168,6 +169,9 @@ class PreparedCscSpmv:
             if device_warp_size is not None
             else info["device_warp_size"]
         )
+        self.ascend_state = None
+        if _is_ascend_runtime():
+            _refresh_ascend_spmv_csc(self)
 
 
 @triton.jit
@@ -355,7 +359,9 @@ def _prepare_spmv_csc_matrix(data, indices, indptr, shape):
         raise ValueError("data, indices, indptr must be CUDA tensors")
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
-    if data.dtype not in SUPPORTED_SPMV_CSC_VALUE_DTYPES:
+    if data.dtype not in SUPPORTED_SPMV_CSC_VALUE_DTYPES and not (
+        _is_ascend_runtime() and data.dtype in (torch.float16, torch.bfloat16)
+    ):
         raise TypeError(_spmv_csc_dtype_error_message())
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
         raise TypeError("indices dtype must be torch.int32 or torch.int64")
@@ -391,7 +397,9 @@ def prepare_spmv_csc(
     transpose=False,
     op=None,
     index_fallback_policy="auto",
+    x=None,
 ):
+    """Prepare CSC metadata and, on Ascend, optional reusable RHS conversion."""
     index_fallback_policy = _normalize_spmv_csc_index_fallback_policy(
         index_fallback_policy
     )
@@ -436,7 +444,7 @@ def prepare_spmv_csc(
         try:
             if _is_ascend_runtime():
                 # A CSC indptr runs over columns, so its "row ids" are column ids.
-                col_ids = _csr_row_ids_torch(indptr, n_cols)
+                col_ids = _csr_row_ids_torch(indptr, n_cols, cache=False)
             else:
                 # Deferred import: sddmm_csr only depends on _common, so there is no cycle,
                 # but keeping it local avoids adding a load-time edge between operators.
@@ -482,7 +490,7 @@ def prepare_spmv_csc(
             )
         except Exception:
             csr_delegate = None
-    return PreparedCscSpmv(
+    prepared = PreparedCscSpmv(
         data=data,
         kernel_indices=indices,
         kernel_indptr=indptr,
@@ -500,6 +508,10 @@ def prepare_spmv_csc(
         launch_backend=launch_backend,
         device_warp_size=device_warp_size,
     )
+    if _is_ascend_runtime() and x is not None:
+        rhs = _validate_spmv_csc_x(x, prepared, op_code)
+        prepared.ascend_state["rhs"] = (rhs, _ascend_spmv_csc_operand(rhs), _ascend_tensor_version(rhs))
+    return prepared
 
 
 def _validate_spmv_csc_x(x, prepared, op_code):
@@ -584,32 +596,96 @@ def _spmv_csc_non_complex_nnzpar_kernel(
 SPMV_CSC_NNZPAR_BLOCK = 256
 
 
-def _ascend_spmv_csc_torch(prepared, x, op_code):
+def _ascend_spmv_csc_indices(indices, indptr, n_cols):
+    return (
+        indices.to(torch.int64).contiguous(),
+        _csr_row_ids_torch(indptr, n_cols, cache=False).to(torch.int64).contiguous(),
+    )
+
+
+def _ascend_spmv_csc_operand(tensor):
+    if tensor.dtype not in (torch.float16, torch.bfloat16):
+        return tensor
+    return tensor.to(torch.float32).contiguous()
+
+
+def _ascend_spmv_csc_non(data, indices, indptr, n_cols):
+    rows, cols = _ascend_spmv_csc_indices(indices, indptr, n_cols)
+    order = torch.argsort(rows, stable=True)
+    rows, cols = rows.index_select(0, order), cols.index_select(0, order)
+    values = data.to(torch.float32).index_select(0, order)
+    return values, rows, cols
+
+
+def _ascend_tensor_version(tensor):
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
+
+
+def _refresh_ascend_spmv_csc(prepared):
+    versions = tuple(_ascend_tensor_version(tensor) for tensor in (
+        prepared.data, prepared.kernel_indices, prepared.kernel_indptr
+    ))
+    state = prepared.ascend_state
+    if state is not None and versions == state["versions"]:
+        return
+    if state is None or versions[1:] != state["versions"][1:]:
+        rows, cols = _ascend_spmv_csc_indices(
+            prepared.kernel_indices, prepared.kernel_indptr, prepared.n_cols
+        )
+        order = None
+        if prepared.data.dtype in (torch.float16, torch.bfloat16, torch.float32) and prepared.op == SPMV_CSC_OP_NON:
+            order = torch.argsort(rows, stable=True)
+            rows, cols = rows.index_select(0, order), cols.index_select(0, order)
+        state = {"rows": rows, "cols": cols, "order": order, "rhs": None}
+        prepared.ascend_state = state
+    values = _ascend_spmv_csc_operand(prepared.data)
+    if state["order"] is not None:
+        values = values.index_select(0, state["order"])
+    state["values"] = values
+    state["versions"] = versions
+
+
+def _ascend_spmv_csc_torch(prepared, x, op_code, out_dtype=None):
     """CSC SpMV fallback using torch_npu indexing primitives.
 
     CANN currently cannot lower the native CSC Triton kernels.  Keep this route
     local to Ascend; all other backends continue to use the kernels above.
     """
     n_rows, n_cols = prepared.n_rows, prepared.n_cols
+    result_dtype = out_dtype or prepared.data.dtype
+    compute_dtype = (
+        torch.float32
+        if prepared.data.dtype in (torch.float16, torch.bfloat16)
+        else prepared.data.dtype
+    )
     nnz = int(prepared.nnz)
     if nnz == 0:
         out_len = n_cols if _spmv_csc_op_transposes(op_code) else n_rows
-        return torch.zeros(out_len, dtype=prepared.data.dtype, device=prepared.data.device)
-    col_ids = getattr(prepared, "col_ids", None)
-    if col_ids is None:
-        col_ids = _csr_row_ids_torch(prepared.kernel_indptr, n_cols)
-    rows = prepared.kernel_indices.to(torch.int64)
-    cols = col_ids.to(torch.int64)
-    values = prepared.data
+        return torch.zeros(out_len, dtype=result_dtype, device=prepared.data.device)
+    _refresh_ascend_spmv_csc(prepared)
+    state = prepared.ascend_state
+    values, rows, cols = state["values"], state["rows"], state["cols"]
+    version = _ascend_tensor_version(x)
+    rhs = state["rhs"]
+    if rhs is None or rhs[0] is not x or rhs[2] != version or version is None:
+        rhs = (x, _ascend_spmv_csc_operand(x), version)
+        state["rhs"] = rhs
+    x = rhs[1]
     if op_code == SPMV_CSC_OP_CONJ_TRANS:
         values = values.conj()
-    if _spmv_csc_op_transposes(op_code):
-        result = torch.zeros(n_cols, dtype=values.dtype, device=values.device)
-        _index_add_values(result, 0, cols, values * _gather_values(x, rows))
+    transposed = _spmv_csc_op_transposes(op_code)
+    target, source = (cols, rows) if transposed else (rows, cols)
+    out_len = n_cols if transposed else n_rows
+    if x.dtype == torch.float64 or _is_complex_dtype(x.dtype):
+        gathered = _gather_values(x, source)
     else:
-        result = torch.zeros(n_rows, dtype=values.dtype, device=values.device)
-        _index_add_values(result, 0, rows, values * _gather_values(x, cols))
-    return result
+        gathered = x.index_select(0, source)
+    result = torch.zeros(out_len, dtype=compute_dtype, device=values.device)
+    _index_add_values(result, 0, target, values * gathered)
+    return result.to(result_dtype)
 
 
 def _triton_spmv_csc_kernel(prepared, x, op_code):
@@ -887,12 +963,15 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
         y = _mixed_spmx.spmv_csc_half(
             data, indices, indptr, x, shape, out=out, out_dtype=out_dtype, return_time=timed)
     else:
-        lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
-        col_ids = torch.repeat_interleave(
-            torch.arange(n_cols, device=indptr.device, dtype=torch.int64),
-            lengths,
-            output_size=int(data.numel()),
-        )
+        if _is_ascend_runtime():
+            _, col_ids = _ascend_spmv_csc_indices(indices, indptr, n_cols)
+        else:
+            lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
+            col_ids = torch.repeat_interleave(
+                torch.arange(n_cols, device=indptr.device, dtype=torch.int64),
+                lengths,
+                output_size=int(data.numel()),
+            )
         y = _mixed_spmx.spmv_coo_mixed(
             data, indices, col_ids, x, (n_rows, n_cols),
             out=out, out_dtype=out_dtype, return_time=timed,
@@ -985,11 +1064,19 @@ def flagsparse_spmv_csc(
         if not op_explicit:
             op_code = prepared.op
     x = _validate_spmv_csc_x(x, prepared, op_code)
+    ascend_out_dtype = None
+    if _is_ascend_runtime() and prepared.data.dtype in (torch.float16, torch.bfloat16):
+        ascend_out_dtype, _ = _mixed_spmx._resolve_types(
+            prepared.data.dtype, x.dtype, out, out_dtype, False
+        )
     do_timing = bool(return_time or return_meta)
     if do_timing:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    y = _run_spmv_csc_prepared_with_fallback(prepared, x, op_code)
+    if ascend_out_dtype is not None:
+        y = _ascend_spmv_csc_torch(prepared, x, op_code, ascend_out_dtype)
+    else:
+        y = _run_spmv_csc_prepared_with_fallback(prepared, x, op_code)
     if do_timing:
         _ACCEL.synchronize()
         compute_ms = (time.perf_counter() - t0) * 1000.0

@@ -25,6 +25,7 @@ import torch
 
 import flagsparse as fs
 from flagsparse.sparse_operations import spmv_sell
+from flagsparse.sparse_operations._common import _is_ascend_runtime
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
     accelerator_available,
@@ -256,7 +257,59 @@ def test_call_route_matches_unprepared():
     p = fs.prepare_spmv_sell(sv, sc, so, (n_rows, n_cols), slice_size=32, route="call")
     assert p.route == "call"
     want = fs.flagsparse_spmv_sell(sv, sc, so, x, (n_rows, n_cols), slice_size=32)
-    assert torch.equal(fs.flagsparse_spmv_sell(prepared=p, x=x), want)
+    got = fs.flagsparse_spmv_sell(prepared=p, x=x)
+    if _is_ascend_runtime():
+        torch.testing.assert_close(got.cpu(), want.cpu(), rtol=1e-5, atol=1e-5)
+    else:
+        assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+@pytest.mark.parametrize("strided", [False, True] if _is_ascend_runtime() else [False])
+def test_call_route_in_place_value_and_structure_changes_are_seen(dtype, strided):
+    dev = accelerator_device()
+    sv = torch.arange(1, 129, dtype=torch.float32).to(dtype).to(dev)
+    sc = (torch.arange(128, dtype=torch.int32) % 12).to(dev)
+    so = torch.tensor([0, 64, 128], dtype=torch.int32, device=dev)
+    if strided:
+        buffers = [torch.empty(tensor.numel() * 2, dtype=tensor.dtype, device=dev)
+                   for tensor in (sv, sc, so)]
+        for buffer, tensor in zip(buffers, (sv, sc, so)):
+            buffer[::2].copy_(tensor)
+        sv, sc, so = (buffer[::2] for buffer in buffers)
+    x = torch.arange(1, 13, dtype=torch.float32).to(dtype).to(dev)
+    p = fs.prepare_spmv_sell(sv, sc, so, (64, 12), slice_size=32, route="call")
+
+    def check():
+        want = fs.flagsparse_spmv_sell(sv, sc, so, x, (64, 12), slice_size=32)
+        got = fs.flagsparse_spmv_sell(prepared=p, x=x)
+        torch.testing.assert_close(got.cpu(), want.cpu(), rtol=1e-5, atol=1e-5)
+
+    check()
+    sv.mul_(-2)
+    check()
+    sc.copy_((sc + 1) % 12)
+    check()
+    so[1] = 32
+    check()
+
+
+@pytest.mark.skipif(not _is_ascend_runtime(), reason="Ascend workspace fallback")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+def test_call_route_fallback_results_own_storage(dtype):
+    dev = accelerator_device()
+    data, indices, indptr = _csr("short", 64, 48, dtype, seed=41)
+    sv, sc, so = _sell(data, indices, indptr, 64, dev)
+    p = fs.prepare_spmv_sell(sv, sc, so, (64, 48), slice_size=32, route="call")
+    p.ascend_csr_plan = None
+    p.ascend_runner = False
+    x = torch.ones(48).to(dtype).to(dev)
+    first = fs.flagsparse_spmv_sell(prepared=p, x=x)
+    saved = first.clone()
+    second = fs.flagsparse_spmv_sell(prepared=p, x=x * -2)
+    assert torch.equal(first.cpu(), saved.cpu())
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(second.cpu(), first.cpu() * -2)
 
 
 @pytest.mark.skipif(not _SIGMA_OK, reason="SELL-C-sigma needs Triton")
@@ -287,8 +340,11 @@ def test_prepared_sell_rejects_misuse():
     x = torch.randn(n_cols, device=dev)
     with pytest.raises(ValueError):
         fs.flagsparse_spmv_sell(sv, prepared=p, x=x)
+    wrong_dtype = x.cpu().double() if _is_ascend_runtime() else x.double()
     with pytest.raises(TypeError):
-        fs.flagsparse_spmv_sell(prepared=p, x=x.double())
+        fs.flagsparse_spmv_sell(prepared=p, x=wrong_dtype)
+    with pytest.raises(TypeError):
+        fs.flagsparse_spmv_sell(prepared=p, x=x.half())
     with pytest.raises(ValueError):
         fs.flagsparse_spmv_sell(prepared=p, x=x[:10])
     with pytest.raises(ValueError):

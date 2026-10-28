@@ -19,6 +19,7 @@ import importlib
 import os
 import statistics
 import time
+import types
 import weakref
 
 try:
@@ -407,6 +408,12 @@ __all__ = (
     "_INDEX_LIMIT_INT32",
     "_is_complex_dtype",
     "_gather_values",
+    "_ascend_gather_values",
+    "_ascend_compile",
+    "_ascend_execution_meta",
+    "_ascend_owned_output",
+    "_ascend_complex_products",
+    "_ascend_index_add",
     "_csr_row_ids_torch",
     "_index_add_values",
     "_resolve_scatter_value_dtype",
@@ -554,9 +561,10 @@ def _is_complex_dtype(value_dtype):
 
 
 _CSR_ROW_IDS_CACHE = {}
+_ASCEND_ROW_IDS_CACHE_MAX_BYTES = 128 * 1024 * 1024
 
 
-def _csr_row_ids_torch(indptr, n_rows):
+def _csr_row_ids_torch(indptr, n_rows, *, cache=True):
     """Per-nonzero row index of a CSR ``indptr``, via ``repeat_interleave``.
 
     For the torch fallbacks (Ascend, XPU) that cannot lower ``_build_row_ids``.
@@ -574,7 +582,7 @@ def _csr_row_ids_torch(indptr, n_rows):
         version = indptr._version
     except RuntimeError:
         version = None
-    entry = _CSR_ROW_IDS_CACHE.get(key)
+    entry = _CSR_ROW_IDS_CACHE.get(key) if cache else None
     if entry is not None and version is not None:
         ref, cached_version, cached_rows, row_ids = entry
         if ref() is indptr and cached_version == version and cached_rows == n_rows:
@@ -583,8 +591,17 @@ def _csr_row_ids_torch(indptr, n_rows):
         torch.arange(n_rows, device=indptr.device, dtype=torch.int64),
         indptr[1:].to(torch.int64) - indptr[:-1].to(torch.int64),
     )
-    if version is None:
+    if version is None or not cache:
         return row_ids
+    if _is_ascend_runtime():
+        size = row_ids.numel() * row_ids.element_size()
+        if size > _ASCEND_ROW_IDS_CACHE_MAX_BYTES:
+            return row_ids
+        while _CSR_ROW_IDS_CACHE and size + sum(
+            entry[3].numel() * entry[3].element_size()
+            for entry in _CSR_ROW_IDS_CACHE.values()
+        ) > _ASCEND_ROW_IDS_CACHE_MAX_BYTES:
+            del _CSR_ROW_IDS_CACHE[next(iter(_CSR_ROW_IDS_CACHE))]
 
     def _evict(dead_ref, key=key):
         current = _CSR_ROW_IDS_CACHE.get(key)
@@ -619,6 +636,74 @@ def _gather_values(values, order):
         return values[order]
     real_view = torch.view_as_real(values if values.is_contiguous() else values.contiguous())
     return torch.view_as_complex(real_view[order].contiguous())
+
+
+def _ascend_gather_values(values, order):
+    if not _is_complex_dtype(values.dtype):
+        return values.index_select(0, order)
+    return torch.view_as_complex(
+        torch.view_as_real(values).index_select(0, order)
+    )
+
+
+def _ascend_compile(function):
+    """Give each plan its own Dynamo code cache without changing global limits."""
+    if isinstance(function, types.FunctionType):
+        private_code = function.__code__.replace(
+            co_name=f"{function.__name__}_{id(function):x}"
+        )
+        private_function = types.FunctionType(
+            private_code, function.__globals__, function.__name__,
+            function.__defaults__, function.__closure__,
+        )
+        private_function.__kwdefaults__ = function.__kwdefaults__
+        function = private_function
+    return torch.compile(function, backend="npugraph_ex", dynamic=False, fullgraph=True)
+
+
+def _ascend_execution_meta(prepared, runner_attr="ascend_runner"):
+    materialized = getattr(prepared, "materialized_route", None)
+    if materialized is not None:
+        return _ascend_execution_meta(materialized, runner_attr)
+    runner = getattr(prepared, runner_attr, None)
+    return {"execution_path": "graph" if runner else "eager", "implementation": "index_add"}
+
+
+def _ascend_owned_output(result):
+    if result.is_complex():
+        return torch.view_as_complex(torch.view_as_real(result.resolve_conj()).clone())
+    return result.clone()
+
+
+def _ascend_complex_products(values, dense, indices):
+    value_pair = torch.view_as_real(values.resolve_conj())
+    dense_pair = torch.view_as_real(dense.resolve_conj()).index_select(0, indices)
+    return torch.stack(
+        (
+            value_pair[:, 0, None] * dense_pair[..., 0]
+            - value_pair[:, 1, None] * dense_pair[..., 1],
+            value_pair[:, 0, None] * dense_pair[..., 1]
+            + value_pair[:, 1, None] * dense_pair[..., 0],
+        ),
+        dim=-1,
+    )
+
+
+def _ascend_index_add(acc, dim, index, source):
+    """Scatter-add on Ascend, using the native low-precision reduction when available."""
+    if _is_ascend_runtime() and torch.compiler.is_compiling():
+        return acc.index_add_(dim, index, source)
+    if (
+        _is_ascend_runtime()
+        and dim == 0
+        and acc.ndim == 2
+        and source.ndim == 2
+        and acc.dtype == source.dtype
+        and source.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int32)
+    ):
+        return torch.ops.npu._npu_index_add(acc, index, source)
+    acc.index_add_(dim, index, source)
+    return acc
 
 
 def _index_add_values(acc, dim, index, source):

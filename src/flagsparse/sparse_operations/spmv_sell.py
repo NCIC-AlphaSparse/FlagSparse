@@ -33,6 +33,7 @@ from ._common import *
 
 import os
 import time
+import warnings
 
 import triton
 import triton.language as tl
@@ -712,6 +713,9 @@ class PreparedSellSpmv:
         "values", "cols", "offsets", "versions",
         "sell_values", "kernel_values", "sell_cols", "sell_offsets", "row_len", "perm", "kernel_perm",
         "gather", "n_slices", "n_values", "grid", "constants",
+        "ascend_valid_positions", "ascend_values", "ascend_rows", "ascend_cols",
+        "ascend_workspace", "ascend_runner", "ascend_csr_order", "ascend_csr_plan",
+        "ascend_meta",
     )
 
     def __repr__(self):
@@ -1027,16 +1031,22 @@ def prepare_spmv_sell(
     p.values = values.contiguous()
     p.cols = col_indices.contiguous()
     p.offsets = slice_offsets.contiguous()
+    if route == "call" and _is_ascend_runtime():
+        p.values, p.cols, p.offsets = values, col_indices, slice_offsets
     p.n_values = int(values.numel())
     for name in ("sigma", "sigma_request", "c", "group", "num_warps", "k", "paired", "reorder",
                  "reorder_request", "x_order", "x_buf", "y_buf", "y_order", "sell_values", "kernel_values",
                  "sell_cols", "sell_offsets", "row_len", "perm", "kernel_perm", "gather", "n_slices", "grid",
-                 "constants", "versions"):
+                 "constants", "versions", "ascend_valid_positions", "ascend_values", "ascend_rows", "ascend_cols",
+                 "ascend_workspace", "ascend_runner", "ascend_csr_order", "ascend_csr_plan",
+                 "ascend_meta"):
         setattr(p, name, None)
     if route == "call":
         if k is not None and int(k) != 1:
             raise ValueError("k > 1 needs route='sigma'")
         p.k = 1
+        if _is_ascend_runtime():
+            _install_sell_call(p)
         return p
 
     complex_values = _is_complex_dtype(values.dtype)
@@ -1168,6 +1178,60 @@ def _refresh_sell_sigma(p):
     p.versions = versions
 
 
+def _install_sell_call(p):
+    rows = _sell_entry_rows(p.cols, p.offsets, p.slice_size)
+    valid = (p.cols >= 0) & (rows < p.n_rows)
+    p.ascend_valid_positions = torch.nonzero(valid, as_tuple=False).flatten()
+    p.ascend_values = p.values.index_select(0, p.ascend_valid_positions).contiguous()
+    p.ascend_rows = rows[valid].contiguous()
+    p.ascend_cols = p.cols[valid].to(torch.int64).contiguous()
+    p.ascend_csr_order = None
+    p.ascend_csr_plan = None
+    p.ascend_meta = {"execution_path": "eager", "implementation": "index_add"}
+    if not _is_complex_dtype(p.acc_dtype):
+        order = torch.argsort(p.ascend_rows, stable=True)
+        csr_rows = p.ascend_rows.index_select(0, order)
+        counts = torch.bincount(csr_rows, minlength=p.n_rows)
+        csr_ptr = torch.zeros(p.n_rows + 1, dtype=torch.int64, device=p.device)
+        csr_ptr[1:] = torch.cumsum(counts, dim=0)
+        from . import mixed_spmx
+
+        p.ascend_csr_order = order
+        p.ascend_csr_plan = mixed_spmx.prepare_spmv_csr_mixed(
+            p.ascend_values.index_select(0, order),
+            p.ascend_cols.index_select(0, order),
+            csr_ptr,
+            p.value_dtype,
+            p.shape,
+            out_dtype=p.out_dtype,
+        )
+    p.ascend_workspace = torch.empty(
+        (p.n_rows,) if _is_complex_dtype(p.acc_dtype) else (p.n_rows, 1),
+        dtype=p.acc_dtype,
+        device=p.device,
+    )
+    p.ascend_runner = None
+    p.versions = tuple(_tensor_version(t) for t in (p.values, p.cols, p.offsets))
+
+
+def _refresh_sell_call(p):
+    versions = tuple(_tensor_version(t) for t in (p.values, p.cols, p.offsets))
+    if versions == p.versions:
+        return
+    if p.versions is None or versions[1:] != p.versions[1:]:
+        _install_sell_call(p)
+        return
+    if p.ascend_valid_positions.numel():
+        p.ascend_values.copy_(p.values.index_select(0, p.ascend_valid_positions))
+        if p.ascend_csr_plan is not None:
+            p.ascend_meta = {"execution_path": "eager", "implementation": "csr_index_add"}
+            ordered = p.ascend_values.index_select(0, p.ascend_csr_order)
+            p.ascend_csr_plan.data.copy_(ordered)
+            p.ascend_csr_plan.ascend_data.copy_(ordered.to(p.ascend_csr_plan.acc_dtype))
+    p.ascend_runner = None
+    p.versions = versions
+
+
 def spmv_sell_prepared(prepared, x, *, out=None, return_time=False):
     """Run a ``prepare_spmv_sell`` plan: check ``x`` / ``out``, launch one kernel."""
     if not isinstance(prepared, PreparedSellSpmv):
@@ -1186,6 +1250,116 @@ def spmv_sell_prepared(prepared, x, *, out=None, return_time=False):
     ):
         raise ValueError("out shape/dtype/device must match the prepared SELL result")
     if p.route == "call":
+        if _is_ascend_runtime():
+            _refresh_sell_call(p)
+        if p.ascend_csr_plan is not None:
+            from . import mixed_spmx
+            p.ascend_meta = {"execution_path": "eager", "implementation": "csr_index_add"}
+            return mixed_spmx.spmv_csr_mixed_prepared(
+                p.ascend_csr_plan, x, out=out, return_time=return_time
+            )
+        if _is_ascend_runtime() and p.ascend_valid_positions is not None:
+            t0 = None
+            if return_time:
+                _ACCEL.synchronize()
+                t0 = time.perf_counter()
+            if p.ascend_runner is None:
+                ascend_values = p.ascend_values
+                ascend_cols = p.ascend_cols
+                ascend_rows = p.ascend_rows
+                ascend_n_rows = p.n_rows
+                ascend_acc_dtype = p.acc_dtype
+                ascend_value_ri = (
+                    torch.view_as_real(ascend_values)
+                    if _is_complex_dtype(ascend_acc_dtype) else None
+                )
+
+                def ascend_spmv(vector):
+                    if _is_complex_dtype(ascend_acc_dtype):
+                        value_ri = ascend_value_ri
+                        x_ri = vector.index_select(0, ascend_cols)
+                        product = torch.empty_like(x_ri)
+                        product[:, 0] = value_ri[:, 0] * x_ri[:, 0] - value_ri[:, 1] * x_ri[:, 1]
+                        product[:, 1] = value_ri[:, 0] * x_ri[:, 1] + value_ri[:, 1] * x_ri[:, 0]
+                        result = torch.zeros(ascend_n_rows, 2, dtype=product.dtype, device=vector.device)
+                        result = _ascend_index_add(
+                            result, 0, ascend_rows, product
+                        )
+                        return result
+                    result = torch.zeros(ascend_n_rows, dtype=ascend_acc_dtype, device=vector.device)
+                    result = result.reshape(ascend_n_rows, 1)
+                    result = _ascend_index_add(
+                        result,
+                        0,
+                        ascend_rows,
+                        ascend_values.to(ascend_acc_dtype)[:, None]
+                        * vector.index_select(0, ascend_cols).to(ascend_acc_dtype)[:, None],
+                    )
+                    return result[:, 0]
+
+                try:
+                    p.ascend_runner = _ascend_compile(ascend_spmv)
+                except Exception as exc:
+                    warnings.warn(
+                        f"SELL Ascend graph compile failed; using eager fallback: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    p.ascend_runner = False
+            if p.ascend_runner:
+                try:
+                    operand = torch.view_as_real(x.resolve_conj()) if _is_complex_dtype(p.acc_dtype) else x
+                    result = p.ascend_runner(operand).clone()
+                    if _is_complex_dtype(p.acc_dtype):
+                        result = torch.view_as_complex(result)
+                except Exception as exc:
+                    warnings.warn(
+                        f"SELL Ascend graph replay failed; using eager fallback: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    p.ascend_runner = False
+                    result = None
+            else:
+                result = None
+            if result is None:
+                workspace = p.ascend_workspace
+                workspace.zero_()
+                if _is_complex_dtype(p.acc_dtype):
+                    value_ri = torch.view_as_real(p.ascend_values)
+                    x_ri = torch.view_as_real(x.resolve_conj()).index_select(0, p.ascend_cols)
+                    product = torch.empty_like(x_ri)
+                    product[:, 0] = value_ri[:, 0] * x_ri[:, 0] - value_ri[:, 1] * x_ri[:, 1]
+                    product[:, 1] = value_ri[:, 0] * x_ri[:, 1] + value_ri[:, 1] * x_ri[:, 0]
+                    real_workspace = torch.view_as_real(workspace)
+                    real_workspace = _ascend_index_add(
+                        real_workspace, 0, p.ascend_rows, product
+                    )
+                    workspace = torch.view_as_complex(real_workspace)
+                else:
+                    product = p.ascend_values.to(p.acc_dtype)[:, None] * x.index_select(
+                        0, p.ascend_cols
+                    ).to(p.acc_dtype)[:, None]
+                    workspace = _ascend_index_add(
+                        workspace, 0, p.ascend_rows, product
+                    )
+                result = (
+                    _ascend_owned_output(workspace)
+                    if _is_complex_dtype(p.acc_dtype)
+                    else workspace[:, 0].clone()
+                )
+            p.ascend_meta = _ascend_execution_meta(p)
+            result = result if result.dtype == p.out_dtype else result.to(p.out_dtype)
+            if out is not None:
+                if result.is_complex():
+                    torch.view_as_real(out).copy_(torch.view_as_real(result))
+                else:
+                    out.copy_(result)
+                result = out
+            if return_time:
+                _ACCEL.synchronize()
+                return result, (time.perf_counter() - t0) * 1000.0
+            return result
         return flagsparse_spmv_sell(
             p.values, p.cols, p.offsets, x, p.shape, slice_size=p.slice_size,
             out=out, out_dtype=p.out_dtype, validate=False, return_time=return_time,

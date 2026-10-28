@@ -1787,6 +1787,11 @@ def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     for key in ("TMPDIR", "TMP", "TEMP"):
         if not env.get(key) or not os.path.isdir(env[key]):
             env[key] = "/tmp"
+    # FlagTree's make_llir imports TLE, whose communication module dlopens libflagcx.so
+    # when FlagCX looks available; a libflagcx without a matching libixccl
+    # ("undefined symbol: ixcclReduce", BI-V 10-27) then fails every kernel compile.
+    # FlagSparse uses no distributed TLE, so keep FlagCX off unless asked for.
+    env.setdefault("USE_FLAGCX", "0")
     if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
         # torch_npu ignores CUDA_VISIBLE_DEVICES: without this every child landed
         # on physical NPU 0 whatever --gpus said (measured on 910B, 2026-09-17).

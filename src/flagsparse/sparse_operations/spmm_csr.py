@@ -16,6 +16,7 @@
 
 import ctypes
 import math
+import warnings
 
 from . import _common as _common_mod
 from ._common import *
@@ -24,9 +25,9 @@ from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
 
-def _ascend_csr_row_ids(indptr, n_rows):
+def _ascend_csr_row_ids(indptr, n_rows, *, cache=True):
     """Per-nonzero row index for the Ascend/XPU fallbacks (repeat_interleave, not Triton)."""
-    return _csr_row_ids_torch(indptr, n_rows)
+    return _csr_row_ids_torch(indptr, n_rows, cache=cache)
 
 
 HipPointer = _common_mod.HipPointer
@@ -783,6 +784,9 @@ class PreparedCsrSpmmRoute:
         "alg",
         "materialized_op",
         "materialized_route",
+        "ascend_row_ids",
+        "ascend_col_ids",
+        "ascend_runner",
     )
 
     def __init__(
@@ -813,6 +817,14 @@ class PreparedCsrSpmmRoute:
         # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
         self.materialized_op = None
         self.materialized_route = None
+        if _is_ascend_runtime():
+            self.ascend_row_ids = _ascend_csr_row_ids(self.kernel_indptr, self.n_rows, cache=False)
+            self.ascend_col_ids = self.kernel_indices.to(torch.int64).contiguous()
+            self.ascend_runner = None
+        else:
+            self.ascend_row_ids = None
+            self.ascend_col_ids = None
+            self.ascend_runner = None
 
 
 def _normalize_spmm_csr_alg(alg):
@@ -1024,7 +1036,152 @@ def _run_spmm_csr_base_route_impl(
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
-    B = _materialize_dense_layout(B, dense_layout)
+    if not _is_ascend_runtime():
+        B = _materialize_dense_layout(B, dense_layout)
+    if _is_ascend_runtime():
+        C_out = _empty_dense_layout(
+            (prepared.n_rows, int(B.shape[1])),
+            prepared.data.dtype,
+            prepared.data.device,
+            dense_layout,
+        )
+        if timing:
+            _ACCEL.synchronize()
+            t0 = time.perf_counter()
+        if _is_ascend_runtime() and prepared.ascend_runner is None:
+            ascend_data = prepared.data
+            ascend_row_ids = prepared.ascend_row_ids
+            ascend_col_ids = prepared.ascend_col_ids
+            ascend_n_rows = prepared.n_rows
+
+            def ascend_spmm(dense):
+                result = torch.zeros(
+                    ascend_n_rows,
+                    dense.shape[1],
+                    dtype=ascend_data.dtype,
+                    device=dense.device,
+                )
+                if ascend_data.is_complex():
+                    values = torch.view_as_real(ascend_data)
+                    dense_values = torch.view_as_real(dense).index_select(
+                        0, ascend_col_ids
+                    )
+                    products = torch.stack(
+                        (
+                            values[:, 0, None] * dense_values[..., 0]
+                            - values[:, 1, None] * dense_values[..., 1],
+                            values[:, 0, None] * dense_values[..., 1]
+                            + values[:, 1, None] * dense_values[..., 0],
+                        ),
+                        dim=-1,
+                    )
+                    result = torch.zeros(
+                        ascend_n_rows,
+                        dense.shape[1],
+                        2,
+                        dtype=dense_values.dtype,
+                        device=dense.device,
+                    )
+                    result = _ascend_index_add(
+                        result, 0, ascend_row_ids, products
+                    )
+                    return torch.view_as_complex(result)
+                else:
+                    products = ascend_data[:, None] * dense.index_select(
+                        0, ascend_col_ids
+                    )
+                    result = _ascend_index_add(
+                        result, 0, ascend_row_ids, products
+                    )
+                return result
+
+            try:
+                prepared.ascend_runner = _ascend_compile(
+                    ascend_spmm
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"CSR SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                prepared.ascend_runner = False
+        if _is_ascend_runtime() and prepared.ascend_runner:
+            try:
+                C_out = _ascend_owned_output(prepared.ascend_runner(B))
+            except Exception as exc:
+                warnings.warn(
+                    f"CSR SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                prepared.ascend_runner = False
+                C_out.zero_()
+                if prepared.data.is_complex():
+                    values = torch.view_as_real(prepared.data)
+                    dense_values = torch.view_as_real(B).index_select(
+                        0, prepared.ascend_col_ids
+                    )
+                    products = torch.stack(
+                        (
+                            values[:, 0, None] * dense_values[..., 0]
+                            - values[:, 1, None] * dense_values[..., 1],
+                            values[:, 0, None] * dense_values[..., 1]
+                            + values[:, 1, None] * dense_values[..., 0],
+                        ),
+                        dim=-1,
+                    )
+                    torch.view_as_real(C_out).index_add_(
+                        0, prepared.ascend_row_ids, products
+                    )
+                else:
+                    products = prepared.data[:, None] * B.index_select(
+                        0, prepared.ascend_col_ids
+                    )
+                    C_out = _ascend_index_add(
+                        C_out, 0, prepared.ascend_row_ids, products
+                    )
+        else:
+            C_out.zero_()
+            if prepared.data.is_complex():
+                values = torch.view_as_real(prepared.data)
+                dense_values = torch.view_as_real(B).index_select(
+                    0, prepared.ascend_col_ids
+                )
+                products = torch.stack(
+                    (
+                        values[:, 0, None] * dense_values[..., 0]
+                        - values[:, 1, None] * dense_values[..., 1],
+                        values[:, 0, None] * dense_values[..., 1]
+                        + values[:, 1, None] * dense_values[..., 0],
+                    ),
+                    dim=-1,
+                )
+                torch.view_as_real(C_out).index_add_(
+                    0, prepared.ascend_row_ids, products
+                )
+            else:
+                products = prepared.data[:, None] * B.index_select(
+                    0, prepared.ascend_col_ids
+                )
+                C_out = _ascend_index_add(
+                    C_out, 0, prepared.ascend_row_ids, products
+                )
+        if timing:
+            _ACCEL.synchronize()
+            compute_ms = (time.perf_counter() - t0) * 1000.0
+        else:
+            compute_ms = None
+        return C_out, {
+            **_ascend_execution_meta(prepared),
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": compute_ms,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C_out.stride()),
+            "output_layout": _dense_layout_name(C_out),
+        }
     C_out = _empty_dense_layout(
         (prepared.n_rows, int(B.shape[1])),
         prepared.data.dtype,
@@ -2800,7 +2957,10 @@ def prepare_spmm_csr_route(data, indices, indptr, shape, *, op="non", alg="auto"
         op=op_name,
         alg=resolved_alg,
     )
-    if op_name != "non" and (_backend_name() == "cuda" or _is_iluvatar_runtime()):
+    if op_name != "non" and (
+        _backend_name() == "cuda" or _is_iluvatar_runtime()
+        or _is_ascend_runtime()
+    ):
         # Materialise A.T (A.conj().T for conj) here instead of on every run. The
         # transpose is a sort + bincount + cumsum over nnz; caching it matches the
         # vendor benchmark's one-time materialization on CUDA and Iluvatar. A
@@ -2951,6 +3111,7 @@ def flagsparse_spmm_csr_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": op_name,
+            **(_ascend_execution_meta(runtime_prepared) if _is_ascend_runtime() else {}),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,

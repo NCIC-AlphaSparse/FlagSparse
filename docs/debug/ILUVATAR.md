@@ -198,7 +198,7 @@ python3 tools/delivery_table.py results_iluvatar_65_<日期>
 
 ### BI-V mixed-baseline runner
 
-`benchmark_biv.py` is the dedicated 65-variant entry point. It invokes the shared
+`benchmark/benchmark_biv.py` is the dedicated 65-variant entry point. It invokes the shared
 `run_flagsparse_pytest.py` runner with the BI-V profile and selects a baseline per
 matrix row: a correctness-passing local vendor sparse-library measurement first,
 then a correctness-passing local PyTorch measurement, and finally the H800
@@ -207,7 +207,7 @@ reference scaled to BI-V. The generated performance CSV carries
 reports `local_vendor`, `local_pytorch`, `h800_scaled`, or a mixed label.
 
 ```bash
-python3 -u benchmark_biv.py --results-dir results_biv_65_$(date +%Y%m%d)
+python3 -u benchmark/benchmark_biv.py --results-dir results_biv_65_$(date +%Y%m%d)
 ```
 
 ### 2026-10-24 合入 `flagsparse_changes_and_results_20261024`（在 CUDA 机器上合并时补的两处）

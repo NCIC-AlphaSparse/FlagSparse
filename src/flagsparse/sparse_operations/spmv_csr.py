@@ -55,8 +55,35 @@ SUPPORTED_SPMV_VALUE_DTYPES = (
 )
 
 
-def _ascend_csr_row_ids(indptr, n_rows):
-    return _csr_row_ids_torch(indptr, n_rows)
+def _ascend_csr_row_ids(indptr, n_rows, *, cache=True):
+    return _csr_row_ids_torch(indptr, n_rows, cache=cache)
+
+
+def _ascend_csr_version(tensor):
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
+
+
+def _refresh_ascend_csr_state(prepared):
+    versions = tuple(_ascend_csr_version(tensor) for tensor in (
+        prepared.data, prepared.kernel_indices, prepared.kernel_indptr
+    ))
+    state = prepared.ascend_state
+    if state is not None and state["versions"] == versions:
+        return state
+    if state is None or state["versions"][1:] != versions[1:]:
+        state = {
+            "rows": _ascend_csr_row_ids(prepared.kernel_indptr, prepared.n_rows, cache=False),
+            "cols": prepared.kernel_indices.to(torch.int64).contiguous(),
+            "rhs": None,
+        }
+        prepared.ascend_state = state
+    compute = torch.float32 if prepared.data.dtype in (torch.float16, torch.bfloat16) else prepared.data.dtype
+    state["values"] = prepared.data.to(compute).contiguous()
+    state["versions"] = versions
+    return state
 
 
 SPMV_OP_NON = 0
@@ -130,6 +157,7 @@ class PreparedCsrSpmv:
         "config_source",
         "backend_caps",
         "config_rejections",
+        "ascend_state",
     ) + (("rocm_nnz_plan",) if _is_rocm_runtime() else ())
 
     def __init__(
@@ -184,6 +212,9 @@ class PreparedCsrSpmv:
         self.config_source = "legacy"
         self.backend_caps = None
         self.config_rejections = []
+        self.ascend_state = None
+        if _is_ascend_runtime():
+            _refresh_ascend_csr_state(self)
         if _is_rocm_runtime():
             self.rocm_nnz_plan = None
 
@@ -2355,33 +2386,83 @@ def flagsparse_spmv_csr(
         if requested in SPMV_CSR_NEW_ALGORITHMS:
             raise NotImplementedError(f"CSR SpMV {requested} has no Ascend profile")
         if prepared is not None:
-            raise NotImplementedError(
-                "Ascend fallback does not accept prepared SpMV metadata"
+            if any(arg is not None for arg in (data, indices, indptr, shape)):
+                raise ValueError(
+                    "prepared CSR calls must not also pass raw CSR arguments"
+                )
+            if op is not None and op_code != prepared.op:
+                raise ValueError("op does not match prepared.op")
+            if transpose is not None and bool(transpose) != prepared.transpose:
+                raise ValueError("transpose does not match prepared.transpose")
+            op_code = prepared.op
+            data = prepared.data
+            indices = prepared.kernel_indices
+            indptr = prepared.kernel_indptr
+            shape = prepared.shape
+            n_rows, n_cols = prepared.n_rows, prepared.n_cols
+            x = _validate_spmv_x(x, prepared)
+        else:
+            if any(arg is None for arg in (data, indices, indptr, shape, x)):
+                raise ValueError("data, indices, indptr, x, and shape are required")
+            if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
+                raise ValueError("data, indices, indptr, and x must be 1D tensors")
+            n_rows, n_cols = int(shape[0]), int(shape[1])
+            if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+                raise ValueError("invalid CSR dimensions")
+            if x.numel() != (n_rows if _spmv_op_transposes(op_code) else n_cols):
+                raise ValueError("x shape does not match CSR operation")
+        state = _refresh_ascend_csr_state(prepared) if prepared is not None else None
+        row_ids = state["rows"] if state is not None else _ascend_csr_row_ids(indptr, n_rows)
+        cols = state["cols"] if state is not None else indices.to(torch.int64).contiguous()
+
+        def gather(source, order):
+            compute_dtype = (
+                torch.float32
+                if source.dtype in (torch.float16, torch.bfloat16)
+                else source.dtype
             )
-        if any(arg is None for arg in (data, indices, indptr, shape, x)):
-            raise ValueError("data, indices, indptr, x, and shape are required")
-        if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
-            raise ValueError("data, indices, indptr, and x must be 1D tensors")
-        n_rows, n_cols = int(shape[0]), int(shape[1])
-        if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
-            raise ValueError("invalid CSR dimensions")
-        if x.numel() != (n_rows if _spmv_op_transposes(op_code) else n_cols):
-            raise ValueError("x shape does not match CSR operation")
-        row_ids = _ascend_csr_row_ids(indptr, n_rows)
-        cols = indices.to(torch.int64)
+            if source.dtype != compute_dtype:
+                version = _ascend_csr_version(source)
+                rhs = state["rhs"] if state is not None else None
+                if rhs is None or rhs[0] is not source or rhs[2] != version or version is None:
+                    rhs = (source, source.to(compute_dtype).contiguous(), version)
+                    if state is not None:
+                        state["rhs"] = rhs
+                source = rhs[1]
+            if _is_complex_dtype(source.dtype):
+                return torch.view_as_complex(
+                    torch.view_as_real(source).index_select(0, order)
+                )
+            if source.dtype == torch.float64:
+                return source[order]
+            return source.index_select(0, order)
+
         timed = bool(return_time or return_meta)
         if timed:
             _ACCEL.synchronize()
         t0 = time.perf_counter()
         if _spmv_op_transposes(op_code):
-            y = torch.zeros((n_cols,), device=data.device, dtype=data.dtype)
+            compute_dtype = torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype
+            y = torch.zeros((n_cols,), device=data.device, dtype=compute_dtype)
             # op(A) = A^H (conjugate transpose) needs the values conjugated too, not
             # just the row/col roles swapped -- op(A) = A^T (plain transpose) does not.
-            vals = data.conj() if op_code == SPMV_OP_CONJ_TRANS else data
-            _index_add_values(y, 0, cols, vals * _gather_values(x, row_ids))
+            vals = state["values"] if state is not None else data
+            vals = vals.conj() if op_code == SPMV_OP_CONJ_TRANS else vals
+            if vals.dtype != compute_dtype:
+                vals = vals.to(compute_dtype).contiguous()
+            _index_add_values(y, 0, cols, vals * gather(x, row_ids))
         else:
-            y = torch.zeros((n_rows,), device=data.device, dtype=data.dtype)
-            _index_add_values(y, 0, row_ids, data * _gather_values(x, cols))
+            compute_dtype = torch.float32 if data.dtype in (torch.float16, torch.bfloat16) else data.dtype
+            y = torch.zeros((n_rows,), device=data.device, dtype=compute_dtype)
+            values = state["values"] if state is not None else data
+            if values.dtype != compute_dtype:
+                values = values.to(compute_dtype).contiguous()
+            _index_add_values(
+                y, 0, row_ids,
+                values * gather(x, cols),
+            )
+        if y.dtype != data.dtype:
+            y = y.to(data.dtype)
         if out is not None:
             out.copy_(y)
             y = out

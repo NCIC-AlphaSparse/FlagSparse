@@ -23,7 +23,17 @@ SUPPORTED_SDDMM_VALUE_DTYPES = (torch.float32, torch.float64, torch.float16, tor
 
 
 # Stored entries per chunk in the Ascend SDDMM fallback (see flagsparse_sddmm_csr).
-_ASCEND_SDDMM_CHUNK_NNZ = 262144
+_ASCEND_SDDMM_CHUNK_NNZ = 1 << 20
+
+
+def _ascend_sddmm_dot(x, y, rows, cols):
+    if not _is_complex_dtype(x.dtype):
+        return (x.index_select(0, rows) * y.index_select(0, cols)).sum(dim=1)
+    x_pair = torch.view_as_real(x).index_select(0, rows)
+    y_pair = torch.view_as_real(y).index_select(0, cols)
+    real = (x_pair[..., 0] * y_pair[..., 0] - x_pair[..., 1] * y_pair[..., 1]).sum(dim=1)
+    imag = (x_pair[..., 0] * y_pair[..., 1] + x_pair[..., 1] * y_pair[..., 0]).sum(dim=1)
+    return torch.view_as_complex(torch.stack((real, imag), dim=-1))
 
 
 def _ascend_csr_row_ids(indptr, n_rows):
@@ -419,6 +429,7 @@ class SDDMMPrepared:
         "n_cols",
         "nnz",
         "row_ids",
+        "ascend_cols",
         "block_k",
         "num_warps",
     )
@@ -431,6 +442,7 @@ class SDDMMPrepared:
         self.n_cols = self.shape[1]
         self.nnz = int(indices.numel())
         self.row_ids = row_ids
+        self.ascend_cols = indices.to(torch.int64).contiguous() if _is_ascend_runtime() else None
         self.block_k = int(block_k)
         self.num_warps = int(num_warps)
 
@@ -629,7 +641,11 @@ def prepare_sddmm_csr(indices, indptr, shape, k_hint=64, validate=True):
     indices, indptr, shape = _prepare_sddmm_csr_pattern(
         indices, indptr, shape, validate=validate
     )
-    row_ids = _build_row_ids(indptr, int(indices.numel()))
+    row_ids = (
+        _ascend_csr_row_ids(indptr, int(shape[0]))
+        if _is_ascend_runtime()
+        else _build_row_ids(indptr, int(indices.numel()))
+    )
     mean_row_len = int(indices.numel()) / shape[0] if shape[0] > 0 else None
     _, block_k, num_warps = _resolve_sddmm_launch_config(
         int(k_hint), mean_row_len=mean_row_len
@@ -982,9 +998,15 @@ def _run_sddmm_prepared(
     # kernel (the accumulator and reduction result receive incompatible
     # encodings).  Advanced indexing and reduction are supported by the XPU
     # runtime, so compute the same sampled dot product directly on-device.
-    if _is_xpu_runtime():
+    if _is_ascend_runtime() or _is_xpu_runtime():
         row_ids = prepared.row_ids.to(torch.int64)
-        vals = torch.sum(x[row_ids] * y[prepared.indices.to(torch.int64)], dim=1)
+        cols = prepared.ascend_cols if _is_ascend_runtime() else prepared.indices.to(torch.int64)
+        vals = torch.empty((nnz,), device=x.device, dtype=x.dtype)
+        for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
+            end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
+            vals[begin:end] = _ascend_sddmm_dot(
+                x, y, row_ids[begin:end], cols[begin:end]
+            )
         vals = vals * float(alpha)
         if data is not None:
             vals = vals + float(beta) * data
@@ -1183,7 +1205,7 @@ def flagsparse_sddmm_csr(
     # Ascend 910B currently fails lowering the generic Triton SDDMM kernel.  Compute the
     # sampled dense products with torch_npu indexing instead; CUDA/ROCm/MetaX/MUSA fall
     # through to the Triton path unchanged.
-    if _is_ascend_runtime():
+    if _is_ascend_runtime() and prepared is None:
         if any(v is None for v in (indices, indptr, x, y, shape)):
             raise ValueError("indices, indptr, x, y, and shape are required on Ascend")
         n_rows, n_cols = int(shape[0]), int(shape[1])
@@ -1213,10 +1235,8 @@ def flagsparse_sddmm_csr(
         vals = torch.empty((nnz,), device=x.device, dtype=x.dtype)
         for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
             end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
-            vals[begin:end] = torch.sum(
-                _gather_values(x, row_ids[begin:end])
-                * _gather_values(y, cols[begin:end]),
-                dim=1,
+            vals[begin:end] = _ascend_sddmm_dot(
+                x, y, row_ids[begin:end], cols[begin:end]
             )
         vals = vals * float(alpha)
         if beta != 0.0:

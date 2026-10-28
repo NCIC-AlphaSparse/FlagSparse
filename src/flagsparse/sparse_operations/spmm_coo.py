@@ -16,6 +16,7 @@
 
 import os
 import ctypes
+import warnings
 from dataclasses import dataclass
 
 from . import _common as _common_mod
@@ -769,6 +770,7 @@ class PreparedCooSpmmRoute:
         "alg",
         "gather_ptr",
         "full_row_ptr",
+        "ascend_runner",
     )
 
     def __init__(
@@ -802,6 +804,7 @@ class PreparedCooSpmmRoute:
         self.alg = str(alg)
         self.gather_ptr = None
         self.full_row_ptr = None
+        self.ascend_runner = None
         if _is_iluvatar_runtime() and self.alg in ("auto", "coo_rowrun"):
             # The BI-V rowrun route writes every output row, including empty ones,
             # so its prepared calls can allocate C without a separate zero fill.
@@ -1839,9 +1842,17 @@ def _spmm_coo_ascend_scatter(
     cols64 = col.to(torch.int64)
     # contrib[p] = A.values[p] * B[col[p]], summed into C[row[p]]. conj (for
     # op=conj_trans) is already folded into `data` by _materialize_spmm_coo_op.
-    contrib = data.unsqueeze(1) * _gather_values(B, cols64)
-    acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
-    _index_add_values(acc, 0, rows64, contrib)
+    if data.is_complex():
+        contrib = _ascend_complex_products(data, B, cols64)
+        acc = torch.zeros(
+            (n_rows, n_dense_cols, 2), dtype=contrib.dtype, device=data.device
+        )
+        acc = _ascend_index_add(acc, 0, rows64, contrib)
+        acc = torch.view_as_complex(acc)
+    else:
+        contrib = data.unsqueeze(1) * B.index_select(0, cols64)
+        acc = torch.zeros((n_rows, n_dense_cols), dtype=contrib.dtype, device=data.device)
+        acc = _ascend_index_add(acc, 0, rows64, contrib)
     acc = acc.to(dtype)
 
     if out is not None:
@@ -2038,6 +2049,85 @@ def _run_spmm_coo_rowrun_route(
     B = _validate_spmm_coo_route_runtime_inputs(
         prepared, B, dense_layout, wide=not (use_gather or use_biv_half)
     )
+    if _is_ascend_runtime():
+        if prepared.ascend_runner is None:
+            ascend_data = prepared.data
+            ascend_row = prepared.row
+            ascend_col = prepared.col
+            ascend_n_rows = prepared.n_rows
+            ascend_output_dtype = prepared.output_dtype
+
+            def ascend_spmm(dense):
+                result = torch.zeros(
+                    ascend_n_rows,
+                    dense.shape[1],
+                    dtype=ascend_data.dtype,
+                    device=dense.device,
+                )
+                if ascend_data.is_complex():
+                    products = _ascend_complex_products(
+                        ascend_data, dense, ascend_col
+                    )
+                    result_pair = torch.zeros(
+                        ascend_n_rows,
+                        dense.shape[1],
+                        2,
+                        dtype=products.dtype,
+                        device=dense.device,
+                    )
+                    result_pair = _ascend_index_add(
+                        result_pair, 0, ascend_row, products
+                    )
+                    return torch.view_as_complex(result_pair)
+                products = ascend_data[:, None] * dense.index_select(0, ascend_col)
+                result = _ascend_index_add(result, 0, ascend_row, products)
+                return result.to(ascend_output_dtype)
+
+            try:
+                prepared.ascend_runner = _ascend_compile(
+                    ascend_spmm
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"COO SpMM Ascend graph compile failed; using eager fallback: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                prepared.ascend_runner = False
+        try:
+            C = _ascend_owned_output(prepared.ascend_runner(B)) if prepared.ascend_runner else None
+        except Exception as exc:
+            warnings.warn(
+                f"COO SpMM Ascend graph replay failed; using eager fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            prepared.ascend_runner = False
+            C = None
+        if C is None:
+            C = _spmm_coo_ascend_scatter(
+                prepared.data,
+                prepared.row,
+                prepared.col,
+                B,
+                prepared.n_rows,
+                int(B.shape[1]),
+                output_dtype=prepared.output_dtype,
+                dense_layout=dense_layout,
+            )
+        return C, {
+            "alg": "coo_ascend_scatter",
+            **_ascend_execution_meta(prepared),
+            "display_name": "COOAscendScatter",
+            "op": prepared.op,
+            "process_cpu_ms": 0.0,
+            "process_gpu_ms": 0.0 if timing else None,
+            "compute_ms": None,
+            "dense_layout": dense_layout,
+            "b_stride": tuple(int(v) for v in B.stride()),
+            "c_stride": tuple(int(v) for v in C.stride()),
+            "output_layout": _dense_layout_name(C),
+        }
     launch = _resolve_spmm_coo_launch_config(
         int(B.shape[1]), prepared.nnz, device=prepared.data.device
     )
@@ -2596,6 +2686,7 @@ def flagsparse_spmm_coo_run(
             "alg": algorithm.name,
             "display_name": algorithm.display_name,
             "op": prepared.op,
+            **(_ascend_execution_meta(prepared) if _is_ascend_runtime() else {}),
             "operator_ms": operator_ms,
             "gpu_ms": gpu_ms,
             "process_cpu_ms": process_cpu_ms,
