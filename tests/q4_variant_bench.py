@@ -26,6 +26,8 @@ Timing matches the scripts' own rows: where the operator has a prepare step
 once outside the timed window, as cuSPARSE's descriptor setup does; the mixed
 precision / int8 paths have no prepare step and are timed as one call. The row's
 ``timed`` column says which.
+Ascend CSR, COO and CSC variants use their prepared paths; CSC also prepares
+reusable RHS dtype conversion outside the timed computation.
 
 Per row: FlagSparse, native cuSPARSE with the same type combination (CUDA only;
 ``tests/cusparse_generic_baseline.py``), and PyTorch on the same matrix. Accuracy
@@ -33,6 +35,7 @@ is checked against a CPU float64 / complex128 SciPy product; int outputs exactly
 """
 
 import csv
+import gc
 import glob
 import os
 from dataclasses import dataclass
@@ -46,6 +49,7 @@ import flagsparse as fs
 from benchmark_utils import accelerator_device
 from flagsparse.sparse_operations import mixed_spmx
 from flagsparse.sparse_operations._common import (
+    _ascend_execution_meta,
     _benchmark_cuda_op,
     _gather_values,
     _is_ascend_runtime,
@@ -448,20 +452,44 @@ def _spmv(v, mat, gen, warmup, iters, row):
                 ours = lambda: fs.flagsparse_spmv_csr(  # noqa: E731
                     prepared=prepared, x=x, out=target
                 )
+            elif _is_ascend_runtime():
+                if mixed:
+                    prepared = mixed_spmx.prepare_spmv_csr_mixed(
+                        vals, mat.cols, mat.ptr, x.dtype, mat.shape,
+                        out_dtype=v.out,
+                    )
+                else:
+                    prepared = fs.prepare_spmv_csr(
+                        vals, mat.cols, mat.ptr, mat.shape, op=v.op_a
+                    )
+                row["timed"] = "prepared"
+                ours = lambda: fs.flagsparse_spmv_csr(  # noqa: E731
+                    prepared=prepared, x=x
+                )
             else:
                 if mixed and not _is_ascend_runtime():
                     # The vendor writes a preallocated y; so does the prepared path below.
                     kw["out"] = torch.empty(y_len, dtype=v.out, device=mat.dev)
                 ours = lambda: fs.flagsparse_spmv_csr(vals, mat.cols, mat.ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
         elif v.fmt == "coo":
-            if v.op_a == "non" and not _is_ascend_runtime():
-                prepared = fs.prepare_spmv_coo(vals, mat.rows, mat.cols, mat.shape)
-                row["timed"] = "prepared"
-                ours = lambda: fs.flagsparse_spmv_coo(prepared=prepared, x=x, **kw)  # noqa: E731
-            else:
-                ours = lambda: fs.flagsparse_spmv_coo(vals, mat.rows, mat.cols, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
+            prepared = fs.prepare_spmv_coo(
+                vals, mat.rows, mat.cols, mat.shape, op=v.op_a
+            )
+            row["timed"] = "prepared"
+            ours = lambda: fs.flagsparse_spmv_coo(  # noqa: E731
+                prepared=prepared, x=x, **kw
+            )
         else:
-            ours = lambda: fs.flagsparse_spmv_csc(csc_vals, mat.csc_rows, mat.csc_ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
+            if _is_ascend_runtime():
+                prepared = fs.prepare_spmv_csc(
+                    csc_vals, mat.csc_rows, mat.csc_ptr, mat.shape, op=v.op_a, x=x
+                )
+                row["timed"] = "prepared"
+                ours = lambda: fs.flagsparse_spmv_csc(  # noqa: E731
+                    prepared=prepared, x=x, **kw
+                )
+            else:
+                ours = lambda: fs.flagsparse_spmv_csc(csc_vals, mat.csc_rows, mat.csc_ptr, x, shape=mat.shape, op=v.op_a, **kw)  # noqa: E731
     else:
         row["timed"] = "prepared"
         if v.fmt == "csr":
@@ -561,24 +589,53 @@ def _spmm(v, mat, gen, warmup, iters, row):
         return _spmm_bell(v, mat, vals, vals_cpu, B, ref, warmup, iters, row)
     kw = {} if v.out == default_out else {"out_dtype": v.out}
     if v.fmt == "csc":
-        row["timed"] = "call"
         csc_vals, csc_rows, csc_ptr = mat.arrays("csc", vals)
-        ours = lambda: fs.flagsparse_spmm_csc(
-            csc_vals, csc_rows, csc_ptr, _op_t(B, v.op_b), mat.shape, op=v.op_a, **kw
-        )
+        if _is_ascend_runtime() and v.value == torch.float16:
+            row["timed"] = "prepared"
+            prepared = mixed_spmx.prepare_spmm_csc_mixed(
+                csc_vals, csc_rows, csc_ptr, mat.shape, out_dtype=v.out
+            )
+            B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
+            ours = lambda: mixed_spmx.spmm_csc_mixed_prepared(prepared, B_eff)
+        elif _is_ascend_runtime():
+            row["timed"] = "prepared"
+            prepared = fs.prepare_spmm_csc_route(
+                csc_vals, csc_rows, csc_ptr, mat.shape, op=v.op_a
+            )
+            B_eff = _op_t(B, v.op_b)
+            ours = lambda: fs.flagsparse_spmm_csc_run(prepared, B_eff)
+        else:
+            row["timed"] = "call"
+            ours = lambda: fs.flagsparse_spmm_csc(
+                csc_vals, csc_rows, csc_ptr, _op_t(B, v.op_b), mat.shape, op=v.op_a, **kw
+            )
     elif (
         v.fmt in ("csr", "coo")
         and (
             mixed_spmx.spmm_needs_mixed(v.value, None, kw.get("out_dtype"))
-            or (_is_ascend_runtime() and v.fmt == "csr")
         )
     ):
-        row["timed"] = "call"
-        if v.fmt == "csr":
+        if _is_ascend_runtime() and v.fmt == "csr":
+            row["timed"] = "prepared"
+            prepared = mixed_spmx.prepare_spmm_csr_mixed(
+                vals, mat.cols, mat.ptr, mat.shape, out_dtype=v.out
+            )
+            B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
+            ours = lambda: mixed_spmx.spmm_csr_mixed_prepared(prepared, B_eff)
+        elif _is_ascend_runtime() and v.fmt == "coo":
+            row["timed"] = "prepared"
+            prepared = mixed_spmx.prepare_spmm_coo_mixed(
+                vals, mat.rows, mat.cols, mat.shape, out_dtype=v.out
+            )
+            B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
+            ours = lambda: mixed_spmx.spmm_coo_mixed_prepared(prepared, B_eff)
+        elif v.fmt == "csr":
+            row["timed"] = "call"
             ours = lambda: fs.flagsparse_spmm_csr(  # noqa: E731
                 vals, mat.cols, mat.ptr, B, mat.shape, op=v.op_a, op_b=v.op_b, **kw
             )
         else:
+            row["timed"] = "call"
             ours = lambda: fs.flagsparse_spmm_coo(  # noqa: E731
                 vals,
                 mat.rows,
@@ -586,7 +643,7 @@ def _spmm(v, mat, gen, warmup, iters, row):
                 B,
                 mat.shape,
                 op=v.op_a,
-                dense_layout=v.layout,
+                **({"dense_layout": v.layout} if _is_ascend_runtime() else {}),
                 **kw,
             )
     else:
@@ -594,15 +651,24 @@ def _spmm(v, mat, gen, warmup, iters, row):
         B_eff = _op_t(B, v.op_b)  # op(B) as a strided view; the run reads its strides
         if v.fmt == "csr":
             prepared = fs.prepare_spmm_csr_route(vals, mat.cols, mat.ptr, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmm_csr_run(prepared, B_eff, alg="auto")  # noqa: E731
+            ours = lambda: fs.flagsparse_spmm_csr_run(  # noqa: E731
+                prepared, B_eff, alg="auto", **({"dense_layout": v.layout} if _is_ascend_runtime() else {})
+            )
         else:
             prepared = fs.prepare_spmm_coo_route(vals, mat.rows, mat.cols, mat.shape, op=v.op_a)
-            ours = lambda: fs.flagsparse_spmm_coo_run(prepared, B_eff, alg="auto")  # noqa: E731
+            ours = lambda: fs.flagsparse_spmm_coo_run(  # noqa: E731
+                prepared, B_eff, alg="auto", **({"dense_layout": v.layout} if _is_ascend_runtime() else {})
+            )
     first = ours()
     first = first[0] if isinstance(first, tuple) else first
     row["max_error"] = _error(first, ref)
     row["out_dtype"] = _name(first.dtype)
     _, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+
+    if _is_ascend_runtime():
+        row.update(_ascend_execution_meta(
+            prepared, "runner" if hasattr(prepared, "runner") else "ascend_runner"
+        ))
 
     def build_vendor():
         C = torch.empty(m_eff, DENSE_COLS, dtype=v.out, device=mat.dev)
@@ -710,18 +776,14 @@ def _sddmm(v, mat, gen, warmup, iters, row):
         A, B = _col_major(A), _col_major(B)
 
     if _is_ascend_runtime():
-        # The public Ascend SDDMM fallback is intentionally raw-input based;
-        # preparing here would compile its Triton row-id helper first.
-        row["timed"] = "call"
+        row["timed"] = "prepared"
+        prepared = fs.prepare_sddmm_csr(mat.cols, mat.ptr, mat.shape, k_hint=kd)
 
         def ours():
             return fs.flagsparse_sddmm_csr(
-                None,
-                mat.cols,
-                mat.ptr,
+                prepared=prepared,
                 x=A,
                 y=B,
-                shape=mat.shape,
                 op_a=v.op_a,
                 op_b=v.op_b,
                 dense_layout=v.layout,
@@ -848,6 +910,8 @@ def run_variants(
                 "n_cols": mat.shape[1],
                 "nnz": mat.csr.nnz,
             }
+            if _is_ascend_runtime():
+                row.update(execution_path="eager", implementation="torch_npu")
             try:
                 out_dtype = _KINDS[v.kind](v, mat, gen, warmup, iters, row)
                 row["status"] = "PASS" if _passes(out_dtype, row["max_error"]) else "FAIL"
@@ -863,6 +927,10 @@ def run_variants(
                 f"[q4] {row['matrix']} {v.name}: {row['status']} ours={row.get('ours_ms')} "
                 f"vendor={row.get('vendor_ms')} torch={row.get('pytorch_ms')} {row.get('error') or ''}"
             )
+            if _is_ascend_runtime():
+                torch._dynamo.reset()
+                gc.collect()
+                torch.npu.empty_cache()
     return rows
 
 

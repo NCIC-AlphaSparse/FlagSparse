@@ -47,7 +47,10 @@ from benchmark_utils import accelerator_device  # noqa: E402
 
 import cusparse_generic_baseline as cusparse_baseline  # noqa: E402
 import flagsparse as fs  # noqa: E402
-from flagsparse.sparse_operations._common import _benchmark_cuda_op  # noqa: E402
+from flagsparse.sparse_operations._common import (  # noqa: E402
+    _benchmark_cuda_op,
+    _is_ascend_runtime,
+)
 
 DEFAULT_CASES = "32768:1024,131072:4096,524288:16384,1048576:65536"
 # (value dtype, op) per operator; the q4 list's variants come first.
@@ -154,13 +157,23 @@ def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen):
         xr = _wide(x_cpu).conj() if spvv_op == "conj" else _wide(x_cpu)
         ref = (xr * _wide(y_cpu)[idx_cpu.long()]).sum().reshape(1)
         y = y_cpu.to(dev)
-        ours = lambda: fs.flagsparse_spvv(x, idx, y, op=spvv_op, validate=False)  # noqa: E731
+        if _is_ascend_runtime():
+            prepared = fs.prepare_spvv(x, idx, y, op=spvv_op, validate=False)
+            ours = lambda: fs.flagsparse_spvv(  # noqa: E731
+                y=y, prepared=prepared
+            )
+        else:
+            ours = lambda: fs.flagsparse_spvv(  # noqa: E731
+                x, idx, y, op=spvv_op, validate=False
+            )
         first = ours()
         err = _error(first.reshape(1), ref)
+        torch_idx = idx.to(torch.int64)
+        torch_lhs = x.conj() if spvv_op == "conj" else x
+        torch_lhs = torch_lhs.to(compute)
 
         def torch_op():
-            xx = x.conj() if spvv_op == "conj" else x
-            return (xx.to(compute) * y.index_select(0, idx.long()).to(compute)).sum()
+            return (torch_lhs * y.index_select(0, torch_idx).to(compute)).sum()
     else:
         ref = _wide(y_cpu) * _BETA
         ref[idx_cpu.long()] += _ALPHA * _wide(x_cpu)
@@ -169,7 +182,17 @@ def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen):
         err = _error(y_check, ref)
         # The timed loops update y in place; beta < 1 keeps it bounded.
         y = y_cpu.to(dev)
-        ours = lambda: fs.flagsparse_axpby(x, idx, y, alpha=_ALPHA, beta=_BETA, validate=False)  # noqa: E731
+        if _is_ascend_runtime():
+            prepared = fs.prepare_axpby(
+                x, idx, y, alpha=_ALPHA, beta=_BETA, validate=False
+            )
+            ours = lambda: fs.flagsparse_axpby(  # noqa: E731
+                y=y, prepared=prepared
+            )
+        else:
+            ours = lambda: fs.flagsparse_axpby(  # noqa: E731
+                x, idx, y, alpha=_ALPHA, beta=_BETA, validate=False
+            )
         y_torch = y_cpu.to(dev).to(compute)
 
         def torch_op():
