@@ -467,6 +467,7 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         if row_state == "PASS":
             status_parts.append("PyTorch-NPU: PASS")
         results.append({"op": name, "implementation": _ascend_implementation(name),
+                        "execution_path": "eager" if _ascend_implementation(name) == "torch_npu" else "triton",
                         "dtype": case.dtype_name,
                         "matrix": case.matrix_path.name if case.matrix_path is not None else "synthetic",
                         "shape": f"{case.m}x{case.n};nnz={case.nnz}",
@@ -497,11 +498,12 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
 
     if op == "spmv_coo":
         x = torch.randn(case.n, device=device, dtype=dtype)
+        coo_prepared = fs.prepare_spmv_coo(
+            coo_data, coo_row, coo_col, (case.m, case.n), op="non"
+        )
         record(
             "spmv_coo",
-            lambda: fs.flagsparse_spmv_coo(
-                coo_data, coo_row, coo_col, x, (case.m, case.n), op="non"
-            ),
+            lambda: fs.flagsparse_spmv_coo(prepared=coo_prepared, x=x),
             lambda: _torch_npu_coo_spmv(
                 coo_data, coo_row, coo_col, x, case.m
             ),
@@ -642,6 +644,7 @@ def main():
                 # ASCEND_OPERATOR_IMPLEMENTATION.  The column name is kept because the
                 # runner's schema matches on it; this field says what actually ran.
                 "implementation": item.get("implementation", "triton"),
+                "execution_path": item.get("execution_path", "unknown"),
                 "triton_ms": "" if fs_ms is None else fs_ms,
                 "pytorch_ms": "" if pt_ms is None else pt_ms,
                 "speedup": "" if fs_ms is None or not fs_ms else (pt_ms / fs_ms if pt_ms is not None else ""),
@@ -652,7 +655,7 @@ def main():
         with open(args.csv_summary, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["dtype", "matrix", "shape", "implementation",
+                fieldnames=["dtype", "matrix", "shape", "implementation", "execution_path",
                             "triton_ms", "pytorch_ms",
                             "speedup", "max_abs_err", "status", "reason"],
             )
