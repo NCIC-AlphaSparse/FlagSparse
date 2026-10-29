@@ -47,8 +47,9 @@ BLOCKED = ("numpy", "scipy", "torch", "torch_npu", "triton")
 def pytest_configure(config):
     """Make ``import <blocked>`` raise, the way it does on the CI runner."""
     for name in BLOCKED:
+        prefix = name + "."
         for module in [
-            key for key in list(sys.modules) if key == name or key.startswith(name + ".")
+            key for key in list(sys.modules) if key == name or key.startswith(prefix)
         ]:
             del sys.modules[module]
         # A ``None`` entry is the documented way to make an import fail.
