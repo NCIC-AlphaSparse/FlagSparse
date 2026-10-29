@@ -228,8 +228,10 @@ def test_spmm_native_selection_is_ascend_and_format_specific(fmt, ascend):
 
 
 def test_primary_spmm_golden_uses_quantized_values_and_wide_accumulation():
-    import numpy as np
-    import scipy.sparse as sparse
+    # Scoped to this test, not the module: the other checks here are pure AST and
+    # must keep running on the CPU-only CI runner, which has neither package.
+    np = pytest.importorskip("numpy")
+    sparse = pytest.importorskip("scipy.sparse")
 
     tree = ast.parse((ROOT / "benchmark/benchmark_ascend.py").read_text())
     function = next(
@@ -266,7 +268,7 @@ def test_primary_spmm_golden_uses_quantized_values_and_wide_accumulation():
 def test_primary_spmm_requires_cpu_golden_before_and_after_timing(
     monkeypatch, before, after, expected
 ):
-    import numpy as np
+    np = pytest.importorskip("numpy")  # see the note above; CI has no numpy
 
     tree = ast.parse((ROOT / "benchmark/benchmark_ascend.py").read_text())
     function = next(
