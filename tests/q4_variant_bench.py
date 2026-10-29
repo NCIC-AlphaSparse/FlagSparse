@@ -49,6 +49,7 @@ import ascend_sparse_baseline as cann_baseline
 import flagsparse as fs
 from benchmark_utils import accelerator_device
 from flagsparse.sparse_operations import mixed_spmx
+from flagsparse.sparse_operations import sddmm_csr
 from flagsparse.sparse_operations._common import (
     _ascend_execution_meta,
     _benchmark_cuda_op,
@@ -845,8 +846,38 @@ def _sddmm(v, mat, gen, warmup, iters, row):
             mat.ptr.long(), mat.cols.long(), torch.zeros(mat.csr.nnz, dtype=compute, device=mat.dev), mat.shape
         )
         row["pytorch_compute_dtype"] = _name(compute)
+        # Transposed once here, outside the timed callable, so op='trans' and
+        # layout='col' are judged on the kernel rather than on a transpose --
+        # exactly as the sampled_addmm path below has always done.
         a_op, b_op = _op_t(A, v.op_a).to(compute), _op_t(B, v.op_b).to(compute)
-        return lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
+        sampled = lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
+        try:
+            sampled()
+        except Exception as exc:
+            # torch_npu registers no aten::sparse_sampled_addmm, so on Ascend
+            # every op/layout variant of this operator used to carry no PyTorch
+            # baseline at all and fell through to the scaled-H800 tier while the
+            # plain non/non/row rows kept a PyTorch one -- the same kernel then
+            # read 6.5x or 0.15x depending only on which tier its row landed in.
+            # Fall back to the gather/multiply/sum formulation that the
+            # sddmm_csr script already times for those rows, so all five
+            # variants share one denominator.
+            #
+            # It is NOT a fused kernel: it materialises an nnz x K temporary and
+            # on a 910B runs ~45x slower than a rescaled H800 cuSPARSE SDDMM, so
+            # a ratio against it is not a vendor speedup. pytorch_formulation
+            # records which one produced the number; do not mix them.
+            row["pytorch_formulation"] = "gather/multiply/sum"
+            row["pytorch_sampled_addmm_reason"] = f"{type(exc).__name__}: {exc}"
+            indices = mat.cols
+            indptr = mat.ptr.to(torch.int64)
+            # _sddmm_reference indexes y by COLUMN id, so it wants (n, K).
+            y_rows = b_op.t().contiguous()
+            return lambda: sddmm_csr._sddmm_reference(
+                indices, indptr, a_op, y_rows, None, 1.0, 0.0
+            )
+        row["pytorch_formulation"] = "sampled_addmm"
+        return sampled
 
     _time_pytorch(row, build_torch, warmup, iters, ref)
     if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
