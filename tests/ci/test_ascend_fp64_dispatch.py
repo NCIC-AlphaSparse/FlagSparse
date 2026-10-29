@@ -140,21 +140,46 @@ def test_prepared_run_refuses_a_plan_for_the_other_orientation():
     assert native.run_fp64_spmm(prepared, dense, "row") is None
 
 
-def test_prepared_run_accepts_a_matching_plan():
-    calls = []
-    plan = SimpleNamespace(
-        shape=(7, 4), run=lambda dense: calls.append(dense) or torch.zeros((7, 2))
-    )
+def _matching_plan(calls):
+    """A stand-in for ``_NativeFP64Spmm``, whose ``run`` takes ``dense, out=None``."""
+
+    def run(dense, out=None):
+        calls.append((dense, out))
+        return torch.zeros((7, 2)) if out is None else out
+
+    plan = SimpleNamespace(shape=(7, 4), run=run)
     prepared = SimpleNamespace(
         ascend_fp64_plan=plan,
         n_rows=7,
         n_cols=4,
         data=torch.ones(1, dtype=torch.float64),
     )
-    dense = torch.ones((4, 2), dtype=torch.float64)
+    return prepared, torch.ones((4, 2), dtype=torch.float64)
+
+
+def test_prepared_run_accepts_a_matching_plan():
+    calls = []
+    prepared, dense = _matching_plan(calls)
 
     result = native.run_fp64_spmm(prepared, dense, "row")
 
     assert result is not None
     assert len(calls) == 1
     assert result[1]["execution_path"] == "native"
+
+
+def test_prepared_run_forwards_out_to_the_plan():
+    """``out`` has to reach the plan, not be honoured by a copy afterwards.
+
+    The operator's run time depends on where its C sits, so a benchmark holding
+    one buffer across calls only gets a stable address if the operator writes
+    into that buffer itself.
+    """
+    calls = []
+    prepared, dense = _matching_plan(calls)
+    out = torch.zeros((7, 2), dtype=torch.float64)
+
+    result = native.run_fp64_spmm(prepared, dense, "row", out=out)
+
+    assert calls[0][1] is out
+    assert result[0] is out

@@ -15,6 +15,8 @@
 """CSR SpMM kernels, helpers, and benchmark entry points."""
 
 import ctypes
+import functools
+import inspect
 import math
 import warnings
 
@@ -858,6 +860,44 @@ def _normalize_spmm_csr_alg(alg):
     return token
 
 
+@functools.lru_cache(maxsize=None)
+def _route_takes_out(run):
+    """Whether a route function accepts ``out=``.
+
+    Only the routes that can write through to a caller's buffer declare it, so
+    the ones that cannot are never handed an argument they would silently drop;
+    the public entry copies into ``out`` for those instead.
+    """
+    return "out" in inspect.signature(run).parameters
+
+
+def _validate_spmm_out(prepared, B, out, dense_layout):
+    """Check a caller-supplied SpMM output buffer before any route touches it.
+
+    Rejecting a mismatched buffer here keeps the failure at the public boundary:
+    a wrong dtype or shape handed to the Ascend native route would otherwise be
+    declined by its own guard, fall back to an internal allocation, and silently
+    return a different tensor than the caller asked to be filled.
+    """
+    if not torch.is_tensor(out):
+        raise TypeError("out must be a torch.Tensor")
+    expected = (int(prepared.n_rows), int(B.shape[1]))
+    if tuple(out.shape) != expected:
+        raise ValueError(f"out must have shape {expected}, got {tuple(out.shape)}")
+    # COO's prepared route names the result dtype explicitly (it supports mixed
+    # i8->i32 and f16->f32 outputs); CSR's result follows its values.
+    expected_dtype = getattr(prepared, "output_dtype", None) or prepared.data.dtype
+    if out.dtype != expected_dtype:
+        raise ValueError(f"out.dtype must be {expected_dtype}, got {out.dtype}")
+    if out.device != B.device:
+        raise ValueError("out must be on the same device as B")
+    if dense_layout == "col":
+        if out.stride(0) != 1:
+            raise ValueError("dense_layout='col' needs a column-major out")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous for dense_layout='row'")
+
+
 def _normalize_dense_layout(layout):
     token = "row" if layout is None else str(layout).strip().lower()
     if token in ("auto", "default"):
@@ -1005,7 +1045,7 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
 
 
 def _run_spmm_csr_base_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out=None
 ):
     return _run_spmm_csr_base_route_impl(
         prepared,
@@ -1015,6 +1055,7 @@ def _run_spmm_csr_base_route(
         dense_layout=dense_layout,
         accuracy=False,
         route_name="csr_base",
+        out=out,
     )
 
 
@@ -1041,13 +1082,16 @@ def _run_spmm_csr_base_route_impl(
     dense_layout="row",
     accuracy=False,
     route_name="csr_base",
+    out=None,
 ):
     B = _validate_spmm_route_runtime_inputs(prepared, B)
     dense_layout = _normalize_dense_layout(dense_layout)
     if not _is_ascend_runtime():
         B = _materialize_dense_layout(B, dense_layout)
     if _is_ascend_runtime():
-        native = _run_ascend_fp64_spmm(prepared, B, dense_layout, timing=timing)
+        native = _run_ascend_fp64_spmm(
+            prepared, B, dense_layout, timing=timing, out=out
+        )
         if native is not None:
             return native
         C_out = _empty_dense_layout(
@@ -3001,8 +3045,14 @@ def flagsparse_spmm_csr_run(
     return_meta=False,
     timing=False,
     diagnostics=False,
+    out=None,
 ):
     """Run a registered CSR SpMM route.
+
+    ``out``, when given, receives the result and is returned -- see
+    ``flagsparse_spmm_coo_run`` for why the Ascend native FP64 route needs the
+    caller to own that buffer. Routes that cannot write through to it allocate
+    and copy, so the semantics hold either way.
 
     The default operator timing follows the AlphaSparse-style benchmark policy:
     ``gpu_ms`` is a CUDA event around the route run, while process CPU time is
@@ -3093,13 +3143,21 @@ def flagsparse_spmm_csr_run(
         op_name,
         timing=bool(timing),
     )
-    C, route_meta = algorithm.run(
-        runtime_prepared,
-        B,
+    if out is not None:
+        _validate_spmm_out(runtime_prepared, B, out, dense_layout)
+    run_kwargs = dict(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
     )
+    if out is not None and _route_takes_out(algorithm.run):
+        run_kwargs["out"] = out
+    C, route_meta = algorithm.run(runtime_prepared, B, **run_kwargs)
+    if out is not None and C is not out:
+        # The route allocated its own output: honour `out` anyway rather than
+        # returning a different tensor, at the cost of one copy.
+        out.copy_(C)
+        C = out
     if end is not None:
         end.record()
         _ACCEL.synchronize()

@@ -138,6 +138,43 @@ def shuffled_unsorted_error(native, arrays, dense, shape, golden):
     return ("OK" if error < 1e-9 else "FAIL"), error
 
 
+def fixed_output_checks(run, prepared, dense, output, golden, matrix):
+    """Three invariants a reused output buffer depends on.
+
+    residue   writing garbage into C first must not survive the call. The
+              operator is assumed to overwrite rather than accumulate -- the
+              internal path allocates with torch.empty and still matched the
+              golden exactly, which only holds if it overwrites -- and sharing
+              one C across calls turns that assumption load bearing.
+    empty_row a row with no stored entries must come back zero, not whatever the
+              previous call left there. This operator is separately known to
+              leave an all-nnz=0 output untouched, so the hole is real.
+    b_update  changing B between calls must change the result, i.e. the plan
+              bound a pointer and not a snapshot of the values.
+    """
+    results = {}
+
+    output.fill_(float("nan"))
+    got = run(prepared, dense, out=output)
+    error = (got.detach().cpu() - golden).abs()
+    results["residue"] = float(error.max()) if error.numel() else 0.0
+
+    empty = torch.from_numpy(np.asarray((matrix.getnnz(axis=1) == 0).nonzero()[0]))
+    if empty.numel():
+        output.fill_(float("nan"))
+        got = run(prepared, dense, out=output)
+        rows = got.detach().cpu().index_select(0, empty)
+        results["empty_row_max_abs"] = float(rows.abs().max())
+    else:
+        results["empty_row_max_abs"] = None
+
+    scaled = dense * 2.0
+    got = run(prepared, scaled, out=output)
+    error = (got.detach().cpu() - golden * 2.0).abs()
+    results["b_update"] = float(error.max()) if error.numel() else 0.0
+    return results
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", type=Path, required=True)
@@ -270,8 +307,14 @@ def main(argv=None):
                 )
                 _, cann_first_run_ms = measured(baseline.run)
                 cann_error = validate(output, golden)
+                # Both sides write into the SAME fixed C, so neither draws a
+                # fresh address between calls: this operator runs 222 ms or 155
+                # ms on one matrix depending only on where B and C sit, and the
+                # CANN plan binds its output once, so a per-call allocation on
+                # our side alone was half of the old 0.72x.
                 operations = dict(
-                    prepared=lambda: run(prepared, dense), cann=baseline.run
+                    prepared=lambda: run(prepared, dense, out=output),
+                    cann=baseline.run,
                 )
                 samples = {key: [] for key in operations}
                 order = []
@@ -297,6 +340,9 @@ def main(argv=None):
                         max_error, validate(operations["prepared"](), golden)
                     )
                     cann_error = max(cann_error, validate(operations["cann"](), golden))
+                checks = fixed_output_checks(
+                    run, prepared, dense, output, golden, matrix
+                )
                 # Outside the argsort guard: this call deliberately hands the
                 # operator unsorted coordinates.
                 if fmt == "coo":
@@ -334,6 +380,9 @@ def main(argv=None):
                     cann_max_error=cann_error,
                     shuffled_status=shuffled_status,
                     shuffled_max_error=shuffled_error,
+                    fixed_out_residue=checks["residue"],
+                    fixed_out_empty_row=checks["empty_row_max_abs"],
+                    fixed_out_b_update=checks["b_update"],
                     implementation=meta["implementation"],
                 )
                 records.append(record)

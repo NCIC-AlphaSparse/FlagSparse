@@ -175,7 +175,18 @@ def prepare_fp64_spmm(values, rows, columns, shape):
         return None
 
 
-def run_fp64_spmm(prepared, dense, dense_layout, *, timing=False):
+def run_fp64_spmm(prepared, dense, dense_layout, *, timing=False, out=None):
+    """Run the prepared native plan; ``out`` receives the result in place.
+
+    Passing ``out`` is what lets a caller keep one output buffer across calls.
+    That matters beyond saving an allocation: this operator's run time depends on
+    where its B and C land (222 ms at one offset against 155 ms at another for
+    the same matrix), so a benchmark comparing against CANN can only hold the
+    address constant on both sides by owning C itself.
+
+    ``dense_layout="col"`` still needs a post-transform, which cannot write
+    through to ``out``, so that case allocates and copies instead.
+    """
     plan = prepared.ascend_fp64_plan
     if plan is None or dense.shape[1] == 0:
         return None
@@ -192,9 +203,13 @@ def run_fp64_spmm(prepared, dense, dense_layout, *, timing=False):
         return None
     started = time.perf_counter() if timing else None
     try:
-        result = plan.run(dense)
         if dense_layout == "col":
-            result = result.T.contiguous().T
+            result = plan.run(dense).T.contiguous().T
+            if out is not None:
+                out.copy_(result)
+                result = out
+        else:
+            result = plan.run(dense, out=out)
     except Exception as exc:
         if _mode() == "native":
             raise

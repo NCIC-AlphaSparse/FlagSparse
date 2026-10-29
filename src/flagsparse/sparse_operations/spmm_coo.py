@@ -27,7 +27,9 @@ from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
 from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
+    _route_takes_out,
     _select_spmm_alg1_warp_and_factor,
+    _validate_spmm_out,
     _spmm_coo_reference_tolerance,
     _spmm_relative_threshold,
     _spmm_validation_metrics,
@@ -2044,7 +2046,7 @@ def _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, *, wide=T
 
 
 def _run_spmm_coo_rowrun_route(
-    prepared, B, *, timing=False, diagnostics=False, dense_layout="row"
+    prepared, B, *, timing=False, diagnostics=False, dense_layout="row", out=None
 ):
     dense_layout = _normalize_dense_layout(dense_layout)
     use_gather = (prepared.gather_ptr is not None and torch.is_tensor(B)
@@ -2058,7 +2060,9 @@ def _run_spmm_coo_rowrun_route(
         prepared, B, dense_layout, wide=not (use_gather or use_biv_half)
     )
     if _is_ascend_runtime():
-        native = _run_ascend_fp64_spmm(prepared, B, dense_layout, timing=timing)
+        native = _run_ascend_fp64_spmm(
+            prepared, B, dense_layout, timing=timing, out=out
+        )
         if native is not None:
             result, meta = native
             return result, {"alg": "coo_ascend_fp64_native", "op": prepared.op, **meta}
@@ -2645,8 +2649,19 @@ def flagsparse_spmm_coo_run(
     return_meta=False,
     timing=False,
     diagnostics=False,
+    out=None,
 ):
-    """Run a registered COO SpMM algorithm with CSR-style timing metadata."""
+    """Run a registered COO SpMM algorithm with CSR-style timing metadata.
+
+    ``out``, when given, receives the result and is returned. It lets a caller
+    reuse one output buffer across calls, which prepare_spmv_sell's prepared run
+    has always allowed and this one did not. On the Ascend native FP64 route the
+    operator writes straight through, so the buffer's address stays fixed -- that
+    route's run time depends on where its B and C land, and a benchmark can only
+    hold both sides at one address by owning C. Other routes still allocate and
+    then copy into ``out``, so the semantics hold everywhere even where the copy
+    is not avoided.
+    """
     if not isinstance(prepared, PreparedCooSpmmRoute):
         raise TypeError("prepared must be a PreparedCooSpmmRoute instance")
     alg_name = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
@@ -2677,13 +2692,21 @@ def flagsparse_spmm_coo_run(
     if start is not None:
         _ACCEL.synchronize()
         start.record()
-    C, route_meta = algorithm.run(
-        prepared,
-        B,
+    if out is not None:
+        _validate_spmm_out(prepared, B, out, dense_layout)
+    run_kwargs = dict(
         timing=bool(timing),
         diagnostics=bool(diagnostics),
         dense_layout=dense_layout,
     )
+    if out is not None and _route_takes_out(algorithm.run):
+        run_kwargs["out"] = out
+    C, route_meta = algorithm.run(prepared, B, **run_kwargs)
+    if out is not None and C is not out:
+        # The route allocated its own output: honour `out` anyway rather than
+        # returning a different tensor, at the cost of one copy.
+        out.copy_(C)
+        C = out
     if end is not None:
         end.record()
         _ACCEL.synchronize()

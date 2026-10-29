@@ -18,6 +18,9 @@ PERF_FIELDS = [
     "baseline_kind", "vendor_name", "cann_status", "cann_reason", "cann_ms",
     "cann_flagsparse_ms", "speedup_vs_cann", "cann_max_error", "cann_prepare_ms",
     "cann_arithmetic_dtype", "cann_i8_promoted_to_i32",
+    # This operator's run time depends on where its B and C sit, so a ratio is
+    # only interpretable alongside the addresses it was measured at.
+    "cann_rhs_shared", "cann_b_data_ptr", "cann_c_data_ptr", "cann_b_stride",
 ]
 
 
@@ -34,6 +37,10 @@ def mark_row(row):
 
 
 def record_result(row, plan, elapsed_ms, error, flagsparse_ms):
+    row.update(cann_rhs_shared=plan.rhs_shared,
+               cann_b_data_ptr=plan.inputs[3].data_ptr(),
+               cann_c_data_ptr=plan.output.data_ptr(),
+               cann_b_stride=str(tuple(plan.inputs[3].stride())))
     row.update(cann_status="PASS", cann_reason="", cann_ms=elapsed_ms,
                cann_flagsparse_ms=flagsparse_ms, cann_max_error=error,
                cann_prepare_ms=plan.prepare_ms, cann_arithmetic_dtype=str(plan.dtype).replace("torch.", ""),
@@ -42,7 +49,8 @@ def record_result(row, plan, elapsed_ms, error, flagsparse_ms):
 
 
 class SparsePlan:
-    def __init__(self, coordinates, values, shape, dense, output, transpose):
+    def __init__(self, coordinates, values, shape, dense, output, transpose,
+                 rhs_shared=False):
         self.descriptors = []
         self.buffers = []
         self.attribute = None
@@ -52,6 +60,7 @@ class SparsePlan:
         self.output = output
         self.dtype = output.dtype
         self.inputs = [coordinates, values, shape, dense]
+        self.rhs_shared = rhs_shared
         home = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
         try:
             self.acl = importlib.import_module("acl")
@@ -160,7 +169,22 @@ def prepare_spmm(fmt, arrays, shape, dense, output, op_a="non", op_b="non", comp
     order = np.argsort(coordinates[:, 0 if op_a == "non" else 1], kind="stable")
     coordinates = coordinates[order]
     values = values[torch.from_numpy(order)]
-    rhs = dense.detach().cpu().to(output.dtype)
+    # Share B with the measured side when nothing needs doing to it. The CPU
+    # round-trip below re-uploads a numerically identical B at a DIFFERENT
+    # address, and this operator's run time depends on where its B lands -- 222
+    # ms at one offset against 155 ms at another for the same matrix -- so the
+    # copy alone moved the ratio to ~0.72. cusparse_generic_baseline wraps the
+    # caller's B directly (_dnmat(B)); this was the one adapter that did not.
+    # Restricted to FP64, which is where a ratio near 1 makes the effect decide
+    # the result; other dtypes keep the established path untouched.
+    share_rhs = (
+        op_b == "non"
+        and output.dtype == torch.float64
+        and dense.dtype == output.dtype
+        and dense.is_contiguous()
+        and dense.device == output.device
+    )
+    rhs = dense if share_rhs else dense.detach().cpu().to(output.dtype)
     if op_a == "trans" and values.is_complex():
         values = values.conj().resolve_conj()
     if op_b != "non":
@@ -173,7 +197,8 @@ def prepare_spmm(fmt, arrays, shape, dense, output, op_a="non", op_b="non", comp
         raise ValueError("CANN sparse/dense/output dimensions do not match")
     plan = SparsePlan(torch.from_numpy(coordinates).to(output.device), values.contiguous().to(output.device),
                       torch.tensor(shape, device=output.device, dtype=torch.int64),
-                      rhs.contiguous().to(output.device), output, op_a != "non")
+                      rhs.contiguous().to(output.device), output, op_a != "non",
+                      rhs_shared=share_rhs)
     torch.npu.synchronize(output.device)
     plan.prepare_ms = (time.perf_counter_ns() - started) / 1e6
     plan.i8_promoted_to_i32 = arrays[0].dtype == torch.int8
