@@ -790,6 +790,20 @@ def _sddmm_ref(mat, a_eff, b_eff):
     return out
 
 
+def _ascend_complex_sddmm_reference(indices, indptr, x, y):
+    row_ids = torch.repeat_interleave(
+        torch.arange(indptr.numel() - 1, dtype=torch.int64, device=indices.device),
+        indptr[1:] - indptr[:-1],
+    )
+    if row_ids.numel() == 0:
+        return torch.empty(0, dtype=x.dtype, device=x.device)
+    left = torch.view_as_real(x.resolve_conj()).index_select(0, row_ids)
+    right = torch.view_as_real(y.resolve_conj()).index_select(0, indices.to(torch.int64))
+    real = (left[..., 0] * right[..., 0] - left[..., 1] * right[..., 1]).sum(dim=1)
+    imag = (left[..., 0] * right[..., 1] + left[..., 1] * right[..., 0]).sum(dim=1)
+    return torch.view_as_complex(torch.stack((real, imag), dim=-1))
+
+
 def _sddmm(v, mat, gen, warmup, iters, row):
     m, n = mat.shape
     kd = DENSE_COLS
@@ -861,18 +875,19 @@ def _sddmm(v, mat, gen, warmup, iters, row):
             # read 6.5x or 0.15x depending only on which tier its row landed in.
             # Fall back to the gather/multiply/sum formulation that the
             # sddmm_csr script already times for those rows, so all five
-            # variants share one denominator.
-            #
-            # It is NOT a fused kernel: it materialises an nnz x K temporary and
-            # on a 910B runs ~45x slower than a rescaled H800 cuSPARSE SDDMM, so
-            # a ratio against it is not a vendor speedup. pytorch_formulation
-            # records which one produced the number; do not mix them.
+            # variants share one denominator. pytorch_formulation records which
+            # formulation produced the number.
             row["pytorch_formulation"] = "gather/multiply/sum"
             row["pytorch_sampled_addmm_reason"] = f"{type(exc).__name__}: {exc}"
             indices = mat.cols
             indptr = mat.ptr.to(torch.int64)
             # _sddmm_reference indexes y by COLUMN id, so it wants (n, K).
             y_rows = b_op.t().contiguous()
+            if _is_ascend_runtime() and compute.is_complex:
+                row["pytorch_complex_strategy"] = "real_planes"
+                return lambda: _ascend_complex_sddmm_reference(
+                    indices, indptr, a_op, y_rows
+                )
             return lambda: sddmm_csr._sddmm_reference(
                 indices, indptr, a_op, y_rows, None, 1.0, 0.0
             )

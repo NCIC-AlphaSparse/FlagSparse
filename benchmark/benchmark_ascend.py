@@ -43,6 +43,16 @@ def _sync(torch):
     torch.npu.synchronize()
 
 
+def _prepare_fp64_spmm(torch, fs, fmt, arrays, shape, dense):
+    _sync(torch)
+    started = time.perf_counter()
+    prepared = getattr(fs, f"prepare_spmm_{fmt}_route")(*arrays, shape)
+    _sync(torch)
+    prepare_ms = (time.perf_counter() - started) * 1000.0
+    run = getattr(fs, f"flagsparse_spmm_{fmt}_run")
+    return lambda: run(prepared, dense), prepare_ms
+
+
 def _bench(torch, fn, warmup: int, iters: int):
     for _ in range(warmup):
         fn()
@@ -458,7 +468,7 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         "baseline_policy": "native CANN SparseTensorDenseMatMul for COO/CSR SpMM; PyTorch-NPU for other operators",
     }]
 
-    def record(name, fs_fn, pt_fn, scipy_ref, output_to_numpy, cann_operands=None):
+    def record(name, fs_fn, pt_fn, scipy_ref, output_to_numpy, cann_operands=None, prepare_ms=None):
         fs_time = pt_time = None
         fs_err = pt_err = None
         fs_out_np = pt_out_np = None
@@ -518,6 +528,8 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
                         "scipy_max_abs_error": {"flagsparse": fs_err, "pytorch": pt_err},
                         "status": row_state,
                         "reason": "; ".join(status_parts) if status_parts else "unknown"})
+        if prepare_ms is not None:
+            results[-1].update(timed="prepared", prepare_ms=prepare_ms)
         if cann_operands is not None:
             fmt, arrays, dense = cann_operands
             results[-1].update(_cann_spmm_fields(
@@ -534,10 +546,17 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
     if op in (None, "spmm_csr"):
         b = torch.randn(case.n, case.dense_cols, device=device, dtype=dtype)
         row_ids = _torch_npu_csr_row_ids(indptr, case.m)
-        record("spmm_csr", lambda: fs.flagsparse_spmm_csr(data, indices, indptr, b, (case.m, case.n)),
+        prepare_ms = None
+        if dtype == torch.float64:
+            fs_fn, prepare_ms = _prepare_fp64_spmm(
+                torch, fs, "csr", (data, indices, indptr), (case.m, case.n), b
+            )
+        else:
+            fs_fn = lambda: fs.flagsparse_spmm_csr(data, indices, indptr, b, (case.m, case.n))
+        record("spmm_csr", fs_fn,
                lambda: _torch_npu_csr_spmm(data, indices, row_ids, b, case.m),
                _scipy_spmm(matrix, _scipy_numpy(b), _scipy_numpy(data)), _scipy_numpy,
-               cann_operands=("csr", (data, indices, indptr), b))
+               cann_operands=("csr", (data, indices, indptr), b), prepare_ms=prepare_ms)
     if op in (None, "sddmm_csr"):
         sx = torch.randn(case.m, 32, device=device, dtype=dtype)
         sy = torch.randn(case.n, 32, device=device, dtype=dtype)
@@ -562,17 +581,25 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         )
     if op == "spmm_coo":
         b = torch.randn(case.n, case.dense_cols, device=device, dtype=dtype)
+        prepare_ms = None
+        if dtype == torch.float64:
+            fs_fn, prepare_ms = _prepare_fp64_spmm(
+                torch, fs, "coo", (coo_data, coo_row, coo_col), (case.m, case.n), b
+            )
+        else:
+            fs_fn = lambda: fs.flagsparse_spmm_coo(
+                coo_data, coo_row, coo_col, b, (case.m, case.n), op="non"
+            )
         record(
             "spmm_coo",
-            lambda: fs.flagsparse_spmm_coo(
-                coo_data, coo_row, coo_col, b, (case.m, case.n), op="non"
-            ),
+            fs_fn,
             lambda: _torch_npu_coo_spmm(
                 coo_data, coo_row, coo_col, b, case.m
             ),
             _scipy_spmm(coo_matrix, _scipy_numpy(b), _scipy_numpy(coo_data)),
             _scipy_numpy,
             cann_operands=("coo", (coo_data, coo_row, coo_col), b),
+            prepare_ms=prepare_ms,
         )
 
     # Gather/scatter are PyTorch indexing baselines; they are not advertised as
@@ -704,7 +731,7 @@ def main():
                 "reason": item.get("reason", ""),
             }
             row.update({key: value for key, value in item.items()
-                        if key.startswith("cann_") or key in ("baseline_kind", "vendor_name", "speedup_vs_cann")})
+                        if key.startswith("cann_") or key in ("baseline_kind", "vendor_name", "speedup_vs_cann", "timed", "prepare_ms")})
             rows.append(row)
         with open(args.csv_summary, "w", newline="", encoding="utf-8") as handle:
             fields = ["dtype", "matrix", "shape", "implementation", "execution_path",
