@@ -45,6 +45,7 @@ import scipy.sparse as sp
 import torch
 
 import cusparse_generic_baseline as cusparse_baseline
+import ascend_sparse_baseline as cann_baseline
 import flagsparse as fs
 from benchmark_utils import accelerator_device
 from flagsparse.sparse_operations import mixed_spmx
@@ -349,28 +350,49 @@ class _Matrix:
 _VENDOR_MAX_ERROR = 1e-2
 
 
-def _vendor(row, build):
-    reason = cusparse_baseline.skip_reason()
+def _vendor(row, build, baseline=cusparse_baseline):
+    reason = baseline.skip_reason()
+    plan = None
     if reason is None:
         try:
             plan, check = build()
             plan.run()
             err = check()
             row["vendor_max_error"] = err
-            if err <= _VENDOR_MAX_ERROR:
+            valid = (_passes(getattr(torch, row["out_dtype"]), err) if baseline is cann_baseline
+                     else err <= _VENDOR_MAX_ERROR)
+            if valid:
+                if baseline is cann_baseline:
+                    plan.check = check
                 return plan, None
             plan.close()
-            reason = f"cuSPARSE result off by {err:.3g} (relative); baseline not used"
+            reason = f"{getattr(baseline, 'NAME', 'cuSPARSE')} result off by {err:.3g} (relative); baseline not used"
         except Exception as exc:
+            if baseline is cann_baseline and plan is not None:
+                plan.close()
             reason = f"{type(exc).__name__}: {exc}"
+    if baseline is cann_baseline:
+        row.update(cann_status="FAIL", cann_reason=reason)
     row["vendor_reason"] = reason
     return None, reason
 
 
 def _time_vendor(row, plan, warmup, iters):
     if plan is not None:
-        _, row["vendor_ms"] = _benchmark_cuda_op(plan.run, warmup, iters)
-        plan.close()
+        try:
+            _, elapsed_ms = _benchmark_cuda_op(plan.run, warmup, iters)
+            if row.get("baseline_kind") == "cann":
+                plan.run()
+                post_error = plan.check()
+                if _passes(getattr(torch, row["out_dtype"]), post_error):
+                    error = max(row["vendor_max_error"], post_error)
+                    cann_baseline.record_result(row, plan, elapsed_ms, error, row["ours_ms"])
+                else:
+                    row.update(cann_status="FAIL", cann_reason=f"CANN post-timing CPU golden validation failed: {post_error}")
+            else:
+                row["vendor_ms"] = elapsed_ms
+        finally:
+            plan.close()
 
 
 def _time_pytorch(row, build, warmup, iters, reference):
@@ -670,16 +692,20 @@ def _spmm(v, mat, gen, warmup, iters, row):
             prepared, "runner" if hasattr(prepared, "runner") else "ascend_runner"
         ))
 
+    baseline = cann_baseline if _is_ascend_runtime() and v.fmt in ("coo", "csr", "csc") else cusparse_baseline
+    if baseline is cann_baseline:
+        cann_baseline.mark_row(row)
+
     def build_vendor():
         C = torch.empty(m_eff, DENSE_COLS, dtype=v.out, device=mat.dev)
-        if v.layout == "col":
+        if v.layout == "col" and baseline is not cann_baseline:
             C = _col_major(C)
-        plan = cusparse_baseline.prepare_spmm(
+        plan = baseline.prepare_spmm(
             v.fmt, mat.arrays(v.fmt, vals), mat.shape, B, C, v.op_a, v.op_b, _compute_dtype(v)
         )
         return plan, lambda: _error(C, ref)
 
-    plan, _ = _vendor(row, build_vendor)
+    plan, _ = _vendor(row, build_vendor, baseline)
     _time_vendor(row, plan, warmup, iters)
 
     def build_torch():
@@ -925,7 +951,8 @@ def run_variants(
             rows.append(row)
             log(
                 f"[q4] {row['matrix']} {v.name}: {row['status']} ours={row.get('ours_ms')} "
-                f"vendor={row.get('vendor_ms')} torch={row.get('pytorch_ms')} {row.get('error') or ''}"
+                f"vendor={row.get('vendor_name', 'cuSPARSE')} vendor_ms={row.get('cann_ms', row.get('vendor_ms'))} "
+                f"torch={row.get('pytorch_ms')} {row.get('error') or ''}"
             )
             if _is_ascend_runtime():
                 torch._dynamo.reset()

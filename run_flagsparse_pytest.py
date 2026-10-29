@@ -237,6 +237,13 @@ PERFORMANCE_METRIC_COLUMNS = {
 # pytorch_ms/ms -- so each layout is listed and _performance_schema prefers the
 # entry whose measurement columns the row actually carries.
 PERFORMANCE_SPEEDUP_SCHEMAS = (
+    # FIRST: a real CANN operator time is the strongest baseline an Ascend row
+    # can carry, so it wins over this row's PyTorch column and over the scaled
+    # H800 time at the bottom -- the cann > pytorch > h800_scaled order. It is
+    # an ordinary vendor entry, not a backend branch: no other backend's CSV has
+    # a cann_ms, and the first pass below needs NUMBERS, so a row without a
+    # usable CANN measurement falls through to its PyTorch column as before.
+    ("speedup_vs_cann", "cann_ms", "cann_flagsparse_ms"),
     ("biv_speedup", "biv_baseline_ms", "biv_flagsparse_ms"),
     # benchmark_ascend.py names its ratio plainly `speedup` over pytorch_ms/triton_ms.
     # Ahead of the generic `speedup` entry below: without a schema of its own every
@@ -718,6 +725,7 @@ ASCEND_PERFORMANCE_DTYPES: dict[str, str] = {
     # untagged row can be projected onto that delivery variant.
     "scatter": "float16,float32,float64,complex64,complex128,int8",
     "spmv_coo": "float32,float64",
+    "spmm_csr": "float32,float64",
     "spmm_coo": "float32,float64",
     "spmv_csc": "float32",
     "spmm_csc": "float32",
@@ -2455,6 +2463,20 @@ def _performance_metric_record(row: dict[str, str]) -> dict[str, object]:
     return {"metrics": metrics, "metadata": metadata, "raw": row}
 
 
+def _cann_baseline_usable(row: dict[str, str]) -> bool:
+    """Whether this row's CANN vendor measurement may be used as the baseline.
+
+    A row whose CANN run did not pass still carries the cann_* columns, and its
+    numbers are not a baseline. Suppressing only the CANN tier -- rather than
+    rejecting the row -- is what lets it fall back to its PyTorch column and
+    then to the scaled H800 time.
+    """
+    if str(row.get("baseline_kind") or "").strip().lower() != "cann":
+        return False
+    status = str(row.get("cann_status") or "PASS").strip().upper()
+    return status == "PASS"
+
+
 def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | None]:
     if _BIV_BASELINE_POLICY:
         if _to_float(row.get("biv_speedup")) is not None:
@@ -2469,7 +2491,10 @@ def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | Non
     # The first pass wants NUMBERS: a backend with no vendor writes "N/A" into
     # speedup_vs_vendor/vendor_ms, and taking that text as "carried" hid the
     # scaled-H800 speedup further down the table (MACA spmv_csr f32/f64).
+    cann_ok = _cann_baseline_usable(row)
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
+        if speedup_key == "speedup_vs_cann" and not cann_ok:
+            continue
         if _to_float(_row_value(row, speedup_key)) is None:
             continue
         if all(
@@ -2478,13 +2503,19 @@ def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | Non
         ):
             return speedup_key, base_key, latency_key
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
+        if speedup_key == "speedup_vs_cann" and not cann_ok:
+            continue
         if _row_value(row, speedup_key):
             return speedup_key, base_key, latency_key
+    # These two sweep every column whose NAME contains "speedup", so they would
+    # pick speedup_vs_cann back up for a row whose CANN attempt failed -- the
+    # suppression above has to hold here too, or an unusable CANN number becomes
+    # the baseline through the back door.
     for key, value in row.items():
-        if "speedup" in key.lower() and value:
+        if "speedup" in key.lower() and value and (cann_ok or "cann" not in key.lower()):
             return key, None, None
     for key in row:
-        if "speedup" in key.lower():
+        if "speedup" in key.lower() and (cann_ok or "cann" not in key.lower()):
             return key, None, None
     return "speedup", None, None
 
@@ -2713,7 +2744,9 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         dtype_entry["details"][shape] = detail  # type: ignore[index]
         if _performance_row_has_complete_speedup(row):
             totals.setdefault(dtype, []).append(speedup)
-            if speedup_key == "biv_speedup":
+            if speedup_key == "speedup_vs_cann":
+                baseline_labels.setdefault(dtype, []).append("cann")
+            elif speedup_key == "biv_speedup":
                 label = str(row.get("biv_baseline_kind") or "local")
                 baseline_labels.setdefault(dtype, []).append(label)
             elif speedup_key == _SCALED_SPEEDUP_KEY:
@@ -2877,20 +2910,43 @@ def summarize_performance_csv(
     if not rows:
         return summary
 
+    summary.update(_speedup_aggregates(rows))
+    return summary
+
+
+# The speedup keys a performance summary carries. A projected delivery/q4
+# variant has to replace all of them, not just "speedup": each one was
+# aggregated over the parent operator's full row set.
+_SPEEDUP_AGGREGATE_KEYS = (
+    "speedup",
+    "speedup_row_count",
+    "speedup_by_column",
+    "two_level_speedup",
+    "speedup_summary_error",
+)
+
+
+def _speedup_aggregates(rows: list[dict[str, object]]) -> dict[str, object]:
+    """The speedup keys of a performance summary, over ``rows`` alone.
+
+    Shared with ``_recompute_variant_speedup`` so that a projected variant's
+    number is derived exactly the way the parent operator's is.
+    """
+    aggregates: dict[str, object] = {}
     # Aggregate only over rows that passed and carry both measurements behind their
     # speedup: FAIL rows and rows with a missing baseline used to be folded in.
     speedup_rows = [row for row in rows if _performance_row_has_complete_speedup(row)]
-    summary["speedup_row_count"] = len(speedup_rows)
+    aggregates["speedup_row_count"] = len(speedup_rows)
     if speedup_rows and all(
         {"dtype", "shape", "speedup"} <= set(row) for row in speedup_rows
     ):
         try:
             from benchmark.performance_utils import two_level_average_speedup
 
-            summary["two_level_speedup"] = two_level_average_speedup(speedup_rows)
-            summary["speedup"] = summary["two_level_speedup"].get("overall")
+            aggregates["two_level_speedup"] = two_level_average_speedup(speedup_rows)
+            aggregates["speedup"] = aggregates["two_level_speedup"].get("overall")
         except Exception as exc:
-            summary["speedup_summary_error"] = str(exc)
+            aggregates["speedup_summary_error"] = str(exc)
 
     speedup_values: dict[str, list[float]] = {}
     for row in speedup_rows:
@@ -2905,8 +2961,8 @@ def summarize_performance_csv(
         by_column = {
             key: statistics.mean(values) for key, values in speedup_values.items()
         }
-        summary["speedup_by_column"] = by_column
-        if "speedup" not in summary:
+        aggregates["speedup_by_column"] = by_column
+        if "speedup" not in aggregates:
             # Vendor-first, same order as the per-row choice: this list used to
             # put triton_speedup_vs_pytorch first, so the operator-level number
             # was against PyTorch even where every row had a cuSPARSE baseline.
@@ -2921,12 +2977,49 @@ def summarize_performance_csv(
             ]
             for key in preferred:
                 if key in by_column:
-                    summary["speedup"] = by_column[key]
+                    aggregates["speedup"] = by_column[key]
                     break
             else:
                 first_key = sorted(by_column)[0]
-                summary["speedup"] = by_column[first_key]
-    return summary
+                aggregates["speedup"] = by_column[first_key]
+    return aggregates
+
+
+def _recompute_variant_speedup(
+    result: dict[str, object],
+    rows: list[dict[str, object]] | None,
+    data: dict[str, object] | None = None,
+) -> None:
+    """Replace the parent operator's speedup aggregates with this variant's own.
+
+    A projected variant keeps only its own slice of the benchmark's rows, but
+    every speedup key beside them was aggregated over the whole parent
+    operator, and ``_phase_rows`` writes that number straight into summary.csv
+    -- so several variants of one operator used to print the same speedup.
+    Recompute from the variant's own rows; where only ``data`` survived the
+    projection, average its per-dtype speedups; with neither, leave the field
+    empty rather than inherit a number that is not this variant's.
+
+    Applies to every backend: the projection is backend-independent, and
+    ``tools/delivery_table.py`` already derived its own per-variant number from
+    ``data``, so a gated fix would leave the two outputs disagreeing.
+    """
+    for key in _SPEEDUP_AGGREGATE_KEYS:
+        result.pop(key, None)
+    if rows:
+        result.update(_speedup_aggregates(rows))
+    elif isinstance(data, dict):
+        values = [
+            number
+            for entry in data.values()
+            if isinstance(entry, dict)
+            for number in (_to_float(entry.get("speedup")),)
+            if number is not None
+        ]
+        if values:
+            result["speedup"] = statistics.mean(values)
+    if result.get("speedup") is None:
+        result["speedup"] = ""
 
 
 _SCALED_SPEEDUP_KEY = "speedup_vs_h800_scaled"
@@ -3982,6 +4075,7 @@ def _q4_performance_phase(
         if str(phase_result.get("status") or "").upper() == "TIMEOUT":
             result = dict(phase_result)
             result["data"] = {}
+            _recompute_variant_speedup(result, None)
             return result
         return _delivery_not_configured_phase(
             "performance", f"the benchmark recorded no {variant_id} rows"
@@ -3996,6 +4090,7 @@ def _q4_performance_phase(
     result["records"] = rows
     result["delivery_row_count"] = len(rows)
     result["non_delivery_row_count"] = len(records or []) - len(rows)
+    _recompute_variant_speedup(result, rows, result["data"])
     if any(_row_failed(row) for row in rows):
         result["status"] = "FAIL"
     return result
@@ -4037,6 +4132,7 @@ def _delivery_performance_phase(
         if str(phase_result.get("status") or "").upper() == "TIMEOUT":
             result = dict(phase_result)
             result["data"] = {}
+            _recompute_variant_speedup(result, None)
             return result
         why = (
             _only_non_production_algorithm_rows(records)
@@ -4048,6 +4144,7 @@ def _delivery_performance_phase(
         )
     result = dict(phase_result)
     result["data"] = selected
+    variant_rows = None
     if delivery_rows is not None:
         # Classic rows are streamed as each case finishes, so there is no fixed
         # row count to check -- only the exit-code / traceback / other-rows rule.
@@ -4057,6 +4154,7 @@ def _delivery_performance_phase(
             if _row_dtype_value(row)
             and str(_row_dtype_value(row)).lower() in _DELIVERY_PERF_DTYPES[dtype]
         ]
+        variant_rows = own_rows
         explained_by = _parent_failure_explained_by_other_rows(
             phase_result, own_rows
         )
@@ -4104,6 +4202,7 @@ def _delivery_performance_phase(
                     "; ".join(dict.fromkeys(reasons))
                     or "no comparable PyTorch-NPU baseline for complex dtype"
                 )
+    _recompute_variant_speedup(result, variant_rows, selected)
     return result
 
 

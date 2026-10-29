@@ -15,6 +15,7 @@
 """Native CSC SpMM benchmark and correctness script."""
 
 import argparse
+import math
 import csv
 import glob
 import os
@@ -38,6 +39,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 import flagsparse as fs
+import ascend_sparse_baseline as cann_baseline
 import reference_utils
 from flagsparse.sparse_operations import _common as fs_common
 from flagsparse.sparse_operations import spmm_csr as spmm_ops
@@ -82,7 +84,10 @@ PERF_FIELDS = [
     "reason",
     "fallback_used",
     "cusparse_reason",
-]
+# Only where they get filled: on every other backend the CANN baseline never
+# runs, so appending them unconditionally put eleven permanently empty columns
+# in each CSV and in every record carried into summary.json.
+] + (cann_baseline.PERF_FIELDS if fs_common._is_ascend_runtime() else [])
 TIMING_FIELDS = ["process_gpu_ms", "compute_ms"]
 
 DTYPE_MAP = {
@@ -671,7 +676,29 @@ def _run_case(
             row["err_vs_pytorch"] = _error_ratio(pytorch_out, csc["out"], dtype)
         except Exception as exc:
             row["pytorch_reason"] = str(exc)
-    if row["status"] != "ERROR" and run_cusparse:
+    if row["status"] != "ERROR" and fs_common._is_ascend_runtime() and run_cusparse:
+        cann_baseline.mark_row(row)
+        native_plan = None
+        try:
+            native_out = torch.empty((logical_out_rows, int(dense_cols)), dtype=dtype, device=data.device)
+            native_plan = cann_baseline.prepare_spmm("csc", (data, indices, indptr), shape, B, native_out, op)
+            native_plan.run()
+            error = _error_ratio(native_out, ref, dtype)
+            if error is None or not math.isfinite(error) or error > 1.0:
+                raise ValueError(f"CANN result failed CPU golden validation: {error}")
+            _, elapsed_ms = fs_common._benchmark_cuda_op(native_plan.run, warmup, iters)
+            native_plan.run()
+            post_error = _error_ratio(native_out, ref, dtype)
+            if post_error is None or not math.isfinite(post_error) or post_error > 1.0:
+                raise ValueError(f"CANN result failed post-timing CPU golden validation: {post_error}")
+            error = max(error, post_error)
+            cann_baseline.record_result(row, native_plan, elapsed_ms, error, row["ms"])
+        except Exception as exc:
+            row.update(cann_status="FAIL", cann_reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            if native_plan is not None:
+                native_plan.close()
+    elif row["status"] != "ERROR" and run_cusparse:
         try:
             cu_ms, cu_reason, cu_out = _time_cusparse_csc(
                 benchmark_data,
@@ -705,6 +732,13 @@ def _resolve_input_paths(input_paths):
 
 
 def _print_notes(run_cusparse):
+    if fs_common._is_ascend_runtime():
+        if not run_cusparse:
+            print("CANN CSC baseline disabled by --no-cusparse.")
+            return
+        print("CANN SparseTensorDenseMatMul COO baseline; CSC conversion and input casts are prepared outside run.")
+        print("Vendor timing uses the real Ascend operator with reusable output, not PyTorch or scaled H800 time.")
+        return
     vendor_backend, vendor_reason = spmm_ops._spmm_csc_sparse_ref_backend(
         torch.float32, torch.int32, torch.int32
     )
@@ -737,12 +771,15 @@ def _print_notes(run_cusparse):
 
 
 def _print_row(row, timing=False):
+    vendor_ms = row.get("cann_ms") if row.get("baseline_kind") == "cann" else row["cusparse_ms"]
+    vendor_speedup = row.get("speedup_vs_cann") if row.get("baseline_kind") == "cann" else row["cusparse_vs_alg_speedup"]
+    vendor_error = row.get("cann_max_error") if row.get("baseline_kind") == "cann" else row["err_vs_cusparse"]
     print(
         f"{row['matrix']:<28} {row['dtype']:<10} {row['index_dtype']:<5} {row['op']:<5} {row['layout']:<4} {row['alg']:<14} "
         f"{row['n_rows']:>7} {row['n_cols']:>7} {row['nnz']:>9} {row['dense_cols']:>5} "
         f"{_fmt(row['ms']):>9} {_fmt(row['gpu_ms']):>9} {_fmt(row['process_cpu_ms']):>9} "
-        f"{_fmt(row['cusparse_ms']):>9} {_fmt(row['cusparse_vs_alg_speedup'], 2):>8} "
-        f"{_fmt(row['err_vs_ref'], 2):>10} {_fmt(row['err_vs_cusparse'], 2):>10} {row['status']:>6}"
+        f"{_fmt(vendor_ms):>9} {_fmt(vendor_speedup, 2):>8} "
+        f"{_fmt(row['err_vs_ref'], 2):>10} {_fmt(vendor_error, 2):>10} {row['status']:>6}"
         + (
             f" {_fmt(row.get('process_gpu_ms')):>9} {_fmt(row.get('compute_ms')):>9}"
             if timing

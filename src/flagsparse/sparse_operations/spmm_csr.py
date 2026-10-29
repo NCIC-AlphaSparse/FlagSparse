@@ -21,6 +21,9 @@ import warnings
 from . import _common as _common_mod
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
+from ._ascend_fp64_spmm import prepare_fp64_spmm as _prepare_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
 from dataclasses import dataclass
 
@@ -787,6 +790,7 @@ class PreparedCsrSpmmRoute:
         "ascend_row_ids",
         "ascend_col_ids",
         "ascend_runner",
+        "ascend_fp64_plan",
     )
 
     def __init__(
@@ -817,10 +821,14 @@ class PreparedCsrSpmmRoute:
         # Filled in by prepare_spmm_csr_route for trans/conj; see the note there.
         self.materialized_op = None
         self.materialized_route = None
+        self.ascend_fp64_plan = None
         if _is_ascend_runtime():
             self.ascend_row_ids = _ascend_csr_row_ids(self.kernel_indptr, self.n_rows, cache=False)
             self.ascend_col_ids = self.kernel_indices.to(torch.int64).contiguous()
             self.ascend_runner = None
+            self.ascend_fp64_plan = _prepare_ascend_fp64_spmm(
+                data, self.ascend_row_ids, self.ascend_col_ids, self.shape
+            )
         else:
             self.ascend_row_ids = None
             self.ascend_col_ids = None
@@ -1039,6 +1047,9 @@ def _run_spmm_csr_base_route_impl(
     if not _is_ascend_runtime():
         B = _materialize_dense_layout(B, dense_layout)
     if _is_ascend_runtime():
+        native = _run_ascend_fp64_spmm(prepared, B, dense_layout, timing=timing)
+        if native is not None:
+            return native
         C_out = _empty_dense_layout(
             (prepared.n_rows, int(B.shape[1])),
             prepared.data.dtype,
@@ -3120,6 +3131,9 @@ def flagsparse_spmm_csr_run(
             "c_stride": route_meta.get("c_stride"),
             "output_layout": route_meta.get("output_layout"),
         }
+        for key in ("execution_path", "implementation"):
+            if key in route_meta:
+                meta[key] = route_meta[key]
         if timing:
             meta["process_gpu_ms"] = process_gpu_ms
             meta["compute_ms"] = route_meta.get("compute_ms")
@@ -4715,15 +4729,22 @@ def flagsparse_spmm_csr(
         if ascend_timed:
             _ACCEL.synchronize()
         t0 = time.perf_counter()
-        if transposed:
-            out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
-            # op(A) = A^H needs the values conjugated too, not just row/col swapped.
-            vals = data.conj() if op_code == SPMM_OP_CONJ_TRANS else data
-            _index_add_values(out_mat, 0, cols, vals[:, None] * _gather_values(B, row_ids))
-        else:
-            out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
-            _index_add_values(out_mat, 0, row_ids, data[:, None] * _gather_values(B, cols))
-        if out is not None:
+        native_rows, native_cols = (cols, row_ids) if transposed else (row_ids, cols)
+        native_shape = (n_cols, n_rows) if transposed else (n_rows, n_cols)
+        out_mat = _run_ascend_fp64_spmm_once(
+            data, native_rows, native_cols, B, native_shape,
+            sort_rows=transposed, out=out,
+        )
+        used_native_fp64 = out_mat is not None
+        if out_mat is None:
+            if transposed:
+                out_mat = torch.zeros((n_cols, B.shape[1]), device=data.device, dtype=data.dtype)
+                vals = data.conj() if op_code == SPMM_OP_CONJ_TRANS else data
+                _index_add_values(out_mat, 0, cols, vals[:, None] * _gather_values(B, row_ids))
+            else:
+                out_mat = torch.zeros((n_rows, B.shape[1]), device=data.device, dtype=data.dtype)
+                _index_add_values(out_mat, 0, row_ids, data[:, None] * _gather_values(B, cols))
+        if out is not None and out_mat is not out:
             out.copy_(out_mat)
             out_mat = out
         if ascend_timed:
@@ -4738,6 +4759,8 @@ def flagsparse_spmm_csr(
                 "op_total_ms": elapsed,
                 "op": _spmm_op_to_name(op_code),
             }
+            if used_native_fp64:
+                meta.update(execution_path="native", implementation="cann_sparse_tensor_dense_matmul_fp64")
             return (out_mat, elapsed, meta) if return_time else (out_mat, meta)
         return (out_mat, elapsed) if return_time else out_mat
 

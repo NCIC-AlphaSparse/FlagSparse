@@ -22,6 +22,9 @@ from dataclasses import dataclass
 from . import _common as _common_mod
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
+from ._ascend_fp64_spmm import prepare_fp64_spmm as _prepare_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
+from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
     _select_spmm_alg1_warp_and_factor,
@@ -771,6 +774,7 @@ class PreparedCooSpmmRoute:
         "gather_ptr",
         "full_row_ptr",
         "ascend_runner",
+        "ascend_fp64_plan",
     )
 
     def __init__(
@@ -805,6 +809,10 @@ class PreparedCooSpmmRoute:
         self.gather_ptr = None
         self.full_row_ptr = None
         self.ascend_runner = None
+        self.ascend_fp64_plan = (
+            _prepare_ascend_fp64_spmm(data, row, col, self.shape)
+            if _is_ascend_runtime() else None
+        )
         if _is_iluvatar_runtime() and self.alg in ("auto", "coo_rowrun"):
             # The BI-V rowrun route writes every output row, including empty ones,
             # so its prepared calls can allocate C without a separate zero fill.
@@ -2050,6 +2058,10 @@ def _run_spmm_coo_rowrun_route(
         prepared, B, dense_layout, wide=not (use_gather or use_biv_half)
     )
     if _is_ascend_runtime():
+        native = _run_ascend_fp64_spmm(prepared, B, dense_layout, timing=timing)
+        if native is not None:
+            result, meta = native
+            return result, {"alg": "coo_ascend_fp64_native", "op": prepared.op, **meta}
         if prepared.ascend_runner is None:
             ascend_data = prepared.data
             ascend_row = prepared.row
@@ -2695,6 +2707,9 @@ def flagsparse_spmm_coo_run(
             "c_stride": route_meta.get("c_stride"),
             "output_layout": route_meta.get("output_layout"),
         }
+        for key in ("execution_path", "implementation"):
+            if key in route_meta:
+                meta[key] = route_meta[key]
         if timing:
             meta["process_gpu_ms"] = route_meta.get("process_gpu_ms")
             meta["compute_ms"] = route_meta.get("compute_ms")
@@ -2841,17 +2856,23 @@ def _run_spmm_coo_route(
         if do_timing:
             _ACCEL.synchronize()
             compute_start = time.perf_counter()
-        C = _spmm_coo_ascend_scatter(
-            data_compute,
-            native_row,
-            native_col,
-            B_compute,
-            n_rows,
-            n_dense_cols,
-            output_dtype=native_data.dtype,
-            out=out,
-            dense_layout=dense_layout,
+        C = _run_ascend_fp64_spmm_once(
+            data_compute, native_row, native_col, B_compute, shape,
+            out=out, dense_layout=dense_layout,
         )
+        used_native_fp64 = C is not None
+        if C is None:
+            C = _spmm_coo_ascend_scatter(
+                data_compute,
+                native_row,
+                native_col,
+                B_compute,
+                n_rows,
+                n_dense_cols,
+                output_dtype=native_data.dtype,
+                out=out,
+                dense_layout=dense_layout,
+            )
         if do_timing:
             _ACCEL.synchronize()
             compute_ms = (time.perf_counter() - compute_start) * 1000.0
@@ -2867,6 +2888,8 @@ def _run_spmm_coo_route(
                 "dense_layout": dense_layout,
                 "output_layout": _dense_layout_name(C),
             }
+            if used_native_fp64:
+                meta.update(execution_path="native", implementation="cann_sparse_tensor_dense_matmul_fp64")
             return (C, op_total_ms, meta) if return_time else (C, meta)
         return (C, op_total_ms) if return_time else C
 

@@ -3,8 +3,8 @@
 
 This entry point deliberately does not touch the CUDA/ROCm benchmark runners.
 It uses SciPy on CPU only for correctness and synchronizes ``torch.npu`` around
-the timed region.  ``ops-sparse`` is a C ``aclsparse`` library; unless a Python
-bridge is supplied, PyTorch-NPU is reported as the fallback baseline.
+the timed region. COO/CSR SpMM additionally measures native CANN; the other
+operators retain their existing PyTorch-NPU baseline.
 """
 
 from __future__ import annotations
@@ -242,7 +242,12 @@ def _case_for_gather_scatter(case: Case):
     )
 
 
-def _scipy_spmm(matrix, b):
+def _scipy_spmm(matrix, b, values=None):
+    if values is not None:
+        wide = np.complex128 if np.iscomplexobj(values) or np.iscomplexobj(b) else np.float64
+        matrix = matrix.astype(wide)
+        matrix.data = values.astype(wide)
+        b = b.astype(wide)
     return matrix @ b
 
 
@@ -320,6 +325,41 @@ def _outputs_pass_accuracy(candidate, baseline, dtype):
         atol=tolerance,
         equal_nan=True,
     )
+
+
+def _cann_spmm_fields(torch, fmt, arrays, shape, dense, golden, flagsparse_ms, warmup, iters):
+    if str(_TESTS) not in sys.path:
+        sys.path.insert(0, str(_TESTS))
+    import ascend_sparse_baseline as baseline
+
+    row = {}
+    baseline.mark_row(row)
+    plan = None
+    try:
+        if flagsparse_ms is None or not np.isfinite(flagsparse_ms) or flagsparse_ms <= 0:
+            raise RuntimeError("FlagSparse has no valid timing")
+        target = torch.empty(golden.shape, dtype=dense.dtype, device=dense.device)
+        plan = baseline.prepare_spmm(fmt, arrays, shape, dense, target)
+        errors = []
+        for phase in ("before", "after"):
+            plan.run()
+            _sync(torch)
+            actual = _scipy_numpy(target)
+            if not np.isfinite(actual).all() or not np.isfinite(golden).all():
+                raise RuntimeError(f"CANN {phase}-timing result or CPU golden is nonfinite")
+            if not _outputs_pass_accuracy(actual, golden, target.dtype):
+                raise RuntimeError(f"CANN {phase}-timing CPU golden validation failed")
+            scale = max(1.0, float(np.abs(golden).max())) if golden.size else 1.0
+            errors.append(float(np.abs(actual - golden).max()) / scale if golden.size else 0.0)
+            if phase == "before":
+                elapsed_ms = _bench(torch, plan.run, warmup, iters)["mean_ms"]
+        baseline.record_result(row, plan, elapsed_ms, max(errors), flagsparse_ms)
+    except Exception as exc:
+        row.update(cann_status="FAIL", cann_reason=f"{type(exc).__name__}: {exc}")
+    finally:
+        if plan is not None:
+            plan.close()
+    return row
 
 
 def _torch_npu_sddmm_sampled(x, y, row_ids, indices, chunk_nnz=262144):
@@ -415,10 +455,10 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
             "gather",
             "scatter",
         ],
-        "baseline_policy": "ops-sparse/aclsparse when a callable bridge is supplied; otherwise PyTorch-NPU",
+        "baseline_policy": "native CANN SparseTensorDenseMatMul for COO/CSR SpMM; PyTorch-NPU for other operators",
     }]
 
-    def record(name, fs_fn, pt_fn, scipy_ref, output_to_numpy):
+    def record(name, fs_fn, pt_fn, scipy_ref, output_to_numpy, cann_operands=None):
         fs_time = pt_time = None
         fs_err = pt_err = None
         fs_out_np = pt_out_np = None
@@ -456,6 +496,9 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         )
         if fs_out_np is not None and pt_out_np is not None and not outputs_match:
             status_parts.append("FlagSparse and PyTorch-NPU outputs differ beyond tolerance")
+        if cann_operands is not None and fs_out_np is not None:
+            if not np.isfinite(fs_out_np).all() or not _outputs_pass_accuracy(fs_out_np, scipy_ref, dtype):
+                status_parts.append("FlagSparse CPU golden validation failed")
         if not status_parts:
             fs_time = _bench(torch, fs_fn, warmup, iters)
             pt_time = _bench(torch, pt_fn, warmup, iters)
@@ -475,6 +518,12 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
                         "scipy_max_abs_error": {"flagsparse": fs_err, "pytorch": pt_err},
                         "status": row_state,
                         "reason": "; ".join(status_parts) if status_parts else "unknown"})
+        if cann_operands is not None:
+            fmt, arrays, dense = cann_operands
+            results[-1].update(_cann_spmm_fields(
+                torch, fmt, arrays, (case.m, case.n), dense, scipy_ref,
+                fs_time["mean_ms"] if fs_time else None, warmup, iters,
+            ))
 
     if op in (None, "spmv_csr"):
         x = torch.randn(case.n, device=device, dtype=dtype)
@@ -487,7 +536,8 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
         row_ids = _torch_npu_csr_row_ids(indptr, case.m)
         record("spmm_csr", lambda: fs.flagsparse_spmm_csr(data, indices, indptr, b, (case.m, case.n)),
                lambda: _torch_npu_csr_spmm(data, indices, row_ids, b, case.m),
-               _scipy_spmm(matrix, _scipy_numpy(b)), _scipy_numpy)
+               _scipy_spmm(matrix, _scipy_numpy(b), _scipy_numpy(data)), _scipy_numpy,
+               cann_operands=("csr", (data, indices, indptr), b))
     if op in (None, "sddmm_csr"):
         sx = torch.randn(case.m, 32, device=device, dtype=dtype)
         sy = torch.randn(case.n, 32, device=device, dtype=dtype)
@@ -520,8 +570,9 @@ def run(case: Case, warmup: int, iters: int, device_id: int = 0, op: str | None 
             lambda: _torch_npu_coo_spmm(
                 coo_data, coo_row, coo_col, b, case.m
             ),
-            _scipy_spmm(coo_matrix, _scipy_numpy(b)),
+            _scipy_spmm(coo_matrix, _scipy_numpy(b), _scipy_numpy(coo_data)),
             _scipy_numpy,
+            cann_operands=("coo", (coo_data, coo_row, coo_col), b),
         )
 
     # Gather/scatter are PyTorch indexing baselines; they are not advertised as
@@ -636,7 +687,7 @@ def main():
             err = item.get("scipy_max_abs_error") or {}
             fs_ms = fs.get("mean_ms")
             pt_ms = pt.get("mean_ms")
-            rows.append({
+            row = {
                 "dtype": item.get("dtype", "float32"),
                 "matrix": item.get("matrix", ""),
                 "shape": item.get("op", args.op or "ascend"),
@@ -651,14 +702,15 @@ def main():
                 "max_abs_err": "" if err.get("flagsparse") is None else err.get("flagsparse"),
                 "status": item.get("status", ""),
                 "reason": item.get("reason", ""),
-            })
+            }
+            row.update({key: value for key, value in item.items()
+                        if key.startswith("cann_") or key in ("baseline_kind", "vendor_name", "speedup_vs_cann")})
+            rows.append(row)
         with open(args.csv_summary, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=["dtype", "matrix", "shape", "implementation", "execution_path",
-                            "triton_ms", "pytorch_ms",
-                            "speedup", "max_abs_err", "status", "reason"],
-            )
+            fields = ["dtype", "matrix", "shape", "implementation", "execution_path",
+                      "triton_ms", "pytorch_ms", "speedup", "max_abs_err", "status", "reason"]
+            fields += list(dict.fromkeys(key for row in rows for key in row if key not in fields))
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
         if q4_variants:

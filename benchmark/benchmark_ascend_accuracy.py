@@ -1,6 +1,6 @@
 """Ascend accuracy probe using SciPy/NumPy references."""
 from __future__ import annotations
-import argparse, json, sys, zlib
+import argparse, importlib, json, sys, types, zlib
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +15,27 @@ GATHER_SCATTER_ACCURACY_DTYPES = 'float16,float32,float64,complex64,complex128,i
 
 def _run_q4_variants(names):
     import torch
-    from tests.pytest import test_q4_variants_accuracy as cases
+
+    class MarkShim:
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: lambda function: function
+
+    class PytestShim(types.ModuleType):
+        mark = MarkShim()
+
+        @staticmethod
+        def param(*args, **kwargs):
+            return args
+
+    previous_pytest = sys.modules.get("pytest")
+    sys.modules["pytest"] = PytestShim("pytest")
+    try:
+        cases = importlib.import_module("tests.pytest.test_q4_variants_accuracy")
+    finally:
+        if previous_pytest is None:
+            sys.modules.pop("pytest", None)
+        else:
+            sys.modules["pytest"] = previous_pytest
 
     selected = {
         name: (builder, dtype)
