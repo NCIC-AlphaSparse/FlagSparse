@@ -50,7 +50,15 @@ def _prepare_fp64_spmm(torch, fs, fmt, arrays, shape, dense):
     _sync(torch)
     prepare_ms = (time.perf_counter() - started) * 1000.0
     run = getattr(fs, f"flagsparse_spmm_{fmt}_run")
-    return lambda: run(prepared, dense), prepare_ms
+    # One output buffer for every call, which is how the CANN baseline adapter
+    # binds its own: this operator's run time depends on where its B and C sit
+    # (222 ms against 155 ms on one matrix, same values), so letting our side
+    # draw a fresh C per call while the baseline keeps a fixed one made the
+    # ratio an allocator lottery rather than a measurement.
+    out = torch.empty(
+        (int(shape[0]), int(dense.shape[1])), dtype=dense.dtype, device=dense.device
+    )
+    return lambda: run(prepared, dense, out=out), prepare_ms
 
 
 def _bench(torch, fn, warmup: int, iters: int):
