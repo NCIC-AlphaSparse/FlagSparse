@@ -16,7 +16,7 @@ PYTHON ?= python
 DIST_DIR ?= dist
 EXPECTED_VERSION ?= auto
 
-.PHONY: help ci check ci-deps compile format-check lint lint-src pre-commit-check build install-wheel validate-wheel test-ci smoke triton-smoke triton-deps gpu-env-check gpu-benchmark release-check release clean
+.PHONY: help ci check ci-deps compile format-check lint lint-src pre-commit-check build install-wheel validate-wheel test-ci test-ci-offline smoke triton-smoke triton-deps gpu-env-check gpu-benchmark release-check release clean
 
 help:
 	@printf '%s\n' \
@@ -28,6 +28,7 @@ help:
 		'  make lint           - run ruff lint checks for CI files' \
 		'  make lint-src       - run critical ruff checks for package source' \
 		'  make pre-commit-check - run configured pre-commit hooks' \
+		'  make test-ci-offline - run tests/ci with CI'"'"'s missing packages blocked' \
 		'  make release        - alias for make release-check' \
 		'  make release-check  - build, validate, and checksum release artifacts' \
 		'  make triton-deps    - install the opt-in triton smoke dependency bundle' \
@@ -72,6 +73,12 @@ validate-wheel:
 
 test-ci:
 	pytest tests/ci -q
+
+# The same suite with the packages CI lacks blocked, so a missing
+# pytest.importorskip fails here instead of on the runner. See
+# tools/ci/block_ci_deps.py; test_installed_wheel fails locally only.
+test-ci-offline:
+	PYTHONPATH=tools/ci pytest tests/ci -q -p block_ci_deps
 
 smoke: test-ci
 
