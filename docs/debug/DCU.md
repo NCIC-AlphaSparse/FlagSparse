@@ -12,8 +12,8 @@
 出现）；原来手工做的独立 TMPDIR 也由入口自动建。因机器而异的只有下面的环境准备。
 
 ```bash
-export HIP_VISIBLE_DEVICES=<卡号>
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+export HIP_VISIBLE_DEVICES=<卡号>   # DCU 先只用一张卡：runner 给子进程设的是 CUDA_VISIBLE_DEVICES，ROCm 只认一半（见 ../DCU.md）
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > delivery_105.log 2>&1 < /dev/null &   # 在 HIP_VISIBLE_DEVICES 里面编号，所以是 0
 # 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
 # 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```

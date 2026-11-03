@@ -147,6 +147,35 @@ def test_dry_run_prints_the_command_without_detecting_or_running(tmp_path):
     assert not (tmp_path / "new").exists()
 
 
+def test_several_cards_reach_every_runner_unchanged(tmp_path):
+    # The per-backend commands this replaced passed --gpus explicitly (Ascend 6,7);
+    # the one-line command keeps that, and the runners spread operators over it.
+    entry = _entry()
+    for backend in DOC_BACKENDS:
+        cmd = entry.build_command(
+            backend, entry.PROFILES[backend], "results_x", "0,1,2,3"
+        )
+        assert cmd[cmd.index("--gpus") + 1] == "0,1,2,3", backend
+    out = subprocess.run(
+        [
+            sys.executable,
+            "run_flagsparse_delivery.py",
+            "--dry-run",
+            "--backend",
+            "ascend",
+            "--gpus",
+            "6,7",
+            "--results-dir",
+            str(tmp_path / "new"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "--gpus 6,7" in out
+
+
 def test_an_existing_results_dir_is_refused(tmp_path):
     proc = subprocess.run(
         [

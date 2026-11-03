@@ -93,20 +93,27 @@ def test_every_selected_family_is_a_real_ctest_family():
 def test_the_runner_hands_ctest_the_delivery_pattern(monkeypatch, tmp_path):
     calls = []
 
+    envs = []
+
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
+        envs.append(kwargs.get("env"))
         return 0
 
     monkeypatch.setattr(split, "run", fake_run)
 
     class Args:
+        backend = "mthreads"
+        gpus = "2,3"
         benchmark_input = "."
         capi_build_dir = "capi/build"
         strict = False
 
     split.run_capi_benchmark(Args(), tmp_path / "bench")
-    ctest = next(c for c in calls if c[0] == "ctest")
+    index = next(i for i, c in enumerate(calls) if c[0] == "ctest")
+    ctest = calls[index]
     assert ctest[ctest.index("-R") + 1] == split.delivery_ctest_regex()[0]
+    assert envs[index]["MUSA_VISIBLE_DEVICES"] == "2"
     check = next(c for c in calls if "check_manifest.py" in " ".join(map(str, c)))
     assert check[check.index("--scope") + 1] == "delivery"
 
@@ -451,3 +458,11 @@ def test_with_h800_reference_the_python_half_also_measures(tmp_path, monkeypatch
     args.h800_card = None
     split.run_pytest_accuracy(args, tmp_path)
     assert seen[1][seen[1].index("--phase") + 1] == "accuracy"
+
+
+def test_capi_half_runs_on_the_first_card_of_gpus():
+    # ctest used to inherit no mask and land on device 0 whatever --gpus said.
+    assert split.capi_device_env("mthreads", "2,3") == {"MUSA_VISIBLE_DEVICES": "2"}
+    assert split.capi_device_env("cuda", " 1 ,0") == {"CUDA_VISIBLE_DEVICES": "1"}
+    # Backends whose runtime mask is not verified keep the caller's environment.
+    assert split.capi_device_env("rocm", "3") == {}

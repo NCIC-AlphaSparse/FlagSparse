@@ -12,8 +12,7 @@
 的还是那 15 个父算子，交付收窄也生效了。开跑前照旧做 `../MACA.md` 0.5 节的检查。因机器而异的只有下面的环境准备。
 
 ```bash
-export FLAGSPARSE_GPUS=0   # 物理卡号，逗号分隔；默认就是 0
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > delivery_105.log 2>&1 < /dev/null &   # 物理卡号，逗号分隔；多卡如 --gpus 0,1,2,3，算子按卡轮流分配、并行跑
 # 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
 # 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```

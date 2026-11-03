@@ -3,7 +3,7 @@
 ## 统一命令（2026-11-03 起，所有后端同一行）
 
 ```bash
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > delivery_105.log 2>&1 < /dev/null &
 ```
 
 `run_flagsparse_delivery.py` 用包自己的识别逻辑判断后端（`_common._backend_name()`；设了 `FLAGSPARSE_BACKEND` 就以它
@@ -24,7 +24,9 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_10
   一样，但交付收窄参数会生效。以前 DCU 的 spmv_csr 因为没收窄，把 7 种算法一起平均了（DCU.md“交付口径问题”）。
   各后端自己的 `--op-benchmark-args` 排在收窄参数后面，仍然以它为准。
 - **因机器而异的只有环境准备**：昇腾先 source `set_env.sh`，MUSA 设 `MUSA_HOME`，DCU 用 `HIP_VISIBLE_DEVICES` 选卡。
-  卡号统一用 `FLAGSPARSE_GPUS`（物理卡号，逗号分隔，默认 0）。
+  卡号用 `--gpus`（物理卡号，逗号分隔，默认取 `FLAGSPARSE_GPUS`，没有就是 0）。多卡如 `--gpus 0,1,2,3`：15 个算子按卡轮流
+  分配、每张卡一个子进程并行跑；MUSA 的 C API 那一半用第一张卡。DCU 暂时只用一张卡（用 `HIP_VISIBLE_DEVICES` 选卡、
+  `--gpus 0`），原因见 DCU.md。
 - **自动做的事**：结果目录取 `results_<后端>_105_<日期_时分>`，目录已存在就拒绝（不往旧目录里补跑）；每次运行建一个
   独立的 TMPDIR；跑完把 `delivery_table.py --show-baseline` 的输出打在日志末尾，并写进 `<结果目录>/delivery_table.txt`。
 - 识别不到可用的加速器（例如昇腾没 source 环境，这时 `_backend_name()` 会回退成 cuda）就直接报错退出，不会拿 CUDA 的

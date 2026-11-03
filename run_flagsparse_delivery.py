@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """One command for the 105-variant delivery run, on every backend.
 
-    setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py \\
+    setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 \\
         > delivery_105.log 2>&1 < /dev/null &
 
 The backend is detected the way the package itself detects it
@@ -28,9 +28,10 @@ seven algorithms into the delivery number (docs/debug/DCU.md). Every backend now
 takes --delivery-only, which selects the same 15 parent operators.
 
 Machine setup stays outside the command: source the vendor toolkit (Ascend's
-set_env.sh, MUSA_HOME for the C API build), and pick cards with FLAGSPARSE_GPUS
-(physical ids, the runners' --gpus; default 0) or the vendor's own visibility
-variable. Afterwards the delivery table is printed and written to
+set_env.sh, MUSA_HOME for the C API build). Cards are --gpus (physical ids,
+passed to the runners' --gpus; FLAGSPARSE_GPUS sets the default, else 0).
+Several cards (--gpus 0,1,2,3) spread the operators over them, one runner child
+per card. Afterwards the delivery table is printed and written to
 <results>/delivery_table.txt.
 """
 
@@ -193,7 +194,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--gpus", default=os.environ.get("FLAGSPARSE_GPUS", "0"),
-        help="Physical device ids, comma-separated (default: $FLAGSPARSE_GPUS or 0).",
+        help="Physical device ids, comma-separated, e.g. 0,1,2,3 (default: $FLAGSPARSE_GPUS "
+        "or 0). The operators are spread over the cards and run in parallel; MUSA's "
+        "C API half runs on the first one.",
     )
     parser.add_argument(
         "--results-dir", default=None,

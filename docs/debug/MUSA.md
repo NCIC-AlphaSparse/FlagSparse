@@ -14,7 +14,7 @@
 
 ```bash
 export MUSA_HOME=<MUSA 工具链目录>   # C API 构建要用，见 ../MUSA.md 第 2 节
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > delivery_105.log 2>&1 < /dev/null &   # 多卡如 --gpus 0,1：pytest 那一半按卡分配算子，C API 那一半用第一张卡
 # 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
 # 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```
