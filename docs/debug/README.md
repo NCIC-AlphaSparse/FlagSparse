@@ -1,5 +1,37 @@
 # 调试手册：交付变体注册表（现为 105 个），上机要做什么
 
+## 统一命令（2026-11-03 起，所有后端同一行）
+
+```bash
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+```
+
+`run_flagsparse_delivery.py` 用包自己的识别逻辑判断后端（`_common._backend_name()`；设了 `FLAGSPARSE_BACKEND` 就以它
+为准），再按文件里的 `PROFILES` 组出命令。以前写在各后端命令行上的差异都搬进了这张表，取值和 11-02 那版命令一样：
+
+| 后端 | 运行器 | `--h800-reference` | 其他 |
+|---|---|---|---|
+| CUDA | `run_flagsparse_pytest.py --delivery-only` | 不带（分母就是 cuSPARSE） | — |
+| DCU（rocm） | 同上 | 不带 | — |
+| MACA（metax） | 同上 | 带 | `--timeout 4500`、`sddmm_csr=--no-cusparse` |
+| MUSA（mthreads） | `run_flagsparse_split_delivery.py` | 带 | 性能取自 C API |
+| Iluvatar | `run_flagsparse_pytest.py --delivery-only` | 带 | `FLAGSPARSE_BACKEND=iluvatar`、`FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`、挡 fp64 的 `-k`、各脚本 dtype 限制 |
+| 昇腾 | 同上 | 带 | `FLAGSPARSE_BACKEND=ascend`、`FLAGSPARSE_ASCEND_VENDOR=torch` |
+
+- 公共参数：`--phase both --mode normal --delivery-only --benchmark-input tests/data --benchmark-warmup 5
+  --benchmark-iters 20 --timeout 3600`。`tests/data` 里就是 git 里的 10 个交付矩阵。
+- **有意的改动只有一处**：DCU、MACA、Iluvatar 原来用 `--ops` 列 15 个算子，现在统一用 `--delivery-only`。选到的算子
+  一样，但交付收窄参数会生效。以前 DCU 的 spmv_csr 因为没收窄，把 7 种算法一起平均了（DCU.md“交付口径问题”）。
+  各后端自己的 `--op-benchmark-args` 排在收窄参数后面，仍然以它为准。
+- **因机器而异的只有环境准备**：昇腾先 source `set_env.sh`，MUSA 设 `MUSA_HOME`，DCU 用 `HIP_VISIBLE_DEVICES` 选卡。
+  卡号统一用 `FLAGSPARSE_GPUS`（物理卡号，逗号分隔，默认 0）。
+- **自动做的事**：结果目录取 `results_<后端>_105_<日期_时分>`，目录已存在就拒绝（不往旧目录里补跑）；每次运行建一个
+  独立的 TMPDIR；跑完把 `delivery_table.py --show-baseline` 的输出打在日志末尾，并写进 `<结果目录>/delivery_table.txt`。
+- 识别不到可用的加速器（例如昇腾没 source 环境，这时 `_backend_name()` 会回退成 cuda）就直接报错退出，不会拿 CUDA 的
+  配置去跑。识别错了可以用 `--backend <名字>` 或 `FLAGSPARSE_BACKEND` 指定。`--dry-run` 只打印解析出的命令，不运行。
+- 改配置表时，`tests/ci/test_delivery_entrypoint.py` 会检查：生成的每个参数在对应运行器里都存在、
+  `--op-benchmark-args` 点名的都是交付父算子、带 `--h800-reference` 的后端都有卡型。
+
 ## 2026-11-02：注册表扩到 105 个变体，各后端复测计划
 
 ### 这次改了什么
@@ -68,15 +100,14 @@ C API split（`results_cuda_split_105_20261102_v2`，同样 10 个交付矩阵�
 
 ### 所有后端都要注意的
 
-1. **`--ops` 写死的命令要加上 `gemvi,geam_csr`**。DCU、MACA、Iluvatar 原来的命令列的是 13 个算子，漏了这两个，
-   对应的 5 个变体会变成 `NotFound`。各后端文件里的新命令已经加好了。昇腾的命令和 MUSA 的 split 本来就带
-   `--delivery-only`，会自动跟上。
-2. **结果目录用新名字**（`results_<后端>_105_<日期>`），不要往 65 变体的旧目录里补跑。
+1. **统一用上面那一行命令**。它带 `--delivery-only`，算子按注册表选，包括 `gemvi`、`geam_csr`，不会再因为 `--ops`
+   列表过时而漏掉算子。
+2. **结果目录用新名字**：入口自动取 `results_<后端>_105_<日期_时分>`，不要往 65 变体的旧目录里补跑。
 3. **新代码第一次在真机上跑**，最该先看的是：
    - 原子散加 kernel：f32 和 int32 的 `tl.atomic_add`。
    - spgemm c32 在 ESC 路径上用到的复数 torch 运算。
    - 3 个 bf16 变体：`spmv_csr_bf16_int_non`、`spmv_csr_bf16f32_int_non`、`spmm_csr_bf16f32_int_non_non_row`。
-4. 跑完把 `python3 tools/delivery_table.py <结果目录> --show-baseline` 的完整输出贴回来。每个后端文件的
+4. 跑完把 `<结果目录>/delivery_table.txt`（就是 `delivery_table.py --show-baseline` 的输出）完整贴回来。每个后端文件的
    "2026-11-02 复测计划"一节列了这个后端要单独确认的项目。
 
 ### 各后端的复测计划

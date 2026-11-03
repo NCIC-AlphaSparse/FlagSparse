@@ -7,19 +7,16 @@
 
 ## 2026-11-02 复测计划：105 变体
 
-注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。命令和后面"要做的事"的第 1–4 步一样，
-只换结果目录。split 的 pytest 那一半带了 `--delivery-only`，会自动包含 `gemvi`、`geam_csr`，不用改参数。
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（
+`run_flagsparse_delivery.py`，说明见 README 的“统一命令”一节）：它自动识别后端，识别到 MUSA 后走
+`run_flagsparse_split_delivery.py --backend mthreads`，带 `--h800-reference`，和原来的 split 命令参数一样。因机
+器而异的只有下面的环境准备。
 
 ```bash
-D=results_musa_split_105_<日期>
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
-  --mode normal --benchmark-input tests/data --timeout 3600 \
-  --h800-reference \
-  --results-dir $D \
-  > $D.log 2>&1 < /dev/null &
-# 跑完后
-tail -5 $D.log
-python3 tools/delivery_table.py $D --show-baseline
+export MUSA_HOME=<MUSA 工具链目录>   # C API 构建要用，见 ../MUSA.md 第 2 节
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+# 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
+# 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```
 
 **C API 没测到的变体由 Python 那一半补位（2026-11-02 起）：**

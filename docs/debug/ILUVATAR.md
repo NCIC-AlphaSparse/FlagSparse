@@ -8,33 +8,18 @@
 
 ## 2026-11-02 复测计划：105 变体
 
-注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。这轮只跑下面这条命令。它和后面
-"要做的事"里的 65 变体命令相比改了两处：`--ops` 加上了 `gemvi,geam_csr`，结果目录换成了新名字。其余参数
-（`-k` 挡 fp64、各脚本的 dtype 限制、`FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`）不变。
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（
+`run_flagsparse_delivery.py`，说明见 README 的“统一命令”一节）：它自动识别后端，走
+`run_flagsparse_pytest.py --delivery-only`，自动设 `FLAGSPARSE_BACKEND=iluvatar`、
+`FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`，并带上原来的 `--h800-reference`、挡 fp64 的 `-k` 和各脚本的 dtype 限
+制，这些值一个没改。原来的 `--ops` 列表换成了 `--delivery-only`，选到的还是那 15 个父算子；`--op-benchmark-args`
+排在交付收窄参数后面，所以 dtype 限制照样生效。因机器而异的只有下面的环境准备。
 
 ```bash
-setsid timeout -s KILL 43200 \
-  env FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
-  python3 -u run_flagsparse_pytest.py \
-    --ops gather,scatter,axpby,spvv,gemvi,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,geam_csr,sddmm_csr \
-    --phase both --mode normal --gpus 0 --timeout 3600 \
-    --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
-    --h800-reference \
-    --pytest-args='-k "test_q4_variant or (((float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)) or (complex64 and (gather or scatter)))"' \
-    --op-benchmark-args='gather=--value-dtypes float16,float32,complex64' \
-    --op-benchmark-args='scatter=--value-dtypes float16,float32,complex64,int8' \
-    --op-benchmark-args='spmv_csr=--dtypes float32 --alg auto' \
-    --op-benchmark-args='spmv_coo=--dtypes float32' \
-    --op-benchmark-args='spmv_csc=--dtypes float32,complex64' \
-    --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
-    --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
-    --op-benchmark-args='spmm_csc=--dtypes float32,complex64' \
-    --op-benchmark-args='sddmm_csr=--dtype float32' \
-    --op-benchmark-args='spgemm_csr=--dtypes float32' \
-    --results-dir results_iluvatar_105_<日期> \
-  > results_iluvatar_105_<日期>.log 2>&1 < /dev/null &
-# 跑完后
-python3 tools/delivery_table.py results_iluvatar_105_<日期> --show-baseline
+export FLAGSPARSE_GPUS=0   # 物理卡号；识别不出 Iluvatar 时（CoreX 标签和 COREX_HOME 都没有）再加 FLAGSPARSE_BACKEND=iluvatar
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+# 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
+# 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```
 
 - **`-k` 过滤对新变体没有影响**：40 个新变体的精度用例都在 `test_q4_variants_accuracy.py` 里，用例名匹配

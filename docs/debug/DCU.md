@@ -5,21 +5,17 @@
 
 ## 2026-11-02 复测计划：105 变体
 
-注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。这轮只跑下面这条命令。它和后面
-"要做的事"里的 65 变体命令相比只改了两处：`--ops` 加上了 `gemvi,geam_csr`，结果目录换成了新名字。
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（
+`run_flagsparse_delivery.py`，说明见 README 的“统一命令”一节）：它自动识别后端，走
+`run_flagsparse_pytest.py --delivery-only`，不带 `--h800-reference`。原来的 `--ops` 列表换成了 `--delivery-only`，
+选到的还是那 15 个父算子，另外交付收窄也生效了（下面“交付口径问题”那一节说的 spmv_csr 7 种算法一起平均的问题不再
+出现）；原来手工做的独立 TMPDIR 也由入口自动建。因机器而异的只有下面的环境准备。
 
 ```bash
-task_tmp=$(mktemp -d /tmp/flagsparse-dcu-105.XXXXXX)
-export TMPDIR="$task_tmp" TMP="$task_tmp" TEMP="$task_tmp"
 export HIP_VISIBLE_DEVICES=<卡号>
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
-  --ops gather,scatter,axpby,spvv,gemvi,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,geam_csr,sddmm_csr \
-  --phase both --mode normal --gpus 0 --timeout 3600 \
-  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
-  --results-dir results_rocm_105_<日期> \
-  > results_rocm_105_<日期>.log 2>&1 < /dev/null &
-# 跑完后
-python3 tools/delivery_table.py results_rocm_105_<日期> --show-baseline
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+# 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
+# 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```
 
 **这个后端的风险点（针对新增的 40 个）：**

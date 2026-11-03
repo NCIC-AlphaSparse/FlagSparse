@@ -10,21 +10,22 @@
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。按约定，`ASCEND_Q4_VARIANTS` 要等 NPU 真机
-验证后才扩，所以这次**一个新变体都没有加进去**，`gemvi`、`geam_csr` 在 `ASCEND_PERFORMANCE_COMMANDS` 里也没有条目。
+验证后才扩，所以这次**一个新变体都没有加进去**；`gemvi`、`geam_csr` 的性能命令 11-03 已经接上。
 这一轮分两步：先全量跑一遍，确认原 65 个没有退化；再按下面的清单逐步把新变体接上。
 
-### 第 1 步：105 变体全量（命令同下面的"先做"一节，只换结果目录）
+### 第 1 步：105 变体全量
+
+2026-11-03 起所有后端用同一行命令（`run_flagsparse_delivery.py`，说明见 README 的“统一命令”一节）：它自动识别后
+端，自动设 `FLAGSPARSE_BACKEND=ascend`、`FLAGSPARSE_ASCEND_VENDOR=torch`，走
+`run_flagsparse_pytest.py --delivery-only --h800-reference`，和原来的命令一样。`PYTHONPATH` 不用再手动设，运行器
+会给子进程补上。因机器而异的只有下面的环境准备。
 
 ```bash
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
-export PYTHONPATH="$PWD/src:$PWD" FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
-  --phase both --mode normal --delivery-only --gpus 6,7 --timeout 3600 \
-  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
-  --h800-reference \
-  --results-dir results_ascend_105_<日期> \
-  > results_ascend_105_<日期>.log 2>&1 < /dev/null &
-python3 tools/delivery_table.py results_ascend_105_<日期> --show-baseline
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh   # 没 source 的话入口找不到 NPU，会直接报错退出
+export FLAGSPARSE_GPUS=6,7
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+# 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
+# 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```
 
 新 40 个在这一步里预期是这样（按代码路径推出来的，没在 NPU 上跑过）：
@@ -43,7 +44,7 @@ python3 tools/delivery_table.py results_ascend_105_<日期> --show-baseline
 
 1. **gemvi、geam_csr 的性能**：已在 2026-11-03 接上（`ASCEND_PERFORMANCE_COMMANDS` 里复用通用脚本的列表加了这两个，
    `tests/ci/test_ascend_reporting.py` 断言注册表里每个交付父算子在昇腾表里都有条目）。第 1 步的全量跑完，
-   看这 5 个变体是不是有耗时；报错的话贴 `results_ascend_105_<日期>/gemvi/`、`geam_csr/` 下的 `performance_stderr.log`。
+   看这 5 个变体是不是有耗时；报错的话贴 `<结果目录>/gemvi/`、`geam_csr/` 下的 `performance_stderr.log`。
 2. **q4 基准的变体**：照 10-10 到 10-11 的做法，每个算子先挑 1 个最简单的新变体，在 `wave.mtx` 上用 q4 基准冒烟。
    跑通、精度对，就加进 `ASCEND_Q4_VARIANTS[算子]`，并在下面的"实机改动记录"里追加一条。建议的顺序：
    - 先接 trans 和 out_dtype 类：`spmv_csc_f32_int_trans`、`spmm_coo_f32_int_non_trans_row`、`spmm_csc_f16f32_int_non_non_row`、
