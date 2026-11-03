@@ -17,7 +17,8 @@
 SpVV, Axpby and SELL SpMV for the q4 operators, plus CSR/COO/CSC SpMV, CSR/COO SpMM
 and CSR SDDMM for the q4 *variants* of existing operators: the mixed-precision and
 integer type combinations (f16 -> f32, i8 -> i32, real A x complex x, ...) that
-the CuPy-based baselines of the existing scripts cannot express.
+the CuPy-based baselines of the existing scripts cannot express. Batch 3 adds
+gemvi and csrgeam2 (legacy API) and complex CSR SpGEMM.
 
 ctypes over the generic API, so no CuPy build is needed (CuPy wraps none of these).
 Descriptors are created once in ``prepare``; ``run`` issues only the library call,
@@ -54,6 +55,7 @@ _ORDER_COL, _ORDER_ROW = 1, 2
 _LIB = None
 _LIB_ERROR = None
 _HANDLE = None
+_OPTIONAL_READY = set()
 
 _P = ctypes.c_void_p
 _PP = ctypes.POINTER(ctypes.c_void_p)
@@ -85,6 +87,57 @@ _SIGNATURES = {
     "cusparseSDDMM_preprocess": [_P, _I, _I, _P, _P, _P, _P, _P, _I, _I, _P],
     "cusparseSDDMM": [_P, _I, _I, _P, _P, _P, _P, _P, _I, _I, _P],
 }
+
+
+# Resolved on first use rather than at load: gemvi is deprecated since CUDA 12.8 and
+# csrgeam2 is legacy API, so a cuSPARSE without them must not break every other
+# baseline in this module -- only the rows that need them.
+_OPTIONAL_SIGNATURES = {
+    "cusparseSgemvi_bufferSize": [_P, _I, _I, _I, _I, ctypes.POINTER(_I)],
+    "cusparseCgemvi_bufferSize": [_P, _I, _I, _I, _I, ctypes.POINTER(_I)],
+    "cusparseSgemvi": [_P, _I, _I, _I, _P, _P, _I, _I, _P, _P, _P, _P, _I, _P],
+    "cusparseCgemvi": [_P, _I, _I, _I, _P, _P, _I, _I, _P, _P, _P, _P, _I, _P],
+    "cusparseCreateMatDescr": [_PP],
+    "cusparseDestroyMatDescr": [_P],
+    "cusparseScsrgeam2_bufferSizeExt": [
+        _P, _I, _I, _P, _P, _I, _P, _P, _P, _P, _P, _I, _P, _P, _P, _P, _P, _P, _P,
+        ctypes.POINTER(ctypes.c_size_t),
+    ],
+    "cusparseCcsrgeam2_bufferSizeExt": [
+        _P, _I, _I, _P, _P, _I, _P, _P, _P, _P, _P, _I, _P, _P, _P, _P, _P, _P, _P,
+        ctypes.POINTER(ctypes.c_size_t),
+    ],
+    "cusparseXcsrgeam2Nnz": [_P, _I, _I, _P, _I, _P, _P, _P, _I, _P, _P, _P, _P, ctypes.POINTER(_I), _P],
+    "cusparseScsrgeam2": [_P, _I, _I, _P, _P, _I, _P, _P, _P, _P, _P, _I, _P, _P, _P, _P, _P, _P, _P, _P],
+    "cusparseCcsrgeam2": [_P, _I, _I, _P, _P, _I, _P, _P, _P, _P, _P, _I, _P, _P, _P, _P, _P, _P, _P, _P],
+    "cusparseSpGEMM_createDescr": [_PP],
+    "cusparseSpGEMM_destroyDescr": [_P],
+    "cusparseSpGEMM_workEstimation": [
+        _P, _I, _I, _P, _P, _P, _P, _P, _I, _I, _P, ctypes.POINTER(ctypes.c_size_t), _P,
+    ],
+    "cusparseSpGEMM_compute": [
+        _P, _I, _I, _P, _P, _P, _P, _P, _I, _I, _P, ctypes.POINTER(ctypes.c_size_t), _P,
+    ],
+    "cusparseSpGEMM_copy": [_P, _I, _I, _P, _P, _P, _P, _P, _I, _I, _P],
+    "cusparseSpMatGetSize": [_P, ctypes.POINTER(_I64), ctypes.POINTER(_I64), ctypes.POINTER(_I64)],
+    "cusparseCsrSetPointers": [_P, _P, _P, _P],
+}
+_SPGEMM_ALG_DEFAULT = 0
+
+
+def _optional(*names):
+    """The library, after checking it exports ``names`` (see _OPTIONAL_SIGNATURES)."""
+    lib = _lib()
+    for name in names:
+        if name in _OPTIONAL_READY:
+            continue
+        fn = getattr(lib, name, None)
+        if fn is None:
+            raise RuntimeError(f"this cuSPARSE has no {name}")
+        fn.argtypes = _OPTIONAL_SIGNATURES[name]
+        fn.restype = _I
+        _OPTIONAL_READY.add(name)
+    return lib
 
 
 def _lib():
@@ -420,3 +473,159 @@ def prepare_sddmm(arrays, shape, A, B, out_values, op_a, op_b, compute_dtype):
 
     destroy = [(lib.cusparseDestroySpMat, m), (lib.cusparseDestroyDnMat, a_d), (lib.cusparseDestroyDnMat, b_d)]
     return _Plan(run, (pattern, A, B, work, one, zero), destroy)
+
+
+def _legacy_prefix(dtype):
+    prefix = {torch.float32: "S", torch.complex64: "C"}.get(dtype)
+    if prefix is None:
+        raise TypeError(f"no legacy cuSPARSE routine wired for {dtype}")
+    return prefix
+
+
+def prepare_gemvi(A, values, indices, y, op, alpha, beta):
+    """cusparse<t>gemvi: y = alpha * op(A) @ x + beta * y, A column-major."""
+    t = _legacy_prefix(A.dtype)
+    lib = _optional(f"cusparse{t}gemvi_bufferSize", f"cusparse{t}gemvi")
+    handle = _handle()
+    if A.stride(0) != 1:
+        raise ValueError("cusparse<t>gemvi needs a column-major A")
+    m, n = int(A.shape[0]), int(A.shape[1])
+    lda = max(1, A.stride(1))
+    nnz = int(values.numel())
+    idx = indices.to(torch.int32).contiguous()
+    size = _I(0)
+    _check(getattr(lib, f"cusparse{t}gemvi_bufferSize")(handle, _OP[op], m, n, nnz, ctypes.byref(size)),
+           f"cusparse{t}gemvi_bufferSize")
+    work = torch.empty(max(1, size.value), dtype=torch.uint8, device=A.device)
+    a, b = _scalar(alpha, A.dtype), _scalar(beta, A.dtype)
+    call = getattr(lib, f"cusparse{t}gemvi")
+
+    def run():
+        _check(
+            call(handle, _OP[op], m, n, ctypes.byref(a), _P(A.data_ptr()), lda, nnz,
+                 _P(values.data_ptr()), _P(idx.data_ptr()), ctypes.byref(b), _P(y.data_ptr()),
+                 _BASE_ZERO, _P(work.data_ptr())),
+            f"cusparse{t}gemvi",
+        )
+        return y
+
+    return _Plan(run, (A, values, idx, y, work, a, b), [])
+
+
+def prepare_geam_csr(a_arrays, b_arrays, shape, alpha, beta):
+    """cusparse<t>csrgeam2, C allocated per call: bufferSize, Nnz, then the sum.
+
+    ``run`` returns (values, col_indices, row_offsets) of C. The whole sequence is
+    in the timed call, as it is for flagsparse_geam_csr, which also counts,
+    allocates and fills on every call.
+    """
+    a_vals, a_cols, a_ptr = a_arrays
+    b_vals, b_cols, b_ptr = b_arrays
+    t = _legacy_prefix(a_vals.dtype)
+    lib = _optional(
+        "cusparseCreateMatDescr", "cusparseDestroyMatDescr", f"cusparse{t}csrgeam2_bufferSizeExt",
+        "cusparseXcsrgeam2Nnz", f"cusparse{t}csrgeam2",
+    )
+    handle = _handle()
+    m, n = int(shape[0]), int(shape[1])
+    a_cols, b_cols = a_cols.to(torch.int32).contiguous(), b_cols.to(torch.int32).contiguous()
+    a_ptr, b_ptr = a_ptr.to(torch.int32).contiguous(), b_ptr.to(torch.int32).contiguous()
+    nnz_a, nnz_b = int(a_vals.numel()), int(b_vals.numel())
+    descrs = []
+    for _ in range(3):
+        d = _P()
+        _check(lib.cusparseCreateMatDescr(ctypes.byref(d)), "cusparseCreateMatDescr")
+        descrs.append(d)
+    da, db, dc = descrs
+    al, be = _scalar(alpha, a_vals.dtype), _scalar(beta, a_vals.dtype)
+    size_fn = getattr(lib, f"cusparse{t}csrgeam2_bufferSizeExt")
+    geam_fn = getattr(lib, f"cusparse{t}csrgeam2")
+    dev = a_vals.device
+
+    def run():
+        c_ptr = torch.empty(m + 1, dtype=torch.int32, device=dev)
+        size = ctypes.c_size_t(0)
+        _check(
+            size_fn(handle, m, n, ctypes.byref(al), da, nnz_a, _P(a_vals.data_ptr()), _P(a_ptr.data_ptr()),
+                    _P(a_cols.data_ptr()), ctypes.byref(be), db, nnz_b, _P(b_vals.data_ptr()),
+                    _P(b_ptr.data_ptr()), _P(b_cols.data_ptr()), dc, _P(0), _P(c_ptr.data_ptr()), _P(0),
+                    ctypes.byref(size)),
+            f"cusparse{t}csrgeam2_bufferSizeExt",
+        )
+        work = torch.empty(max(1, size.value), dtype=torch.uint8, device=dev)
+        nnz_c = _I(0)
+        _check(
+            lib.cusparseXcsrgeam2Nnz(handle, m, n, da, nnz_a, _P(a_ptr.data_ptr()), _P(a_cols.data_ptr()),
+                                     db, nnz_b, _P(b_ptr.data_ptr()), _P(b_cols.data_ptr()), dc,
+                                     _P(c_ptr.data_ptr()), ctypes.byref(nnz_c), _P(work.data_ptr())),
+            "cusparseXcsrgeam2Nnz",
+        )
+        c_cols = torch.empty(max(1, nnz_c.value), dtype=torch.int32, device=dev)
+        c_vals = torch.empty(max(1, nnz_c.value), dtype=a_vals.dtype, device=dev)
+        _check(
+            geam_fn(handle, m, n, ctypes.byref(al), da, nnz_a, _P(a_vals.data_ptr()), _P(a_ptr.data_ptr()),
+                    _P(a_cols.data_ptr()), ctypes.byref(be), db, nnz_b, _P(b_vals.data_ptr()),
+                    _P(b_ptr.data_ptr()), _P(b_cols.data_ptr()), dc, _P(c_vals.data_ptr()),
+                    _P(c_ptr.data_ptr()), _P(c_cols.data_ptr()), _P(work.data_ptr())),
+            f"cusparse{t}csrgeam2",
+        )
+        return c_vals[: nnz_c.value], c_cols[: nnz_c.value], c_ptr
+
+    destroy = [(lib.cusparseDestroyMatDescr, d) for d in descrs]
+    return _Plan(run, (a_vals, a_cols, a_ptr, b_vals, b_cols, b_ptr, al, be), destroy)
+
+
+def prepare_spgemm_csr(a_arrays, a_shape, b_arrays, b_shape):
+    """Generic cusparseSpGEMM (ALG_DEFAULT), the whole sequence per call.
+
+    createDescr -> workEstimation x2 -> compute x2 -> getSize -> setPointers ->
+    copy, allocating C each time: what CuPy's ``A @ B`` runs for the real dtypes in
+    tests/test_spgemm.py, and what one flagsparse_spgemm_csr call does. int32
+    indices only (cuSPARSE SpGEMM has no 64-bit index path).
+    """
+    lib = _optional(
+        "cusparseSpGEMM_createDescr", "cusparseSpGEMM_destroyDescr", "cusparseSpGEMM_workEstimation",
+        "cusparseSpGEMM_compute", "cusparseSpGEMM_copy", "cusparseSpMatGetSize", "cusparseCsrSetPointers",
+    )
+    handle = _handle()
+    a_vals, a_cols, a_ptr = a_arrays[0], a_arrays[1].to(torch.int32), a_arrays[2].to(torch.int32)
+    b_vals, b_cols, b_ptr = b_arrays[0], b_arrays[1].to(torch.int32), b_arrays[2].to(torch.int32)
+    dtype, dev = a_vals.dtype, a_vals.device
+    ctype = _CUDA_TYPES[dtype]
+    mat_a = _spmat("csr", (a_vals, a_cols, a_ptr), a_shape, dtype)
+    mat_b = _spmat("csr", (b_vals, b_cols, b_ptr), b_shape, dtype)
+    m, n = int(a_shape[0]), int(b_shape[1])
+    one, zero = _scalar(1, dtype), _scalar(0, dtype)
+
+    def run():
+        mat_c = _P()
+        _check(lib.cusparseCreateCsr(ctypes.byref(mat_c), m, n, 0, _P(0), _P(0), _P(0),
+                                     _INDEX_32I, _INDEX_32I, _BASE_ZERO, ctype), "cusparseCreateCsr")
+        descr = _P()
+        _check(lib.cusparseSpGEMM_createDescr(ctypes.byref(descr)), "cusparseSpGEMM_createDescr")
+        try:
+            args = (handle, _OP["non"], _OP["non"], ctypes.byref(one), mat_a, mat_b, ctypes.byref(zero),
+                    mat_c, ctype, _SPGEMM_ALG_DEFAULT, descr)
+            buffers = []
+            for step in (lib.cusparseSpGEMM_workEstimation, lib.cusparseSpGEMM_compute):
+                size = ctypes.c_size_t(0)
+                _check(step(*args, ctypes.byref(size), _P(0)), step.__name__)
+                buf = torch.empty(max(1, size.value), dtype=torch.uint8, device=dev)
+                _check(step(*args, ctypes.byref(size), _P(buf.data_ptr())), step.__name__)
+                buffers.append(buf)
+            rows, cols, nnz = _I64(0), _I64(0), _I64(0)
+            _check(lib.cusparseSpMatGetSize(mat_c, ctypes.byref(rows), ctypes.byref(cols), ctypes.byref(nnz)),
+                   "cusparseSpMatGetSize")
+            c_ptr = torch.empty(m + 1, dtype=torch.int32, device=dev)
+            c_cols = torch.empty(max(1, nnz.value), dtype=torch.int32, device=dev)
+            c_vals = torch.empty(max(1, nnz.value), dtype=dtype, device=dev)
+            _check(lib.cusparseCsrSetPointers(mat_c, _P(c_ptr.data_ptr()), _P(c_cols.data_ptr()),
+                                              _P(c_vals.data_ptr())), "cusparseCsrSetPointers")
+            _check(lib.cusparseSpGEMM_copy(*args), "cusparseSpGEMM_copy")
+            return c_vals[: nnz.value], c_cols[: nnz.value], c_ptr
+        finally:
+            lib.cusparseSpGEMM_destroyDescr(descr)
+            lib.cusparseDestroySpMat(mat_c)
+
+    destroy = [(lib.cusparseDestroySpMat, mat_a), (lib.cusparseDestroySpMat, mat_b)]
+    return _Plan(run, (a_vals, a_cols, a_ptr, b_vals, b_cols, b_ptr, one, zero), destroy)

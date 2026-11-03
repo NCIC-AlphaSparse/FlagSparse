@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <complex>
 #include <vector>
 
@@ -1117,5 +1118,80 @@ TEST_F(SpMMAccuracy, CooRejectsUnsortedRows) {
     flagsparseDestroyDnMat(matB);
     flagsparseDestroySpMat(matA);
 }
+
+// op(A) = A^T and A^H for a complex64 CSR A, with non-zero imaginary parts so
+// the conjugate is actually exercised (the benchmark's complex operands are
+// real-valued). Runs on the CSR of A^T built in preprocess.
+TEST_F(SpMMAccuracy, CsrComplex64TransposeAndConjugateTranspose) {
+    using C = std::complex<float>;
+    using cd = std::complex<double>;
+    const int64_t m = 53, k = 41, n = 6;
+    std::vector<int32_t> ptr{0}, cols;
+    std::vector<C> vals;
+    for (int64_t r = 0; r < m; ++r) {
+        for (int64_t c = 0; c < k; ++c) {
+            if ((r * 13 + c * 7) % 5 == 0) {
+                cols.push_back(static_cast<int32_t>(c));
+                vals.emplace_back(0.25f * static_cast<float>((r + c) % 7) - 0.5f,
+                                  0.125f * static_cast<float>((2 * r + c) % 5) - 0.25f);
+            }
+        }
+        ptr.push_back(static_cast<int32_t>(cols.size()));
+    }
+    std::vector<C> B(static_cast<std::size_t>(m * n));  // op(A) is k x m: B is m x n
+    for (std::size_t i = 0; i < B.size(); ++i) {
+        B[i] = C(0.5f - 0.125f * static_cast<float>(i % 9), 0.25f * static_cast<float>(i % 4));
+    }
+    for (auto op : {FLAGSPARSE_OPERATION_TRANSPOSE, FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE}) {
+        std::vector<cd> ref(static_cast<std::size_t>(k * n), cd(0));
+        for (int64_t r = 0; r < m; ++r) {
+            for (int32_t p = ptr[r]; p < ptr[r + 1]; ++p) {
+                cd a(vals[p].real(), vals[p].imag());
+                if (op == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) a = std::conj(a);
+                for (int64_t j = 0; j < n; ++j) {
+                    const C b = B[static_cast<std::size_t>(r * n + j)];
+                    ref[static_cast<std::size_t>(cols[p] * n + j)] += a * cd(b.real(), b.imag());
+                }
+            }
+        }
+        DeviceBuffer d_ptr = DeviceBuffer::from(ptr), d_cols = DeviceBuffer::from(cols),
+                     d_vals = DeviceBuffer::from(vals), d_B = DeviceBuffer::from(B);
+        DeviceBuffer d_C(static_cast<std::size_t>(k * n) * sizeof(C));
+        flagsparseSpMatDescr_t matA = nullptr;
+        flagsparseDnMatDescr_t matB = nullptr, matC = nullptr;
+        ASSERT_EQ(flagsparseCreateCsr(&matA, m, k, static_cast<int64_t>(cols.size()), d_ptr.get(),
+                                      d_cols.get(), d_vals.get(), FLAGSPARSE_INDEX_32I,
+                                      FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                                      FLAGSPARSE_C_32F),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        flagsparseCreateDnMat(&matB, m, n, n, d_B.get(), FLAGSPARSE_C_32F, FLAGSPARSE_ORDER_ROW);
+        flagsparseCreateDnMat(&matC, k, n, n, d_C.get(), FLAGSPARSE_C_32F, FLAGSPARSE_ORDER_ROW);
+        const C alpha(1.0f, 0.0f), beta(0.0f, 0.0f);
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, op, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &alpha, matA, matB, &beta, matC, FLAGSPARSE_C_32F,
+                                            FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        DeviceBuffer work(bytes ? bytes : 1);
+        ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, op, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &alpha, matA, matB, &beta, matC, FLAGSPARSE_C_32F,
+                                            FLAGSPARSE_SPMM_ALG_DEFAULT, work.get()),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseSpMM(handle.h, op, FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA,
+                                 matB, &beta, matC, FLAGSPARSE_C_32F, FLAGSPARSE_SPMM_ALG_DEFAULT,
+                                 work.get()),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        const auto got = d_C.download<C>(static_cast<std::size_t>(k * n));
+        double err = 0.0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            err = std::max(err, std::abs(cd(got[i].real(), got[i].imag()) - ref[i]));
+        }
+        EXPECT_LE(err, 1e-5) << "op=" << op;
+        flagsparseDestroyDnMat(matC);
+        flagsparseDestroyDnMat(matB);
+        flagsparseDestroySpMat(matA);
+    }
+}
+
 
 }  // namespace

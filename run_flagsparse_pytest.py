@@ -336,6 +336,26 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         )
         for op in ("axpby", "spvv")
     },
+    # gemvi takes a dense A and a sparse x: synthetic (m, n, nnz) cases too.
+    "gemvi": (
+        "tests/test_gemvi.py",
+        "--csv-summary",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "geam_csr": (
+        "tests/test_geam_csr.py",
+        "{input}",
+        "--csv",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "spmv_sell": (
         "tests/test_spmv_sell.py",
         "{input}",
@@ -921,9 +941,13 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
     # benchmark_ascend.py routing. spgemm_csr was on the probe, which times
     # synthetic shapes (tiny_square, square_1k, ...) instead of the delivery
     # matrices -- no speedup and nothing an H800 reference could be matched to.
+    # gemvi and geam_csr (batch 3, 2026-11-02) were left out of this list when
+    # they were added, so Ascend reported them NOT_CONFIGURED; benchmark_ascend.py
+    # has no --op for them, and their scripts take no --q4-variants, so
+    # ASCEND_Q4_VARIANTS does not narrow them.
     **{
         op: PERFORMANCE_COMMANDS[op]
-        for op in ("axpby", "spvv", "spmv_sell", "spgemm_csr")
+        for op in ("axpby", "spvv", "spmv_sell", "spgemm_csr", "gemvi", "geam_csr")
     },
 }
 
@@ -932,6 +956,8 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "spmv_sell": OperatorTestConfig("spmv_sell", PERFORMANCE_COMMANDS["spmv_sell"]),
     "axpby": OperatorTestConfig("axpby", PERFORMANCE_COMMANDS["axpby"]),
     "spvv": OperatorTestConfig("spvv", PERFORMANCE_COMMANDS["spvv"]),
+    "gemvi": OperatorTestConfig("gemvi", PERFORMANCE_COMMANDS["gemvi"]),
+    "geam_csr": OperatorTestConfig("geam_csr", PERFORMANCE_COMMANDS["geam_csr"]),
     "gather": OperatorTestConfig("gather", PERFORMANCE_COMMANDS["gather"]),
     "scatter": OperatorTestConfig("scatter", PERFORMANCE_COMMANDS["scatter"]),
     "spmv_csr": OperatorTestConfig("spmv_csr", PERFORMANCE_COMMANDS["spmv_csr"]),
@@ -1667,6 +1693,10 @@ EXPECTED_ACCURACY_SKIP_REASONS = (
     # tests/pytest/test_spmv_csr_maca_accuracy.py is a MACA-only regression; its
     # float16/complex64 cases turned spmv_csr_f16 / _c64 "Skipped" elsewhere.
     "maca required",
+    # tests/pytest/test_sddmm_iluvatar_layout_accuracy.py runs only on Iluvatar; its
+    # f32 cases turned sddmm_csr_f32_int_non_non_row "Skipped" on CUDA (2026-11-02,
+    # 2 passed + 2 of these skips).
+    "bi-v layout specialization",
 )
 
 

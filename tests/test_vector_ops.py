@@ -55,9 +55,11 @@ from flagsparse.sparse_operations._common import (  # noqa: E402
 DEFAULT_CASES = "32768:1024,131072:4096,524288:16384,1048576:65536"
 # (value dtype, op) per operator; the q4 list's variants come first.
 DEFAULT_DTYPES = {
-    "spvv": "float16,int8,complex64,float32",
+    "spvv": "float16,int8,complex64,float32,int8:float32",
     "axpby": "float16,float32,complex64",
 }
+# ``<value>:<result>`` asks spvv for a non-default result type (out_dtype); int8
+# has two in cuSPARSE, int32 (the default) and float32 -- spvv_i8f32_int_non.
 _DTYPES = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -134,17 +136,22 @@ def _ratio(base, ours):
     return None if base is None or not ours else base / ours
 
 
-def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen):
+def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen, out_dtype=None):
     dev = accelerator_device()
-    compute = _compute_dtype(dtype)
+    compute = out_dtype or _compute_dtype(dtype)
     idx_cpu = torch.randperm(dense_size, generator=gen)[:nnz].to(torch.int32)
     x_cpu, y_cpu = _rand(nnz, dtype, gen), _rand(dense_size, dtype, gen)
     idx, x = idx_cpu.to(dev), x_cpu.to(dev)
     name = str(dtype).replace("torch.", "")
     tag = (_SPVV_TAGS.get(name) if op == "spvv" else None) or _TAGS[name]
+    if out_dtype is not None:
+        tag = _TAGS[name] + _TAGS[str(out_dtype).replace("torch.", "")]
+    out_kw = {} if out_dtype is None else {"out_dtype": out_dtype}
     row = {
         "variant": f"{op}_{tag}_int" + (f"_{spvv_op}" if op == "spvv" else ""),
-        "case_id": f"{op}|{str(dtype).replace('torch.', '')}|dense={dense_size}|nnz={nnz}"
+        "case_id": f"{op}|{str(dtype).replace('torch.', '')}"
+        + ("" if out_dtype is None else f">{str(out_dtype).replace('torch.', '')}")
+        + f"|dense={dense_size}|nnz={nnz}"
         + (f"|{spvv_op}" if op == "spvv" else ""),
         "op": spvv_op if op == "spvv" else "non",
         "value_dtype": str(dtype).replace("torch.", ""),
@@ -158,13 +165,13 @@ def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen):
         ref = (xr * _wide(y_cpu)[idx_cpu.long()]).sum().reshape(1)
         y = y_cpu.to(dev)
         if _is_ascend_runtime():
-            prepared = fs.prepare_spvv(x, idx, y, op=spvv_op, validate=False)
+            prepared = fs.prepare_spvv(x, idx, y, op=spvv_op, validate=False, **out_kw)
             ours = lambda: fs.flagsparse_spvv(  # noqa: E731
                 y=y, prepared=prepared
             )
         else:
             ours = lambda: fs.flagsparse_spvv(  # noqa: E731
-                x, idx, y, op=spvv_op, validate=False
+                x, idx, y, op=spvv_op, validate=False, **out_kw
             )
         first = ours()
         err = _error(first.reshape(1), ref)
@@ -287,18 +294,23 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     dtypes = [t.strip() for t in (args.value_dtypes or DEFAULT_DTYPES[args.op]).split(",") if t.strip()]
-    unknown = [t for t in dtypes if t not in _DTYPES]
+    unknown = [t for t in dtypes if any(part not in _DTYPES for part in t.split(":"))]
     if unknown:
         parser.error(f"unsupported value dtypes: {unknown}")
     gen = torch.Generator().manual_seed(args.seed)
     rows = []
-    for name in dtypes:
+    for spec in dtypes:
+        name, _, out_name = spec.partition(":")
         dtype = _DTYPES[name]
-        ops = ("conj",) if args.op == "spvv" and dtype.is_complex else ("non",)
+        out_dtype = _DTYPES[out_name] if out_name else None
+        # Complex spvv is delivered both ways: spvv_c32_int_conj and spvv_c32_int_non.
+        ops = ("conj", "non") if args.op == "spvv" and dtype.is_complex else ("non",)
         for spvv_op in ops:
             for dense, nnz in _parse_cases(args.cases):
                 try:
-                    row = _run_case(args.op, dtype, spvv_op, dense, nnz, args.warmup, args.iters, gen)
+                    row = _run_case(
+                        args.op, dtype, spvv_op, dense, nnz, args.warmup, args.iters, gen, out_dtype
+                    )
                 except Exception as exc:
                     row = {
                         "case_id": f"{args.op}|{name}|dense={dense}|nnz={nnz}",

@@ -55,6 +55,9 @@ const char* name() { return "none"; }
 
 Status spmv_csr(const DeviceCsr&, const void*, void*, const void*, const void*,
                 flagsparseOperation_t, int, int, Timing*) { return none(); }
+Status spmv_mixed(const DeviceCsr&, const void*, flagsparseDataType_t, void*,
+                  flagsparseDataType_t, flagsparseDataType_t, const void*, const void*,
+                  flagsparseOperation_t, int, int, Timing*) { return none(); }
 Status spmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, void*, int64_t,
                 const void*, const void*, flagsparseOperation_t,
                 flagsparseOperation_t, int, int, Timing*, flagsparseOrder_t,
@@ -75,5 +78,12 @@ Status gather(const void*, void*, const void*, int64_t, int64_t,
               flagsparseDataType_t, int, int, Timing*) { return none(); }
 Status scatter(void*, const void*, const void*, int64_t, int64_t,
                flagsparseDataType_t, int, int, Timing*) { return none(); }
+
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return none();
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) { return none(); }
 
 }  // namespace fstest::baseline

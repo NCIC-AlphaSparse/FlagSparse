@@ -74,6 +74,14 @@ Status spmv_csr(const DeviceCsr&, const void*, void*, const void*, const void*,
                    "to a real SpMV");
 }
 
+Status spmv_mixed(const DeviceCsr&, const void*, flagsparseDataType_t, void*,
+                  flagsparseDataType_t, flagsparseDataType_t, const void*, const void*,
+                  flagsparseOperation_t, int, int, Timing*) {
+    return pending("aclnnMm over a sparse-to-dense conversion, or torch_npu's "
+                   "sparse mm",
+                   "CANN has no dedicated SpMV, mixed-precision or otherwise");
+}
+
 Status spmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, void*, int64_t,
                 const void*, const void*, flagsparseOperation_t,
                 flagsparseOperation_t, int, int, Timing*, flagsparseOrder_t,
@@ -121,6 +129,15 @@ Status scatter(void*, const void*, const void*, int64_t, int64_t,
                    "index_put semantics differ on duplicate indices; the sweep "
                    "deduplicates, so a bound baseline must too or the two are not "
                    "measuring the same thing");
+}
+
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return pending("a dense gather + aclnnMv", "no CANN gemvi");
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) {
+    return pending("a sparse add", "no CANN csrgeam2");
 }
 
 }  // namespace fstest::baseline

@@ -34,6 +34,7 @@ import _bootstrap  # noqa: F401,E402
 from flagsparse.sparse_operations._common import (  # noqa: E402,F401
     _dense_copy_kernel,
     _dense_scale_kernel,
+    _permute_values_kernel,
 )
 
-__all__ = ["_dense_scale_kernel", "_dense_copy_kernel"]
+__all__ = ["_dense_scale_kernel", "_dense_copy_kernel", "_permute_values_kernel"]

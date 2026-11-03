@@ -3,6 +3,44 @@
 `FLAGSPARSE_BACKEND=rocm`（通常能自动识别）。环境搭建、交付复现见 [`../DCU.md`](../DCU.md)。背景见
 本目录 [`README.md`](README.md)。
 
+## 2026-11-02 复测计划：105 变体
+
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（
+`run_flagsparse_delivery.py`，说明见 README 的“统一命令”一节）：它自动识别后端，走
+`run_flagsparse_pytest.py --delivery-only`，不带 `--h800-reference`。原来的 `--ops` 列表换成了 `--delivery-only`，
+选到的还是那 15 个父算子，另外交付收窄也生效了（下面“交付口径问题”那一节说的 spmv_csr 7 种算法一起平均的问题不再
+出现）；原来手工做的独立 TMPDIR 也由入口自动建。因机器而异的只有下面的环境准备。
+
+```bash
+export HIP_VISIBLE_DEVICES=<卡号>
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+# 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
+# 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
+```
+
+**这个后端的风险点（针对新增的 40 个）：**
+
+- **厂商列全空**：`cusparse_generic_baseline.skip_reason()` 在 ROCm 上返回 `no hipSPARSE baseline wired ...`，
+  所以新变体只有 PyTorch 对照，gemvi、geam、spgemm c32 也一样。新变体在 H800 上没有数据，PyTorch 列一旦也
+  无效，就没有加速比。
+- **bf16 走 row_tile**：`spmv_csr_bf16_int_non` 在 ROCm 上走 `row_tile`。CUDA 模拟时它和那 4 个老变体一样，报
+  `unverified capabilities for rocm/120`。真机 gfx936 应该能过；要是也报这个错，按下面"已知风险点"里 row_tile
+  的处理办法来。
+- **spgemm c32 走哪条路径取决于 TLE**：ROCm 不在 `tle_hash_safe` 的排除名单里。所以 DCU 的 Triton 能导入 TLE 时，
+  c32 走新的哈希填充 kernel：它和 f32/f64 用同一套 TLE 原语，只多一张累加表，每个槽位 4+8 字节，和 f64 一样，
+  共享内存预算也一样。导入不了 TLE 时走 ESC，结果对，但慢。共享内存不足时也会自动退回 ESC。日志里看一下走的是哪条。
+- **原子操作**：6 个混合精度转置变体用到 f32 和 int32 的 `tl.atomic_add`（`sem="relaxed"`）。
+
+**跑完要确认：**
+
+1. `missing` 是不是 0；105 个变体的精度是不是都 Passed。
+2. 新 40 个里的 int8 变体精度是不是真的执行并通过了（每个 2/2）：`spmv_coo_i8f32_int_non`、`spmv_csc_i8i32_int_non`、
+   `spmm_csr_i8f32_int_non_non_row`、`spmm_csr_i8i32_int_non_non_col`、`spmv_csr_i8i32_int_trans`、`spvv_i8f32_int_non`。
+3. `spmv_csr_bf16_int_non` 精度通过了吗；Triton target 是不是 `hip gfx936`。
+4. `spgemm_csr_c32_int_non_non` 的 `performance.csv` 里应该只有 10 行 c32（每个矩阵 1 行）。有 20 行说明没拉到
+   2026-11-02 的修复。
+5. 新 40 个里没有加速比的变体逐个列出来，附上 `performance.csv` 里那一行的 `pytorch_reason`。
+
 ## 要做的事
 
 环境按 `../DCU.md` 第 1、2 节配好后（**务必先做第 3 节的 diagnose，不要直接跑基准**）：

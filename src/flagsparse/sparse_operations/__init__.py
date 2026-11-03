@@ -160,6 +160,8 @@ from .spmv_sell import (
     prepare_spmv_sell,
     spmv_sell_prepared,
 )
+from .gemvi import flagsparse_gemvi
+from .geam_csr import flagsparse_geam_csr
 from .vector_ops import (
     PreparedAxpby,
     PreparedSpvv,
@@ -316,6 +318,8 @@ __all__ = [
     "spmv_sell_prepared",
     "flagsparse_axpby",
     "flagsparse_spvv",
+    "flagsparse_gemvi",
+    "flagsparse_geam_csr",
     "PreparedAxpby",
     "PreparedSpvv",
     "prepare_axpby",

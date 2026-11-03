@@ -38,9 +38,13 @@ import triton.language as tl  # noqa: E402
 from flagsparse.sparse_operations.mixed_spmx import (  # noqa: E402,F401
     _coo_spmm_mixed_kernel,
     _coo_spmv_atomic_kernel,
+    _coo_spmv_real_by_complex_atomic_kernel,
     _csr_spmm_mixed_kernel,
+    _csr_spmm_trans_atomic_kernel,
     _csr_spmv_mixed_kernel,
     _csr_spmv_real_by_complex_kernel,
+    _csr_spmv_trans_atomic_kernel,
+    _csr_spmv_trans_real_by_complex_kernel,
 )
 
 
@@ -126,6 +130,40 @@ def coo_spmm_mixed_f32acc(
                            ACC=tl.float32, BLOCK_N=BLOCK_N)
 
 
+@triton.jit
+def csr_spmv_trans_i32acc(
+    acc_ptr, data_ptr, cols_ptr, indptr_ptr, x_ptr, n_rows,
+    ROWS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """y[col] += v * x[row] for every stored entry: A^T x for CSR A, and A x for
+    a CSC A read as the CSR of A^T. int8 -> int32."""
+    _csr_spmv_trans_atomic_kernel(acc_ptr, data_ptr, cols_ptr, indptr_ptr, x_ptr, n_rows,
+                                  ACC=tl.int32, ROWS=ROWS, BLOCK=BLOCK)
+
+
+@triton.jit
+def csr_spmv_trans_f32acc(
+    acc_ptr, data_ptr, cols_ptr, indptr_ptr, x_ptr, n_rows,
+    ROWS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """As csr_spmv_trans_i32acc, accumulated in float32 (int8, float16, bfloat16)."""
+    _csr_spmv_trans_atomic_kernel(acc_ptr, data_ptr, cols_ptr, indptr_ptr, x_ptr, n_rows,
+                                  ACC=tl.float32, ROWS=ROWS, BLOCK=BLOCK)
+
+
+@triton.jit
+def csr_spmm_trans_f32acc(
+    c_ptr, data_ptr, cols_ptr, indptr_ptr, b_ptr, n_rows, n_dense,
+    stride_bk, stride_bn, stride_cm, stride_cn,
+    ROWS: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """C[col, :] += v * B[row, :]: A^T B for CSR A, A B for a CSC A read as the
+    CSR of A^T. float32 accumulation into a zeroed float32 C."""
+    _csr_spmm_trans_atomic_kernel(c_ptr, data_ptr, cols_ptr, indptr_ptr, b_ptr, n_rows, n_dense,
+                                  stride_bk, stride_bn, stride_cm, stride_cn,
+                                  ACC=tl.float32, ROWS=ROWS, BLOCK_N=BLOCK_N)
+
+
 __all__ = [
     "_csr_spmv_mixed_kernel",
     "_csr_spmv_real_by_complex_kernel",
@@ -140,4 +178,9 @@ __all__ = [
     "csr_spmm_mixed_f32acc",
     "coo_spmm_mixed_i32acc",
     "coo_spmm_mixed_f32acc",
+    "_coo_spmv_real_by_complex_atomic_kernel",
+    "_csr_spmv_trans_real_by_complex_kernel",
+    "csr_spmv_trans_i32acc",
+    "csr_spmv_trans_f32acc",
+    "csr_spmm_trans_f32acc",
 ]

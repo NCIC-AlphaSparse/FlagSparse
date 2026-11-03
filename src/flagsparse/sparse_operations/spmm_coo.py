@@ -27,6 +27,7 @@ from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
 from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from .spmm_csr import (
     SUPPORTED_SPMM_VALUE_DTYPES,
+    _apply_spmm_op_b,
     _route_takes_out,
     _select_spmm_alg1_warp_and_factor,
     _validate_spmm_out,
@@ -2993,16 +2994,20 @@ def flagsparse_spmm_coo(
     return_meta=False,
     dense_layout="auto",
     *,
+    op_b=None,
     out_dtype=None,
 ):
     """COO SpMM using a native Triton COO row-run kernel by default.
 
     op: 0/'non' for A @ B, 1/'trans' for A.T @ B,
     2/'conj' for A.conj().T @ B.
+    op_b: 'non' (B is K x N), 'trans' (B is N x K, uses B.T) or 'conj' (B.T.conj()),
+    as cusparseSpMM's opB -- the same strided view flagsparse_spmm_csr takes.
     out_dtype (or out.dtype): int8 -> int32 (default) or float32; float16/
     bfloat16 -> same type or float32. Both run in ``mixed_spmx`` -- see
     flagsparse_spmm_csr's identical out_dtype for the CSR counterpart.
     """
+    B = _apply_spmm_op_b(B, op_b)
     if torch.is_tensor(data) and _mixed_spmx.spmm_needs_mixed(data.dtype, out, out_dtype):
         if transpose or (op is not None and str(op).strip().lower() not in ("0", "n", "non", "non_trans")):
             raise NotImplementedError("mixed-precision/int8 COO SpMM supports op='non' only")

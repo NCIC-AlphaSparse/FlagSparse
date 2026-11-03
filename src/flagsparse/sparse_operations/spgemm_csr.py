@@ -21,7 +21,7 @@ from ._common import *
 
 HipPointer = _common_mod.HipPointer
 
-SUPPORTED_SPGEMM_VALUE_DTYPES = (torch.float32, torch.float64)
+SUPPORTED_SPGEMM_VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64)
 
 
 class SpGEMMPrepared:
@@ -99,7 +99,9 @@ def _validate_csr(data, indices, indptr, shape, tag):
     if not _is_accel_tensor(data) or not _is_accel_tensor(indices) or not _is_accel_tensor(indptr):
         raise ValueError(f"{tag} tensors must be CUDA tensors")
     if data.dtype not in SUPPORTED_SPGEMM_VALUE_DTYPES:
-        raise TypeError(f"{tag}_data dtype must be torch.float32 or torch.float64")
+        raise TypeError(
+            f"{tag}_data dtype must be torch.float32, torch.float64 or torch.complex64"
+        )
     if indices.dtype != torch.int32:
         raise TypeError(f"{tag}_indices dtype must be torch.int32")
     if indptr.dtype not in (torch.int32, torch.int64):
@@ -272,6 +274,42 @@ def prepare_spgemm_csr(
     )
 
 
+def _esc_gather(values, index):
+    """``values[index]``, with a complex tensor gathered through its real view.
+
+    torch_musa has no complex index kernel ("IndexMusa" not implemented for
+    'ComplexFloat', MTT S5000, 2026-11-03), and ESC is the SpGEMM path there, so
+    the product, the reorder and the reduction below all stay on real views.
+    """
+    if values.dtype.is_complex:
+        return torch.view_as_complex(torch.view_as_real(values)[index])
+    return values[index]
+
+
+def _esc_mul(a, b):
+    """Elementwise ``a * b``; complex operands multiply on their real views."""
+    if not a.dtype.is_complex:
+        return a * b
+    ar, ai = torch.view_as_real(a).unbind(-1)
+    br, bi = torch.view_as_real(b).unbind(-1)
+    return torch.view_as_complex(
+        torch.stack((ar * br - ai * bi, ar * bi + ai * br), dim=-1)
+    )
+
+
+def _esc_sum_duplicates(n_out, inverse, values, dtype, device):
+    """``zeros(n_out).index_add_(0, inverse, values)``, through the real view for complex."""
+    if dtype.is_complex:
+        out = torch.zeros(
+            (n_out, 2), dtype=torch.view_as_real(values).dtype, device=device
+        )
+        out.index_add_(0, inverse, torch.view_as_real(values))
+        return torch.view_as_complex(out)
+    out = torch.zeros(n_out, dtype=dtype, device=device)
+    out.index_add_(0, inverse, values)
+    return out
+
+
 def _spgemm_esc_compute(prepared):
     """C = A @ B via a single global expand-sort-reduce (ESC).
 
@@ -323,16 +361,15 @@ def _spgemm_esc_compute(prepared):
     within = torch.arange(total, device=device) - torch.repeat_interleave(base, seg)
     bpos = b_indptr64[k][ap] + within
     out_col = b_indices[bpos].to(torch.int64)
-    out_val = a_data[ap] * b_data[bpos]
+    out_val = _esc_mul(_esc_gather(a_data, ap), _esc_gather(b_data, bpos))
     out_row = a_row[ap]
 
     key = out_row * n_cols + out_col
     order = torch.argsort(key)
     key_sorted = key[order]
-    val_sorted = out_val[order]
+    val_sorted = _esc_gather(out_val, order)
     uniq_key, inverse = torch.unique_consecutive(key_sorted, return_inverse=True)
-    c_data = torch.zeros(uniq_key.numel(), dtype=dtype, device=device)
-    c_data.index_add_(0, inverse, val_sorted)
+    c_data = _esc_sum_duplicates(uniq_key.numel(), inverse, val_sorted, dtype, device)
     c_rows = torch.div(uniq_key, n_cols, rounding_mode="floor")
     c_indices = (uniq_key - c_rows * n_cols).to(torch.int32)
 
@@ -704,6 +741,126 @@ if _TLE_AVAILABLE:
             )
 
 
+    # complex64 twin: a_data / b_data / c_data are the interleaved float32
+    # (re, im) views, accumulated in two float32 tables -- the same 4 + 8 bytes
+    # per slot as float64, so it shares that shared-memory budget.
+    @triton.jit
+    def _spgemm_hash_fill_kernel_c64(
+        a_data,
+        a_ind,
+        a_ptr,
+        a_pref,
+        b_data,
+        b_ind,
+        b_ptr,
+        rows_ptr,
+        nrows,
+        rw_ptr,
+        c_indptr,
+        c_ind,
+        c_data,
+        row_nnz_ptr,
+        ovf_ptr,
+        CAP: tl.constexpr,
+        BLOCK: tl.constexpr,
+        USE_ROWS: tl.constexpr,
+        REPORT: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= nrows:
+            return
+        if USE_ROWS:
+            row = tl.load(rows_ptr + pid)
+        else:
+            row = pid
+        rw = tl.load(rw_ptr + row)
+        keys = _tle.gpu.alloc([CAP], tl.int32, scope=_tle.gpu.smem)
+        accum = _tle.gpu.alloc([CAP], tl.float32, scope=_tle.gpu.smem)
+        accum_im = _tle.gpu.alloc([CAP], tl.float32, scope=_tle.gpu.smem)
+        tl.store(
+            _tle.gpu.local_ptr(keys, (tl.arange(0, CAP),)),
+            tl.full((CAP,), -1, tl.int32),
+        )
+        tl.store(
+            _tle.gpu.local_ptr(accum, (tl.arange(0, CAP),)),
+            tl.zeros((CAP,), tl.float32),
+        )
+        tl.store(
+            _tle.gpu.local_ptr(accum_im, (tl.arange(0, CAP),)),
+            tl.zeros((CAP,), tl.float32),
+        )
+        a_s = tl.load(a_ptr + row)
+        a_e = tl.load(a_ptr + row + 1)
+        fail = 0
+        q0 = 0
+        while (q0 < rw) & (fail == 0):
+            q = q0 + tl.arange(0, BLOCK)
+            m = q < rw
+            lo = tl.full((BLOCK,), a_s, tl.int32)
+            hi = tl.full((BLOCK,), a_e, tl.int32)
+            while tl.sum((hi - lo > 1).to(tl.int32)) > 0:
+                mid = (lo + hi) // 2
+                pv = tl.load(a_pref + mid, mask=(mid < a_e), other=0x7FFFFFFF)
+                take = pv <= q
+                lo = tl.where(take, mid, lo)
+                hi = tl.where(take, hi, mid)
+            ap = lo
+            k = tl.load(a_ind + ap, mask=m, other=0)
+            av = tl.load(a_data + 2 * ap, mask=m, other=0.0)
+            av_im = tl.load(a_data + 2 * ap + 1, mask=m, other=0.0)
+            pv = tl.load(a_pref + ap, mask=m, other=0)
+            bpos = tl.load(b_ptr + k, mask=m, other=0) + (q - pv)
+            j = tl.load(b_ind + bpos, mask=m, other=-1)
+            bv = tl.load(b_data + 2 * bpos, mask=m, other=0.0)
+            bv_im = tl.load(b_data + 2 * bpos + 1, mask=m, other=0.0)
+            prod = av * bv - av_im * bv_im
+            prod_im = av * bv_im + av_im * bv
+            h = (j.to(tl.uint32) * 2654435761).to(tl.int32) & (CAP - 1)
+            done = (~m) | (j < 0)
+            it = 0
+            while (tl.sum((~done).to(tl.int32)) > 0) & (it < CAP):
+                cur = tl.atomic_cas(
+                    _tle.gpu.local_ptr(keys, (h,)),
+                    tl.full((BLOCK,), -1, tl.int32),
+                    j,
+                )
+                hit = (cur == -1) | (cur == j)
+                da = (~done) & hit
+                tl.atomic_add(
+                    _tle.gpu.local_ptr(accum, (h,)),
+                    tl.where(da, prod, 0.0),
+                    mask=da,
+                )
+                tl.atomic_add(
+                    _tle.gpu.local_ptr(accum_im, (h,)),
+                    tl.where(da, prod_im, 0.0),
+                    mask=da,
+                )
+                done = done | hit
+                j = tl.where(done, -1, j)
+                h = (h + 1) & (CAP - 1)
+                it += 1
+            fail = fail | (tl.sum((~done).to(tl.int32)) > 0).to(tl.int32)
+            q0 += BLOCK
+        sl = tl.arange(0, CAP)
+        kk = tl.load(_tle.gpu.local_ptr(keys, (sl,)))
+        vv = tl.load(_tle.gpu.local_ptr(accum, (sl,)))
+        vv_im = tl.load(_tle.gpu.local_ptr(accum_im, (sl,)))
+        ne = kk != -1
+        pos = tl.load(c_indptr + row) + (
+            tl.cumsum(ne.to(tl.int32), 0) - ne.to(tl.int32)
+        )
+        tl.store(c_ind + pos, kk, mask=ne)
+        tl.store(c_data + 2 * pos, vv, mask=ne)
+        tl.store(c_data + 2 * pos + 1, vv_im, mask=ne)
+        if REPORT:
+            # single-pass mode: this pass also serves as the counting pass
+            tl.store(ovf_ptr + row, fail)
+            tl.store(
+                row_nnz_ptr + row,
+                tl.where(fail != 0, 0, tl.sum(ne.to(tl.int32))),
+            )
+
 def _spgemm_row_products(prepared):
     """Products (expanded work) per output row: ``sum_k nnz(B[A_col_k, :])``.
 
@@ -765,16 +922,17 @@ def _spgemm_esc_expand_rows(prepared, rows):
     within_b = torch.arange(total, device=device) - torch.repeat_interleave(base, seg)
     bpos = b_indptr64[k][aap] + within_b
     out_col = b_indices[bpos].to(torch.int64)
-    out_val = a_data[ap][aap] * b_data[bpos]
+    out_val = _esc_mul(
+        _esc_gather(_esc_gather(a_data, ap), aap), _esc_gather(b_data, bpos)
+    )
     out_row = arow[aap]
 
     key = out_row * n_cols + out_col
     order = torch.argsort(key)
     key_sorted = key[order]
-    val_sorted = out_val[order]
+    val_sorted = _esc_gather(out_val, order)
     uniq_key, inverse = torch.unique_consecutive(key_sorted, return_inverse=True)
-    cval = torch.zeros(uniq_key.numel(), dtype=dtype, device=device)
-    cval.index_add_(0, inverse, val_sorted)
+    cval = _esc_sum_duplicates(uniq_key.numel(), inverse, val_sorted, dtype, device)
     crow = torch.div(uniq_key, n_cols, rounding_mode="floor")
     ccol = (uniq_key - crow * n_cols).to(torch.int32)
     return crow, ccol, cval
@@ -874,6 +1032,9 @@ def _spgemm_hash_hybrid_compute(prepared):
     elif dtype == torch.float64:
         fill_kernel = _spgemm_hash_fill_kernel_f64
         acc_bytes = 8
+    elif dtype == torch.complex64:
+        fill_kernel = _spgemm_hash_fill_kernel_c64
+        acc_bytes = 8
     else:
         return None
     n_rows = prepared.n_rows
@@ -906,6 +1067,9 @@ def _spgemm_hash_hybrid_compute(prepared):
     bp = prepared.b_indptr.to(torch.int32).contiguous()
     a_data = prepared.a_data.contiguous()
     b_data = prepared.b_data.contiguous()
+    if dtype.is_complex:
+        a_data = torch.view_as_real(a_data).reshape(-1)
+        b_data = torch.view_as_real(b_data).reshape(-1)
     rw32 = rw.contiguous()
     dummy = torch.empty(1, dtype=torch.int32, device=device)
 
@@ -999,6 +1163,7 @@ def _spgemm_hash_hybrid_compute(prepared):
     nnz_c = int(c_indptr[-1].item())
     c_indices = torch.empty(nnz_c, dtype=torch.int32, device=device)
     c_data = torch.empty(nnz_c, dtype=dtype, device=device)
+    c_fill = torch.view_as_real(c_data).reshape(-1) if dtype.is_complex else c_data
 
     # fill, sized from the exact counts rather than the row-work bound
     hashed = row_nnz > 0
@@ -1099,7 +1264,7 @@ def _spgemm_hash_hybrid_compute(prepared):
                 rw32,
                 c_indptr,
                 c_indices,
-                c_data,
+                c_fill,
                 row_nnz,
                 ovf,
                 CAP=cap,
@@ -1128,7 +1293,7 @@ def _spgemm_hash_hybrid_compute(prepared):
                     rw32,
                     c_indptr,
                     c_indices,
-                    c_data,
+                    c_fill,
                     row_nnz,
                     ovf,
                     CAP=cap,
@@ -1162,13 +1327,17 @@ def _spgemm_compute(prepared):
     # BI-V150, 2026-10-09), which failed every SpGEMM row there.
     # C550 has no TLE. Its product, reductions and CSR construction use the
     # MACA-only standard Triton implementation, never torch.sparse.mm or ESC.
-    if _is_maca_runtime() and isinstance(prepared, SpGEMMPrepared):
+    if (
+        _is_maca_runtime()
+        and isinstance(prepared, SpGEMMPrepared)
+        and not prepared.a_data.dtype.is_complex
+    ):
         return _maca_triton_spgemm_compute(prepared)
 
     tle_hash_safe = not (
         _is_mthreads_runtime() or _is_xpu_runtime() or _is_iluvatar_runtime()
     )
-    if tle_hash_safe and _TLE_AVAILABLE and prepared.a_data.dtype in (torch.float32, torch.float64):
+    if tle_hash_safe and _TLE_AVAILABLE and prepared.a_data.dtype in SUPPORTED_SPGEMM_VALUE_DTYPES:
         try:
             result = _spgemm_hash_hybrid_compute(prepared)
         except (triton.runtime.errors.OutOfResources, _accel_oom_error()):

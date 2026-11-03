@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <complex>
 #include <vector>
 
 #include "adaptor/adaptor.hpp"
@@ -290,5 +291,105 @@ TEST_F(SpGEMMAccuracy, RejectsMisuseAndUnsupported) {
     flagsparseSpGEMM_destroyDescr(descr);
     flagsparseDestroySpMat(matC);
 }
+
+// complex64 with non-zero imaginary parts, against a complex128 host product;
+// the device phases count the structure, copy() materialises the values.
+TEST_F(SpGEMMAccuracy, Complex64) {
+    using C = std::complex<float>;
+    using cd = std::complex<double>;
+    auto build = [](int64_t rows, int64_t cols, int salt, std::vector<int32_t>* ptr,
+                    std::vector<int32_t>* idx, std::vector<C>* val) {
+        ptr->assign(1, 0);
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < cols; ++c) {
+                if ((r * 11 + c * 5 + salt) % 4 == 0) {
+                    idx->push_back(static_cast<int32_t>(c));
+                    val->emplace_back(0.5f * static_cast<float>((r + c + salt) % 5) - 1.0f,
+                                      0.25f * static_cast<float>((r + 2 * c) % 3) - 0.25f);
+                }
+            }
+            ptr->push_back(static_cast<int32_t>(idx->size()));
+        }
+    };
+    const int64_t m = 23, k = 19, n = 17;
+    std::vector<int32_t> ap, ai, bp, bi;
+    std::vector<C> av, bv;
+    build(m, k, 0, &ap, &ai, &av);
+    build(k, n, 1, &bp, &bi, &bv);
+    std::vector<std::vector<cd>> ref(static_cast<std::size_t>(m), std::vector<cd>(n));
+    std::vector<std::vector<bool>> present(static_cast<std::size_t>(m), std::vector<bool>(n));
+    for (int64_t r = 0; r < m; ++r)
+        for (int32_t p = ap[r]; p < ap[r + 1]; ++p)
+            for (int32_t q = bp[ai[p]]; q < bp[ai[p] + 1]; ++q) {
+                ref[r][bi[q]] += cd(av[p].real(), av[p].imag()) * cd(bv[q].real(), bv[q].imag());
+                present[r][bi[q]] = true;
+            }
+
+    DeviceBuffer d_ap = DeviceBuffer::from(ap), d_ai = DeviceBuffer::from(ai),
+                 d_av = DeviceBuffer::from(av), d_bp = DeviceBuffer::from(bp),
+                 d_bi = DeviceBuffer::from(bi), d_bv = DeviceBuffer::from(bv);
+    flagsparseSpMatDescr_t matA = nullptr, matB = nullptr, matC = nullptr;
+    const auto I32 = FLAGSPARSE_INDEX_32I;
+    ASSERT_EQ(flagsparseCreateCsr(&matA, m, k, static_cast<int64_t>(ai.size()), d_ap.get(),
+                                  d_ai.get(), d_av.get(), I32, I32, FLAGSPARSE_INDEX_BASE_ZERO,
+                                  FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateCsr(&matB, k, n, static_cast<int64_t>(bi.size()), d_bp.get(),
+                                  d_bi.get(), d_bv.get(), I32, I32, FLAGSPARSE_INDEX_BASE_ZERO,
+                                  FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    DeviceBuffer probe(static_cast<size_t>(m + 1) * sizeof(int32_t));
+    ASSERT_EQ(flagsparseCreateCsr(&matC, m, n, 0, probe.get(), nullptr, nullptr, I32, I32,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F),
+              FLAGSPARSE_STATUS_SUCCESS);
+    flagsparseSpGEMMDescr_t descr = nullptr;
+    ASSERT_EQ(flagsparseSpGEMM_createDescr(&descr), FLAGSPARSE_STATUS_SUCCESS);
+    const C one(1, 0), zero(0, 0);
+    const auto NT = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+    const auto ALG = FLAGSPARSE_SPGEMM_DEFAULT;
+    size_t s1 = 0, s2 = 0;
+    ASSERT_EQ(flagsparseSpGEMM_workEstimation(handle.h, NT, NT, &one, matA, matB, &zero, matC,
+                                              FLAGSPARSE_C_32F, ALG, descr, &s1, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    DeviceBuffer b1(s1 ? s1 : 1);
+    ASSERT_EQ(flagsparseSpGEMM_workEstimation(handle.h, NT, NT, &one, matA, matB, &zero, matC,
+                                              FLAGSPARSE_C_32F, ALG, descr, &s1, b1.get()),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpGEMM_compute(handle.h, NT, NT, &one, matA, matB, &zero, matC,
+                                       FLAGSPARSE_C_32F, ALG, descr, &s2, nullptr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    DeviceBuffer b2(s2 ? s2 : 1);
+    ASSERT_EQ(flagsparseSpGEMM_compute(handle.h, NT, NT, &one, matA, matB, &zero, matC,
+                                       FLAGSPARSE_C_32F, ALG, descr, &s2, b2.get()),
+              FLAGSPARSE_STATUS_SUCCESS);
+    int64_t rows = 0, cols = 0, nnz = 0;
+    ASSERT_EQ(flagsparseSpMatGetSize(matC, &rows, &cols, &nnz), FLAGSPARSE_STATUS_SUCCESS);
+    int64_t want = 0;
+    for (const auto& row : present) want += std::count(row.begin(), row.end(), true);
+    ASSERT_EQ(nnz, want);
+    DeviceBuffer c_ptr(static_cast<size_t>(m + 1) * sizeof(int32_t));
+    DeviceBuffer c_col(static_cast<size_t>(std::max<int64_t>(nnz, 1)) * sizeof(int32_t));
+    DeviceBuffer c_val(static_cast<size_t>(std::max<int64_t>(nnz, 1)) * sizeof(C));
+    ASSERT_EQ(flagsparseCsrSetPointers(matC, c_ptr.get(), c_col.get(), c_val.get()),
+              FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseSpGEMM_copy(handle.h, NT, NT, &one, matA, matB, &zero, matC,
+                                    FLAGSPARSE_C_32F, ALG, descr),
+              FLAGSPARSE_STATUS_SUCCESS);
+    dev_sync();
+    const auto ptr = c_ptr.download<int32_t>(static_cast<std::size_t>(m + 1));
+    const auto col = c_col.download<int32_t>(static_cast<std::size_t>(nnz));
+    const auto val = c_val.download<C>(static_cast<std::size_t>(nnz));
+    double err = 0.0;
+    for (int64_t r = 0; r < m; ++r) {
+        for (int32_t p = ptr[r]; p < ptr[r + 1]; ++p) {
+            ASSERT_TRUE(present[r][col[p]]) << "row " << r << " col " << col[p];
+            err = std::max(err, std::abs(cd(val[p].real(), val[p].imag()) - ref[r][col[p]]));
+        }
+    }
+    EXPECT_LE(err, 1e-5);
+    flagsparseSpGEMM_destroyDescr(descr);
+    flagsparseDestroySpMat(matC);
+    flagsparseDestroySpMat(matB);
+    flagsparseDestroySpMat(matA);
+}
+
 
 }  // namespace

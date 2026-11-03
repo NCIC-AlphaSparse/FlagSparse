@@ -53,8 +53,16 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opX
     const bool c32 = X->value_type == FLAGSPARSE_C_32F &&
                      Y->value_type == FLAGSPARSE_C_32F &&
                      computeType == FLAGSPARSE_C_32F;
-    return (f16f32 || i8i32 || c32) ? FLAGSPARSE_STATUS_SUCCESS
-                             : FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    // float32, and int8 with cuSPARSE's other int8 result type: both run the
+    // float32-accumulating kernel, which converts its loads to the accumulator.
+    const bool f32 = X->value_type == FLAGSPARSE_R_32F &&
+                     Y->value_type == FLAGSPARSE_R_32F &&
+                     computeType == FLAGSPARSE_R_32F;
+    const bool i8f32 = X->value_type == FLAGSPARSE_R_8I &&
+                       Y->value_type == FLAGSPARSE_R_8I &&
+                       computeType == FLAGSPARSE_R_32F;
+    return (f16f32 || i8i32 || c32 || f32 || i8f32) ? FLAGSPARSE_STATUS_SUCCESS
+                                                    : FLAGSPARSE_STATUS_NOT_SUPPORTED;
 }
 
 flagsparseStatus_t store_zero(flagsparseHandle_t handle, void* result,

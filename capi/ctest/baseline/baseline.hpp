@@ -116,6 +116,16 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
                 const void* beta, flagsparseOperation_t op, int warmup, int iters,
                 Timing* out);
 
+// SpMV whose vectors are not of A's value type, with the compute type the vendor
+// takes as a separate argument: the mixed-precision variants (f16f32, bf16f32,
+// i8f32, i8i32, f32c32). alpha/beta are read at compute_dtype. spmv_csr is this
+// with all three types equal to A.dtype; a backend that has not vouched for its
+// mixed modes declines anything else.
+Status spmv_mixed(const DeviceCsr& A, const void* x, flagsparseDataType_t x_dtype,
+                  void* y, flagsparseDataType_t y_dtype,
+                  flagsparseDataType_t compute_dtype, const void* alpha,
+                  const void* beta, flagsparseOperation_t op, int warmup, int iters,
+                  Timing* out);
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
@@ -158,6 +168,21 @@ struct BaselineCsrOut {
 };
 
 void free_csr(BaselineCsrOut* c);
+
+// y = alpha * op(A) * x + beta * y, A dense column-major (lda), x sparse with
+// int32 indices: the legacy cusparse<t>gemvi, bufferSize included, outside the
+// timed calls.
+Status gemvi(flagsparseOperation_t op, int m, int n, const void* alpha, const void* A,
+             int lda, int nnz, const void* x_val, const void* x_ind, const void* beta,
+             void* y, flagsparseDataType_t dtype, int warmup, int iters, Timing* out);
+
+// C = alpha * A + beta * B with the legacy cusparse<t>csrgeam2: Nnz then the sum
+// in every timed call, into the caller's c_ptr (rows + 1) / c_ind / c_val, which
+// must hold c_capacity entries -- what FlagSparse's own call fills too, so verify
+// reads the baseline's answer from the same buffers.
+Status csrgeam2(const DeviceCsr& A, const DeviceCsr& B, const void* alpha, const void* beta,
+                void* c_ptr, void* c_ind, void* c_val, int64_t c_capacity, int warmup,
+                int iters, Timing* out);
 
 // C = A * A. Pass `result` to take ownership of C and check the vendor's answer;
 // pass nullptr to have the baseline free it (only the timing escapes).

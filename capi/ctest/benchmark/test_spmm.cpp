@@ -187,9 +187,12 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                 const bool mixed = variant_is_mixed(*v);
                 const std::string vid = v->variant_id ? v->variant_id : "";
                 const bool row_layout = vid.find("_row") != std::string::npos;
-                const bool trans_a = vid.find("_int_trans_non_") != std::string::npos;
+                const bool conj_a = vid.find("_int_conj_non_") != std::string::npos;
+                const bool trans_a = conj_a || vid.find("_int_trans_non_") != std::string::npos;
                 const bool trans_b = vid.find("_int_non_trans_") != std::string::npos;
-                if (trans_a && !is_csr) continue;
+                const flagsparseOperation_t op_a = !trans_a ? FLAGSPARSE_OPERATION_NON_TRANSPOSE
+                    : (conj_a ? FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE
+                              : FLAGSPARSE_OPERATION_TRANSPOSE);
                 const int64_t b_logical_rows = trans_a ? A.rows : A.cols;
                 const int64_t out_rows = trans_a ? A.cols : A.rows;
                 const std::vector<double> b_row_variant =
@@ -197,18 +200,24 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                             : b_row;
                 std::vector<double> ref_row_variant;
                 if (trans_a) {
+                    // Narrow inputs as uploaded; the host values are real, so A^H is A^T.
+                    const bool narrow = dtype_is_half(dt) || dtype_is_int8(dt);
                     ref_row_variant.assign(static_cast<std::size_t>(out_rows * n), 0.0);
                     for (int64_t r = 0; r < A.rows; ++r) {
                         for (int32_t p = A.indptr[static_cast<std::size_t>(r)];
                              p < A.indptr[static_cast<std::size_t>(r) + 1]; ++p) {
                             const int64_t c = A.indices[static_cast<std::size_t>(p)];
+                            const double a = narrow
+                                ? quantize_scalar(A.values[static_cast<std::size_t>(p)], dt)
+                                : A.values[static_cast<std::size_t>(p)];
                             for (int64_t j = 0; j < n; ++j) {
+                                const double b = b_row_variant[static_cast<std::size_t>(r * n + j)];
                                 ref_row_variant[static_cast<std::size_t>(c * n + j)] +=
-                                    A.values[static_cast<std::size_t>(p)] *
-                                    b_row_variant[static_cast<std::size_t>(r * n + j)];
+                                    a * (narrow ? quantize_scalar(b, dt) : b);
                             }
                         }
                     }
+                    if (narrow && !mixed) quantize_vector_inplace(&ref_row_variant, out_dt);
                 } else {
                     if (is_csc || (dtype_is_half(dt) && !mixed)) {
                         const flagsparseDataType_t accum_dt =
@@ -307,7 +316,7 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
 
                 std::size_t bufsz = 0;
                 flagsparseSpMM_bufferSize(handle.h,
-                                          trans_a ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                          op_a,
                                           trans_b ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                                           sc.alpha(out_dt), matA, matB, sc.beta(out_dt), matC,
                                           out_dt, FLAGSPARSE_SPMM_ALG_DEFAULT, &bufsz);
@@ -323,14 +332,12 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                 baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
                                        A.rows, A.cols, A.nnz, dt,
                                        is_coo ? rowind.get() : nullptr};
-#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
                 if (is_csc) bA.format = baseline::DeviceCsr::Format::Csc;
-#endif
                 g_report.measure_vs_baseline(
                     std::move(row),
                     [&]() {
                         return flagsparseSpMM(handle.h,
-                                              trans_a ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                              op_a,
                                               trans_b ? FLAGSPARSE_OPERATION_TRANSPOSE : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                                               sc.alpha(out_dt), matA, matB, sc.beta(out_dt),
                                               matC, out_dt, FLAGSPARSE_SPMM_ALG_DEFAULT,
@@ -344,15 +351,12 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                                             out_dt, relaxed);
                     },
                     [&](baseline::Timing* t) {
-                        if (mixed
-#if !defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
-                            || is_csc
-#endif
-                        ) {
+                        if (mixed) {
                             return baseline::Status::no(
-                                mixed ? "mixed-precision SpMM has no matching vendor baseline"
-                                      : "no matching cuSPARSE CSC SpMM baseline in harness");
+                                "mixed-precision SpMM has no matching vendor baseline");
                         }
+                        // CSC goes to the vendor as a CSC descriptor; a backend
+                        // that has not wired one declines with its own reason.
                         // Pass the exact descriptors and layouts to the vendor
                         // library so its result overwrites the verify() buffer.
                         const int64_t b_ld = order == FLAGSPARSE_ORDER_ROW ? b_cols : b_rows;
@@ -360,8 +364,7 @@ TEST(SpmmBenchmark, CsrOverCorpus) {
                         return baseline::spmm_csr(
                             bA, B.get(), n, b_ld, C.get(), c_ld, sc.alpha(out_dt),
                             sc.beta(out_dt),
-                            trans_a ? FLAGSPARSE_OPERATION_TRANSPOSE
-                                    : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                            op_a,
                             trans_b ? FLAGSPARSE_OPERATION_TRANSPOSE
                                      : FLAGSPARSE_OPERATION_NON_TRANSPOSE,
                             BenchReport::kWarmup, BenchReport::kIters, t, order, order);

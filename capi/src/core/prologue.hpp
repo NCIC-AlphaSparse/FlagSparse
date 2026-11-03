@@ -57,4 +57,13 @@ flagsparseStatus_t copy_dense(flagsparseHandle_t handle, const void* src, void* 
                               int64_t src_stride_m, int64_t src_stride_n,
                               int64_t dst_stride_m, int64_t dst_stride_n);
 
+// copy_dense with a different element type on each side (the store converts):
+// how an operator that accumulates in float32 writes a float16/bfloat16 result.
+flagsparseStatus_t copy_dense_cast(flagsparseHandle_t handle,
+                                   const void* src, flagsparseDataType_t src_component,
+                                   void* dst, flagsparseDataType_t dst_component,
+                                   bool is_complex, int64_t n_rows, int64_t n_cols,
+                                   int64_t src_stride_m, int64_t src_stride_n,
+                                   int64_t dst_stride_m, int64_t dst_stride_n);
+
 }  // namespace flagsparse

@@ -88,6 +88,8 @@ add_library(flagsparse SHARED
     src/ops/spmm.cpp
     src/ops/spmv.cpp
     src/ops/spvv.cpp
+    src/ops/gemvi.cpp
+    src/ops/geam.cpp
     src/ops/spsm.cpp
     src/ops/spsv.cpp
 )

@@ -27,10 +27,13 @@ from tools.delivery_variants import load_delivery_variants
 ROOT = Path(__file__).resolve().parents[2]
 CAPI = ROOT / "capi"
 
-# What the split runner launches: every family that owns a delivery variant.
+# What the split runner launches: every family that owns a delivery variant
+# (geam and gemvi since batch 3 reached the C API, 2026-11-02).
 DELIVERY_FAMILIES = [
     "axpby",
     "gather",
+    "geam",
+    "gemvi",
     "scatter",
     "sddmm",
     "spgemm",
@@ -356,6 +359,78 @@ def test_merge_prefers_the_python_half_then_the_capi_time(tmp_path):
     assert merged["v_capi"]["performance"]["status"] == "Passed"
     # neither -> still NoBaseline, and said so
     assert merged["v_none"]["performance"]["status"] == "NoBaseline"
+
+
+def test_merge_fills_variants_the_capi_did_not_measure_from_the_python_half(tmp_path):
+    # MUSA 2026-11-02: the 24 `capi: false` batch-3 variants read NotFound in the
+    # merged report although the Python half had timed them.
+    spec = importlib.util.spec_from_file_location(
+        "split_delivery", ROOT / "run_flagsparse_split_delivery.py"
+    )
+    split = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(split)
+
+    measured_skip = {
+        "status": "Skipped",
+        "data": {
+            "fp32": {"result": "Unknown", "details": {"A": {"base": 0.0, "gems": 1.0}}}
+        },
+    }
+    capi = {
+        "result": {
+            "v_notfound": {"performance": {"status": "NotFound", "data": {}}},
+            "v_unsupported": {
+                "performance": {
+                    "status": "Skipped",
+                    "data": {"fp32": {"result": "Unknown", "details": {}}},
+                }
+            },
+            "v_measured_skip": {"performance": measured_skip},
+            "v_no_python": {"performance": {"status": "NotFound", "data": {}}},
+        }
+    }
+    with_speedup = {"status": "Passed", "data": {"fp32": {"speedup": 0.9}}}
+    no_baseline = {"status": "Passed", "data": {"fp32": {"speedup": None}}}
+    py = {
+        "result": {
+            "v_notfound": {
+                "accuracy": {"status": "Passed"},
+                "performance": with_speedup,
+            },
+            "v_unsupported": {
+                "accuracy": {"status": "Passed"},
+                "performance": no_baseline,
+            },
+            "v_measured_skip": {
+                "accuracy": {"status": "Passed"},
+                "performance": with_speedup,
+            },
+            "v_no_python": {
+                "accuracy": {"status": "Passed"},
+                "performance": {"status": "NOT_CONFIGURED"},
+            },
+        }
+    }
+    (tmp_path / "py.json").write_text(json.dumps(py), encoding="utf-8")
+    (tmp_path / "capi.json").write_text(json.dumps(capi), encoding="utf-8")
+    out = tmp_path / "merged.json"
+    # No --h800-reference: this step does not depend on it.
+    split.merge_summaries(tmp_path / "py.json", tmp_path / "capi.json", out)
+    merged = json.loads(out.read_text(encoding="utf-8"))["result"]
+
+    assert merged["v_notfound"]["performance"]["source"] == "python"
+    assert merged["v_notfound"]["performance"]["data"]["fp32"]["speedup"] == 0.9
+    assert merged["v_notfound"]["capi_performance"]["status"] == "NotFound"
+    # only not_supported rows: no timing at all, so the Python one is taken even
+    # without a speedup
+    assert merged["v_unsupported"]["performance"]["source"] == "python"
+    assert merged["v_unsupported"]["performance"]["status"] == "Passed"
+    # the C API measured something: untouched
+    assert merged["v_measured_skip"]["performance"] == measured_skip
+    assert "capi_performance" not in merged["v_measured_skip"]
+    # nothing measured on either side: stays NotFound
+    assert merged["v_no_python"]["performance"]["status"] == "NotFound"
+    assert "source" not in merged["v_no_python"]["performance"]
 
 
 def test_with_h800_reference_the_python_half_also_measures(tmp_path, monkeypatch):

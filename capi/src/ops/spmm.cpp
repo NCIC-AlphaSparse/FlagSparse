@@ -218,6 +218,33 @@ bool alg_supported(flagsparseFormat_t format, flagsparseSpMMAlg_t alg) {
     return false;
 }
 
+// Which op(A) != A requests have a route (see run()):
+//  * CSR float32 A^T -- atomic scatter, or the transposed-topology gather on CUDA;
+//  * CSR complex64 A^T / A^H -- the CSR of A^T, its structure built in preprocess
+//    and its values permuted (and conjugated) per call;
+//  * CSC A^T -- a CSC matrix IS the CSR of A^T, so the plain CSR kernels run;
+//  * COO float32 A^T -- the row offsets preprocess builds make it a CSR matrix,
+//    which takes the CSR atomic scatter.
+// A real matrix's A^H is its A^T.
+bool transpose_route_exists(const SpMatDescr* A, flagsparseOperation_t opA,
+                            flagsparseDataType_t computeType) {
+    const bool conj = opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE;
+    const bool complex = is_complex(computeType);
+    switch (A->format) {
+        case FLAGSPARSE_FORMAT_CSR:
+            return (opA == FLAGSPARSE_OPERATION_TRANSPOSE && computeType == FLAGSPARSE_R_32F) ||
+                   computeType == FLAGSPARSE_C_32F;
+        case FLAGSPARSE_FORMAT_CSC: return !(conj && complex);
+        case FLAGSPARSE_FORMAT_COO: return computeType == FLAGSPARSE_R_32F;
+        default: return false;
+    }
+}
+
+bool csr_complex_transpose(const SpMatDescr* A, flagsparseOperation_t opA) {
+    return A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA) &&
+           A->value_type == FLAGSPARSE_C_32F;
+}
+
 flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA,
                             flagsparseOperation_t opB,
                             flagsparseConstSpMatDescr_t matA,
@@ -250,14 +277,9 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
 
-    // CSR f32 transpose is handled by an atomic scatter route.  Other transpose
-    // requests remain unsupported because their value types need a matching
-    // atomic implementation (and conjugation needs separate arithmetic).
-    const bool csr_transpose_f32 =
-        A->format == FLAGSPARSE_FORMAT_CSR &&
-        opA == FLAGSPARSE_OPERATION_TRANSPOSE &&
-        computeType == FLAGSPARSE_R_32F;
-    if (transposes(opA) && !csr_transpose_f32) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    if (transposes(opA) && !transpose_route_exists(A, opA, computeType)) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
     // op(B) = B^T is free (strides swap), but conj(B) would have to negate the
     // imaginary part inside the kernel.
     if (opB == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) {
@@ -302,7 +324,7 @@ bool mixed_narrow_wide_pair(flagsparseDataType_t input_type,
         if (output_type == FLAGSPARSE_R_32F) { *acc_is_i32 = false; return true; }
         return false;
     }
-    if (input_type == FLAGSPARSE_R_16F) {
+    if (input_type == FLAGSPARSE_R_16F || input_type == FLAGSPARSE_R_16BF) {
         *acc_is_i32 = false;
         return output_type == FLAGSPARSE_R_32F;
     }
@@ -455,6 +477,101 @@ flagsparseStatus_t run_csr_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
         acc_is_i32 ? "csr_spmm_mixed_i32acc" : "csr_spmm_mixed_f32acc", sig,
         ctx(handle)->stream, A->rows, (C->cols + block_n - 1) / block_n, 1,
         /*num_warps=*/2, /*num_stages=*/3, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+// ------------------------------------------- mixed precision, scattered ---
+//
+// The narrow-input products a row-owned kernel cannot write: CSR with op(A) =
+// A^T, and CSC with op(A) = A (the CSR of A^T, transposed). Both scatter
+// C[col, :] += v * B[row, :] through mixed_spmx.py's _csr_spmm_trans_atomic_kernel
+// into a zeroed float32 C. alpha = 1, beta = 0 only, like the other mixed routes.
+
+bool is_mixed_scatter_request(flagsparseOperation_t opA, flagsparseConstSpMatDescr_t matA,
+                              flagsparseConstDnMatDescr_t matB,
+                              flagsparseConstDnMatDescr_t matC) {
+    if (matA == nullptr || matB == nullptr || matC == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    const DnMatDescr* B = dnmat(matB);
+    const DnMatDescr* C = dnmat(matC);
+    const bool narrow = A->value_type == FLAGSPARSE_R_16F || A->value_type == FLAGSPARSE_R_16BF ||
+                        A->value_type == FLAGSPARSE_R_8I;
+    if (!narrow || B->value_type != A->value_type || C->value_type != FLAGSPARSE_R_32F) {
+        return false;
+    }
+    return (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA)) ||
+           (A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA));
+}
+
+flagsparseStatus_t validate_mixed_scatter(flagsparseHandle_t handle,
+                                          flagsparseOperation_t opA, flagsparseOperation_t opB,
+                                          flagsparseConstSpMatDescr_t matA,
+                                          flagsparseConstDnMatDescr_t matB,
+                                          flagsparseConstDnMatDescr_t matC,
+                                          flagsparseDataType_t computeType,
+                                          flagsparseSpMMAlg_t alg) {
+    if (handle == nullptr) return FLAGSPARSE_STATUS_NOT_INITIALIZED;
+    const SpMatDescr* A = spmat(matA);
+    const DnMatDescr* B = dnmat(matB);
+    const DnMatDescr* C = dnmat(matC);
+    if (computeType != C->value_type || A->idx_base != FLAGSPARSE_INDEX_BASE_ZERO ||
+        !alg_supported(A->format, alg) || A->nnz > static_cast<int64_t>(INT32_MAX) ||
+        triton_index_dtype(A->indices_type)[0] == '\0' ||
+        triton_index_dtype(A->offsets_type)[0] == '\0') {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    if (opB != FLAGSPARSE_OPERATION_NON_TRANSPOSE && opB != FLAGSPARSE_OPERATION_TRANSPOSE) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    const int64_t m = transposes(opA) ? A->cols : A->rows;
+    const int64_t k = transposes(opA) ? A->rows : A->cols;
+    const int64_t b_rows = transposes(opB) ? B->cols : B->rows;
+    const int64_t b_cols = transposes(opB) ? B->rows : B->cols;
+    if (C->rows != m || b_rows != k || b_cols != C->cols) return FLAGSPARSE_STATUS_INVALID_VALUE;
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+flagsparseStatus_t run_mixed_scatter(flagsparseHandle_t handle, const SpMatDescr* A,
+                                     flagsparseOperation_t opB, const DnMatDescr* B,
+                                     DnMatDescr* C) {
+    const std::size_t storage = static_cast<std::size_t>(
+        C->order == FLAGSPARSE_ORDER_ROW ? C->rows * C->ld : C->cols * C->ld);
+    if (adaptor::memset_device(reinterpret_cast<adaptor::DevicePtr>(C->values), 0,
+                               storage * dtype_size(C->value_type)) != FLAGSPARSE_STATUS_SUCCESS) {
+        return FLAGSPARSE_STATUS_EXECUTION_FAILED;
+    }
+    if (A->nnz == 0 || C->cols == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    // The pointer array walks CSR rows, or CSC columns -- the rows of A^T.
+    const int64_t n_major = A->format == FLAGSPARSE_FORMAT_CSC ? A->cols : A->rows;
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* ot = triton_index_dtype(A->offsets_type);
+    const char* xt = triton_dtype(A->value_type);
+    const DenseStrides bs = mixed_strides_of(B);
+    const DenseStrides cs = mixed_strides_of(C);
+    const int block_n = mixed_block_n(C->cols);
+    const int rows_per = std::max(1, 128 / block_n);
+
+    std::string sig = std::string("*fp32:16,*") + xt + ":16,*" + it + ":16,*" + ot + ":16,*" +
+                      xt + ":16,i32,i32,i64,i64,i64,i64," + std::to_string(rows_per) + "," +
+                      std::to_string(block_n);
+    std::vector<jit::Arg> args;
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(C->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(B->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(n_major)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(C->cols)));
+    args.push_back(jit::Arg::i64v(transposes(opB) ? bs.col : bs.row));
+    args.push_back(jit::Arg::i64v(transposes(opB) ? bs.row : bs.col));
+    args.push_back(jit::Arg::i64v(cs.row));
+    args.push_back(jit::Arg::i64v(cs.col));
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("mixed_spmx.py"), "csr_spmm_trans_f32acc", sig, ctx(handle)->stream,
+        (n_major + rows_per - 1) / rows_per, (C->cols + block_n - 1) / block_n, 1,
+        /*num_warps=*/4, /*num_stages=*/2, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
 }
@@ -738,6 +855,26 @@ bool transpose_gather_available(const SpMatDescr* A) {
         std::strcmp(flagsparseGetBackendName(), "cuda") == 0;
 }
 
+// COO float32 A^T on CUDA takes the same gather route as CSR: its scratch is the
+// row offsets (16-byte aligned) followed by the transposed topology.
+bool coo_transpose_gather(const SpMatDescr* A, flagsparseOperation_t opA) {
+    return A->format == FLAGSPARSE_FORMAT_COO && transposes(opA) &&
+        A->value_type == FLAGSPARSE_R_32F &&
+        std::strcmp(flagsparseGetBackendName(), "cuda") == 0;
+}
+
+size_t coo_offsets_bytes(const SpMatDescr* A) {
+    return (static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t) + 15) / 16 * 16;
+}
+
+SpMatDescr coo_csr_view(const SpMatDescr* A, void* offsets) {
+    SpMatDescr T = *A;
+    T.format = FLAGSPARSE_FORMAT_CSR;
+    T.offsets = offsets;
+    T.offsets_type = FLAGSPARSE_INDEX_32I;
+    return T;
+}
+
 flagsparseStatus_t prepare_transpose_topology(SpMatDescr* A, void* buffer) {
     if (buffer == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
     const size_t os = index_size(A->offsets_type), is = index_size(A->indices_type);
@@ -761,6 +898,8 @@ flagsparseStatus_t prepare_transpose_topology(SpMatDescr* A, void* buffer) {
         if (col < 0 || col >= A->cols) return FLAGSPARSE_STATUS_INVALID_VALUE;
         ++ptr[col + 1];
     }
+    int64_t longest = 0;
+    for (int64_t c = 0; c < A->cols; ++c) longest = std::max<int64_t>(longest, ptr[c + 1]);
     for (int64_t c = 0; c < A->cols; ++c) ptr[c + 1] += ptr[c];
     std::vector<int64_t> cursor(ptr, ptr + A->cols);
     if (at(offsets, os, 0) != 0 || at(offsets, os, A->rows) != A->nnz) return FLAGSPARSE_STATUS_INVALID_VALUE;
@@ -775,7 +914,86 @@ flagsparseStatus_t prepare_transpose_topology(SpMatDescr* A, void* buffer) {
     }
     if (auto s = adaptor::memcpy_h2d(reinterpret_cast<adaptor::DevicePtr>(buffer), topology.data(), topology.size() * sizeof(int64_t))) return s;
     A->spmm_transpose_buffer = buffer;
+    A->transpose_max_row_nnz = longest;
     return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+size_t transpose_topology_bytes(const SpMatDescr* A) {
+    return (transpose_ptr_count(A) + 2 * transpose_nnz_count(A)) * sizeof(int64_t);
+}
+
+// Builds the COO's row offsets and, on its gather route, the transposed topology
+// of that CSR view -- remembered on A, since the view is a temporary.
+flagsparseStatus_t prepare_coo_transpose(SpMatDescr* A, flagsparseOperation_t opA,
+                                         void* buffer) {
+    if (A->coo_offsets_buffer != buffer) {
+        if (flagsparseStatus_t s = build_coo_row_offsets(A, buffer)) return s;
+    }
+    if (!coo_transpose_gather(A, opA)) return FLAGSPARSE_STATUS_SUCCESS;
+    void* topology = static_cast<unsigned char*>(buffer) + coo_offsets_bytes(A);
+    if (A->spmm_transpose_buffer == topology) return FLAGSPARSE_STATUS_SUCCESS;
+    SpMatDescr T = coo_csr_view(A, buffer);
+    if (flagsparseStatus_t s = prepare_transpose_topology(&T, topology)) return s;
+    A->spmm_transpose_buffer = topology;
+    A->transpose_max_row_nnz = T.transpose_max_row_nnz;
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+// The CSR descriptor of A^T over a transposed topology in `buffer` and the
+// permuted values that follow it (a multiple of 16 bytes in, since both counts
+// are rounded up to even). B and C are untouched: only op(A) changes shape.
+SpMatDescr transposed_view(const SpMatDescr* A, void* buffer, void* values) {
+    SpMatDescr T = *A;
+    auto* ptr = static_cast<int64_t*>(buffer);
+    T.format = FLAGSPARSE_FORMAT_CSR;
+    T.rows = A->cols;
+    T.cols = A->rows;
+    T.offsets = ptr;
+    T.indices = ptr + transpose_ptr_count(A) + transpose_nnz_count(A);
+    T.values = values;
+    T.offsets_type = T.indices_type = FLAGSPARSE_INDEX_64I;
+    T.max_row_nnz = A->transpose_max_row_nnz;
+    T.spmm_transpose_buffer = nullptr;
+    return T;
+}
+
+// op(A) = A^T / A^H for a complex64 CSR A: refresh the permuted (conjugated)
+// values, then the plain complex CSR kernel runs on the CSR of A^T -- no atomics,
+// which complex values would need two of per product.
+flagsparseStatus_t run_csr_transpose_permuted(flagsparseHandle_t handle,
+                                              flagsparseOperation_t opA, SpMatDescr* A,
+                                              const DnMatDescr* B, DnMatDescr* C,
+                                              flagsparseDataType_t computeType,
+                                              Operands ops, void* buffer) {
+    if (buffer == nullptr) {
+        ctx(handle)->last_error =
+            "a complex SpMM with op(A) = A^T or A^H needs the externalBuffer reported by "
+            "flagsparseSpMM_bufferSize; it holds the transposed structure";
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    if (A->spmm_transpose_buffer != buffer) {
+        if (auto s = prepare_transpose_topology(A, buffer)) return s;
+    }
+    void* values = static_cast<unsigned char*>(buffer) + transpose_topology_bytes(A);
+    if (A->nnz > 0) {
+        constexpr int kBlock = 1024;
+        const auto* order = static_cast<int64_t*>(buffer) + transpose_ptr_count(A);
+        std::string sig = "*fp32:16,*i64:16,*fp32:16,i32," + std::to_string(kBlock) + ",True,";
+        sig += opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE ? "True" : "False";
+        std::vector<jit::Arg> args;
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(order)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(values)));
+        args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->nnz)));
+        std::string err;
+        const auto st = jit::launch(jit::codegen_module("_dense.py"), "_permute_values_kernel",
+                                    sig, ctx(handle)->stream, (A->nnz + kBlock - 1) / kBlock, 1, 1,
+                                    4, 2, args, &err);
+        if (st != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return st; }
+    }
+    SpMatDescr T = transposed_view(A, buffer, values);
+    ops.m = T.rows;
+    return run_csr(handle, &T, B, C, computeType, ops);
 }
 
 flagsparseStatus_t run_csr_transpose_gather(flagsparseHandle_t handle, SpMatDescr* A,
@@ -948,7 +1166,8 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
     }
     if (ops.m == 0 || ops.n == 0) return FLAGSPARSE_STATUS_SUCCESS;
     if (musa_gather_type(A)) {
-        const bool indirect = A->format == FLAGSPARSE_FORMAT_CSC ||
+        // CSC's gather route computes A @ B; its A^T goes through the CSR view below.
+        const bool indirect = (A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA));
         const bool direct = A->format == FLAGSPARSE_FORMAT_CSR &&
             !transposes(opA) && ops.complex_op && ops.n == 8;
@@ -959,6 +1178,37 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
                 opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, externalBuffer, indirect);
     }
 
+    if (transposes(opA) && A->format == FLAGSPARSE_FORMAT_CSC) {
+        // A CSC matrix's arrays are the CSR of A^T, as they stand.
+        int64_t longest = 0;
+        if (flagsparseStatus_t s = ensure_max_row_nnz(A, &longest)) return s;
+        SpMatDescr T = *A;
+        T.format = FLAGSPARSE_FORMAT_CSR;
+        T.rows = A->cols;
+        T.cols = A->rows;
+        T.max_row_nnz = longest;
+        ops.m = T.rows;
+        return run_csr(handle, &T, B, C, computeType, ops);
+    }
+    if (transposes(opA) && A->format == FLAGSPARSE_FORMAT_COO) {
+        // A row-sorted COO plus the offsets preprocess builds is a CSR matrix.
+        if (externalBuffer == nullptr) {
+            ctx(handle)->last_error =
+                "SpMM on a COO matrix needs the externalBuffer reported by "
+                "flagsparseSpMM_bufferSize; it holds the row-offsets array.";
+            return FLAGSPARSE_STATUS_INVALID_VALUE;
+        }
+        if (flagsparseStatus_t s = prepare_coo_transpose(A, opA, externalBuffer)) return s;
+        SpMatDescr T = coo_csr_view(A, externalBuffer);
+        if (coo_transpose_gather(A, opA)) {
+            return run_csr_transpose_gather(handle, &T, B, C, ops, A->spmm_transpose_buffer);
+        }
+        return run_csr_transpose_atomic(handle, &T, B, C, ops);
+    }
+    if (csr_complex_transpose(A, opA)) {
+        return run_csr_transpose_permuted(handle, opA, A, B, C, computeType, ops,
+                                          externalBuffer);
+    }
     return (A->format == FLAGSPARSE_FORMAT_COO)
                ? run_coo(handle, A, B, C, ops, externalBuffer)
                : (A->format == FLAGSPARSE_FORMAT_CSC
@@ -984,6 +1234,9 @@ flagsparseStatus_t flagsparseSpMM_bufferSize(
     *bufferSize = 0;
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        if (is_mixed_scatter_request(opA, matA, matB, matC)) {
+            return validate_mixed_scatter(handle, opA, opB, matA, matB, matC, computeType, alg);
+        }
         if (is_mixed_request(opA, matA, matB, matC, &acc_is_i32)) {
             return validate_mixed(handle, opA, opB, matA, matB, matC, computeType, alg);
         }
@@ -995,16 +1248,24 @@ flagsparseStatus_t flagsparseSpMM_bufferSize(
         // has to be given one, so the caller allocates rows + 1 int32 and passes
         // it to preprocess and to every solve.
         const SpMatDescr* A = spmat(matA);
-        if (musa_gather_type(A) && (A->format == FLAGSPARSE_FORMAT_CSC ||
-            (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA)))) {
+        if (musa_gather_type(A) &&
+            ((A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
+             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA)))) {
             *bufferSize = gather_bytes(A);
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
+        if (csr_complex_transpose(A, opA)) {
+            *bufferSize = transpose_topology_bytes(A) +
+                          static_cast<size_t>(A->nnz) * dtype_size(A->value_type);
             return FLAGSPARSE_STATUS_SUCCESS;
         }
         if (transposes(opA) && transpose_gather_available(A)) {
             *bufferSize = (transpose_ptr_count(A) + 2 * transpose_nnz_count(A)) * sizeof(int64_t);
         }
         if (A->format == FLAGSPARSE_FORMAT_COO) {
-            *bufferSize = static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t);
+            *bufferSize = coo_transpose_gather(A, opA)
+                ? coo_offsets_bytes(A) + transpose_topology_bytes(A)
+                : static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t);
         }
         return FLAGSPARSE_STATUS_SUCCESS;
     });
@@ -1018,6 +1279,9 @@ flagsparseStatus_t flagsparseSpMM_preprocess(
     (void)alpha; (void)beta;
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        if (is_mixed_scatter_request(opA, matA, matB, matC)) {
+            return validate_mixed_scatter(handle, opA, opB, matA, matB, matC, computeType, alg);
+        }
         if (is_mixed_request(opA, matA, matB, matC, &acc_is_i32)) {
             return validate_mixed(handle, opA, opB, matA, matB, matC, computeType, alg);
         }
@@ -1031,14 +1295,16 @@ flagsparseStatus_t flagsparseSpMM_preprocess(
         // also where a COO that is not sorted by row gets rejected.
         auto* A = const_cast<SpMatDescr*>(spmat(matA));
         if (musa_gather_type(A) && externalBuffer &&
-            (A->format == FLAGSPARSE_FORMAT_CSC ||
+            ((A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
              (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA))))
             return prepare_sparse_gather(A, externalBuffer);
-        if (transposes(opA) && transpose_gather_available(A) && externalBuffer)
+        if ((csr_complex_transpose(A, opA) ||
+             (transposes(opA) && transpose_gather_available(A))) && externalBuffer)
             return prepare_transpose_topology(A, externalBuffer);
         if (A->format == FLAGSPARSE_FORMAT_COO) {
             if (A->rows == 0) return FLAGSPARSE_STATUS_SUCCESS;
             if (externalBuffer == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
+            if (transposes(opA)) return prepare_coo_transpose(A, opA, externalBuffer);
             return build_coo_row_offsets(A, externalBuffer);
         }
         int64_t unused = 0;
@@ -1053,6 +1319,16 @@ flagsparseStatus_t flagsparseSpMM(
     flagsparseSpMMAlg_t alg, void* externalBuffer) {
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        if (is_mixed_scatter_request(opA, matA, matB, matC)) {
+            if (flagsparseStatus_t s = validate_mixed_scatter(
+                    handle, opA, opB, matA, matB, matC, computeType, alg)) {
+                return s;
+            }
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            return run_mixed_scatter(handle, spmat(matA), opB, dnmat(matB), dnmat(matC));
+        }
         if (is_mixed_request(opA, matA, matB, matC, &acc_is_i32)) {
             if (flagsparseStatus_t s =
                     validate_mixed(handle, opA, opB, matA, matB, matC, computeType, alg)) {

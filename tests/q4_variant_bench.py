@@ -77,7 +77,11 @@ class Variant:
     x: torch.dtype = None  # SpMV vector dtype when it differs from the matrix's
 
 
-f16, f32, c32, i8, i32 = torch.float16, torch.float32, torch.complex64, torch.int8, torch.int32
+f16, bf16, f32, c32 = torch.float16, torch.bfloat16, torch.float32, torch.complex64
+i8, i32 = torch.int8, torch.int32
+
+# Each list keeps the q4 variants first, then the batch-3 ones
+# (docs/NEW_OPERATORS_BATCH3.md, first tier) in that document's order.
 
 VARIANTS = {
     "spmv_csr": [
@@ -89,6 +93,11 @@ VARIANTS = {
         Variant("spmv_csr_i8f32_int_non", "spmv", "csr", i8, f32),
         Variant("spmv_csr_i8i32_int_non", "spmv", "csr", i8, i32),
         Variant("spmv_csr_c32_int_conj", "spmv", "csr", c32, c32, op_a="conj"),
+        Variant("spmv_csr_bf16f32_int_non", "spmv", "csr", bf16, f32),
+        Variant("spmv_csr_bf16_int_non", "spmv", "csr", bf16, bf16),
+        Variant("spmv_csr_f16f32_int_trans", "spmv", "csr", f16, f32, op_a="trans"),
+        Variant("spmv_csr_f32c32_int_trans", "spmv", "csr", f32, c32, op_a="trans", x=c32),
+        Variant("spmv_csr_i8i32_int_trans", "spmv", "csr", i8, i32, op_a="trans"),
     ],
     "spmv_coo": [
         Variant("spmv_coo_f16f32_int_non", "spmv", "coo", f16, f32),
@@ -97,11 +106,18 @@ VARIANTS = {
         Variant("spmv_coo_f16_int_non", "spmv", "coo", f16, f16),
         Variant("spmv_coo_c32_int_conj", "spmv", "coo", c32, c32, op_a="conj"),
         Variant("spmv_coo_i8i32_int_non", "spmv", "coo", i8, i32),
+        Variant("spmv_coo_i8f32_int_non", "spmv", "coo", i8, f32),
+        Variant("spmv_coo_f32c32_int_non", "spmv", "coo", f32, c32, x=c32),
+        Variant("spmv_coo_f16_int_trans", "spmv", "coo", f16, f16, op_a="trans"),
     ],
     "spmv_csc": [
         Variant("spmv_csc_f32_int_non", "spmv", "csc", f32, f32),
         Variant("spmv_csc_c32_int_non", "spmv", "csc", c32, c32),
         Variant("spmv_csc_f16_int_non", "spmv", "csc", f16, f16),
+        Variant("spmv_csc_f32_int_trans", "spmv", "csc", f32, f32, op_a="trans"),
+        Variant("spmv_csc_c32_int_conj", "spmv", "csc", c32, c32, op_a="conj"),
+        Variant("spmv_csc_f16f32_int_non", "spmv", "csc", f16, f32),
+        Variant("spmv_csc_i8i32_int_non", "spmv", "csc", i8, i32),
     ],
     "spmm_csr": [
         Variant("spmm_csr_f16f32_int_non_non_row", "spmm", "csr", f16, f32),
@@ -111,6 +127,13 @@ VARIANTS = {
         Variant("spmm_csr_c32_int_non_non_row", "spmm", "csr", c32, c32),
         Variant("spmm_csr_i8i32_int_non_non_row", "spmm", "csr", i8, i32),
         Variant("spmm_csr_f32_int_trans_non_row", "spmm", "csr", f32, f32, op_a="trans"),
+        Variant("spmm_csr_bf16f32_int_non_non_row", "spmm", "csr", bf16, f32),
+        Variant("spmm_csr_f16f32_int_non_non_col", "spmm", "csr", f16, f32, layout="col"),
+        Variant("spmm_csr_i8f32_int_non_non_row", "spmm", "csr", i8, f32),
+        Variant("spmm_csr_c32_int_non_trans_row", "spmm", "csr", c32, c32, op_b="trans"),
+        Variant("spmm_csr_i8i32_int_non_non_col", "spmm", "csr", i8, i32, layout="col"),
+        Variant("spmm_csr_c32_int_conj_non_row", "spmm", "csr", c32, c32, op_a="conj"),
+        Variant("spmm_csr_f16f32_int_trans_non_row", "spmm", "csr", f16, f32, op_a="trans"),
     ],
     # Tagged here so the row carries a cuSPARSE Blocked-ELL baseline: the script's own
     # CuPy baseline has no Blocked-ELL SpMM, so its rows have no speedup on CUDA.
@@ -121,11 +144,17 @@ VARIANTS = {
         Variant("spmm_coo_c32_int_non_non_row", "spmm", "coo", c32, c32),
         Variant("spmm_coo_f16_int_non_non_row", "spmm", "coo", f16, f16),
         Variant("spmm_coo_i8i32_int_non_non_row", "spmm", "coo", i8, i32),
+        Variant("spmm_coo_f16f32_int_non_non_row", "spmm", "coo", f16, f32),
+        Variant("spmm_coo_f32_int_non_non_col", "spmm", "coo", f32, f32, layout="col"),
+        Variant("spmm_coo_f32_int_trans_non_row", "spmm", "coo", f32, f32, op_a="trans"),
+        Variant("spmm_coo_f32_int_non_trans_row", "spmm", "coo", f32, f32, op_b="trans"),
     ],
     "spmm_csc": [
         Variant("spmm_csc_f16_int_non_non_row", "spmm", "csc", f16, f16),
         Variant("spmm_csc_f32_int_non_non_row", "spmm", "csc", f32, f32),
         Variant("spmm_csc_c32_int_non_non_row", "spmm", "csc", c32, c32),
+        Variant("spmm_csc_f32_int_trans_non_row", "spmm", "csc", f32, f32, op_a="trans"),
+        Variant("spmm_csc_f16f32_int_non_non_row", "spmm", "csc", f16, f32),
     ],
     "sddmm_csr": [
         Variant("sddmm_csr_f32_int_non_non_col", "sddmm", "csr", f32, f32, layout="col"),
@@ -133,6 +162,20 @@ VARIANTS = {
         Variant("sddmm_csr_f32_int_trans_non_row", "sddmm", "csr", f32, f32, op_a="trans"),
         Variant("sddmm_csr_c32_int_non_non_row", "sddmm", "csr", c32, c32),
         Variant("sddmm_csr_f16_int_non_non_row", "sddmm", "csr", f16, f16),
+        Variant("sddmm_csr_f32_int_trans_trans_row", "sddmm", "csr", f32, f32, op_a="trans", op_b="trans"),
+        Variant("sddmm_csr_c32_int_non_trans_row", "sddmm", "csr", c32, c32, op_b="trans"),
+        Variant("sddmm_csr_f16_int_non_trans_row", "sddmm", "csr", f16, f16, op_b="trans"),
+        Variant("sddmm_csr_f16f32_int_non_non_row", "sddmm", "csr", f16, f32),
+    ],
+    # Sparse results: C = A @ B (A @ A when square, A @ A^T otherwise, as
+    # tests/test_spgemm.py's input_mode=auto) and C = A + B (B = A^T when square,
+    # otherwise a second value set on A's pattern).
+    "spgemm_csr": [
+        Variant("spgemm_csr_c32_int_non_non", "spgemm", "csr", c32, c32),
+    ],
+    "geam_csr": [
+        Variant("geam_csr_f32_int", "geam", "csr", f32, f32),
+        Variant("geam_csr_c32_int", "geam", "csr", c32, c32),
     ],
 }
 
@@ -176,6 +219,16 @@ COLUMN_MAPS = {
         "ours_ms": "triton_ms", "vendor_ms": "cusparse_ms", "speedup_vs_vendor": "triton_speedup_vs_cusparse",
         "speedup_vs_pytorch": "triton_speedup_vs_pytorch", "vendor_max_error": "err_cu",
         "vendor_reason": "cu_reason", "dense_cols": "k",
+    },
+    "spgemm_csr": {
+        "ours_ms": "triton_ms", "vendor_ms": "cusparse_ms", "speedup_vs_vendor": "triton_speedup_vs_cusparse",
+        "speedup_vs_pytorch": "triton_speedup_vs_pytorch", "vendor_max_error": "err_cu",
+        "pytorch_max_error": "err_pt", "vendor_reason": "cusparse_reason",
+    },
+    "geam_csr": {
+        "ours_ms": "triton_ms", "vendor_ms": "cusparse_ms", "speedup_vs_vendor": "triton_speedup_vs_cusparse",
+        "speedup_vs_pytorch": "triton_speedup_vs_pytorch", "vendor_max_error": "cusparse_max_error",
+        "vendor_reason": "cusparse_reason",
     },
 }
 # Script columns that must hold a fixed value on q4 rows (e.g. their ``alg``).
@@ -815,6 +868,7 @@ def _sddmm(v, mat, gen, warmup, iters, row):
     A, B = a_cpu.to(mat.dev), b_cpu.to(mat.dev)
     if v.layout == "col":
         A, B = _col_major(A), _col_major(B)
+    out_dtype = None if v.out == v.value else v.out
 
     if _is_ascend_runtime():
         row["timed"] = "prepared"
@@ -828,6 +882,7 @@ def _sddmm(v, mat, gen, warmup, iters, row):
                 op_a=v.op_a,
                 op_b=v.op_b,
                 dense_layout=v.layout,
+                out_dtype=out_dtype,
             )
     else:
         row["timed"] = "prepared"
@@ -835,7 +890,8 @@ def _sddmm(v, mat, gen, warmup, iters, row):
 
         def ours():
             return fs.flagsparse_sddmm_csr(
-                x=A, y=B, prepared=prepared, op_a=v.op_a, op_b=v.op_b, dense_layout=v.layout
+                x=A, y=B, prepared=prepared, op_a=v.op_a, op_b=v.op_b, dense_layout=v.layout,
+                out_dtype=out_dtype,
             )
 
     first = ours()
@@ -847,7 +903,7 @@ def _sddmm(v, mat, gen, warmup, iters, row):
     def build_vendor():
         out_vals = torch.empty(mat.csr.nnz, dtype=v.out, device=mat.dev)
         plan = cusparse_baseline.prepare_sddmm(
-            (None, mat.cols, mat.ptr), mat.shape, A, B, out_vals, v.op_a, v.op_b, v.value
+            (None, mat.cols, mat.ptr), mat.shape, A, B, out_vals, v.op_a, v.op_b, _compute_dtype(v)
         )
         return plan, lambda: _error(out_vals, ref)
 
@@ -933,7 +989,112 @@ def _time_cupy_sddmm(row, mat, A, B, op_a, op_b, warmup, iters, reference):
         row["cupy_reason"] = f"{type(exc).__name__}: {exc}"
 
 
-_KINDS = {"spmv": _spmv, "spmm": _spmm, "sddmm": _sddmm}
+def _scipy_from(c_vals, c_cols, c_ptr, shape):
+    return sp.csr_matrix(
+        (_wide_np(c_vals), c_cols.detach().cpu().numpy(), c_ptr.detach().cpu().numpy()), shape
+    )
+
+
+def _sparse_error(result, reference):
+    """Relative max error of a CSR result against a SciPy matrix (any column order)."""
+    c_vals, c_cols, c_ptr = result[:3]
+    diff = _scipy_from(c_vals, c_cols, c_ptr, reference.shape) - reference
+    scale = max(1.0, float(abs(reference).max())) if reference.nnz else 1.0
+    return float(abs(diff).max() / scale) if diff.nnz else 0.0
+
+
+def _sparse_baseline(row, prefix, build, warmup, iters, reference):
+    """Time a sparse-result baseline after checking it computes ``reference``."""
+    plan = None
+    try:
+        plan = build()
+        err = _sparse_error(plan.run(), reference)
+        row[f"{prefix}_max_error"] = err
+        if err > _VENDOR_MAX_ERROR:
+            row[f"{prefix}_reason"] = f"result off by {err:.3g} (relative); baseline not used"
+            return
+        _, row[f"{prefix}_ms"] = _benchmark_cuda_op(plan.run, warmup, iters)
+    except Exception as exc:
+        row[f"{prefix}_reason"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if plan is not None and hasattr(plan, "close"):
+            plan.close()
+
+
+class _CallPlan:
+    """A torch callable shaped like a cuSPARSE plan: ``run`` returns CSR arrays."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def run(self):
+        out = self._fn()
+        if out.layout == torch.sparse_csr:
+            return out.values(), out.col_indices(), out.crow_indices()
+        return out
+
+
+def _second_operand(v, mat, vals, vals_cpu, gen):
+    """B for SpGEMM / geam: A^T (from the CSC arrays) when square or for SpGEMM."""
+    t_vals = mat.arrays("csc", vals)[0]
+    t_cpu = _gather_values(vals_cpu, mat.csc_order)
+    t_shape = (mat.shape[1], mat.shape[0])
+    t_scipy = sp.csr_matrix((_wide_np(t_cpu), mat.csc_rows.cpu().numpy(), mat.csc_ptr.cpu().numpy()), t_shape)
+    return (t_vals, mat.csc_rows, mat.csc_ptr), t_shape, t_scipy
+
+
+def _sparse_result(v, mat, gen, warmup, iters, row):
+    m, n = mat.shape
+    vals_cpu = _matrix_values(mat.csr, v.value, gen)
+    vals = vals_cpu.to(mat.dev)
+    A = (vals, mat.cols, mat.ptr)
+    a_scipy = mat.scipy(vals_cpu)
+    if v.kind == "spgemm":
+        if m == n:
+            B, b_shape, b_scipy = A, mat.shape, a_scipy
+            row["input_mode"] = "A_EQUALS_B"
+        else:
+            B, b_shape, b_scipy = _second_operand(v, mat, vals, vals_cpu, gen)
+            row["input_mode"] = "A_AT"
+        reference = (a_scipy @ b_scipy).tocsr()
+        ours = lambda: fs.flagsparse_spgemm_csr(*A, mat.shape, *B, b_shape)  # noqa: E731
+        vendor = lambda: cusparse_baseline.prepare_spgemm_csr(A, mat.shape, B, b_shape)  # noqa: E731
+        torch_b_shape = b_shape
+    else:
+        if m == n:
+            B, _, b_scipy = _second_operand(v, mat, vals, vals_cpu, gen)
+            row["input_mode"] = "A_PLUS_AT"
+        else:
+            b_cpu = _rand((mat.csr.nnz,), v.value, gen)
+            B, b_scipy = (b_cpu.to(mat.dev), mat.cols, mat.ptr), mat.scipy(b_cpu)
+            row["input_mode"] = "A_PLUS_A_PATTERN"
+        reference = (a_scipy + b_scipy).tocsr()
+        ours = lambda: fs.flagsparse_geam_csr(*A, *B, mat.shape, validate=False)  # noqa: E731
+        vendor = lambda: cusparse_baseline.prepare_geam_csr(A, B, mat.shape, 1.0, 1.0)  # noqa: E731
+        torch_b_shape = mat.shape
+    row["timed"] = "call"  # count + allocate + fill on every call, as cuSPARSE's sequence
+    first = ours()
+    row["max_error"] = _sparse_error(first, reference)
+    row["out_dtype"] = _name(first[0].dtype)
+    row["nnz_c"] = int(first[0].numel())
+    _, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+
+    reason = cusparse_baseline.skip_reason()
+    if reason is None:
+        _sparse_baseline(row, "vendor", vendor, warmup, iters, reference)
+    else:
+        row["vendor_reason"] = reason
+
+    def torch_plan():
+        a = torch.sparse_csr_tensor(mat.ptr.long(), mat.cols.long(), vals, mat.shape)
+        b = torch.sparse_csr_tensor(B[2].long(), B[1].long(), B[0], torch_b_shape)
+        return _CallPlan((lambda: a @ b) if v.kind == "spgemm" else (lambda: a + b))
+
+    _sparse_baseline(row, "pytorch", torch_plan, warmup, iters, reference)
+    return v.out
+
+
+_KINDS = {"spmv": _spmv, "spmm": _spmm, "sddmm": _sddmm, "spgemm": _sparse_result, "geam": _sparse_result}
 
 
 def matrix_paths(inputs):

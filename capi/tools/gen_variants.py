@@ -47,12 +47,14 @@ DTYPES = {
 # variant id (sweep.hpp's variant_output_dtype).
 REGISTRY_DTYPES = {
     "f16": ("FLAGSPARSE_R_16F", "f16"),
+    "bf16": ("FLAGSPARSE_R_16BF", "bf16"),
     "f32": ("FLAGSPARSE_R_32F", "f32"),
     "f64": ("FLAGSPARSE_R_64F", "f64"),
     "i8": ("FLAGSPARSE_R_8I", "i8"),
     "c32": ("FLAGSPARSE_C_32F", "c32"),
     "c64": ("FLAGSPARSE_C_64F", "c64"),
     "f16f32": ("FLAGSPARSE_R_16F", "f16f32"),
+    "bf16f32": ("FLAGSPARSE_R_16BF", "bf16f32"),
     "i8f32": ("FLAGSPARSE_R_8I", "i8f32"),
     "i8i32": ("FLAGSPARSE_R_8I", "i8i32"),
     "f32c32": ("FLAGSPARSE_R_32F", "f32c32"),

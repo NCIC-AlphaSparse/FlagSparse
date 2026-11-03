@@ -1938,8 +1938,20 @@ def flagsparse_spmm_csc(
     alg="auto",
     timing=False,
     index_fallback_policy="auto",
+    *,
+    out_dtype=None,
 ):
-    """CSC SpMM using native Triton CSC kernels."""
+    """CSC SpMM using native Triton CSC kernels.
+
+    out_dtype (or out.dtype): float16 -> float16 (default) or float32, as
+    cusparseSpMM's CUDA_R_16F x CUDA_R_32F; every other value type writes itself.
+    """
+    if out_dtype is None and out is not None and data is not None and torch.is_tensor(data):
+        if data.dtype == torch.float16 and out.dtype == torch.float32:
+            out_dtype = torch.float32
+    if out_dtype is not None and data is not None and out_dtype != data.dtype:
+        if not (data.dtype == torch.float16 and out_dtype == torch.float32):
+            raise TypeError(f"{data.dtype} CSC SpMM has no {out_dtype} output")
     # BI-V's CSC non-transpose scatter path performs one atomic update per
     # (nnz, dense-column) product.  Reuse a prepared CSC->CSR topology and run
     # the row-owned CSR kernel instead; the conversion is cached by the sparse
@@ -1995,7 +2007,7 @@ def flagsparse_spmm_csc(
         )
         return mixed_spmx.spmm_csr_mixed(
             csr_data, csr_cols, csr_ptr, B, csr_shape, out=out,
-            return_time=return_time,
+            out_dtype=out_dtype, return_time=return_time,
         )
 
     # float16 is not in SUPPORTED_SPMM_CSC_VALUE_DTYPES: the `non` route scatters
@@ -2007,8 +2019,10 @@ def flagsparse_spmm_csc(
     # thing in float32 (the same "atomic_add on a float32 buffer, cast at the
     # end" shape COO already uses) and cast back once at this public boundary.
     if prepared is None and data is not None and data.dtype == torch.float16:
+        result_dtype = out_dtype or torch.float16
         if (
             _is_mthreads_runtime()
+            and result_dtype == torch.float16
             and indices is not None and indptr is not None and shape is not None
             and B is not None and B.dtype == torch.float16
             and not return_meta and not timing
@@ -2058,7 +2072,7 @@ def flagsparse_spmm_csc(
             index_fallback_policy=index_fallback_policy,
         )
         pieces = list(result) if isinstance(result, tuple) else [result]
-        pieces[0] = pieces[0].to(torch.float16)
+        pieces[0] = pieces[0].to(result_dtype)
         if out is not None:
             out.copy_(pieces[0])
             pieces[0] = out
@@ -2119,6 +2133,9 @@ def flagsparse_spmm_csc(
         return_meta=return_meta,
         timing=timing,
     )
+    result_dtype = (C[0] if return_time or return_meta else C).dtype
+    if out_dtype is not None and out_dtype != result_dtype:
+        raise TypeError(f"this CSC SpMM writes {result_dtype}, not {out_dtype}")
     if out is None:
         return C
     result = C[0] if return_time or return_meta else C

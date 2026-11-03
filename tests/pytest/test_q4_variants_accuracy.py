@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The 45 variants of conf/operators.yaml's q4_variants list, one case each.
+"""The 45 q4 variants plus the 40 batch-3 variants (docs/NEW_OPERATORS_BATCH3.md)
+of conf/operators.yaml's ``delivery_variants``, one case each.
 
 Every case runs the public operator on the accelerator and compares it with a CPU
 float64 / complex128 golden (integer outputs exactly). Case ids are the variant
@@ -145,7 +146,8 @@ def spvv(dtype, out_dtype, op):
         n = shape[0] * 4
         idx = torch.randperm(n, generator=gen)[: shape[1]].to(torch.int32)
         x, y = _rand((shape[1],), dtype, gen), _rand((n,), dtype, gen)
-        result = fs.flagsparse_spvv(*_dev(x, idx, y), op=op)
+        kw = {"out_dtype": out_dtype} if (dtype, out_dtype) == (torch.int8, torch.float32) else {}
+        result = fs.flagsparse_spvv(*_dev(x, idx, y), op=op, **kw)
         xr = _wide(x).conj() if op == "conj" else _wide(x)
         return result.reshape(1), (xr * _wide(y)[idx.long()]).sum().reshape(1), out_dtype
     return build
@@ -181,23 +183,27 @@ def spmv_csr(dtype, op="non", out_dtype=None, x_dtype=None):
     return build
 
 
-def spmv_coo(dtype, op="non", out_dtype=None):
+def spmv_coo(dtype, op="non", out_dtype=None, x_dtype=None):
+    def build(_unused, shape, gen):
+        m, k, _ = shape
+        A = _sparse(m, k, dtype, gen)
+        xd = x_dtype or dtype
+        x = _rand((k if op == "non" else m,), xd, gen)
+        kw = {} if out_dtype is None else {"out_dtype": out_dtype}
+        y = fs.flagsparse_spmv_coo(*_coo(A), *_dev(x), shape=(m, k), op=op, **kw)
+        ref = _op(_wide(A).to(_wide(x).dtype), op) @ _wide(x)
+        return y, ref, out_dtype or xd
+    return build
+
+
+def spmv_csc(dtype, op="non", out_dtype=None):
     def build(_unused, shape, gen):
         m, k, _ = shape
         A = _sparse(m, k, dtype, gen)
         x = _rand((k if op == "non" else m,), dtype, gen)
         kw = {} if out_dtype is None else {"out_dtype": out_dtype}
-        y = fs.flagsparse_spmv_coo(*_coo(A), *_dev(x), shape=(m, k), op=op, **kw)
+        y = fs.flagsparse_spmv_csc(*_csc(A), *_dev(x), shape=(m, k), op=op, **kw)
         return y, _op(_wide(A), op) @ _wide(x), out_dtype or dtype
-    return build
-
-
-def spmv_csc(dtype):
-    def build(_unused, shape, gen):
-        m, k, _ = shape
-        A, x = _sparse(m, k, dtype, gen), _rand((k,), dtype, gen)
-        y = fs.flagsparse_spmv_csc(*_csc(A), *_dev(x), shape=(m, k))
-        return y, _wide(A) @ _wide(x), dtype
     return build
 
 
@@ -218,22 +224,30 @@ def spmm_csr(dtype, op_a="non", op_b="non", layout="row", out_dtype=None):
     return build
 
 
-def spmm_coo(dtype, out_dtype=None):
+def spmm_coo(dtype, op_a="non", layout="row", out_dtype=None, op_b="non"):
     def build(_unused, shape, gen):
         m, k, n = shape
-        A, B = _sparse(m, k, dtype, gen), _rand((k, n), dtype, gen)
+        A = _sparse(m, k, dtype, gen) if op_a == "non" else _sparse(k, m, dtype, gen)
+        B = _rand((k, n), dtype, gen) if op_b == "non" else _rand((n, k), dtype, gen)
+        (B_d,) = _dev(B)
+        if layout == "col":
+            B_d = B_d.t().contiguous().t()
         kw = {"out_dtype": out_dtype} if out_dtype is not None else {}
-        C = fs.flagsparse_spmm_coo(*_coo(A), *_dev(B), (m, k), **kw)
-        return C, _wide(A) @ _wide(B), out_dtype or dtype
+        if op_b != "non":
+            kw["op_b"] = op_b
+        C = fs.flagsparse_spmm_coo(*_coo(A), B_d, tuple(A.shape), op=op_a, **kw)
+        return C, _op(_wide(A), op_a) @ _op(_wide(B), op_b), out_dtype or dtype
     return build
 
 
-def spmm_csc(dtype):
+def spmm_csc(dtype, op_a="non", out_dtype=None):
     def build(_unused, shape, gen):
         m, k, n = shape
-        A, B = _sparse(m, k, dtype, gen), _rand((k, n), dtype, gen)
-        C = fs.flagsparse_spmm_csc(*_csc(A), *_dev(B), (m, k))
-        return C, _wide(A) @ _wide(B), dtype
+        A = _sparse(m, k, dtype, gen) if op_a == "non" else _sparse(k, m, dtype, gen)
+        B = _rand((k, n), dtype, gen)
+        kw = {"out_dtype": out_dtype} if out_dtype is not None else {}
+        C = fs.flagsparse_spmm_csc(*_csc(A), *_dev(B), tuple(A.shape), op=op_a, **kw)
+        return C, _op(_wide(A), op_a) @ _wide(B), out_dtype or dtype
     return build
 
 
@@ -250,6 +264,40 @@ def spgemm(dtype):
             c_data.cpu(), c_shape
         ).to_dense()
         return C, _wide(A) @ _wide(B), dtype
+    return build
+
+
+def gemvi(dtype, op="non"):
+    def build(_unused, shape, gen):
+        m, k, _ = shape
+        A = _rand((m, k), dtype, gen)
+        n_in, n_out = (k, m) if op == "non" else (m, k)
+        idx = torch.randperm(n_in, generator=gen)[: max(1, n_in // 4)].to(torch.int32)
+        x, y = _rand((idx.numel(),), dtype, gen), _rand((n_out,), dtype, gen)
+        A_d, x_d, idx_d, y_d = _dev(A, x, idx, y)
+        A_d = A_d.t().contiguous().t()  # column-major, as cusparse<t>gemvi stores A
+        fs.flagsparse_gemvi(A_d, x_d, idx_d, y_d, op=op, alpha=1.5, beta=-0.5)
+        dense_x = torch.zeros(n_in, dtype=_wide(x).dtype)
+        dense_x[idx.long()] = _wide(x)
+        return y_d, 1.5 * (_op(_wide(A), op) @ dense_x) - 0.5 * _wide(y), dtype
+    return build
+
+
+def geam(dtype):
+    def build(_unused, shape, gen):
+        m, k, _ = shape
+        A, B = _sparse(m, k, dtype, gen), _sparse(m, k, dtype, gen, 0.25)
+        c_data, c_indices, c_indptr = fs.flagsparse_geam_csr(
+            *_csr(A), *_csr(B), (m, k), alpha=1.5, beta=-0.5
+        )
+        ptr, cols = c_indptr.cpu().to(torch.int64), c_indices.cpu().to(torch.int64)
+        rows = torch.repeat_interleave(torch.arange(m), ptr.diff())
+        same_row = rows[1:] == rows[:-1]
+        assert bool((cols[1:][same_row] > cols[:-1][same_row]).all()), "C columns not sorted"
+        union = (A != 0) | (B != 0)
+        assert int(c_data.numel()) == int(union.sum()), "C pattern is not A's union B's"
+        C = torch.sparse_csr_tensor(ptr, cols, c_data.cpu(), (m, k)).to_dense()
+        return C, 1.5 * _wide(A) - 0.5 * _wide(B), dtype
     return build
 
 
@@ -288,7 +336,7 @@ def spmm_bell(dtype, bd=4):
     return build
 
 
-def sddmm(op_a, op_b, layout, dtype=torch.float32):
+def sddmm(op_a, op_b, layout, dtype=torch.float32, out_dtype=None):
     def build(_unused, shape, gen):
         m, n, k = shape
         S = _sparse(m, n, dtype, gen, 0.2)
@@ -297,17 +345,20 @@ def sddmm(op_a, op_b, layout, dtype=torch.float32):
         A_d, B_d = _dev(A, B)
         if layout == "col":
             A_d, B_d = A_d.t().contiguous().t(), B_d.t().contiguous().t()
+        kw = {"out_dtype": out_dtype} if out_dtype is not None else {}
         vals = fs.flagsparse_sddmm_csr(
-            None, *_csr(S)[1:], A_d, B_d, shape=(m, n), op_a=op_a, op_b=op_b, dense_layout=layout
+            None, *_csr(S)[1:], A_d, B_d, shape=(m, n), op_a=op_a, op_b=op_b,
+            dense_layout=layout, **kw,
         )
         full = _op(_wide(A), op_a) @ _op(_wide(B), op_b)
         pattern = S.to_sparse_csr()
         rows = torch.repeat_interleave(torch.arange(m), pattern.crow_indices().diff())
-        return vals, full[rows, pattern.col_indices()], dtype
+        return vals, full[rows, pattern.col_indices()], out_dtype or dtype
     return build
 
 
-f16, f32, c32, i8, i32 = torch.float16, torch.float32, torch.complex64, torch.int8, torch.int32
+f16, bf16, f32, c32 = torch.float16, torch.bfloat16, torch.float32, torch.complex64
+i8, i32 = torch.int8, torch.int32
 
 # (variant, marker, builder, value dtype passed to generic builders)
 VARIANTS = [
@@ -356,12 +407,56 @@ VARIANTS = [
     ("sddmm_csr_f16_int_non_non_row", "sddmm_csr", sddmm("non", "non", "row", dtype=f16), None),
     ("spmm_csc_f16_int_non_non_row", "spmm_csc", spmm_csc(f16), None),
     ("spgemm_csr_f32_int_non_non", "spgemm_csr", spgemm(f32), None),
+    # Batch 3, first tier (docs/NEW_OPERATORS_BATCH3.md #1-#24), in that order.
+    ("axpby_f32_int", "axpby", axpby, f32),
+    ("axpby_c32_int", "axpby", axpby, c32),
+    ("spvv_f32_int_non", "spvv", spvv(f32, f32, "non"), None),
+    ("spmv_csc_f32_int_trans", "spmv_csc", spmv_csc(f32, "trans"), None),
+    ("spmv_csr_bf16f32_int_non", "spmv_csr", spmv_csr(bf16, out_dtype=f32), None),
+    ("spmv_csr_bf16_int_non", "spmv_csr", spmv_csr(bf16), None),
+    ("spmm_csc_f32_int_trans_non_row", "spmm_csc", spmm_csc(f32, op_a="trans"), None),
+    ("spmm_csr_bf16f32_int_non_non_row", "spmm_csr", spmm_csr(bf16, out_dtype=f32), None),
+    ("spvv_c32_int_non", "spvv", spvv(c32, c32, "non"), None),
+    ("spmv_csc_c32_int_conj", "spmv_csc", spmv_csc(c32, "conj"), None),
+    ("spmv_csc_f16f32_int_non", "spmv_csc", spmv_csc(f16, out_dtype=f32), None),
+    ("spmm_csr_f16f32_int_non_non_col", "spmm_csr", spmm_csr(f16, layout="col", out_dtype=f32), None),
+    ("spmm_coo_f16f32_int_non_non_row", "spmm_coo", spmm_coo(f16, out_dtype=f32), None),
+    ("spmm_csr_i8f32_int_non_non_row", "spmm_csr", spmm_csr(i8, out_dtype=f32), None),
+    ("spmm_coo_f32_int_non_non_col", "spmm_coo", spmm_coo(f32, layout="col"), None),
+    ("spmm_csr_c32_int_non_trans_row", "spmm_csr", spmm_csr(c32, op_b="trans"), None),
+    ("spmv_coo_i8f32_int_non", "spmv_coo", spmv_coo(i8, out_dtype=f32), None),
+    ("spmv_csc_i8i32_int_non", "spmv_csc", spmv_csc(i8, out_dtype=i32), None),
+    ("spmm_csr_i8i32_int_non_non_col", "spmm_csr", spmm_csr(i8, layout="col", out_dtype=i32), None),
+    ("sddmm_csr_f32_int_trans_trans_row", "sddmm_csr", sddmm("trans", "trans", "row"), None),
+    ("spmm_coo_f32_int_trans_non_row", "spmm_coo", spmm_coo(f32, op_a="trans"), None),
+    ("spmm_csr_c32_int_conj_non_row", "spmm_csr", spmm_csr(c32, op_a="conj"), None),
+    ("sddmm_csr_c32_int_non_trans_row", "sddmm_csr", sddmm("non", "trans", "row", dtype=c32), None),
+    ("sddmm_csr_f16_int_non_trans_row", "sddmm_csr", sddmm("non", "trans", "row", dtype=f16), None),
+    # Batch 3, second tier (#25-#34): parameters and transposes the public
+    # operators did not take before.
+    ("spvv_i8f32_int_non", "spvv", spvv(i8, f32, "non"), None),
+    ("spmv_csr_f16f32_int_trans", "spmv_csr", spmv_csr(f16, "trans", out_dtype=f32), None),
+    ("spmv_coo_f32c32_int_non", "spmv_coo", spmv_coo(f32, x_dtype=c32), None),
+    ("spmm_coo_f32_int_non_trans_row", "spmm_coo", spmm_coo(f32, op_b="trans"), None),
+    ("spmm_csc_f16f32_int_non_non_row", "spmm_csc", spmm_csc(f16, out_dtype=f32), None),
+    ("spmm_csr_f16f32_int_trans_non_row", "spmm_csr", spmm_csr(f16, op_a="trans", out_dtype=f32), None),
+    ("spmv_csr_f32c32_int_trans", "spmv_csr", spmv_csr(f32, "trans", x_dtype=c32), None),
+    ("spmv_coo_f16_int_trans", "spmv_coo", spmv_coo(f16, "trans"), None),
+    ("spmv_csr_i8i32_int_trans", "spmv_csr", spmv_csr(i8, "trans", out_dtype=i32), None),
+    ("sddmm_csr_f16f32_int_non_non_row", "sddmm_csr", sddmm("non", "non", "row", dtype=f16, out_dtype=f32), None),
+    # Batch 3, third tier (#35-#40): new operators and complex SpGEMM.
+    ("gemvi_f32_int_non", "gemvi", gemvi(f32), None),
+    ("gemvi_f32_int_trans", "gemvi", gemvi(f32, "trans"), None),
+    ("gemvi_c32_int_non", "gemvi", gemvi(c32), None),
+    ("geam_csr_f32_int", "geam_csr", geam(f32), None),
+    ("geam_csr_c32_int", "geam_csr", geam(c32), None),
+    ("spgemm_csr_c32_int_non_non", "spgemm_csr", spgemm(c32), None),
 ]
 
 
-def test_the_list_has_45_distinct_variants():
+def test_the_list_has_85_distinct_variants():
     names = [v[0] for v in VARIANTS]
-    assert len(names) == 45 and len(set(names)) == 45
+    assert len(names) == 85 and len(set(names)) == 85
 
 
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "x".join(map(str, s)))

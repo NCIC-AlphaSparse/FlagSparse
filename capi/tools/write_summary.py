@@ -327,13 +327,24 @@ def main():
             perf_status = (
                 "Passed" if sp else ("NoBaseline" if no_baseline else "Skipped")
             )
+            # A row that failed its accuracy gate (or its launch) fails the variant,
+            # the same rule as run_flagsparse_pytest.py's delivery projection. It
+            # used to be dropped before the checks above, so a variant with one
+            # failed matrix read Passed or NoBaseline from the rest (2026-11-02:
+            # three SpMV transposes on ASIC_680ks). The speedup stays over the
+            # rows that passed.
+            failed_rows = [r for r in vrows if r.get("status") == "failed"]
+            if failed_rows:
+                perf_status = "Failed"
             dt_data = {
-                "result": "Passed"
-                if sp
+                "result": perf_status
+                if failed_rows or sp
                 else ("NoBaseline" if no_baseline else "Unknown"),
                 "details": det,
                 "speedup": sum(sp) / len(sp) if sp else 0.0,
             }
+            if failed_rows:
+                dt_data["failed_rows"] = [shape_key(r) for r in failed_rows]
             if no_baseline:
                 dt_data["reason"] = sorted(
                     {
@@ -369,9 +380,9 @@ def main():
                 },
                 "performance": {
                     "duration": 0.0,
-                    "exit_code": 0,
                     "data_file": path.name,
                     "data": {dt: dt_data},
+                    "exit_code": 1 if failed_rows else 0,
                     "status": flaggems_status(perf_status),
                     "test_case": "matrix",
                 },

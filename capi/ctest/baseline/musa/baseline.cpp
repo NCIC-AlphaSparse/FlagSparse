@@ -116,11 +116,26 @@ musparseOrder_t map_order(flagsparseOrder_t order) {
     return order == FLAGSPARSE_ORDER_ROW ? MUSPARSE_ORDER_ROW : MUSPARSE_ORDER_COLUMN;
 }
 
-musparseOperation_t csc_as_csr_operation(const DeviceCsr& A, musparseOperation_t op) {
-    if (!A.is_csc()) return op;
-    if (op == MUSPARSE_OPERATION_NON_TRANSPOSE) return MUSPARSE_OPERATION_TRANSPOSE;
-    if (op == MUSPARSE_OPERATION_TRANSPOSE) return MUSPARSE_OPERATION_NON_TRANSPOSE;
-    return op;
+// CSC(A) goes to muSPARSE as CSR(A^T) = M, so op(A) is re-expressed on M:
+// A = M^T, A^T = M. A^H = conj(M) is a conjugate WITHOUT a transpose, which the
+// generic API cannot spell, so a complex conjugate-transpose on CSC is declined.
+// Passing CONJUGATE_TRANSPOSE through used to compute M^H x = conj(A) x, and on a
+// rectangular A it wrote rows-many outputs into a cols-long y: past the buffer,
+// which broke every later row of the SpMV sweep (2026-11-03 run, from GL7d14 on).
+// On a real A conjugation is a no-op, so A^H = A^T = M.
+Status csc_as_csr_operation(const DeviceCsr& A, musparseOperation_t* op) {
+    if (!A.is_csc()) return Status::good();
+    if (*op == MUSPARSE_OPERATION_NON_TRANSPOSE) {
+        *op = MUSPARSE_OPERATION_TRANSPOSE;
+    } else if (*op == MUSPARSE_OPERATION_TRANSPOSE) {
+        *op = MUSPARSE_OPERATION_NON_TRANSPOSE;
+    } else if (A.dtype == FLAGSPARSE_C_32F || A.dtype == FLAGSPARSE_C_64F) {
+        return Status::no("muSPARSE: CSC is passed as CSR(A^T), and op(A)=A^H would be "
+                          "conj(A^T) without a transpose, which the generic API cannot express");
+    } else {
+        *op = MUSPARSE_OPERATION_NON_TRANSPOSE;
+    }
+    return Status::good();
 }
 
 Status set_triangle(musparseSpMatDescr_t A, flagsparseFillMode_t fill,
@@ -174,7 +189,7 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
     musaDataType_t type; musparseOperation_t mop;
     if (!map_dtype(A.dtype, &type) || !map_op(op, &mop))
         return Status::no("muSPARSE: unsupported SpMV type or operation");
-    mop = csc_as_csr_operation(A, mop);
+    if (Status s = csc_as_csr_operation(A, &mop); !s.ok) return s;
     musparseSpMatDescr_t mat = nullptr; musparseDnVecDescr_t vx = nullptr, vy = nullptr;
     if (Status s = make_matrix(A, &mat); !s.ok) return s;
     const int64_t xlen = op == FLAGSPARSE_OPERATION_NON_TRANSPOSE ? A.cols : A.rows;
@@ -195,6 +210,16 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
     return result;
 }
 
+Status spmv_mixed(const DeviceCsr& A, const void* x, flagsparseDataType_t x_dtype,
+                  void* y, flagsparseDataType_t y_dtype,
+                  flagsparseDataType_t compute_dtype, const void* alpha,
+                  const void* beta, flagsparseOperation_t op, int warmup, int iters,
+                  Timing* out) {
+    if (x_dtype != A.dtype || y_dtype != A.dtype || compute_dtype != A.dtype)
+        return Status::no("muSPARSE: mixed-precision SpMV baseline is not wired");
+    return spmv_csr(A, x, y, alpha, beta, op, warmup, iters, out);
+}
+
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
@@ -203,7 +228,7 @@ Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void*
     musaDataType_t type; musparseOperation_t ma, mb;
     if (!map_dtype(A.dtype, &type) || !map_op(opA, &ma) || !map_op(opB, &mb))
         return Status::no("muSPARSE: unsupported SpMM type or operation");
-    ma = csc_as_csr_operation(A, ma);
+    if (Status s = csc_as_csr_operation(A, &ma); !s.ok) return s;
     musparseSpMatDescr_t mat = nullptr; musparseDnMatDescr_t b = nullptr, c = nullptr;
     if (Status s = make_matrix(A, &mat); !s.ok) return s;
     const int64_t k = opA == FLAGSPARSE_OPERATION_NON_TRANSPOSE ? A.cols : A.rows;
@@ -490,6 +515,17 @@ Status scatter(void* dense, const void* values, const void* indices, int64_t nnz
                                    warmup, iters, out);
     if (d) musparseDestroyDnVec(d); if (s) musparseDestroySpVec(s);
     return result;
+}
+
+// Legacy musparse<t>gemvi / <t>csrgeam2 are not verified on muSPARSE 4.3.5;
+// wire them on a MUSA box, the way the cuSPARSE template does.
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return Status::no("muSPARSE: legacy <t>gemvi baseline not wired (unverified on 4.3.5)");
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) {
+    return Status::no("muSPARSE: legacy <t>csrgeam2 baseline not wired (unverified on 4.3.5)");
 }
 
 }  // namespace fstest::baseline

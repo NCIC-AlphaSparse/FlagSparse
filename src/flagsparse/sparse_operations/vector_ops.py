@@ -104,11 +104,11 @@ class PreparedSpvv:
         "op",
     )
 
-    def __init__(self, values, indices, op):
+    def __init__(self, values, indices, op, out_dtype=None):
         self.values = values
         self.indices = indices
         self.value_dtype = values.dtype
-        self.compute_dtype = _vector_compute_dtype(values.dtype)
+        self.compute_dtype = _spvv_compute_dtype(values.dtype, out_dtype)
         self.compute_values = values.to(self.compute_dtype) if self.compute_dtype != values.dtype else values
         self.device = values.device
         self.nnz = int(values.numel())
@@ -133,7 +133,7 @@ def prepare_axpby(values, indices, y, alpha=1.0, beta=1.0, *, validate=True):
     )
 
 
-def prepare_spvv(values, indices, y, op="non", *, validate=True):
+def prepare_spvv(values, indices, y, op="non", *, validate=True, out_dtype=None):
     """Prepare Ascend SpVV metadata and reusable compute operands."""
     if not _is_ascend_runtime():
         raise ValueError("prepared SpVV is currently supported on Ascend only")
@@ -141,7 +141,9 @@ def prepare_spvv(values, indices, y, op="non", *, validate=True):
     kernel_idx = _validate_sparse_vector(
         values, indices, y, SPVV_VALUE_DTYPES, "spvv", check_range=validate
     )
-    return PreparedSpvv(values.contiguous(), kernel_idx.to(torch.int64).contiguous(), op)
+    return PreparedSpvv(
+        values.contiguous(), kernel_idx.to(torch.int64).contiguous(), op, out_dtype
+    )
 
 
 def _run_prepared_axpby(prepared, y, alpha=None, beta=None):
@@ -178,6 +180,21 @@ def _vector_compute_dtype(value_dtype):
     if value_dtype == torch.int8:
         return torch.int32
     return value_dtype
+
+
+def _spvv_compute_dtype(value_dtype, out_dtype=None):
+    """SpVV's result type: the default compute type, or int8's float32 alternative.
+
+    cuSPARSE SpVV pairs int8 inputs with an int32 or a float32 result; every other
+    input type has exactly one, so asking for it explicitly is allowed and anything
+    else is rejected rather than silently cast.
+    """
+    default = _vector_compute_dtype(value_dtype)
+    if out_dtype is None or out_dtype == default:
+        return default
+    if value_dtype == torch.int8 and out_dtype == torch.float32:
+        return torch.float32
+    raise TypeError(f"{value_dtype} SpVV has no {out_dtype} result")
 
 
 def _real_dtype(dtype):
@@ -497,8 +514,8 @@ def _spvv_complex_finalize(P, Y, N, BLOCK: tl.constexpr):
     tl.store(Y + 1, tl.sum(imag, 0))
 
 
-def _torch_spvv(values, indices, y, op):
-    compute = _vector_compute_dtype(values.dtype)
+def _torch_spvv(values, indices, y, op, compute=None):
+    compute = compute or _vector_compute_dtype(values.dtype)
     idx = indices.to(torch.int64)
     if _is_complex_dtype(compute):
         if _is_ascend_runtime():
@@ -540,11 +557,14 @@ def flagsparse_spvv(
     *,
     validate=True,
     prepared=None,
+    out_dtype=None,
 ):
     """Sparse-dense dot product ``sum(op(x)[k] * y[indices[k]])`` (``cusparseSpVV``).
 
     ``op`` is ``"non"`` or ``"conj"``. Returns a 0-d tensor of the compute dtype:
     float32 for float16/bfloat16, int32 for int8, otherwise the value dtype.
+    ``out_dtype=torch.float32`` selects int8's other cuSPARSE result type; a
+    prepared plan carries the one it was prepared with.
     ``validate=False`` skips the index range check (a host sync).
     """
     if prepared is not None:
@@ -552,6 +572,8 @@ def flagsparse_spvv(
             raise ValueError("prepared SpVV is currently supported on Ascend only")
         if not isinstance(prepared, PreparedSpvv):
             raise TypeError("prepared must be a PreparedSpvv")
+        if out_dtype is not None and out_dtype != prepared.compute_dtype:
+            raise ValueError("out_dtype must match the prepared SpVV plan")
         if values is not None or indices is not None:
             raise ValueError("pass either prepared or values/indices, not both")
         if y is None:
@@ -572,7 +594,7 @@ def flagsparse_spvv(
     )
     values = values.contiguous()
     y = y.contiguous()
-    compute = _vector_compute_dtype(values.dtype)
+    compute = _spvv_compute_dtype(values.dtype, out_dtype)
     t0 = None
     if return_time:
         _ACCEL.synchronize()
@@ -595,7 +617,7 @@ def flagsparse_spvv(
     elif _is_ascend_runtime():
         if kernel_idx.dtype != torch.int64:
             kernel_idx = kernel_idx.to(torch.int64).contiguous()
-        result = _torch_spvv(values, kernel_idx, y, op)
+        result = _torch_spvv(values, kernel_idx, y, op, compute)
     else:
         nnz = values.numel()
         n_parts = max(1, triton.cdiv(nnz, _VECTOR_BLOCK))

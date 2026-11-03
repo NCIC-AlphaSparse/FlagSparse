@@ -445,6 +445,51 @@ FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseScatter(flagsparseHandle_t handle
                                                        flagsparseConstSpVecDescr_t vecX,
                                                        flagsparseDnVecDescr_t vecY);
 
+/* ------------------------------------------------------------------ gemvi */
+/* y = alpha * op(A) * x + beta * y with A a dense m x n COLUMN-MAJOR matrix
+   (lda >= m) and x a sparse vector of nnz entries (xVal, xInd; int32 indices)
+   over op(A)'s columns: cusparse<t>gemvi, with the value type passed as
+   `valueType` instead of spelled into the name. op(A) is NON_TRANSPOSE or
+   TRANSPOSE; like cuSPARSE, there is no conjugate transpose. alpha / beta are
+   host pointers of `valueType`; idxBase must be ZERO. pBuffer may be NULL when
+   bufferSize reports 0. */
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseGemvi_bufferSize(
+    flagsparseHandle_t handle, flagsparseOperation_t transA, int m, int n, int nnz,
+    flagsparseDataType_t valueType, size_t* bufferSize);
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseGemvi(
+    flagsparseHandle_t handle, flagsparseOperation_t transA, int m, int n,
+    const void* alpha, const void* A, int lda, int nnz, const void* xVal,
+    const int* xInd, const void* beta, void* y, flagsparseIndexBase_t idxBase,
+    flagsparseDataType_t valueType, void* pBuffer);
+
+/* --------------------------------------------------------------- csrgeam2 */
+/* C = alpha * A + beta * B for m x n CSR matrices with int32 row pointers and
+   column indices, sorted and duplicate-free within each row: the three calls of
+   cusparse<t>csrgeam2 (bufferSizeExt, Xcsrgeam2Nnz, csrgeam2), with the value
+   type as `valueType` and without cuSPARSE's cusparseMatDescr_t arguments -- all
+   three matrices are general and zero-based, the only descriptor csrgeam2
+   accepts there. Nnz writes csrRowPtrC (m + 1 entries) and the total nnz of C
+   to *nnzTotalDevHostPtr (host or device memory, per the pointer mode); the
+   caller then allocates csrColIndC / csrValC and calls csrgeam2 with the same
+   workspace, which keeps what Nnz computed. A column present in both inputs is
+   stored once, also when its sum is zero. */
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseCsrgeam2_bufferSizeExt(
+    flagsparseHandle_t handle, int m, int n, const void* alpha, int nnzA,
+    const void* csrValA, const int* csrRowPtrA, const int* csrColIndA,
+    const void* beta, int nnzB, const void* csrValB, const int* csrRowPtrB,
+    const int* csrColIndB, const void* csrValC, const int* csrRowPtrC,
+    const int* csrColIndC, flagsparseDataType_t valueType, size_t* bufferSize);
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseXcsrgeam2Nnz(
+    flagsparseHandle_t handle, int m, int n, int nnzA, const int* csrRowPtrA,
+    const int* csrColIndA, int nnzB, const int* csrRowPtrB, const int* csrColIndB,
+    int* csrRowPtrC, int* nnzTotalDevHostPtr, void* workspace);
+FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseCsrgeam2(
+    flagsparseHandle_t handle, int m, int n, const void* alpha, int nnzA,
+    const void* csrValA, const int* csrRowPtrA, const int* csrColIndA,
+    const void* beta, int nnzB, const void* csrValB, const int* csrRowPtrB,
+    const int* csrColIndB, void* csrValC, const int* csrRowPtrC, int* csrColIndC,
+    flagsparseDataType_t valueType, void* pBuffer);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
