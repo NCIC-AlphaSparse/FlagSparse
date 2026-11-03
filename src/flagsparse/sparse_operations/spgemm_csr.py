@@ -274,6 +274,42 @@ def prepare_spgemm_csr(
     )
 
 
+def _esc_gather(values, index):
+    """``values[index]``, with a complex tensor gathered through its real view.
+
+    torch_musa has no complex index kernel ("IndexMusa" not implemented for
+    'ComplexFloat', MTT S5000, 2026-11-03), and ESC is the SpGEMM path there, so
+    the product, the reorder and the reduction below all stay on real views.
+    """
+    if values.dtype.is_complex:
+        return torch.view_as_complex(torch.view_as_real(values)[index])
+    return values[index]
+
+
+def _esc_mul(a, b):
+    """Elementwise ``a * b``; complex operands multiply on their real views."""
+    if not a.dtype.is_complex:
+        return a * b
+    ar, ai = torch.view_as_real(a).unbind(-1)
+    br, bi = torch.view_as_real(b).unbind(-1)
+    return torch.view_as_complex(
+        torch.stack((ar * br - ai * bi, ar * bi + ai * br), dim=-1)
+    )
+
+
+def _esc_sum_duplicates(n_out, inverse, values, dtype, device):
+    """``zeros(n_out).index_add_(0, inverse, values)``, through the real view for complex."""
+    if dtype.is_complex:
+        out = torch.zeros(
+            (n_out, 2), dtype=torch.view_as_real(values).dtype, device=device
+        )
+        out.index_add_(0, inverse, torch.view_as_real(values))
+        return torch.view_as_complex(out)
+    out = torch.zeros(n_out, dtype=dtype, device=device)
+    out.index_add_(0, inverse, values)
+    return out
+
+
 def _spgemm_esc_compute(prepared):
     """C = A @ B via a single global expand-sort-reduce (ESC).
 
@@ -325,16 +361,15 @@ def _spgemm_esc_compute(prepared):
     within = torch.arange(total, device=device) - torch.repeat_interleave(base, seg)
     bpos = b_indptr64[k][ap] + within
     out_col = b_indices[bpos].to(torch.int64)
-    out_val = a_data[ap] * b_data[bpos]
+    out_val = _esc_mul(_esc_gather(a_data, ap), _esc_gather(b_data, bpos))
     out_row = a_row[ap]
 
     key = out_row * n_cols + out_col
     order = torch.argsort(key)
     key_sorted = key[order]
-    val_sorted = out_val[order]
+    val_sorted = _esc_gather(out_val, order)
     uniq_key, inverse = torch.unique_consecutive(key_sorted, return_inverse=True)
-    c_data = torch.zeros(uniq_key.numel(), dtype=dtype, device=device)
-    c_data.index_add_(0, inverse, val_sorted)
+    c_data = _esc_sum_duplicates(uniq_key.numel(), inverse, val_sorted, dtype, device)
     c_rows = torch.div(uniq_key, n_cols, rounding_mode="floor")
     c_indices = (uniq_key - c_rows * n_cols).to(torch.int32)
 
@@ -887,16 +922,17 @@ def _spgemm_esc_expand_rows(prepared, rows):
     within_b = torch.arange(total, device=device) - torch.repeat_interleave(base, seg)
     bpos = b_indptr64[k][aap] + within_b
     out_col = b_indices[bpos].to(torch.int64)
-    out_val = a_data[ap][aap] * b_data[bpos]
+    out_val = _esc_mul(
+        _esc_gather(_esc_gather(a_data, ap), aap), _esc_gather(b_data, bpos)
+    )
     out_row = arow[aap]
 
     key = out_row * n_cols + out_col
     order = torch.argsort(key)
     key_sorted = key[order]
-    val_sorted = out_val[order]
+    val_sorted = _esc_gather(out_val, order)
     uniq_key, inverse = torch.unique_consecutive(key_sorted, return_inverse=True)
-    cval = torch.zeros(uniq_key.numel(), dtype=dtype, device=device)
-    cval.index_add_(0, inverse, val_sorted)
+    cval = _esc_sum_duplicates(uniq_key.numel(), inverse, val_sorted, dtype, device)
     crow = torch.div(uniq_key, n_cols, rounding_mode="floor")
     ccol = (uniq_key - crow * n_cols).to(torch.int32)
     return crow, ccol, cval

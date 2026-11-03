@@ -65,7 +65,7 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_10
 - **`tl.atomic_add`**：散加 kernel 在 MUSA 上用到 f32 和 int32 的原子加，以前 MUSA 的混合精度路径没用过，属于新的风险点。
 - **`torch.sparse` 没有矩阵乘**：geam（CSR 加法）、spgemm（CSR 乘法）的 PyTorch 基线在 MUSA 上会失败，写进
   `pytorch_reason`。gemvi 的 PyTorch 基线是稠密运算，不受影响。
-- **复数索引**：geam_c32、gemvi_c32 的 kernel 都通过 `view_as_real` 访问数据。q4 基准构造 Aᵀ 时用的是
+- **复数索引**：geam_c32、gemvi_c32 的 kernel 都通过 `view_as_real` 访问数据（spgemm 的 ESC 当时漏了，见下面 11-03 一节）。q4 基准构造 Aᵀ 时用的是
   `_common._gather_values`，不会碰到 `IndexMusa` 对 ComplexFloat 的限制。
 
 **跑完要确认：**
@@ -78,6 +78,27 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_10
 4. 40 个新变体在 C API 里各自是什么状态（Passed、NoBaseline 还是由 Python 补位）。合并后的
    `summary_split.json` 里看 `capi_performance` 字段就知道。有 `not_supported` 或精度失败的，贴 C API 的 detail。
 5. 散加 kernel 和 spgemm c32 有没有报错或卡死。
+
+**2026-11-03 那一轮（`results_mthreads_105_20261103_0509`，HEAD c8993be）的结果和修复：**
+
+精度 104/105，性能 56 Passed、39 Failed、10 NoBaseline。39 个 Failed 里 SpMV 占 35 个，它们是一个基线 bug 连带出来的，
+不是 SpMV 本身坏了：
+
+- **muSPARSE 的 CSC conj 基线写越界**（已修，`capi/ctest/baseline/musa/baseline.cpp::csc_as_csr_operation`）。CSC(A)
+  是按 CSR(Aᵀ)=M 交给 muSPARSE 的，非转置和转置互换没问题，但 conj 原样传了下去，于是算的是 Mᴴx = conj(A)x。
+  - 方阵上只是算错：ASIC_680ks 上的误差比是 6.9e7，结果这个"厂商也没过"让我们拿到了一个不该给的 pass_relaxed。
+  - 长方矩阵 GL7d14（171375×47271）上，它往长度 47271 的 y 里写了 171375 个值，越界写坏了显存，从这一行起整个
+    SpMV 进程后面的行几乎都错（误差比约 1/tol，"INVALID_VALUE"）。
+  - 10-19 那轮没有 `spmv_csc_c32_int_conj`，所以当时没触发。
+  - 现在 complex 的 CSC conj 直接拒绝并写明原因（通用 API 表达不了不带转置的共轭）；实数的 conj 按 trans 处理。
+- **spgemm c32 精度 Failed**（已修，`spgemm_csr.py` 的 ESC）：torch_musa 没有 complex 的索引 kernel，报
+  `"IndexMusa" not implemented for 'ComplexFloat'`。上面"复数索引"那条只查了 geam/gemvi，漏了 ESC。现在 ESC
+  里复数的取值、乘法和重复项累加都在 `view_as_real` 视图上做。在 CUDA 上和 SciPy 对照过，complex64、f32、f64 都正确，
+  MUSA 上还没跑过。
+- 修完以后还剩下的（需要在 MUSA 上复测确认）：
+  - `spmm_coo_f32_int_trans_non_row`：ASIC_680ks 上误差比 1.36，没有 muSPARSE 基线，判不了放宽。
+  - `spmm_csr_c32_int_conj_non_row`：ASIC_680ks 上 1.36，muSPARSE 是 0.07，属于我们自己的精度差距。
+  - 10 个 NoBaseline：混合精度 SpMM 7 个、gemvi_c32、geam f32/c32。
 
 ## 要做的事
 
