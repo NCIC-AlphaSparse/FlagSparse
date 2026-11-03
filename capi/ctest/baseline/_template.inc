@@ -588,4 +588,173 @@ Status scatter(void* dense, const void* sparse_val, const void* sparse_idx,
     return result;
 }
 
+// -------------------------------------------------------- gemvi / csrgeam2
+//
+// Legacy (type-prefixed) API, so only where a backend says it has it: the
+// vendor libraries mirroring cuSPARSE's generic API need not carry these, and a
+// missing symbol here would break that whole baseline build, not one row.
+
+#if defined(FS_SP_LEGACY_GEMVI_CSRGEAM2)
+
+Status gemvi(flagsparseOperation_t op, int m, int n, const void* alpha, const void* A,
+             int lda, int nnz, const void* x_val, const void* x_ind, const void* beta,
+             void* y, flagsparseDataType_t dtype, int warmup, int iters, Timing* out) {
+    FS_SP_OPERATION vop;
+    if (!map_op(op, &vop)) return Status::no("baseline: unmapped operation");
+    int bytes = 0;
+    FS_SP_STATUS st;
+    switch (dtype) {
+        case FLAGSPARSE_R_32F: st = FS_SP(Sgemvi_bufferSize)(vendor(), vop, m, n, nnz, &bytes); break;
+        case FLAGSPARSE_R_64F: st = FS_SP(Dgemvi_bufferSize)(vendor(), vop, m, n, nnz, &bytes); break;
+        case FLAGSPARSE_C_32F: st = FS_SP(Cgemvi_bufferSize)(vendor(), vop, m, n, nnz, &bytes); break;
+        case FLAGSPARSE_C_64F: st = FS_SP(Zgemvi_bufferSize)(vendor(), vop, m, n, nnz, &bytes); break;
+        default: return Status::no("baseline: gemvi value type unsupported");
+    }
+    if (st != FS_SP_E(STATUS_SUCCESS)) return Status::no(fail("gemvi_bufferSize", st));
+    ad::DevicePtr buf = 0;
+    if (ad::device_malloc(&buf, static_cast<std::size_t>(std::max(bytes, 1))) !=
+        FLAGSPARSE_STATUS_SUCCESS) {
+        return Status::no("baseline: gemvi buffer allocation failed");
+    }
+    void* pbuf = reinterpret_cast<void*>(buf);
+    const auto* ind = static_cast<const int*>(x_ind);
+    Status result = timed(
+        [&]() -> Status {
+            FS_SP_STATUS s;
+            switch (dtype) {
+                case FLAGSPARSE_R_32F:
+                    s = FS_SP(Sgemvi)(vendor(), vop, m, n, static_cast<const float*>(alpha),
+                                      static_cast<const float*>(A), lda, nnz,
+                                      static_cast<const float*>(x_val), ind,
+                                      static_cast<const float*>(beta), static_cast<float*>(y),
+                                      FS_SP_E(INDEX_BASE_ZERO), pbuf);
+                    break;
+                case FLAGSPARSE_R_64F:
+                    s = FS_SP(Dgemvi)(vendor(), vop, m, n, static_cast<const double*>(alpha),
+                                      static_cast<const double*>(A), lda, nnz,
+                                      static_cast<const double*>(x_val), ind,
+                                      static_cast<const double*>(beta), static_cast<double*>(y),
+                                      FS_SP_E(INDEX_BASE_ZERO), pbuf);
+                    break;
+                case FLAGSPARSE_C_32F:
+                    s = FS_SP(Cgemvi)(vendor(), vop, m, n,
+                                      static_cast<const FS_SP_COMPLEX*>(alpha),
+                                      static_cast<const FS_SP_COMPLEX*>(A), lda, nnz,
+                                      static_cast<const FS_SP_COMPLEX*>(x_val), ind,
+                                      static_cast<const FS_SP_COMPLEX*>(beta),
+                                      static_cast<FS_SP_COMPLEX*>(y), FS_SP_E(INDEX_BASE_ZERO),
+                                      pbuf);
+                    break;
+                default:
+                    s = FS_SP(Zgemvi)(vendor(), vop, m, n,
+                                      static_cast<const FS_SP_DCOMPLEX*>(alpha),
+                                      static_cast<const FS_SP_DCOMPLEX*>(A), lda, nnz,
+                                      static_cast<const FS_SP_DCOMPLEX*>(x_val), ind,
+                                      static_cast<const FS_SP_DCOMPLEX*>(beta),
+                                      static_cast<FS_SP_DCOMPLEX*>(y), FS_SP_E(INDEX_BASE_ZERO),
+                                      pbuf);
+                    break;
+            }
+            return s == FS_SP_E(STATUS_SUCCESS) ? Status::good() : Status::no(fail("gemvi", s));
+        },
+        warmup, iters, out);
+    ad::device_free(buf);
+    return result;
+}
+
+Status csrgeam2(const DeviceCsr& A, const DeviceCsr& B, const void* alpha, const void* beta,
+                void* c_ptr, void* c_ind, void* c_val, int64_t c_capacity, int warmup,
+                int iters, Timing* out) {
+    const flagsparseDataType_t dtype = A.dtype;
+    if (dtype != FLAGSPARSE_R_32F && dtype != FLAGSPARSE_R_64F && dtype != FLAGSPARSE_C_32F &&
+        dtype != FLAGSPARSE_C_64F) {
+        return Status::no("baseline: csrgeam2 value type unsupported");
+    }
+    const int m = static_cast<int>(A.rows), n = static_cast<int>(A.cols);
+    const int nnz_a = static_cast<int>(A.nnz), nnz_b = static_cast<int>(B.nnz);
+    FS_SP_MAT_DESCR da = nullptr, db = nullptr, dc = nullptr;
+    FS_SP(CreateMatDescr)(&da);
+    FS_SP(CreateMatDescr)(&db);
+    FS_SP(CreateMatDescr)(&dc);
+    const auto* ap = static_cast<const int*>(A.indptr);
+    const auto* ai = static_cast<const int*>(A.indices);
+    const auto* bp = static_cast<const int*>(B.indptr);
+    const auto* bi = static_cast<const int*>(B.indices);
+    auto* cp = static_cast<int*>(c_ptr);
+    auto* ci = static_cast<int*>(c_ind);
+    std::size_t bytes = 0;
+    FS_SP_STATUS st;
+#define FS_GEAM_ARGS(T)                                                                    \
+    vendor(), m, n, static_cast<const T*>(alpha), da, nnz_a, static_cast<const T*>(A.values), \
+        ap, ai, static_cast<const T*>(beta), db, nnz_b, static_cast<const T*>(B.values), bp, bi, dc
+    switch (dtype) {
+        case FLAGSPARSE_R_32F:
+            st = FS_SP(Scsrgeam2_bufferSizeExt)(FS_GEAM_ARGS(float), static_cast<const float*>(c_val), cp, ci, &bytes);
+            break;
+        case FLAGSPARSE_R_64F:
+            st = FS_SP(Dcsrgeam2_bufferSizeExt)(FS_GEAM_ARGS(double), static_cast<const double*>(c_val), cp, ci, &bytes);
+            break;
+        case FLAGSPARSE_C_32F:
+            st = FS_SP(Ccsrgeam2_bufferSizeExt)(FS_GEAM_ARGS(FS_SP_COMPLEX), static_cast<const FS_SP_COMPLEX*>(c_val), cp, ci, &bytes);
+            break;
+        default:
+            st = FS_SP(Zcsrgeam2_bufferSizeExt)(FS_GEAM_ARGS(FS_SP_DCOMPLEX), static_cast<const FS_SP_DCOMPLEX*>(c_val), cp, ci, &bytes);
+            break;
+    }
+    Status result = Status::good();
+    ad::DevicePtr buf = 0;
+    if (st != FS_SP_E(STATUS_SUCCESS)) {
+        result = Status::no(fail("csrgeam2_bufferSizeExt", st));
+    } else if (ad::device_malloc(&buf, std::max<std::size_t>(bytes, 1)) != FLAGSPARSE_STATUS_SUCCESS) {
+        result = Status::no("baseline: csrgeam2 buffer allocation failed");
+    } else {
+        void* work = reinterpret_cast<void*>(buf);
+        result = timed(
+            [&]() -> Status {
+                int nnz_c = 0;
+                auto s = FS_SP(Xcsrgeam2Nnz)(vendor(), m, n, da, nnz_a, ap, ai, db, nnz_b, bp, bi,
+                                             dc, cp, &nnz_c, work);
+                if (s != FS_SP_E(STATUS_SUCCESS)) return Status::no(fail("Xcsrgeam2Nnz", s));
+                if (nnz_c > c_capacity) return Status::no("baseline: csrgeam2 C larger than given");
+                switch (dtype) {
+                    case FLAGSPARSE_R_32F:
+                        s = FS_SP(Scsrgeam2)(FS_GEAM_ARGS(float), static_cast<float*>(c_val), cp, ci, work);
+                        break;
+                    case FLAGSPARSE_R_64F:
+                        s = FS_SP(Dcsrgeam2)(FS_GEAM_ARGS(double), static_cast<double*>(c_val), cp, ci, work);
+                        break;
+                    case FLAGSPARSE_C_32F:
+                        s = FS_SP(Ccsrgeam2)(FS_GEAM_ARGS(FS_SP_COMPLEX), static_cast<FS_SP_COMPLEX*>(c_val), cp, ci, work);
+                        break;
+                    default:
+                        s = FS_SP(Zcsrgeam2)(FS_GEAM_ARGS(FS_SP_DCOMPLEX), static_cast<FS_SP_DCOMPLEX*>(c_val), cp, ci, work);
+                        break;
+                }
+                return s == FS_SP_E(STATUS_SUCCESS) ? Status::good() : Status::no(fail("csrgeam2", s));
+            },
+            warmup, iters, out);
+        ad::device_free(buf);
+    }
+#undef FS_GEAM_ARGS
+    FS_SP(DestroyMatDescr)(da);
+    FS_SP(DestroyMatDescr)(db);
+    FS_SP(DestroyMatDescr)(dc);
+    return result;
+}
+
+#else
+
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return Status::no(std::string(FS_SP_NAME) +
+                      ": legacy <t>gemvi is not wired for this library (no verified symbol)");
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) {
+    return Status::no(std::string(FS_SP_NAME) +
+                      ": legacy <t>csrgeam2 is not wired for this library (no verified symbol)");
+}
+
+#endif  // FS_SP_LEGACY_GEMVI_CSRGEAM2
+
 }  // namespace fstest::baseline

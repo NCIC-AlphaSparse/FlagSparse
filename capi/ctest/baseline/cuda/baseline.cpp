@@ -34,4 +34,11 @@
 #define FS_SP_SPSV_DESCR   cusparseSpSVDescr_t
 #define FS_SP_SPSM_DESCR   cusparseSpSMDescr_t
 
+// Legacy API the template only binds where a backend vouches for the symbols.
+#define FS_SP_LEGACY_GEMVI_CSRGEAM2 1
+#define FS_SP_MAT_DESCR    cusparseMatDescr_t
+#define FS_SP_STATUS       cusparseStatus_t
+#define FS_SP_COMPLEX      cuComplex
+#define FS_SP_DCOMPLEX     cuDoubleComplex
+
 #include "../_template.inc"

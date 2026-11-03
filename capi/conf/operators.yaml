@@ -61,10 +61,11 @@ operators:
     c_api: [flagsparseAxpby]
     python_impl: [flagsparse_axpby]
     formats: [sparse_vector]
-    dtypes: [f16]
+    dtypes: [f16, f32, c64]
     index_types: [int]
     kernel_module: flagsparse_codegen/axpby.py
-    kernel_name: [axpby_scale_f16, axpby_add_f16]
+    kernel_name: [axpby_scale_f16, axpby_add_f16, axpby_scale_f32, axpby_add_f32,
+                  _scale_complex_kernel, _axpy_complex_kernel]
     dispatch: src/ops/axpby.cpp
     tests: [ctest/accuracy/test_axpby.cpp, ctest/benchmark/test_axpby.cpp]
     status: implemented
@@ -120,8 +121,8 @@ operators:
     c_api: [flagsparseSpVV, flagsparseSpVV_bufferSize]
     python_impl: [flagsparse_spvv]
     formats: [sparse_vector]
-    dtypes: [c32]
-    mixed_dtypes: [f16f32, i8i32]
+    dtypes: [c32, f32]
+    mixed_dtypes: [f16f32, i8i32, i8f32]
     index_types: [int]
     ops: [non, conj]
     kernel_module: flagsparse_codegen/spvv.py
@@ -144,12 +145,13 @@ operators:
     formats: [csr]
     # f16 (spmv_csr_f16_int_non) is dtype-generic through the same
     # dispatch as f32/f64/complex -- no separate kernel needed.
-    dtypes: [f32, f64, c64, c128, f16]   # complex wired 2026-09; measured accurate vs host fp64
+    dtypes: [f32, f64, c64, c128, f16, bf16]   # complex wired 2026-09; bf16 via the mixed row tile
     index_types: [int]
     # trans is f32 only and conj_trans c32 only (atomic scatter, spmv_transpose.py);
     # mixed_dtypes are input->output pairs through mixed_spmx.py.
     ops: [non, trans, conj_trans]
-    mixed_dtypes: [f16f32, f32c32, i8f32, i8i32]
+    # A^T / A^H of the mixed pairs scatter through mixed_spmx.py (2026-11-02).
+    mixed_dtypes: [f16f32, f32c32, i8f32, i8i32, bf16f32]
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_CSR_ALG1, FLAGSPARSE_SPMV_CSR_ALG2]
     kernel_module: flagsparse_codegen/spmv_csr.py
     kernel_name: _spmv_csr_real_kernel
@@ -178,7 +180,7 @@ operators:
     index_types: [int]
     # trans is f32 only and conj_trans c32 only (direct atomic scatter).
     ops: [non, trans, conj_trans]
-    mixed_dtypes: [f16f32, i8i32]
+    mixed_dtypes: [f16f32, i8i32, i8f32, f32c32]
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_COO_ALG1,
                  FLAGSPARSE_SPMV_COO_ALG2]
     kernel_module: flagsparse_codegen/spmv_coo.py
@@ -205,6 +207,8 @@ operators:
     dtypes: [f32, f64, c64, c128, f16]
     index_types: [int]
     ops: [non, trans, conj_trans]
+    # A @ x scattered through mixed_spmx.py's CSR-of-A^T kernel (2026-11-02).
+    mixed_dtypes: [f16f32, i8i32]
     kernel_module: flagsparse_codegen/spmv_csc.py
     kernel_name: [_spmv_csc_non_real_kernel, _spmv_csc_non_complex_kernel,
                   _spmv_csc_trans_real_kernel, _spmv_csc_trans_complex_kernel]
@@ -295,7 +299,9 @@ operators:
     formats: [csc]
     dtypes: [f16, f32, c32]
     index_types: [int]
-    ops: [non]
+    # A^T: a CSC matrix is the CSR of A^T (2026-11-02).
+    ops: [non, trans]
+    mixed_dtypes: [f16f32]
     orders: [row]
     algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT]
     kernel_module: flagsparse_codegen/spmm_csc.py
@@ -315,9 +321,11 @@ operators:
     python_impl: [flagsparse_spmm_csr, flagsparse_spmm_csr_run, prepare_spmm_csr_route]
     formats: [csr]
     dtypes: [f32, f64, c64, c128, f16]
-    mixed_dtypes: [f16f32, i8i32]
+    mixed_dtypes: [f16f32, i8i32, bf16f32, i8f32]
     index_types: [int]
-    ops: [non, trans]           # f32 CSR transpose uses the atomic scatter route
+    # f32 A^T: atomic scatter (or the transposed-topology gather on CUDA); complex64
+    # A^T / A^H: the CSR of A^T built in preprocess (2026-11-02).
+    ops: [non, trans, conj_trans]
     orders: [row, col]
     algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT, FLAGSPARSE_SPMM_CSR_ALG1,
                  FLAGSPARSE_SPMM_CSR_ALG2, FLAGSPARSE_SPMM_CSR_ALG3]
@@ -349,9 +357,10 @@ operators:
     python_impl: [flagsparse_spmm_coo]
     formats: [coo]
     dtypes: [f32, f64, c64, c128, f16]
-    mixed_dtypes: [i8i32]
+    mixed_dtypes: [i8i32, f16f32]
     index_types: [int]
-    ops: [non]                  # opA trans/conj pending; opB non and trans both work
+    # f32 A^T through the CSR view of its row offsets (2026-11-02); opB non and trans both work
+    ops: [non, trans]
     orders: [row, col]
     algorithms: [FLAGSPARSE_SPMM_ALG_DEFAULT, FLAGSPARSE_SPMM_COO_ALG1,
                  FLAGSPARSE_SPMM_COO_ALG2]
@@ -412,7 +421,7 @@ operators:
             flagsparseCsrSetPointers]
     python_impl: [flagsparse_spgemm_csr, prepare_spgemm_csr]
     formats: [csr]
-    dtypes: [f32, f64]          # the hash kernels have no complex twin
+    dtypes: [f32, f64, c64]     # structure on the device; c64 values accumulate in copy()
     index_types: [int]
     ops: [non]
     algorithms: [FLAGSPARSE_SPGEMM_DEFAULT]
@@ -448,6 +457,7 @@ operators:
     # underlying Python kernel's scalar contract.
     dtypes: [f32, f64, f16, c32]
     delivery_dtypes: [f32, f64]
+    mixed_dtypes: [f16f32]
     index_types: [int]
     ops: [non, trans]           # for BOTH dense operands; conj pending
     orders: [row, col]
@@ -640,6 +650,49 @@ operators:
       Same treatment as SpSV COO: _analysis builds a row-offsets array after the
       solver's own scratch, and the CSR kernel runs over that view. No second
       kernel, no converted copy.
+
+  - id: gemvi
+    zhiyuan_name: gemvi
+    cusparse_api: cusparse<t>gemvi
+    c_api: [flagsparseGemvi, flagsparseGemvi_bufferSize]
+    python_impl: [flagsparse_gemvi]
+    formats: [sparse_vector]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    ops: [non, trans]
+    kernel_module: flagsparse_codegen/gemvi.py
+    kernel_name: [gemvi_real, gemvi_complex, gemvi_reduce]
+    dispatch: src/ops/gemvi.cpp
+    tests: [ctest/accuracy/test_gemvi.cpp, ctest/benchmark/test_gemvi.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      Dense column-major A times a sparse vector, cusparse<t>gemvi's shape with the
+      value type as a parameter. No conjugate transpose, as in cuSPARSE. A product
+      too small for the grid to fill the device splits x's entries; the partial
+      sums live in the bufferSize scratch and gemvi_reduce applies alpha / beta.
+
+  - id: geam_csr
+    zhiyuan_name: csrgeam2
+    cusparse_api: cusparse<t>csrgeam2
+    c_api: [flagsparseCsrgeam2_bufferSizeExt, flagsparseXcsrgeam2Nnz, flagsparseCsrgeam2]
+    python_impl: [flagsparse_geam_csr]
+    formats: [csr]
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int]
+    kernel_module: flagsparse_codegen/geam_csr.py
+    kernel_name: [_geam_probe_kernel, _geam_place_a_kernel, _geam_place_b_kernel,
+                  _geam_row_nnz_kernel, _geam_scan_blocks_kernel, _geam_scan_sums_kernel,
+                  _geam_scan_add_kernel]
+    dispatch: src/ops/geam.cpp
+    tests: [ctest/accuracy/test_geam.cpp, ctest/benchmark/test_geam.cpp]
+    status: implemented
+    reporting: retained
+    notes: >
+      C = alpha A + beta B, cuSPARSE's three calls without its cusparseMatDescr_t
+      arguments (general and zero-based is the only descriptor csrgeam2 takes there).
+      Rows must be sorted and duplicate-free. The same rank-based kernels as
+      flagsparse_geam_csr; its two prefix sums run as device scans.
 
   - id: sparse_format_constructors
     zhiyuan_name: 稀疏格式构造

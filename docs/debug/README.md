@@ -1,4 +1,93 @@
-# 调试手册：65 变体统一注册表，上机要做什么
+# 调试手册：交付变体注册表（现为 105 个），上机要做什么
+
+## 2026-11-02：注册表扩到 105 个变体，各后端复测计划
+
+### 这次改了什么
+
+`conf/operators.yaml` 的 `delivery_variants:` 从 65 个扩到 105 个。新增的 40 个是第三批变体，见
+[`../NEW_OPERATORS_BATCH3.md`](../NEW_OPERATORS_BATCH3.md)，按文档顺序排在列表末尾。新增的父算子有两个：
+`gemvi`、`geam_csr`。另外有几处改动会影响原有算子的行为：
+
+- **新算子**：`flagsparse_gemvi`（稠密矩阵 × 稀疏向量）和 `flagsparse_geam_csr`（C = αA + βB）。两个都是纯 Triton，
+  昇腾上走 torch_npu。
+- **混合精度路径支持转置**：`mixed_spmx.py` 新增一组原子散加 kernel，按 `y[col] += v·x[row]` 计算 Aᵀx 和 AᵀB。
+  f16/i8 的累加类型是 f32/i32，用到 f32 和 int32 的 `tl.atomic_add`。以前这里会抛 `NotImplementedError`。
+- **COO 支持"实矩阵 × 复向量"**：f32 矩阵 × c32 向量，同样走散加 kernel。
+- **新增参数**：`spvv`、`spmm_csc`、`sddmm_csr` 加了 `out_dtype`；`spmm_coo` 加了 `op_b`。
+- **spgemm 支持 complex64**：哈希路径新增 complex64 填充 kernel，用 TLE 共享内存。不用 TLE 的后端（MUSA、
+  Iluvatar、MACA）走 ESC，结果对，但很慢（CUDA 上 ESC 只有 cuSPARSE 的约 0.1 倍）。
+- **基准**：
+  - 新脚本：`tests/test_gemvi.py`（合成数据）、`tests/test_geam_csr.py`。
+  - spgemm 的 c32 行：`tests/test_spgemm.py` 只在包含 float32 的那个进程里追加。
+  - 其余新变体：由 `tests/q4_variant_bench.py` 追加。
+- **新基线只在 CUDA 上有**：gemvi、csrgeam2、通用 SpGEMM 三个 cuSPARSE 基线加在 `tests/cusparse_generic_baseline.py`。
+  其他后端照旧走 `skip_reason()`，跳过厂商列。
+- **C API 也补齐了 40 个新变体**（只影响走 split 的 MUSA）：新增 `flagsparseGemvi[_bufferSize]` 和
+  `flagsparseCsrgeam2_bufferSizeExt` / `flagsparseXcsrgeam2Nnz` / `flagsparseCsrgeam2` 两组接口，SpMV / SpMM 加了
+  混合精度转置、CSC 混合、COO `i8f32` / `f32c32`、bf16、c32 trans/conj_trans、CSC / COO 转置等路由，spvv、axpby、
+  spgemm 加了新类型。注册表里 105 个都是 `capi: true`。split 的 C API 基准族多了 `gemvi`、`geam`，自动带上。
+  gemvi / csrgeam2 的厂商基线只在 CUDA 上接了，其他后端是 `NoBaseline`。
+- **H800 参照只覆盖前 65 个**：新增的 40 个在 H800 上没跑过，所以 `--h800-reference` 补不上它们。一个变体如果在
+  本机既没有厂商基线、也没有可用的 PyTorch 基线，交付表里就没有加速比，这是预期的。
+
+### CUDA（RTX 5090）上的结果
+
+结果目录是 `pytest_results_105_cuda_20261102`：10 个交付矩阵，warmup 5、iters 20，耗时 21 分钟。
+
+- 105 个变体都在，0 missing。
+- 性能 105/105 Passed。
+- 精度 104 个 Passed，1 个 Skipped，是 `sddmm_csr_f32_int_non_non_row`。原因是 Iluvatar 专用测试的跳过原因
+  "BI-V layout specialization" 没登记，现在已加进 `EXPECTED_ACCURACY_SKIP_REASONS`，按原产物重新投影是 Passed。
+- 加速比（几何平均）：原 65 个 0.991，新 40 个 0.778。0.8 倍以下的变体有 40 个，大多是向量类和 CSC，以及
+  混合精度的 COO。
+
+C API split（`results_cuda_split_105_20261102_v2`，同样 10 个交付矩阵，约 1 小时）：
+
+- 精度 105/105 Passed，0 missing；性能 46 Passed、54 NoBaseline、5 Failed。NoBaseline 是因为 C API 没给 axpby、
+  spvv、CSC、SELL、混合精度、f16 接厂商基线，原 65 个里同类变体也是这样。
+- C API 加速比几何平均：原 65 个 0.834（34 个有基线），新 40 个 1.071（12 个有基线）。
+- C API SpMV 原来只有 cuSPARSE 的 0.02–0.4 倍，原因是 CUDA 上每行启动一个 program（耗时随行数涨，不随 nnz）。
+  现在 CUDA 的实数 CSR/COO 走 row_tile、c32 在 alpha=1/beta=0 时走 Python 的复数 row_tile，10 矩阵几何平均：
+  csr f32 1.17、f64 1.14，coo f32 1.00、f64 1.07，c32 csr 0.77、coo 0.70。MUSA 和其他后端的路由没变。
+- 5 个 Failed 是 `capi/tools/write_summary.py` 改了规则之后如实报出来的：一个变体只要有一行没过 C API 的精度门槛，
+  性能就记 Failed（和 `run_flagsparse_pytest.py` 的规则一致）。以前这一行被直接丢掉，剩下的行照常算
+  NoBaseline。这 5 个都没有厂商基线：`spmv_csc_f32_int_trans`、`spmv_csc_c32_int_conj`、`spmv_csr_f32c32_int_trans`、
+  `spmm_csc_f32_int_trans_non_row`（ASIC_680ks）和 `spmm_csc_c32_int_non_non_row`（cfd2）。原子散加的严格误差比
+  1.0–1.36，放宽后约 0.01，但规范 6.3.1 的放宽要厂商基线来证明矩阵两边都难，没有基线就只能判失败。累加顺序
+  不确定，压线的行每轮会变（`spmm_csc_f32_int_non_non_row` 上一轮失败、这一轮通过）。交付精度（pytest）都是 Passed。
+- split 在 CUDA 上不能带 `--h800-reference`（会报 "no card known" 退出），这个参数只给非 CUDA 后端用。
+- 105 个变体的列表写进了仓库根目录 `Q4算子列表.xlsx` 的 `delivery_105` 工作表（前 65 个已交付，后 40 个新增）。
+
+在 CUDA 上用 `FLAGSPARSE_BACKEND` 模拟各后端的派发，跑 85 个 q4 变体加上 gemvi/geam 的边界用例：
+
+- MACA、MUSA、Iluvatar 都是 216/216。
+- DCU 有 10 个失败，报错都是 `row_tile: unverified capabilities for rocm/120`：8 个是以前记过的那 4 个变体，
+  另外 2 个是新加的 `spmv_csr_bf16_int_non`。这是 CUDA 卡上模拟不出 gfx 架构造成的，不是代码 bug。
+
+这些都不是真机结果。
+
+### 所有后端都要注意的
+
+1. **`--ops` 写死的命令要加上 `gemvi,geam_csr`**。DCU、MACA、Iluvatar 原来的命令列的是 13 个算子，漏了这两个，
+   对应的 5 个变体会变成 `NotFound`。各后端文件里的新命令已经加好了。昇腾的命令和 MUSA 的 split 本来就带
+   `--delivery-only`，会自动跟上。
+2. **结果目录用新名字**（`results_<后端>_105_<日期>`），不要往 65 变体的旧目录里补跑。
+3. **新代码第一次在真机上跑**，最该先看的是：
+   - 原子散加 kernel：f32 和 int32 的 `tl.atomic_add`。
+   - spgemm c32 在 ESC 路径上用到的复数 torch 运算。
+   - 3 个 bf16 变体：`spmv_csr_bf16_int_non`、`spmv_csr_bf16f32_int_non`、`spmm_csr_bf16f32_int_non_non_row`。
+4. 跑完把 `python3 tools/delivery_table.py <结果目录> --show-baseline` 的完整输出贴回来。每个后端文件的
+   "2026-11-02 复测计划"一节列了这个后端要单独确认的项目。
+
+### 各后端的复测计划
+
+| 后端 | 文件 | 这轮最主要的风险或缺口 |
+|---|---|---|
+| 海光 DCU | [`DCU.md`](DCU.md) | 新变体都没有厂商基线（hipSPARSE 没接），只有 PyTorch 列；bf16 走 row_tile |
+| 沐曦 MACA | [`MACA.md`](MACA.md) | 没有厂商库；spgemm c32 走 ESC；SDDMM 的 PyTorch 参考会被校验拦下 |
+| 摩尔 MUSA | [`MUSA.md`](MUSA.md) | split 的性能取自 C API；40 个新变体的 C API 路由是 11-02 新加的，第一次在 MUSA 上跑；C API 没测到的由 Python 那一半补位（要带 `--h800-reference`）；gemvi/geam 没有 muSPARSE 基线 |
+| 天数 Iluvatar | [`ILUVATAR.md`](ILUVATAR.md) | bf16 支持未知；spgemm c32 走 ESC；`torch.sparse` 会静默算错 |
+| 昇腾 Ascend | [`ASCEND.md`](ASCEND.md) | `ASCEND_Q4_VARIANTS` 没扩：16 个变体没有精度结果，约 34 个没有性能结果；gemvi/geam 没有性能命令 |
 
 ## 背景（2026-10-08，CUDA 机器上完成）
 

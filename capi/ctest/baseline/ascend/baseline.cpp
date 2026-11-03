@@ -123,4 +123,13 @@ Status scatter(void*, const void*, const void*, int64_t, int64_t,
                    "measuring the same thing");
 }
 
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return pending("a dense gather + aclnnMv", "no CANN gemvi");
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) {
+    return pending("a sparse add", "no CANN csrgeam2");
+}
+
 }  // namespace fstest::baseline

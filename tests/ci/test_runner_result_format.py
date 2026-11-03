@@ -1193,6 +1193,25 @@ def test_the_maca_only_spmv_csr_gate_does_not_demote_a_delivery_variant():
     assert summary["skipped"] == 1
 
 
+def test_the_iluvatar_only_sddmm_layout_gate_does_not_demote_a_delivery_variant():
+    # Seen on CUDA 2026-11-02: sddmm_csr_f32_int_non_non_row read "Skipped" with its
+    # own two f32 cases passed -- the f32 token pulled in the BI-V-only cases.
+    raw = {
+        "tests/pytest/test_spgemm_sddmm_accuracy.py::test_sddmm[float32]": {
+            "params": {"dtype": "torch.float32"},
+            "result": "passed",
+        },
+        "tests/pytest/test_sddmm_iluvatar_layout_accuracy.py::test_live[f32]": {
+            "params": {"dtype": "torch.float32"},
+            "result": "skipped",
+            "reason": "Skipped: BI-V layout specialization",
+        },
+    }
+    summary = runner.summarize_accuracy_cases(raw)
+    assert summary["status"] == "Passed"
+    assert summary["skipped"] == 1
+
+
 def test_spgemm_split_path_honours_a_dtypes_override(tmp_path, monkeypatch):
     # Iluvatar passes spgemm_csr=--dtypes float32: its fp64 child could only fail.
     seen = []

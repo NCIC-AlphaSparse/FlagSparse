@@ -44,6 +44,7 @@ import triton.language as tl  # noqa: E402
 
 from flagsparse.sparse_operations.spmv_csr import (  # noqa: E402,F401
     _spmv_csr_complex_kernel,
+    _spmv_csr_complex_row_tile_kernel,
     _spmv_csr_real_kernel,
 )
 
@@ -89,5 +90,6 @@ def spmv_csr_row_tile_real(
 __all__ = [
     "_spmv_csr_real_kernel",
     "_spmv_csr_complex_kernel",
+    "_spmv_csr_complex_row_tile_kernel",
     "spmv_csr_row_tile_real",
 ]

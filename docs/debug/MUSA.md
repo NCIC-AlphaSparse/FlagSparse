@@ -5,6 +5,83 @@
 
 **MUSA 实现约束（用户于 2026-10-18 明确）**：算子计算内核必须使用 Triton，允许使用当前后端支持且经实测验证的 TLE 特性。禁止以手写 MUSA C++/`.mu` 内核、mcc 编译的计算库或 PyTorch 原生索引替代被测算子的计算内核。C API 主机封装、设备内存/流管理和厂商对照基线不属于计算内核；其他后端保持原实现。本文后半部保留的原生实验为撤回历史，不能用于全 Triton 验收。
 
+## 2026-11-02 复测计划：105 变体
+
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。命令和后面"要做的事"的第 1–4 步一样，
+只换结果目录。split 的 pytest 那一半带了 `--delivery-only`，会自动包含 `gemvi`、`geam_csr`，不用改参数。
+
+```bash
+D=results_musa_split_105_<日期>
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
+  --mode normal --benchmark-input tests/data --timeout 3600 \
+  --h800-reference \
+  --results-dir $D \
+  > $D.log 2>&1 < /dev/null &
+# 跑完后
+tail -5 $D.log
+python3 tools/delivery_table.py $D --show-baseline
+```
+
+**C API 没测到的变体由 Python 那一半补位（2026-11-02 起）：**
+
+- split 的性能原本只取 C API 的结果，Python 那一半只补 `NoBaseline`。C API 没实现或没测到的变体会被
+  `capi/tools/write_summary.py` 记成 `NotFound`。新 40 个变体一开始有 24 个 C API 没实现，2026-11-02 已在 C API
+  里全部补上（见下面"C API 现在覆盖全部 105 个变体"），所以这条补位现在只是兜底：MUSA 上某个新路由报
+  `not_supported` 或者没出行时才会用到。
+- 现在 `run_flagsparse_split_delivery.py::fill_unmeasured_from_python` 会先处理这类变体：C API 一行都没有
+  （`NotFound`），或者行全是 `not_supported`（`Skipped`、没有任何耗时明细），就改用 Python 那一半的性能结果。
+  不管有没有加速比、是不是 FAIL，只要 Python 真的测了就用。来源标成 `source: python`，原来的 C API 条目留在
+  `capi_performance`。C API 测到了的变体完全不动。
+- Python 那一半只有在带 `--h800-reference` 时才跑性能，所以上面的命令里这个参数不能省。省掉的话，这些变体
+  仍然是 `NotFound`。
+- 日志里会多一行 `variants the C API did not measure: filled from the Python half=…, still unmeasured=…`。
+- 补上的数字来自 Python 侧的基准，规模和 C API 不同。新 40 个在 H800 上没有数据，MUSA 上 `torch.sparse` 又没有
+  矩阵乘，所以这些变体大多是"性能 Passed、没有加速比"。这是实情，照实报。
+
+**C API 现在覆盖全部 105 个变体（2026-11-02，CUDA 上完成）：**
+
+- 40 个新变体全部在 C API 里有了路由，`capi: true`，`CAPI_FALSE_IDS` 为空。新增两个公开接口族：
+  `flagsparseGemvi[_bufferSize]`（对应 `cusparse<t>gemvi`）和 `flagsparseCsrgeam2_bufferSizeExt` /
+  `flagsparseXcsrgeam2Nnz` / `flagsparseCsrgeam2`（对应 `cusparse<t>csrgeam2`，去掉了 `cusparseMatDescr_t` 参数），
+  对应的 ctest 族是 `gemvi`、`geam`，split 会自动带上。
+- 在 CUDA（RTX 5090）上都测过、精度通过。**MUSA 上一个都没跑过**，下面这些是新代码：
+  - SpMV 的混合精度转置、CSC 混合、COO 的 `i8f32` / `f32c32`：Triton 原子散加（`mixed_spmx.py` 的
+    `_csr_spmv_trans_atomic_kernel` 等），f16/bf16 输出先写 f32 scratch 再转回。
+  - SpMM：CSC 转置当作 Aᵀ 的 CSR 走 `run_csr`；COO f32 转置在 CUDA 走转置拓扑 gather，**其他后端走原子散加**；
+    c32 的 `trans` / `conj_trans` 在 preprocess 里建 Aᵀ 的 CSR，再用 `_permute_values_kernel` 搬值（共轭时取反虚部）；
+    混合精度 CSR 转置 / CSC 用 `_csr_spmm_trans_atomic_kernel`。
+  - **MUSA 的 gather 判定改过**：`indirect` 从只看 CSC 改成 `(CSC && !trans) || (CSR && trans)`，原因是 CSC 转置现在
+    走 CSR 视图。这改动只在 CUDA 上验证了编译和其他后端路径，MUSA 上要重点确认 CSC / CSR 转置的 SpMM 精度。
+  - gemvi / geam / spvv f32、i8f32 / axpby f32、c32 / spgemm c32 都是新 kernel 或新分支。
+- **基线**：gemvi 和 csrgeam2 是 cuSPARSE 的 legacy 接口，只在 `ctest/baseline/cuda/baseline.cpp` 接了
+  （`FS_SP_LEGACY_GEMVI_CSRGEAM2`）。MUSA 的基线文件里是桩，返回 "legacy ... not wired"，所以这 5 个变体在 MUSA 上
+  是 `NoBaseline`，由 Python 那一半补基线。muSPARSE 有没有这两个接口没查过。
+- C API 的 spgemm 在 compute 里只在设备上算结构，值在 `copy()` 里在主机上算，计时不含值。c32 也是这样。
+
+**这个后端的风险点（针对新增的 40 个）：**
+
+- **全 Triton 约束**：
+  - gemvi、geam 和混合精度转置用的都是 Triton kernel。MUSA 上 COO 的转置和"实 × 复"不走 `_musa_coo_csr`，改走通用的
+    Triton 原子散加。
+  - spgemm c32 和 f32 一样走 ESC（MUSA 不在 `tle_hash_safe` 里），ESC 用的是 torch 的排序和归约。这一点是否满足 10-18 的
+    约束，和 f32 的 spgemm 一样，需要你判断。
+- **`tl.atomic_add`**：散加 kernel 在 MUSA 上用到 f32 和 int32 的原子加，以前 MUSA 的混合精度路径没用过，属于新的风险点。
+- **`torch.sparse` 没有矩阵乘**：geam（CSR 加法）、spgemm（CSR 乘法）的 PyTorch 基线在 MUSA 上会失败，写进
+  `pytorch_reason`。gemvi 的 PyTorch 基线是稠密运算，不受影响。
+- **复数索引**：geam_c32、gemvi_c32 的 kernel 都通过 `view_as_real` 访问数据。q4 基准构造 Aᵀ 时用的是
+  `_common._gather_values`，不会碰到 `IndexMusa` 对 ComplexFloat 的限制。
+
+**跑完要确认：**
+
+1. 精度那一半：105 个变体的精度是不是都 Passed（精度由 pytest 产出，不受上面 C API 缺口的影响）。
+2. 日志里 `NoBaseline variants filled from the Python half=…, from the C API time=…, still without a baseline=…` 这一行
+   原样贴回。
+3. 日志里 `variants the C API did not measure: filled from the Python half=…, still unmeasured=…` 这一行原样贴回。
+   按设计 `still unmeasured` 应该是 0，不是 0 就列出是哪些变体。
+4. 40 个新变体在 C API 里各自是什么状态（Passed、NoBaseline 还是由 Python 补位）。合并后的
+   `summary_split.json` 里看 `capi_performance` 字段就知道。有 `not_supported` 或精度失败的，贴 C API 的 detail。
+5. 散加 kernel 和 spgemm c32 有没有报错或卡死。
+
 ## 要做的事
 
 环境按 `../MUSA.md` 第 2 节配好（`FLAGSPARSE_BACKEND=mthreads`、`MUSA_HOME`）后，跑一轮 split：

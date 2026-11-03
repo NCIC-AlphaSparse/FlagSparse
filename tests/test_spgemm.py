@@ -2055,6 +2055,15 @@ def run_all_dtypes_export_csv(
                 print("-" * 320)
     _clear_spgemm_inflight(csv_path)
     print(f"Wrote {written} rows to {csv_path}")
+    # complex64 (spgemm_csr_c32_int_non_non) is measured by q4_variant_bench and
+    # appended as variant-tagged rows; the sweep above stays float32/float64.
+    # Only alongside float32: the runner splits spgemm into one process per dtype
+    # (run_flagsparse_pytest.py::_run_spgemm_split_dtypes), and appending in each
+    # measured every matrix twice (CUDA 2026-11-02: 20 c32 rows for 10 matrices).
+    if torch.float32 in value_dtypes:
+        import q4_variant_bench
+
+        q4_variant_bench.run_and_append("spgemm_csr", paths, csv_path, warmup, iters)
 
 
 def run_api_validation_checks():

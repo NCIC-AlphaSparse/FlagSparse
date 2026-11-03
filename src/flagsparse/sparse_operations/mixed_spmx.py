@@ -287,6 +287,33 @@ def _normalize_non_op(op, transpose):
         raise NotImplementedError("mixed-precision/int8 paths support op='non' only")
 
 
+_MIXED_OP_ALIASES = {
+    "0": "non", "n": "non", "non_trans": "non",
+    "1": "trans", "t": "trans",
+    "2": "conj", "c": "conj", "conj_trans": "conj",
+}
+
+
+def _normalize_mixed_op(op, transpose, data_dtype):
+    """'non' or 'trans' for the SpMV / CSR SpMM mixed paths.
+
+    The conjugate transpose of a real matrix is its transpose, which is the only
+    case these paths meet: their matrices are half, int8, or real times a complex
+    operand. A complex matrix's conjugate transpose stays unsupported here.
+    """
+    token = "non" if op is None else str(op).strip().lower()
+    token = _MIXED_OP_ALIASES.get(token, token)
+    if token not in ("non", "trans", "conj"):
+        raise ValueError("op must be one of: non, trans, conj")
+    if transpose and token == "non":
+        token = "trans"
+    if token != "non" and _is_complex_dtype(data_dtype):
+        raise NotImplementedError(
+            "mixed-precision paths transpose real matrices only"
+        )
+    return "non" if token == "non" else "trans"
+
+
 def _check_1d(*pairs):
     for tensor, name in pairs:
         if not torch.is_tensor(tensor):
@@ -1030,19 +1057,29 @@ def _torch_spmv_rows(data, rows, cols, x, n_out, acc_dtype):
 
 def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
                    out=None, out_dtype=None, return_time=False):
-    _normalize_non_op(op, transpose)
     _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"), (x, "x"))
+    op = _normalize_mixed_op(op, transpose, data.dtype)
     n_rows, n_cols = int(shape[0]), int(shape[1])
+    n_in, n_out = (n_cols, n_rows) if op == "non" else (n_rows, n_cols)
     if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
         raise ValueError("invalid CSR dimensions")
-    if x.numel() != n_cols:
+    if x.numel() != n_in:
         raise ValueError("x shape does not match CSR operation")
     result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, True)
-    if out is not None and (out.shape != (n_rows,) or out.device != x.device):
+    if out is not None and (out.shape != (n_out,) or out.device != x.device):
         raise ValueError("out shape/device must match the CSR SpMV result")
     data, x = data.contiguous(), x.contiguous()
     cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
+    if op == "trans":
+        if _is_ascend_runtime():
+            rows = _csr_row_ids(ptr, n_rows, data.numel())
+            y = _torch_spmv_rows(
+                data, cols.to(torch.int64), rows, x, n_cols, acc_dtype
+            ).to(result_dtype)
+        else:
+            y = _csr_spmv_trans(data, cols, ptr, x, n_rows, n_cols, result_dtype, acc_dtype)
+        return _finish(y, out, t0, return_time)
     if _is_mthreads_runtime():
         y = _musa_csr_spmv(data, cols, ptr, x, n_rows, result_dtype, acc_dtype, out)
         return _finish(y, out, t0, return_time)
@@ -1136,6 +1173,171 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
 
 
 # ---------------------------------------------------------------------------
+# Transposed SpMV / SpMM: y = A^T x scatters each stored entry into y[col]
+# ---------------------------------------------------------------------------
+# Every op != 'non' mixed call lands here. The accumulate buffer is zeroed and
+# atomically updated, then cast once to the result type; half and int8 results
+# therefore accumulate in float32 / int32 like the 'non' kernels. No transposed
+# copy of the matrix is built, so nothing has to be prepared or cached.
+
+
+@triton.jit
+def _csr_spmv_trans_atomic_kernel(
+    acc_ptr, data_ptr, cols_ptr, indptr_ptr, x_ptr, n_rows,
+    ACC: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    rmask = rows < n_rows
+    start = tl.load(indptr_ptr + rows, mask=rmask, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=rmask, other=0)
+    xv = tl.load(x_ptr + rows, mask=rmask, other=0).to(ACC)
+    max_len = tl.max(end - start, axis=0)
+    for j in range(0, max_len, BLOCK):
+        offs = start[:, None] + j + tl.arange(0, BLOCK)[None, :]
+        mask = offs < end[:, None]
+        col = tl.load(cols_ptr + offs, mask=mask, other=0)
+        v = tl.load(data_ptr + offs, mask=mask, other=0).to(ACC)
+        tl.atomic_add(acc_ptr + col, v * xv[:, None], mask=mask, sem="relaxed")
+
+
+@triton.jit
+def _csr_spmv_trans_real_by_complex_kernel(
+    acc_ri_ptr, data_ptr, cols_ptr, indptr_ptr, x_ri_ptr, n_rows,
+    ROWS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    rmask = rows < n_rows
+    start = tl.load(indptr_ptr + rows, mask=rmask, other=0)
+    end = tl.load(indptr_ptr + rows + 1, mask=rmask, other=0)
+    xr = tl.load(x_ri_ptr + 2 * rows, mask=rmask, other=0.0)
+    xi = tl.load(x_ri_ptr + 2 * rows + 1, mask=rmask, other=0.0)
+    max_len = tl.max(end - start, axis=0)
+    for j in range(0, max_len, BLOCK):
+        offs = start[:, None] + j + tl.arange(0, BLOCK)[None, :]
+        mask = offs < end[:, None]
+        col = tl.load(cols_ptr + offs, mask=mask, other=0)
+        v = tl.load(data_ptr + offs, mask=mask, other=0.0).to(xr.dtype)
+        tl.atomic_add(acc_ri_ptr + 2 * col, v * xr[:, None], mask=mask, sem="relaxed")
+        tl.atomic_add(acc_ri_ptr + 2 * col + 1, v * xi[:, None], mask=mask, sem="relaxed")
+
+
+@triton.jit
+def _coo_spmv_real_by_complex_atomic_kernel(
+    acc_ri_ptr, data_ptr, out_idx_ptr, in_idx_ptr, x_ri_ptr, nnz, BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < nnz
+    dst = tl.load(out_idx_ptr + offs, mask=mask, other=0)
+    src = tl.load(in_idx_ptr + offs, mask=mask, other=0)
+    xr = tl.load(x_ri_ptr + 2 * src, mask=mask, other=0.0)
+    xi = tl.load(x_ri_ptr + 2 * src + 1, mask=mask, other=0.0)
+    v = tl.load(data_ptr + offs, mask=mask, other=0.0).to(xr.dtype)
+    tl.atomic_add(acc_ri_ptr + 2 * dst, v * xr, mask=mask, sem="relaxed")
+    tl.atomic_add(acc_ri_ptr + 2 * dst + 1, v * xi, mask=mask, sem="relaxed")
+
+
+@triton.jit
+def _csr_spmm_trans_atomic_kernel(
+    c_ptr, data_ptr, cols_ptr, indptr_ptr, b_ptr, n_rows, n_dense,
+    stride_bk, stride_bn, stride_cm, stride_cn,
+    ACC: tl.constexpr, ROWS: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    n_offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_mask = rows < n_rows
+    n_mask = n_offs < n_dense
+    starts = tl.load(indptr_ptr + rows, row_mask, other=0)
+    ends = tl.load(indptr_ptr + rows + 1, row_mask, other=0)
+    # op(A) = A^T, so row r of A meets row r of B and lands in C's row col(p).
+    dense = tl.load(
+        b_ptr + rows[:, None] * stride_bk + n_offs[None, :] * stride_bn,
+        row_mask[:, None] & n_mask[None, :],
+        other=0,
+    ).to(ACC)
+    max_length = tl.max(ends - starts, 0)
+    for offset in range(max_length):
+        pos = starts + offset
+        valid = row_mask & (pos < ends)
+        col = tl.load(cols_ptr + pos, valid, other=0)
+        value = tl.load(data_ptr + pos, valid, other=0).to(ACC)
+        tl.atomic_add(
+            c_ptr + col[:, None] * stride_cm + n_offs[None, :] * stride_cn,
+            value[:, None] * dense,
+            mask=valid[:, None] & n_mask[None, :],
+            sem="relaxed",
+        )
+
+
+def _csr_spmm_trans(data, cols, ptr, B, n_rows, n_cols, acc_dtype):
+    """C = A^T B for CSR A, accumulated in ``acc_dtype``."""
+    n_dense = int(B.shape[1])
+    if _is_ascend_runtime():
+        rows = _csr_row_ids(ptr, n_rows, data.numel())
+        C = torch.zeros(n_cols, n_dense, dtype=acc_dtype, device=B.device)
+        C.index_add_(
+            0, cols.to(torch.int64),
+            data.to(acc_dtype).unsqueeze(1) * B.index_select(0, rows).to(acc_dtype),
+        )
+        return C
+    C = torch.zeros(n_cols, n_dense, dtype=acc_dtype, device=B.device)
+    if n_rows and n_dense and data.numel():
+        block_n = min(128, max(16, triton.next_power_of_2(n_dense)))
+        rows_per = max(1, 128 // block_n)
+        _csr_spmm_trans_atomic_kernel[(triton.cdiv(n_rows, rows_per), triton.cdiv(n_dense, block_n))](
+            C, data, cols, ptr, B, n_rows, n_dense,
+            B.stride(0), B.stride(1), C.stride(0), C.stride(1),
+            ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK_N=block_n, num_warps=4,
+        )
+    return C
+
+
+def _complex_acc(n, real_dtype, device):
+    return torch.zeros(n, 2, dtype=real_dtype, device=device)
+
+
+def _csr_spmv_trans(data, cols, ptr, x, n_rows, n_cols, result_dtype, acc_dtype):
+    """y = A^T x for CSR A without materialising A^T."""
+    nnz = data.numel()
+    rows_per, block = _csr_row_tile(nnz, n_rows)
+    grid = (triton.cdiv(n_rows, rows_per),) if n_rows else (0,)
+    if _is_complex_dtype(result_dtype):
+        acc = _complex_acc(n_cols, acc_dtype, x.device)
+        if nnz and n_rows:
+            _csr_spmv_trans_real_by_complex_kernel[grid](
+                acc, data, cols, ptr, torch.view_as_real(x).reshape(-1), n_rows,
+                ROWS=rows_per, BLOCK=block, num_warps=4,
+            )
+        return torch.view_as_complex(acc)
+    acc = torch.zeros(n_cols, dtype=acc_dtype, device=x.device)
+    if nnz and n_rows:
+        _csr_spmv_trans_atomic_kernel[grid](
+            acc, data, cols, ptr, x, n_rows,
+            ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK=block, num_warps=4,
+        )
+    return acc if acc_dtype == result_dtype else acc.to(result_dtype)
+
+
+def _coo_spmv_scatter(data, out_idx, in_idx, x, n_out, result_dtype, acc_dtype):
+    """y[out_idx[k]] += data[k] * x[in_idx[k]]: COO SpMV either way round."""
+    nnz = data.numel()
+    block = 256
+    if _is_complex_dtype(result_dtype):
+        acc = _complex_acc(n_out, acc_dtype, x.device)
+        if nnz:
+            _coo_spmv_real_by_complex_atomic_kernel[(triton.cdiv(nnz, block),)](
+                acc, data, out_idx, in_idx, torch.view_as_real(x).reshape(-1), nnz,
+                BLOCK=block, num_warps=4,
+            )
+        return torch.view_as_complex(acc)
+    acc = torch.zeros(n_out, dtype=acc_dtype, device=x.device)
+    if nnz:
+        _coo_spmv_atomic_kernel[(triton.cdiv(nnz, block),)](
+            acc, data, out_idx, in_idx, x, nnz, ACC=_TL_ACC[acc_dtype], BLOCK=block, num_warps=4,
+        )
+    return acc if acc_dtype == result_dtype else acc.to(result_dtype)
+
+
+# ---------------------------------------------------------------------------
 # COO SpMV
 # ---------------------------------------------------------------------------
 
@@ -1156,20 +1358,24 @@ def _coo_spmv_atomic_kernel(
 
 def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
                    out=None, out_dtype=None, return_time=False):
-    _normalize_non_op(op, transpose)
-    musa = _is_mthreads_runtime()
+    op = _normalize_mixed_op(op, transpose, data.dtype)
+    complex_rhs = torch.is_tensor(x) and _is_complex_dtype(x.dtype)
+    # MUSA's cached COO->CSR route covers the real 'non' products; the transposed
+    # and real-by-complex ones take the generic scatter below like CUDA's.
+    musa = _is_mthreads_runtime() and op == "non" and not complex_rhs
     if musa:
         # Cached sparse operands retain their metadata and mutation signature.
         _check_1d((x, "x"))
     else:
         _check_1d((data, "data"), (row, "row"), (col, "col"), (x, "x"))
     n_rows, n_cols = int(shape[0]), int(shape[1])
+    n_in, n_out = (n_cols, n_rows) if op == "non" else (n_rows, n_cols)
     if not musa and not (data.numel() == row.numel() == col.numel()):
         raise ValueError("data, row and col must have the same length")
-    if x.numel() != n_cols:
+    if x.numel() != n_in:
         raise ValueError("x shape does not match COO operation")
-    result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, False)
-    if out is not None and (out.shape != (n_rows,) or out.device != x.device):
+    result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, True)
+    if out is not None and (out.shape != (n_out,) or out.device != x.device):
         raise ValueError("out shape/device must match the COO SpMV result")
     if musa:
         t0 = _start(return_time)
@@ -1186,13 +1392,20 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     if _is_ascend_runtime():
         rows = _index32(row.contiguous()).to(torch.int64).contiguous()
         cols = _index32(col.contiguous()).to(torch.int64).contiguous()
+        if op == "trans":
+            rows, cols = cols, rows
         compute_data = data.to(acc_dtype).contiguous()
         rhs = x
         rhs_dtype = x.dtype if _is_complex_dtype(x.dtype) else acc_dtype
         if x.dtype != rhs_dtype:
             rhs = x.to(rhs_dtype).contiguous()
-        y = _torch_spmv_rows(compute_data, rows, cols, rhs, n_rows, acc_dtype)
+        y = _torch_spmv_rows(compute_data, rows, cols, rhs, n_out, acc_dtype)
         return _finish(y.to(result_dtype), out, t0, return_time)
+    if op == "trans" or complex_rhs:
+        rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
+        out_idx, in_idx = (rows, cols) if op == "non" else (cols, rows)
+        y = _coo_spmv_scatter(data, out_idx, in_idx, x, n_out, result_dtype, acc_dtype)
+        return _finish(y, out, t0, return_time)
     if _is_rocm_runtime() or _is_iluvatar_runtime():
         # Group sorted COO rows into CSR tiles instead of atomically updating
         # every output row once per nonzero.
@@ -1429,22 +1642,27 @@ def _csr_spmm_complex_rows_kernel(
 def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
                    out=None, out_dtype=None, return_time=False):
     """``B`` may be any 2D strided view (column-major, or a transposed ``op_b``)."""
-    _normalize_non_op(op, transpose)
     _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+    op = _normalize_mixed_op(op, transpose, data.dtype)
     if not torch.is_tensor(B) or B.ndim != 2 or not _is_accel_tensor(B):
         raise ValueError("B must be a 2D accelerator tensor")
     n_rows, n_cols = int(shape[0]), int(shape[1])
+    n_in, n_out = (n_cols, n_rows) if op == "non" else (n_rows, n_cols)
     if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
         raise ValueError("invalid CSR dimensions")
-    if B.shape[0] != n_cols:
-        raise ValueError(f"B has {B.shape[0]} rows, expected {n_cols}")
+    if B.shape[0] != n_in:
+        raise ValueError(f"B has {B.shape[0]} rows, expected {n_in}")
     result_dtype, acc_dtype = _resolve_types(data.dtype, B.dtype, out, out_dtype, False)
     n_dense = int(B.shape[1])
-    if out is not None and (tuple(out.shape) != (n_rows, n_dense) or out.device != B.device):
+    if out is not None and (tuple(out.shape) != (n_out, n_dense) or out.device != B.device):
         raise ValueError("out shape/device must match the CSR SpMM result")
     data = data.contiguous()
     cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
+    if op == "trans":
+        C = _csr_spmm_trans(data, cols, ptr, B, n_rows, n_cols, acc_dtype)
+        C = C if C.dtype == result_dtype else C.to(result_dtype)
+        return _finish(C, out, t0, return_time)
     if data.dtype in (torch.complex64, torch.complex128):
         C = out if out is not None else torch.empty(
             n_rows, n_dense, dtype=result_dtype, device=B.device

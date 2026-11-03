@@ -139,9 +139,12 @@ def test_spgemm_csr_rejects_unsupported_index_and_value_dtypes():
             (10, 6),
         )
 
-    A_complex = _random_csr(8, 10, torch.complex64, golden)
+    # complex64 is supported since batch 3 (spgemm_csr_c32_int_non_non);
+    # complex128 is still rejected.
+    A_complex = _random_csr(8, 10, torch.complex128, golden)
     with pytest.raises(
-        TypeError, match="a_data dtype must be torch.float32 or torch.float64"
+        TypeError,
+        match="a_data dtype must be torch.float32, torch.float64 or torch.complex64",
     ):
         flagsparse_spgemm_csr(
             A_complex.values().to(device),

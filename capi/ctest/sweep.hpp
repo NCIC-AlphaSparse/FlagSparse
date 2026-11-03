@@ -385,6 +385,7 @@ inline bool benchmark_variant_selected(const registry::Variant& variant) {
 inline bool variant_is_mixed(const registry::Variant& v) {
     const std::string q = v.variant_id ? v.variant_id : "";
     return q.find("_f16f32_") != std::string::npos ||
+           q.find("_bf16f32_") != std::string::npos ||
            q.find("_i8f32_") != std::string::npos ||
            q.find("_i8i32_") != std::string::npos ||
            q.find("_f32c32_") != std::string::npos;
@@ -393,6 +394,7 @@ inline bool variant_is_mixed(const registry::Variant& v) {
 inline flagsparseDataType_t variant_output_dtype(const registry::Variant& v) {
     const std::string q = v.variant_id ? v.variant_id : "";
     if (q.find("_f16f32_") != std::string::npos) return FLAGSPARSE_R_32F;
+    if (q.find("_bf16f32_") != std::string::npos) return FLAGSPARSE_R_32F;
     if (q.find("_i8f32_") != std::string::npos) return FLAGSPARSE_R_32F;
     if (q.find("_i8i32_") != std::string::npos) return FLAGSPARSE_R_32I;
     if (q.find("_f32c32_") != std::string::npos) return FLAGSPARSE_C_32F;

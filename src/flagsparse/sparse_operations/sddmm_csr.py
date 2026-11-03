@@ -918,6 +918,20 @@ def _validate_sddmm_dense_inputs(data, prepared, x, y):
     return int(x.shape[1])
 
 
+def _resolve_sddmm_out_dtype(x, out, out_dtype):
+    """None (write x's dtype) or float32 for float16 operands; raises otherwise."""
+    if not torch.is_tensor(x):
+        return out_dtype
+    if out_dtype is None and out is not None and torch.is_tensor(out):
+        if x.dtype == torch.float16 and out.dtype == torch.float32:
+            out_dtype = torch.float32
+    if out_dtype is None or out_dtype == x.dtype:
+        return None
+    if x.dtype == torch.float16 and out_dtype == torch.float32:
+        return out_dtype
+    raise TypeError(f"{x.dtype} SDDMM has no {out_dtype} output")
+
+
 def _prepare_validated_sddmm_out(prepared, x, out, out_dtype=None):
     nnz = prepared.nnz
     target_dtype = x.dtype if out_dtype is None else out_dtype
@@ -1188,8 +1202,13 @@ def flagsparse_sddmm_csr(
     op_a=None,
     op_b=None,
     dense_layout=None,
+    out_dtype=None,
 ):
     """CSR SDDMM: out[p] = alpha * dot(x[row(p)], y[col(p)]) + beta * data[p].
+
+    ``out_dtype`` (or ``out.dtype``): float16 x/y -> float16 (default) or float32,
+    as cusparseSDDMM's CUDA_R_16F inputs with a CUDA_R_32F C; every other value
+    type writes itself. Both accumulate in float32.
 
     ``validate=False`` is forwarded to :func:`prepare_sddmm_csr` and only applies
     when this call builds the prepared pattern itself.
@@ -1202,6 +1221,7 @@ def flagsparse_sddmm_csr(
     ('row' / 'col') checks how x and y are stored; any strides are read in place.
     """
     x, y = _apply_sddmm_dense_ops(x, y, op_a, op_b, dense_layout)
+    out_dtype = _resolve_sddmm_out_dtype(x, out, out_dtype)
     # Ascend 910B currently fails lowering the generic Triton SDDMM kernel.  Compute the
     # sampled dense products with torch_npu indexing instead; CUDA/ROCm/MetaX/MUSA fall
     # through to the Triton path unchanged.
@@ -1232,7 +1252,7 @@ def flagsparse_sddmm_csr(
         # chunk bounds the temporaries to _ASCEND_SDDMM_CHUNK_NNZ x K.
         cols = indices.to(torch.int64)
         nnz = int(indices.numel())
-        vals = torch.empty((nnz,), device=x.device, dtype=x.dtype)
+        vals = torch.empty((nnz,), device=x.device, dtype=out_dtype or x.dtype)
         for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
             end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
             vals[begin:end] = _ascend_sddmm_dot(
@@ -1289,7 +1309,7 @@ def flagsparse_sddmm_csr(
         raise ValueError("data is required when beta is non-zero")
     k_dim = _validate_sddmm_dense_inputs(data, prepared, x, y)
     if k_dim == 0:
-        out = _prepare_validated_sddmm_out(prepared, x, out)
+        out = _prepare_validated_sddmm_out(prepared, x, out, out_dtype=out_dtype)
         if beta == 0.0 or data is None:
             out.zero_()
         else:
@@ -1323,6 +1343,7 @@ def flagsparse_sddmm_csr(
         beta,
         out,
         allow_fallback=allow_fallback,
+        out_dtype=out_dtype,
     )
     elapsed_ms = 0.0
     if timed:

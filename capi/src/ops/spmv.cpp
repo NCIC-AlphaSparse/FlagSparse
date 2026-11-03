@@ -56,6 +56,12 @@ bool musa_backend() {
     return std::string(adaptor::backend_name()) == "musa";
 }
 
+// Cached: SpMV is short enough that a string compare per call shows up.
+bool cuda_backend() {
+    static const bool cuda = std::string(adaptor::backend_name()) == "cuda";
+    return cuda;
+}
+
 // alpha/beta arrive as void* under the handle's pointer mode. DEVICE mode would
 // need a copy back or a kernel argument fetch; it is refused rather than
 // silently dereferencing a device address on the host. Complex scalars are read
@@ -303,30 +309,52 @@ flagsparseStatus_t launch_csr_rowpar(flagsparseHandle_t handle, SpMatDescr* A,
     return st;
 }
 
-flagsparseStatus_t launch_csr_row_tile_short(flagsparseHandle_t handle, SpMatDescr* A,
-                                              const DnVecDescr* X, DnVecDescr* Y,
-                                              const Operands& ops,
-                                              int64_t max_row_nnz) {
-    const double avg_row_nnz = A->rows > 0
-                                   ? static_cast<double>(A->nnz) / A->rows
-                                   : 0.0;
+// Several rows per program, LANES_PER_ROW nonzeros of each row per step: one
+// program per row (launch_csr_rowpar) pays a 128-lane program for rows that
+// average 3-25 nonzeros on the delivery matrices, and its time grows with the
+// row count, not nnz -- about 0.46 ns a row on an RTX 5090, 0.02-0.4x of
+// cuSPARSE (2026-11-02). The tile shapes below are measured, per backend.
+struct RowTile { int rows_per_program, lanes_per_row, num_warps; };
+
+RowTile row_tile_shape(const Operands& ops, double avg_row_nnz, int64_t max_row_nnz) {
+    if (cuda_backend()) {
+        // RTX 5090, the 10 delivery matrices, swept over R x V x warps. Uniformly
+        // short rows (roadNet-TX: avg 2.8, max 12) want 4 lanes; a short average
+        // with a long tail (ASIC_680ks: avg 3.4, max 210) still wants 8.
+        const bool uniform_short = avg_row_nnz <= 4.0 && max_row_nnz <= 16;
+        if (ops.acc_is_fp64) return avg_row_nnz <= 7.0 ? RowTile{32, 4, 2} : RowTile{8, 8, 2};
+        return uniform_short ? RowTile{64, 4, 2} : RowTile{32, 8, 4};
+    }
+    // Tuned on Moore Threads MUSA.
     const bool long_tail = max_row_nnz > 64;
     const bool ultra_short = !long_tail && avg_row_nnz <= 2.0;
     const bool short_rows = avg_row_nnz <= 8.0;
-    const int rows_per_program = ultra_short ? 128 : (short_rows ? 64 : 32);
-    const int lanes_per_row = ultra_short ? 4 : (short_rows ? 8 : 16);
-    const int num_warps = 4;
+    return {ultra_short ? 128 : (short_rows ? 64 : 32), ultra_short ? 4 : (short_rows ? 8 : 16), 4};
+}
+
+// Whether the real row tile takes this matrix: MUSA for every short-row matrix,
+// CUDA only inside the average row length it was measured on.
+bool use_real_row_tile(const Operands& ops, double avg_row_nnz, int64_t max_row_nnz) {
+    if (ops.complex_op || max_row_nnz > kCsrShortRowLimit) return false;
+    if (musa_backend()) return true;
+    return cuda_backend() && avg_row_nnz <= 32.0;
+}
+
+flagsparseStatus_t launch_csr_row_tile(flagsparseHandle_t handle, SpMatDescr* A,
+                                       void* offsets, const char* offsets_type,
+                                       const DnVecDescr* X, DnVecDescr* Y,
+                                       const Operands& ops, const RowTile& tile) {
     std::string sig;
     sig.reserve(160);
     sig += "*"; sig += ops.vt; sig += ":16,";
     sig += "*"; sig += ops.it; sig += ":16,";
-    sig += "*"; sig += ops.ot; sig += ":16,";
+    sig += "*"; sig += offsets_type; sig += ":16,";
     sig += "*"; sig += ops.vt; sig += ":16,";
     sig += "*"; sig += ops.vt; sig += ":16,";
     sig += ops.vt; sig += ",";
     sig += ops.vt; sig += ",i32,";
-    sig += std::to_string(rows_per_program) + ",";
-    sig += std::to_string(lanes_per_row) + ",";
+    sig += std::to_string(tile.rows_per_program) + ",";
+    sig += std::to_string(tile.lanes_per_row) + ",";
     sig += ops.acc_is_fp64 ? "True," : "False,";
     sig += ops.has_beta ? "True," : "False,";
     const bool wide = A->rows > INT32_MAX - 128 || A->nnz > INT32_MAX - 128 ||
@@ -336,7 +364,7 @@ flagsparseStatus_t launch_csr_row_tile_short(flagsparseHandle_t handle, SpMatDes
     args.reserve(8);
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
-    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(offsets)));
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
     push_scalar(ops, ops.alpha_re, &args);
@@ -345,10 +373,70 @@ flagsparseStatus_t launch_csr_row_tile_short(flagsparseHandle_t handle, SpMatDes
     std::string err;
     const flagsparseStatus_t st = jit::launch(
         jit::codegen_module("spmv_csr.py"), "spmv_csr_row_tile_real", sig,
-        ctx(handle)->stream, (A->rows + rows_per_program - 1) / rows_per_program, 1, 1,
-        num_warps, /*num_stages=*/2, args, &err);
+        ctx(handle)->stream, (A->rows + tile.rows_per_program - 1) / tile.rows_per_program,
+        1, 1, tile.num_warps, /*num_stages=*/2, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
+}
+
+// complex64 with alpha = 1, beta = 0 on CUDA: the Python package's own
+// _spmv_csr_complex_row_tile_kernel, with its own row-length table
+// (spmv_csr.py's complex route). That kernel has no alpha/beta, so any other
+// scalars stay on the row-parallel kernel.
+bool use_complex_row_tile(const Operands& ops, double avg_row_nnz, int64_t max_row_nnz) {
+    return cuda_backend() && ops.complex_op && !ops.acc_is_fp64 && !ops.has_beta &&
+           ops.alpha_re == 1.0 && ops.alpha_im == 0.0 && avg_row_nnz <= 32.0 &&
+           max_row_nnz <= 512;
+}
+
+flagsparseStatus_t launch_csr_complex_row_tile(flagsparseHandle_t handle, SpMatDescr* A,
+                                               void* offsets, const char* offsets_type,
+                                               const DnVecDescr* X, DnVecDescr* Y,
+                                               const Operands& ops, double avg_row_nnz) {
+    int rows_per = 4, block_nnz = 16;
+    if (avg_row_nnz <= 4.0) { rows_per = 32; block_nnz = 4; }
+    else if (avg_row_nnz <= 8.0) { rows_per = 8; block_nnz = 8; }
+    else if (avg_row_nnz <= 16.0) { rows_per = 8; block_nnz = 16; }
+    std::string sig;
+    sig.reserve(96);
+    sig += "*fp32:16,";
+    sig += "*"; sig += ops.it; sig += ":16,";
+    sig += "*"; sig += offsets_type; sig += ":16,";
+    sig += "*fp32:16,*fp32:16,i32,";
+    sig += std::to_string(rows_per) + "," + std::to_string(block_nnz);
+    std::vector<jit::Arg> args;
+    args.reserve(6);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->rows)));
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spmv_csr.py"), "_spmv_csr_complex_row_tile_kernel", sig,
+        ctx(handle)->stream, (A->rows + rows_per - 1) / rows_per, 1, 1,
+        /*num_warps=*/1, /*num_stages=*/2, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
+}
+
+// The row routes over any row-offsets array: A's own (CSR) or the one COO
+// builds in its externalBuffer. False when neither row tile applies.
+bool try_row_tile(flagsparseHandle_t handle, SpMatDescr* A, void* offsets,
+                  const char* offsets_type, int64_t max_row_nnz, const DnVecDescr* X,
+                  DnVecDescr* Y, const Operands& ops, flagsparseStatus_t* st) {
+    const double avg = A->rows > 0 ? static_cast<double>(A->nnz) / A->rows : 0.0;
+    if (use_real_row_tile(ops, avg, max_row_nnz)) {
+        *st = launch_csr_row_tile(handle, A, offsets, offsets_type, X, Y, ops,
+                                  row_tile_shape(ops, avg, max_row_nnz));
+        return true;
+    }
+    if (use_complex_row_tile(ops, avg, max_row_nnz)) {
+        *st = launch_csr_complex_row_tile(handle, A, offsets, offsets_type, X, Y, ops, avg);
+        return true;
+    }
+    return false;
 }
 
 // ------------------------------------------------------- mixed-precision CSR
@@ -482,6 +570,11 @@ bool is_identity_alpha_beta(flagsparseHandle_t handle, flagsparseDataType_t comp
         float v = 1.0f; std::memcpy(one.data(), &v, sizeof(v));
     } else if (computeType == FLAGSPARSE_C_32F) {
         float v = 1.0f; std::memcpy(one.data(), &v, sizeof(v));
+    } else if (computeType == FLAGSPARSE_R_16F) {
+        const std::uint16_t v = double_to_fp16(1.0); std::memcpy(one.data(), &v, sizeof(v));
+    } else if (computeType == FLAGSPARSE_R_16BF) {
+        const std::uint16_t v = 0x3F80;  // bfloat16 1.0
+        std::memcpy(one.data(), &v, sizeof(v));
     } else {
         return false;
     }
@@ -502,6 +595,13 @@ bool is_mixed_csr_request(flagsparseOperation_t opA, flagsparseConstSpMatDescr_t
     const DnVecDescr* X = dnvec(vecX);
     const DnVecDescr* Y = dnvec(vecY);
     if (X->value_type != A->value_type) return false;
+    // bfloat16 has no plain (non-mixed) CSR kernel, so bf16 -> bf16 rides the
+    // float32-accumulating row tile too; its store rounds back to bf16. CSR only:
+    // the COO mixed route accumulates with atomics straight into y.
+    if (A->value_type == FLAGSPARSE_R_16BF) {
+        *acc_is_i32 = false;
+        return Y->value_type == FLAGSPARSE_R_32F || Y->value_type == FLAGSPARSE_R_16BF;
+    }
     return mixed_narrow_wide_pair(A->value_type, Y->value_type, acc_is_i32);
 }
 
@@ -743,15 +843,181 @@ flagsparseStatus_t run_coo_mixed(flagsparseHandle_t handle, const SpMatDescr* A,
     return st;
 }
 
+// ------------------------------------------------ scatter: y[col] += v * x[row]
+//
+// The products that walk the stored entries in the "wrong" direction for a
+// row-owned kernel: CSR/COO with op(A) = A^T, and CSC with op(A) = A (a CSC
+// matrix is the CSR of A^T). mixed_spmx.py's _csr_spmv_trans_atomic_kernel
+// covers CSR and CSC, _coo_spmv_atomic_kernel with its two index arrays swapped
+// covers COO, and the real-by-complex pair covers a float32 A times a complex64
+// x. Only the narrow or real-by-complex types come here -- float32/complex64
+// transposes keep run_transpose_atomic. The accumulator is zeroed and summed
+// atomically; a float16/bfloat16 result accumulates in a float32 scratch (from
+// bufferSize) and is converted once at the end. alpha = 1, beta = 0 only, like
+// every other mixed path in this file.
+
+struct ScatterPlan {
+    bool real_by_complex = false;
+    bool acc_is_i32 = false;
+    bool via_scratch = false;   // result narrower than the float32 accumulator
+};
+
+bool scatter_types(flagsparseDataType_t a, flagsparseDataType_t x, flagsparseDataType_t y,
+                   ScatterPlan* plan) {
+    if (a == FLAGSPARSE_R_32F && x == FLAGSPARSE_C_32F && y == FLAGSPARSE_C_32F) {
+        plan->real_by_complex = true;
+        return true;
+    }
+    if (x != a) return false;
+    if (a == FLAGSPARSE_R_8I) {
+        if (y != FLAGSPARSE_R_32I && y != FLAGSPARSE_R_32F) return false;
+        plan->acc_is_i32 = (y == FLAGSPARSE_R_32I);
+        return true;
+    }
+    if (a == FLAGSPARSE_R_16F || a == FLAGSPARSE_R_16BF) {
+        if (y == a) { plan->via_scratch = true; return true; }
+        return y == FLAGSPARSE_R_32F;
+    }
+    return false;
+}
+
+bool is_scatter_request(flagsparseOperation_t opA, flagsparseConstSpMatDescr_t matA,
+                        flagsparseConstDnVecDescr_t vecX, flagsparseConstDnVecDescr_t vecY,
+                        ScatterPlan* plan) {
+    if (matA == nullptr || vecX == nullptr || vecY == nullptr) return false;
+    const SpMatDescr* A = spmat(matA);
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    ScatterPlan p;
+    if (!scatter_types(A->value_type, X->value_type, Y->value_type, &p)) return false;
+    // conj(A)^T of a real matrix is A^T; a complex A never reaches here.
+    const bool trans = transposes(opA);
+    bool ok = false;
+    switch (A->format) {
+        case FLAGSPARSE_FORMAT_CSR: ok = trans; break;
+        // COO's non-transposed narrow products already have run_coo_mixed (and
+        // float16 -> float16 the plain kernel); real-by-complex has no other route.
+        case FLAGSPARSE_FORMAT_COO: ok = trans || p.real_by_complex; break;
+        // float16 -> float16 CSC has the plain kernel.
+        case FLAGSPARSE_FORMAT_CSC:
+            ok = !trans && !p.real_by_complex && !p.via_scratch; break;
+        default: break;
+    }
+    if (ok) *plan = p;
+    return ok;
+}
+
+int64_t scatter_output_len(const SpMatDescr* A, flagsparseOperation_t opA) {
+    return transposes(opA) ? A->cols : A->rows;
+}
+
+flagsparseStatus_t validate_scatter(flagsparseHandle_t handle, flagsparseOperation_t opA,
+                                    flagsparseConstSpMatDescr_t matA,
+                                    flagsparseConstDnVecDescr_t vecX,
+                                    flagsparseConstDnVecDescr_t vecY) {
+    if (handle == nullptr) return FLAGSPARSE_STATUS_NOT_INITIALIZED;
+    const SpMatDescr* A = spmat(matA);
+    const DnVecDescr* X = dnvec(vecX);
+    const DnVecDescr* Y = dnvec(vecY);
+    if (A->idx_base != FLAGSPARSE_INDEX_BASE_ZERO || A->nnz > static_cast<int64_t>(INT32_MAX) ||
+        triton_index_dtype(A->indices_type)[0] == '\0' ||
+        (A->format != FLAGSPARSE_FORMAT_COO && triton_index_dtype(A->offsets_type)[0] == '\0')) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
+    const int64_t n_in = transposes(opA) ? A->rows : A->cols;
+    if (X->size != n_in || Y->size != scatter_output_len(A, opA)) {
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
+flagsparseStatus_t run_scatter(flagsparseHandle_t handle, flagsparseOperation_t opA,
+                               const SpMatDescr* A, const DnVecDescr* X, DnVecDescr* Y,
+                               const ScatterPlan& plan, void* scratch) {
+    const int64_t y_len = Y->size;
+    if (y_len == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    if (plan.via_scratch && scratch == nullptr) {
+        ctx(handle)->last_error =
+            "a float16/bfloat16 SpMV of this shape accumulates in the float32 "
+            "externalBuffer reported by flagsparseSpMV_bufferSize";
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    const flagsparseDataType_t acc_type = plan.real_by_complex ? FLAGSPARSE_C_32F
+        : (plan.acc_is_i32 ? FLAGSPARSE_R_32I : FLAGSPARSE_R_32F);
+    void* acc = plan.via_scratch ? scratch : Y->values;
+    if (adaptor::memset_device(reinterpret_cast<adaptor::DevicePtr>(acc), 0,
+                               static_cast<std::size_t>(y_len) * dtype_size(acc_type)) !=
+        FLAGSPARSE_STATUS_SUCCESS) {
+        return FLAGSPARSE_STATUS_EXECUTION_FAILED;
+    }
+    const char* it = triton_index_dtype(A->indices_type);
+    const char* xt = plan.real_by_complex ? "fp32" : triton_dtype(A->value_type);
+    const char* at = plan.real_by_complex ? "fp32" : triton_dtype(acc_type);
+    std::string err;
+    flagsparseStatus_t st = FLAGSPARSE_STATUS_SUCCESS;
+    if (A->nnz > 0 && A->format == FLAGSPARSE_FORMAT_COO) {
+        // A^T swaps which index array names the output.
+        const bool trans = transposes(opA);
+        void* out_idx = trans ? A->indices : A->row_ind;
+        void* in_idx = trans ? A->row_ind : A->indices;
+        constexpr int kBlock = 256;
+        std::string sig = std::string("*") + at + ":16,*" + (plan.real_by_complex ? "fp32" : xt) +
+                          ":16,*" + it + ":16,*" + it + ":16,*" + xt + ":16,i32," +
+                          std::to_string(kBlock);
+        std::vector<jit::Arg> args;
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(acc)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(out_idx)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(in_idx)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+        args.push_back(jit::Arg::i(static_cast<std::int32_t>(A->nnz)));
+        const char* kernel = plan.real_by_complex ? "_coo_spmv_real_by_complex_atomic_kernel"
+            : (plan.acc_is_i32 ? "coo_spmv_atomic_i32acc" : "coo_spmv_atomic_f32acc");
+        st = jit::launch(jit::codegen_module("mixed_spmx.py"), kernel, sig, ctx(handle)->stream,
+                         (A->nnz + kBlock - 1) / kBlock, 1, 1, /*num_warps=*/4,
+                         /*num_stages=*/2, args, &err);
+    } else if (A->nnz > 0) {
+        // CSR (op = A^T) and CSC (op = A) both walk "rows" of the stored pointer
+        // array and scatter into the indices it lists.
+        const char* ot = triton_index_dtype(A->offsets_type);
+        const int64_t n_major = A->format == FLAGSPARSE_FORMAT_CSC ? A->cols : A->rows;
+        int rows_per = 128, block = 4;
+        csr_mixed_row_tile(A->nnz, n_major, &rows_per, &block);
+        std::string sig = std::string("*") + at + ":16,*" + xt + ":16,*" + it + ":16,*" + ot +
+                          ":16,*" + xt + ":16,i32," + std::to_string(rows_per) + "," +
+                          std::to_string(block);
+        std::vector<jit::Arg> args;
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(acc)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+        args.push_back(jit::Arg::i(static_cast<std::int32_t>(n_major)));
+        const char* kernel = plan.real_by_complex ? "_csr_spmv_trans_real_by_complex_kernel"
+            : (plan.acc_is_i32 ? "csr_spmv_trans_i32acc" : "csr_spmv_trans_f32acc");
+        st = jit::launch(jit::codegen_module("mixed_spmx.py"), kernel, sig, ctx(handle)->stream,
+                         (n_major + rows_per - 1) / rows_per, 1, 1, /*num_warps=*/4,
+                         /*num_stages=*/2, args, &err);
+    }
+    if (st != FLAGSPARSE_STATUS_SUCCESS) {
+        ctx(handle)->last_error = err;
+        return st;
+    }
+    if (plan.via_scratch) {
+        return copy_dense_cast(handle, scratch, FLAGSPARSE_R_32F, Y->values, Y->value_type,
+                               false, 1, y_len, 0, 1, 0, 1);
+    }
+    return FLAGSPARSE_STATUS_SUCCESS;
+}
+
 flagsparseStatus_t run_csr(flagsparseHandle_t handle, SpMatDescr* A,
                            const DnVecDescr* X, DnVecDescr* Y, const Operands& ops) {
     int64_t max_row_nnz = 0;
     if (flagsparseStatus_t s = ensure_max_row_nnz(A, &max_row_nnz)) return s;
-    // This tile shape is tuned on Moore Threads MUSA. Other backends retain the
+    // The row tiles are measured on MUSA and CUDA only. Other backends keep the
     // portable row-parallel route so their launch configuration does not shift.
-    if (musa_backend() && !ops.complex_op && max_row_nnz <= kCsrShortRowLimit) {
-        return launch_csr_row_tile_short(handle, A, X, Y, ops, max_row_nnz);
-    }
+    flagsparseStatus_t st = FLAGSPARSE_STATUS_SUCCESS;
+    if (try_row_tile(handle, A, A->offsets, ops.ot, max_row_nnz, X, Y, ops, &st)) return st;
     return launch_csr_rowpar(handle, A, A->offsets, ops.ot, A->rows, max_row_nnz, X, Y,
                              ops);
 }
@@ -778,6 +1044,14 @@ flagsparseStatus_t run_coo(flagsparseHandle_t handle, SpMatDescr* A,
     // values already ARE the CSR arrays, so the offsets are the only thing that
     // was missing. Complex goes through it too now that the CSR launcher picks
     // the complex kernel by name.
+    // CUDA's row tiles run over the same offsets, for either COO algorithm: the
+    // segment kernel below is one program per row too. (MUSA keeps its routes.)
+    flagsparseStatus_t tile_st = FLAGSPARSE_STATUS_SUCCESS;
+    if (cuda_backend() &&
+        try_row_tile(handle, A, externalBuffer, "i32",
+                     A->max_row_nnz < 0 ? 0 : A->max_row_nnz, X, Y, ops, &tile_st)) {
+        return tile_st;
+    }
     if (to_csr) {
         return launch_csr_rowpar(handle, A, externalBuffer, "i32", A->rows,
                                  A->max_row_nnz < 0 ? 0 : A->max_row_nnz, X, Y, ops);
@@ -1102,6 +1376,14 @@ flagsparseStatus_t flagsparseSpMV_bufferSize(
     *bufferSize = 0;
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        ScatterPlan scatter;
+        if (is_scatter_request(opA, matA, vecX, vecY, &scatter)) {
+            if (flagsparseStatus_t s = validate_scatter(handle, opA, matA, vecX, vecY)) return s;
+            if (scatter.via_scratch) {
+                *bufferSize = static_cast<size_t>(dnvec(vecY)->size) * sizeof(float);
+            }
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
         if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
             return validate_mixed_sell(handle, opA, matA, vecX, vecY,
                                        computeType, alg);
@@ -1142,6 +1424,10 @@ flagsparseStatus_t flagsparseSpMV_preprocess(
     (void)alpha; (void)beta;
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        ScatterPlan scatter;
+        if (is_scatter_request(opA, matA, vecX, vecY, &scatter)) {
+            return validate_scatter(handle, opA, matA, vecX, vecY);  // nothing to precompute
+        }
         if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
             return validate_mixed_sell(handle, opA, matA, vecX, vecY,
                                        computeType, alg);
@@ -1182,6 +1468,15 @@ flagsparseStatus_t flagsparseSpMV(
     flagsparseDataType_t computeType, flagsparseSpMVAlg_t alg, void* externalBuffer) {
     return guard(handle, [&]() -> flagsparseStatus_t {
         bool acc_is_i32 = false;
+        ScatterPlan scatter;
+        if (is_scatter_request(opA, matA, vecX, vecY, &scatter)) {
+            if (flagsparseStatus_t s = validate_scatter(handle, opA, matA, vecX, vecY)) return s;
+            if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
+                return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+            }
+            return run_scatter(handle, opA, spmat(matA), dnvec(vecX), dnvec(vecY), scatter,
+                               externalBuffer);
+        }
         if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
             if (flagsparseStatus_t s = validate_mixed_sell(
                     handle, opA, matA, vecX, vecY, computeType, alg)) {

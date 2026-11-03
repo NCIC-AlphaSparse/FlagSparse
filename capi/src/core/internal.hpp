@@ -100,6 +100,9 @@ struct SpMatDescr {
     void* coo_offsets_buffer = nullptr;
     // CSR transpose topology lives in caller-owned SpMM scratch, never values.
     void* spmm_transpose_buffer = nullptr;
+    // Longest row of A^T (= longest column of A), filled with the transposed
+    // topology so a CSR-of-A^T launch never reads it back inside a solve.
+    int64_t transpose_max_row_nnz = -1;
     // MUSA SpMV/SpMM output-row topology in caller-owned scratch.
     void* sparse_gather_buffer = nullptr;
 

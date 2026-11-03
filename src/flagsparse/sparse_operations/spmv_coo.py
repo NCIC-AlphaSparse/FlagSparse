@@ -1429,7 +1429,7 @@ def flagsparse_spmv_coo(
             )
             if _is_iluvatar_runtime() and op_code == SPMV_COO_OP_NON:
                 result_dtype, _ = _mixed_spmx._resolve_types(
-                    mixed_data.dtype, x.dtype, out, out_dtype, False
+                    mixed_data.dtype, x.dtype, out, out_dtype, True
                 )
                 plan = prepared.sell_plans.get(result_dtype)
                 if plan is not None:

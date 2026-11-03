@@ -6,6 +6,66 @@
 > SELL / COO 的优化任务（瓶颈探针 `tools/biv_spmv_probe.py`、`prepare_spmv_sell` 的 A/B 命令和交给 Codex 的 prompt）
 > 见 [`ILUVATAR_SELL_COO_PLAN.md`](ILUVATAR_SELL_COO_PLAN.md) 第 9 节。
 
+## 2026-11-02 复测计划：105 变体
+
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。这轮只跑下面这条命令。它和后面
+"要做的事"里的 65 变体命令相比改了两处：`--ops` 加上了 `gemvi,geam_csr`，结果目录换成了新名字。其余参数
+（`-k` 挡 fp64、各脚本的 dtype 限制、`FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`）不变。
+
+```bash
+setsid timeout -s KILL 43200 \
+  env FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python3 -u run_flagsparse_pytest.py \
+    --ops gather,scatter,axpby,spvv,gemvi,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,geam_csr,sddmm_csr \
+    --phase both --mode normal --gpus 0 --timeout 3600 \
+    --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+    --h800-reference \
+    --pytest-args='-k "test_q4_variant or (((float or half or f16 or f32) and not (double or float64 or bfloat16 or complex64 or complex128)) or (complex64 and (gather or scatter)))"' \
+    --op-benchmark-args='gather=--value-dtypes float16,float32,complex64' \
+    --op-benchmark-args='scatter=--value-dtypes float16,float32,complex64,int8' \
+    --op-benchmark-args='spmv_csr=--dtypes float32 --alg auto' \
+    --op-benchmark-args='spmv_coo=--dtypes float32' \
+    --op-benchmark-args='spmv_csc=--dtypes float32,complex64' \
+    --op-benchmark-args='spmm_csr=--dtypes float16,float32' \
+    --op-benchmark-args='spmm_coo=--dtypes float16,float32' \
+    --op-benchmark-args='spmm_csc=--dtypes float32,complex64' \
+    --op-benchmark-args='sddmm_csr=--dtype float32' \
+    --op-benchmark-args='spgemm_csr=--dtypes float32' \
+    --results-dir results_iluvatar_105_<日期> \
+  > results_iluvatar_105_<日期>.log 2>&1 < /dev/null &
+# 跑完后
+python3 tools/delivery_table.py results_iluvatar_105_<日期> --show-baseline
+```
+
+- **`-k` 过滤对新变体没有影响**：40 个新变体的精度用例都在 `test_q4_variants_accuracy.py` 里，用例名匹配
+  `test_q4_variant`，全部保留，包括 3 个 bf16 变体和 c32 变体。另外 `test_gemvi_geam_accuracy.py` 里的边界用例
+  只保留 f32 那部分，c32 和 f64/c128 会被这个过滤挡掉，这是预期的。
+- **dtype 限制不影响新变体**：新变体的基准由 q4 基准和新脚本（`test_gemvi.py`、`test_geam_csr.py`）产出，不受各脚本
+  `--dtypes` 的限制。`spgemm_csr=--dtypes float32` 正好保证复数行由 float32 进程追加。
+
+**这个后端的风险点（针对新增的 40 个）：**
+
+- **bf16 未验证**：CoreX 对 bf16 的支持没有验证过。3 个 bf16 变体（`spmv_csr_bf16_int_non`、`spmv_csr_bf16f32_int_non`、
+  `spmm_csr_bf16f32_int_non_non_row`）要么正常，要么报 Triton 编译错误，也可能静默算错。精度用例是和 CPU 参考比的，
+  算错会显示 FAIL。
+- **spgemm c32 走 ESC**：Iluvatar 不能用 TLE 共享内存，所以 c32 和 f32 一样走 ESC，用到复数的 torch 排序和
+  `index_add_`。这是这张卡上第一次跑复数 SpGEMM。
+- **`torch.sparse` 会静默算错**：geam 的 PyTorch 基线是 CSR 加法，spgemm 是 CSR 乘法，都会先和 SciPy 参考比，偏差
+  超过 1e-2 就不计时，并写进 `pytorch_reason`。gemvi 的 PyTorch 基线是稠密的 `index_select` 加 matmul，不经过
+  `torch.sparse`。
+- **没有厂商列**：q4 基准用的 `cusparse_generic_baseline` 在 Iluvatar 上跳过，这和 45 个 q4 变体一样，CoreX 的
+  legacy `cusparseScsrmv` 只接在各脚本自己的经典行上。新变体在 H800 上也没有数据，PyTorch 列被拦下的话就没有
+  加速比。
+- **f64 静默变 0**：新 40 个都不含 f64，参考结果在 CPU 上算，不受影响。
+
+**跑完要确认：**
+
+1. `missing` 是不是 0。原 65 个里那 9 个 f64/c64 显示 NotFound 是预期的；新 40 个的精度应该都是 Passed。
+2. 3 个 bf16 变体的精度结果，失败的话贴原始报错。
+3. `spgemm_csr_c32_int_non_non`：精度、耗时，以及 `performance.csv` 里是不是只有 10 行 c32。
+4. 新 40 个里没有加速比的变体逐个列出，附上 `pytorch_reason`（这张卡上被拦下的会比较多）。
+5. `tools/delivery_table.py --show-baseline` 的输出原样贴回。
+
 ## 要做的事
 
 环境按 `../ILUVATAR.md` 第 1 节配好后（**一定要显式设 `FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse`，

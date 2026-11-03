@@ -83,16 +83,30 @@ flagsparseStatus_t copy_dense(flagsparseHandle_t handle, const void* src, void* 
                               int64_t n_rows, int64_t n_cols,
                               int64_t src_stride_m, int64_t src_stride_n,
                               int64_t dst_stride_m, int64_t dst_stride_n) {
+    return copy_dense_cast(handle, src, component_type, dst, component_type, is_complex,
+                           n_rows, n_cols, src_stride_m, src_stride_n,
+                           dst_stride_m, dst_stride_n);
+}
+
+flagsparseStatus_t copy_dense_cast(flagsparseHandle_t handle,
+                                   const void* src, flagsparseDataType_t src_component,
+                                   void* dst, flagsparseDataType_t dst_component,
+                                   bool is_complex, int64_t n_rows, int64_t n_cols,
+                                   int64_t src_stride_m, int64_t src_stride_n,
+                                   int64_t dst_stride_m, int64_t dst_stride_n) {
     if (src == nullptr || dst == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
     if (n_rows <= 0 || n_cols <= 0) return FLAGSPARSE_STATUS_SUCCESS;
 
-    const char* vt = triton_dtype(component_type);
-    if (vt[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    const char* st_ = triton_dtype(src_component);
+    const char* dt_ = triton_dtype(dst_component);
+    if (st_[0] == '\0' || dt_[0] == '\0') return FLAGSPARSE_STATUS_NOT_SUPPORTED;
 
+    // _dense_copy_kernel's tl.store converts to the destination's element type,
+    // so a float32 accumulator lands in a float16 output with one kernel.
     std::string sig;
     sig.reserve(112);
-    sig += "*"; sig += vt; sig += ":16,";
-    sig += "*"; sig += vt; sig += ":16,";
+    sig += "*"; sig += st_; sig += ":16,";
+    sig += "*"; sig += dt_; sig += ":16,";
     sig += "i32,i32,";                     // n_rows, n_cols
     sig += "i64,i64,i64,";                 // src strides (m, n, r)
     sig += "i64,i64,i64,";                 // dst strides (m, n, r)

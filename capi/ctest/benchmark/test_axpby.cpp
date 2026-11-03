@@ -21,12 +21,17 @@ TEST(AxpbyBenchmark, SparseVector) {
     const std::vector<double> sparse_h{2.0, -1.0, 4.0};
     const std::vector<double> initial_h{1.0, 2.0, 3.0, -2.0};
     const std::vector<double> ref{2.5, -1.0, -3.0, 7.0};
-    const uint16_t alpha = float_to_fp16(1.5f);
-    const uint16_t beta = float_to_fp16(-0.5f);
+    // Scalars in the value type: float16 bits, a float, or a (re, im) float pair.
+    const uint16_t alpha_h = float_to_fp16(1.5f), beta_h = float_to_fp16(-0.5f);
+    const float alpha_f[2] = {1.5f, 0.0f}, beta_f[2] = {-0.5f, 0.0f};
 
     for (const registry::Variant* v : declared) {
         if (!benchmark_variant_selected(*v)) continue;
         const auto dt = v->dt;
+        const void* alpha = dt == FLAGSPARSE_R_16F ? static_cast<const void*>(&alpha_h)
+                                                   : static_cast<const void*>(alpha_f);
+        const void* beta = dt == FLAGSPARSE_R_16F ? static_cast<const void*>(&beta_h)
+                                                  : static_cast<const void*>(beta_f);
         BenchRow row;
         row.name = std::string("axpby_spvec_") + v->dtype;
         row.tag("operator", v->op).tag("format", v->format).tag("dtype", v->dtype)
@@ -53,7 +58,7 @@ TEST(AxpbyBenchmark, SparseVector) {
         }
         g_report.measure_vs_baseline(
             std::move(row),
-            [&]() { return flagsparseAxpby(handle.h, &alpha, x, &beta, y); },
+            [&]() { return flagsparseAxpby(handle.h, alpha, x, beta, y); },
             [&](bool relaxed) { return ratio_against(d_y.get(), ref, dt, relaxed); },
             [&](baseline::Timing*) {
                 return baseline::Status::no("no matching cuSPARSE Axpby baseline in harness");

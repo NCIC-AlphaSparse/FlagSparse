@@ -195,6 +195,9 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
             // Shadows the outer A: half-precision variants run on the scaled copy.
             const CsrMatrix& A = dtype_is_half(dt) ? A_half : entry.A;
             const auto out_dt = variant_output_dtype(*v);
+            // bfloat16 has no scalar slot of its own: cuSPARSE computes a bf16 SpMV
+            // in float32 and takes float32 alpha/beta, and so does this library.
+            const auto compute_dt = out_dt == FLAGSPARSE_R_16BF ? FLAGSPARSE_R_32F : out_dt;
             const auto x_dt = variant_vector_input_dtype(*v);
             const bool mixed = variant_is_mixed(*v);
             const std::string vid = v->variant_id ? v->variant_id : "";
@@ -230,7 +233,17 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                     std::vector<double>(static_cast<std::size_t>(A.rows), 0.0));
                 quantize_vector_inplace(&ref_variant, out_dt);
             }
-            if (!trans && variant_is_mixed(*v) && !is_csc && !is_sell) {
+            if (trans && (mixed || dtype_is_half(dt) || dtype_is_int8(dt))) {
+                // Narrow and mixed transposes: the inputs as uploaded, the result
+                // in the output type (a float16 one is rounded once, at the end).
+                CsrMatrix Aq = A;
+                for (double& value : Aq.values) value = quantize_scalar(value, dt);
+                std::vector<double> xq = x_host;
+                for (double& value : xq) value = quantize_scalar(value, x_dt);
+                ref_variant = transpose_reference(Aq, xq);
+                quantize_vector_inplace(&ref_variant, out_dt);
+            }
+            if (!trans && variant_is_mixed(*v) && !is_sell) {
                 CsrMatrix Aq = A;
                 for (double& value : Aq.values) value = quantize_scalar(value, dt);
                 std::vector<double> xq = x_host;
@@ -301,8 +314,8 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
             // outside the timed region so the allocator never lands in a sample.
             std::size_t bufsz = 0;
             flagsparseSpMV_bufferSize(handle.h, op_a,
-                                      sc.alpha(out_dt), matA, vecX, sc.beta(out_dt), vecY, out_dt,
-                                      FLAGSPARSE_SPMV_ALG_DEFAULT, &bufsz);
+                                      sc.alpha(compute_dt), matA, vecX, sc.beta(compute_dt), vecY,
+                                      compute_dt, FLAGSPARSE_SPMV_ALG_DEFAULT, &bufsz);
             DeviceBuffer scratch(bufsz ? bufsz : 1);
             if (!scratch.get()) {
                 flagsparseDestroyDnVec(vecX); flagsparseDestroyDnVec(vecY);
@@ -322,8 +335,8 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                 std::move(row),
                 [&]() {
                     return flagsparseSpMV(handle.h, op_a,
-                                          sc.alpha(out_dt), matA, vecX, sc.beta(out_dt), vecY,
-                                          out_dt, is_sell ? FLAGSPARSE_SPMV_SELL_ALG1 :
+                                          sc.alpha(compute_dt), matA, vecX, sc.beta(compute_dt),
+                                          vecY, compute_dt, is_sell ? FLAGSPARSE_SPMV_SELL_ALG1 :
                                           FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get());
                 },
                 [&](bool relaxed) {

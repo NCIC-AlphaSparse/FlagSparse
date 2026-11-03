@@ -159,6 +159,21 @@ struct BaselineCsrOut {
 
 void free_csr(BaselineCsrOut* c);
 
+// y = alpha * op(A) * x + beta * y, A dense column-major (lda), x sparse with
+// int32 indices: the legacy cusparse<t>gemvi, bufferSize included, outside the
+// timed calls.
+Status gemvi(flagsparseOperation_t op, int m, int n, const void* alpha, const void* A,
+             int lda, int nnz, const void* x_val, const void* x_ind, const void* beta,
+             void* y, flagsparseDataType_t dtype, int warmup, int iters, Timing* out);
+
+// C = alpha * A + beta * B with the legacy cusparse<t>csrgeam2: Nnz then the sum
+// in every timed call, into the caller's c_ptr (rows + 1) / c_ind / c_val, which
+// must hold c_capacity entries -- what FlagSparse's own call fills too, so verify
+// reads the baseline's answer from the same buffers.
+Status csrgeam2(const DeviceCsr& A, const DeviceCsr& B, const void* alpha, const void* beta,
+                void* c_ptr, void* c_ind, void* c_val, int64_t c_capacity, int warmup,
+                int iters, Timing* out);
+
 // C = A * A. Pass `result` to take ownership of C and check the vendor's answer;
 // pass nullptr to have the baseline free it (only the timing escapes).
 Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,

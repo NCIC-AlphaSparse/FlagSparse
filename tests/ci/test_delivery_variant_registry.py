@@ -10,10 +10,10 @@ from tools.delivery_variants import load_delivery_variants
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# `delivery_variants:` in conf/operators.yaml holds 65 variants: the 20 originally
-# delivered to the C API plus 45 more from docs/NEW_OPERATORS_CUSPARSE_12_5.md that
-# are implemented and accuracy-tested in Python but not all wrapped by the C API /
-# c_fs layer yet. There is no separate "q4" list any more -- a variant's pytest
+# `delivery_variants:` in conf/operators.yaml holds 105 variants: the 20 originally
+# delivered to the C API, 45 more from docs/NEW_OPERATORS_CUSPARSE_12_5.md, and the
+# 40 of docs/NEW_OPERATORS_BATCH3.md (2026-11-02). There is no separate "q4" list
+# any more -- a variant's pytest
 # cases and benchmark rows are found by its `id`
 # (tests/pytest/test_q4_variants_accuracy.py, the `variant` CSV column).
 #
@@ -25,10 +25,13 @@ ROOT = Path(__file__).resolve().parents[2]
 # default report" scope (checked separately by
 # test_the_capi_manifests_own_delivery_scope_has_not_grown below).
 #
-# All 65 since 2026-10-08: the origin/q4 C API work was ported and every variant
-# produced benchmark rows on CUDA (RTX 5090, the 10 delivery matrices). Pinned so
-# a regression -- a manifest entry narrowed, an op dropped -- fails here by name.
-CAPI_TRUE_COUNT = 65
+# The first 65 since 2026-10-08: the origin/q4 C API work was ported and every
+# variant produced benchmark rows on CUDA (RTX 5090, the 10 delivery matrices).
+# Batch 3 (40 more) since 2026-11-02, after the C API routes were added and each
+# was benchmarked the same way. Pinned so a regression -- a manifest entry
+# narrowed, an op dropped -- fails here by name.
+CAPI_FALSE_IDS = []
+CAPI_TRUE_COUNT = 105
 
 # The C API manifest names dtypes by the width of the whole value (c64 = complex of
 # two fp32); the registry names the component (c32 = complex64).
@@ -114,17 +117,17 @@ def _capi_derived_true(variant: dict, capi_ops: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
-def test_delivery_registry_has_65_unique_variants():
+def test_delivery_registry_has_105_unique_variants():
     variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
     ids = [variant["id"] for variant in variants]
-    assert len(ids) == 65 and len(set(ids)) == 65
+    assert len(ids) == 105 and len(set(ids)) == 105
 
 
 def test_the_capi_true_subset_is_pinned():
     """`capi: true` disappearing must be a deliberate edit here too."""
     variants = load_delivery_variants(ROOT / "conf" / "operators.yaml")
     not_capi = sorted(v["id"] for v in variants if not v["capi"])
-    assert not_capi == [], not_capi
+    assert not_capi == CAPI_FALSE_IDS, not_capi
     assert sum(v["capi"] for v in variants) == CAPI_TRUE_COUNT
 
 

@@ -52,6 +52,11 @@ Produces, same as run_flagsparse_pytest.py's own delivery run:
     <capi-bench-out>/summary.json           performance only, from the C API
     <results-dir>/summary_split.json        merged: accuracy from the first,
                                              performance from the second
+
+A variant the C API did not measure at all (no row, or only not_supported rows)
+takes the Python half's performance instead, marked ``source: python`` -- see
+fill_unmeasured_from_python. The Python half measures performance only under
+--h800-reference, so without it those variants stay NotFound.
 """
 
 from __future__ import annotations
@@ -273,6 +278,63 @@ def _has_speedup(performance: object) -> bool:
     )
 
 
+# Python-side performance statuses that are not a measurement either.
+_UNMEASURED_PERFORMANCE = ("NotFound", "NOT_CONFIGURED")
+
+
+def _capi_did_not_measure(performance: object) -> bool:
+    """The C API has no timing for this variant at all.
+
+    ``NotFound``: no benchmark row (capi/tools/write_summary.py writes it for every
+    registered variant the run never reached, e.g. a ``capi: false`` one).
+    ``Skipped`` with no per-matrix details: rows exist, but none ran -- all
+    ``not_supported`` -- since write_summary.py fills ``details`` from ``ok`` rows only.
+    A ``Skipped`` entry with details was measured and is left alone.
+    """
+    if not isinstance(performance, dict):
+        return False
+    status = performance.get("status")
+    if status in _UNMEASURED_PERFORMANCE:
+        return True
+    if status != "Skipped":
+        return False
+    data = performance.get("data")
+    return not (
+        isinstance(data, dict)
+        and any(isinstance(d, dict) and d.get("details") for d in data.values())
+    )
+
+
+def fill_unmeasured_from_python(merged_result: dict, py_result: dict | None) -> dict:
+    """A variant the C API did not measure takes the Python half's performance.
+
+    The C API implements only the ``capi: true`` variants, so every other one used
+    to read ``NotFound`` in the merged report even when the Python half (which
+    measures performance under --h800-reference) had timed it -- 24 of the 40
+    batch-3 variants on MUSA. Any real Python measurement is taken, with or
+    without a speedup and whatever its status: a FAIL or a row without a baseline
+    says more than "not found". Marked ``source: python``; the C API entry is kept
+    under ``capi_performance``. Returns {"python": n, "missing": [ids]}.
+    """
+    counts = {"python": 0, "missing": []}
+    for variant_id, entry in merged_result.items():
+        performance = entry.get("performance")
+        if not _capi_did_not_measure(performance):
+            continue
+        py_perf = ((py_result or {}).get(variant_id) or {}).get("performance")
+        if (
+            isinstance(py_perf, dict)
+            and py_perf.get("status")
+            and py_perf.get("status") not in _UNMEASURED_PERFORMANCE
+        ):
+            entry["capi_performance"] = performance
+            entry["performance"] = dict(py_perf, source="python")
+            counts["python"] += 1
+        else:
+            counts["missing"].append(variant_id)
+    return counts
+
+
 def apply_h800_scaled_baseline(
     merged_result: dict, reference: str, card: str, py_result: dict | None = None
 ) -> dict:
@@ -356,6 +418,14 @@ def merge_summaries(
         entry.setdefault("customized", py_entry.get("customized", capi_entry.get("customized", True)))
         entry.setdefault("labels", py_entry.get("labels") or capi_entry.get("labels") or [])
         merged_result[variant_id] = entry
+
+    # Before the H800 step, which only touches NoBaseline entries: a variant filled
+    # here carries the Python half's own status and baseline from then on.
+    unmeasured = fill_unmeasured_from_python(merged_result, py_result)
+    if unmeasured["python"] or unmeasured["missing"]:
+        log(f"variants the C API did not measure: filled from the Python half="
+            f"{unmeasured['python']}, still unmeasured={len(unmeasured['missing'])} "
+            f"{unmeasured['missing']}")
 
     if h800_reference and h800_card:
         counts = apply_h800_scaled_baseline(

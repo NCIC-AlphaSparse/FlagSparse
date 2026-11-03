@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <array>
+#include <complex>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -218,8 +219,10 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
         B->idx_base != FLAGSPARSE_INDEX_BASE_ZERO) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
-    // The hash kernels accumulate in fp32 or fp64 and have no complex twin.
-    if (computeType != FLAGSPARSE_R_32F && computeType != FLAGSPARSE_R_64F) {
+    // The device phases only count C's structure, which no value type affects;
+    // copy() materialises the values (complex64 accumulated in complex128).
+    if (computeType != FLAGSPARSE_R_32F && computeType != FLAGSPARSE_R_64F &&
+        computeType != FLAGSPARSE_C_32F) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     if (A->cols != B->rows) return FLAGSPARSE_STATUS_INVALID_VALUE;
@@ -231,19 +234,23 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
 
     // cuSPARSE itself only defines alpha == 1, beta == 0 for SpGEMM; anything
     // else would need a D operand this API has no room for.
-    double a_re = 1.0, b_re = 0.0;
+    double a_re = 1.0, b_re = 0.0, a_im = 0.0, b_im = 0.0;
     if (alpha == nullptr || beta == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
     if (ctx(handle)->pointer_mode != FLAGSPARSE_POINTER_MODE_HOST) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
-    if (computeType == FLAGSPARSE_R_32F) {
-        a_re = *static_cast<const float*>(alpha);
-        b_re = *static_cast<const float*>(beta);
+    if (computeType == FLAGSPARSE_R_32F || computeType == FLAGSPARSE_C_32F) {
+        a_re = static_cast<const float*>(alpha)[0];
+        b_re = static_cast<const float*>(beta)[0];
+        if (computeType == FLAGSPARSE_C_32F) {
+            a_im = static_cast<const float*>(alpha)[1];
+            b_im = static_cast<const float*>(beta)[1];
+        }
     } else {
         a_re = *static_cast<const double*>(alpha);
         b_re = *static_cast<const double*>(beta);
     }
-    if (a_re != 1.0 || b_re != 0.0) {
+    if (a_re != 1.0 || b_re != 0.0 || a_im != 0.0 || b_im != 0.0) {
         ctx(handle)->last_error =
             "SpGEMM supports alpha == 1 and beta == 0 only, as cuSPARSE does.";
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
@@ -748,6 +755,30 @@ flagsparseStatus_t flagsparseSpGEMM_copy(
                     out_cols.push_back(static_cast<std::int32_t>(j));
                     const float narrowed = static_cast<float>(value);
                     const auto* p = reinterpret_cast<const unsigned char*>(&narrowed);
+                    out_vals.insert(out_vals.end(), p, p + sizeof(narrowed));
+                }
+            } else if (computeType == FLAGSPARSE_C_32F) {
+                // complex64 in, complex128 accumulation, complex64 out -- the
+                // float32 branch's reasoning, per component.
+                using cd = std::complex<double>;
+                const auto* av_ri = reinterpret_cast<const float*>(a_raw.data());
+                const auto* bv_ri = reinterpret_cast<const float*>(b_raw.data());
+                std::map<int64_t, cd> row;
+                for (int64_t ap = a_off[static_cast<std::size_t>(r)];
+                     ap < a_off[static_cast<std::size_t>(r) + 1]; ++ap) {
+                    const int64_t k = a_col[static_cast<std::size_t>(ap)];
+                    const cd av(av_ri[2 * ap], av_ri[2 * ap + 1]);
+                    for (int64_t bp = b_off[static_cast<std::size_t>(k)];
+                         bp < b_off[static_cast<std::size_t>(k) + 1]; ++bp) {
+                        const int64_t j = b_col[static_cast<std::size_t>(bp)];
+                        row[j] += av * cd(bv_ri[2 * bp], bv_ri[2 * bp + 1]);
+                    }
+                }
+                for (const auto& [j, value] : row) {
+                    out_cols.push_back(static_cast<std::int32_t>(j));
+                    const float narrowed[2] = {static_cast<float>(value.real()),
+                                               static_cast<float>(value.imag())};
+                    const auto* p = reinterpret_cast<const unsigned char*>(narrowed);
                     out_vals.insert(out_vals.end(), p, p + sizeof(narrowed));
                 }
             } else {

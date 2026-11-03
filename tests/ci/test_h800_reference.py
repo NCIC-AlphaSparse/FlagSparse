@@ -352,7 +352,7 @@ def test_every_delivery_operator_has_a_usable_library_time_column(bundled):
 
 
 def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
-    """45 of the 65 delivery variants have no H800 run yet -- that is expected.
+    """The 40 batch-3 delivery variants have no H800 run yet -- that is expected.
 
     `conf/h800_reference.json` only has real H800 wall times for variants someone
     has actually run there; fabricating numbers for the rest is not an option. Once
@@ -363,13 +363,17 @@ def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
     assert set(bundled["variants"]) <= delivery_ids
 
 
-# The bundle is built from the 2026-10-14 H800 run of the whole 65-variant registry
-# (conf/h800_reference.json's own "reference" block). Pinned to the registry on
-# purpose: a regenerated bundle that lost a variant must fail here, not shrink
-# silently.
-def test_the_bundled_variants_are_the_whole_delivery_registry(bundled):
-    delivery_ids = {v["id"] for v in load_delivery_variants()}
-    assert set(bundled["variants"]) == delivery_ids
+# The bundle is built from the 2026-10-14 H800 run of the whole registry as it
+# stood then, its first 65 variants (conf/h800_reference.json's own "reference"
+# block); the 40 batch-3 variants appended on 2026-11-02 have no H800 run yet.
+# Pinned to the registry on purpose: a regenerated bundle that lost a variant
+# must fail here, not shrink silently.
+H800_RUN_VARIANT_COUNT = 65
+
+
+def test_the_bundled_variants_are_the_registry_as_run_on_h800(bundled):
+    delivery_ids = [v["id"] for v in load_delivery_variants()]
+    assert set(bundled["variants"]) == set(delivery_ids[:H800_RUN_VARIANT_COUNT])
 
 
 def test_no_bundled_variant_failed(bundled):

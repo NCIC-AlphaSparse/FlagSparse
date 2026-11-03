@@ -66,3 +66,51 @@ def test_capi_summary_reports_nobaseline_instead_of_skipped(tmp_path):
     assert f16["data"]["fp16"]["reason"] == ["muSPARSE: Gather dtype unsupported"]
     assert result["gather_f32_int"]["performance"]["status"] == "Passed"
     assert result["gather_f64_int"]["performance"]["status"] == "Skipped"
+
+
+def _summarize(tmp_path, rows):
+    (tmp_path / "gather_benchmark.json").write_text(
+        json.dumps({"operator": "gather", "env": {"backend": "CUDA"}, "result": rows}),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "capi" / "tools" / "write_summary.py"),
+            "--bench-dir",
+            str(tmp_path),
+            "--out",
+            str(tmp_path),
+            "--no-html",
+        ],
+        check=True,
+        cwd=ROOT,
+        capture_output=True,
+    )
+    return json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))["result"]
+
+
+def test_a_failed_row_fails_the_variant_instead_of_dropping_out(tmp_path):
+    # CUDA, 2026-11-02: three SpMV transposes failed their accuracy gate on one
+    # matrix of ten and still read NoBaseline -- the failed row was filtered out
+    # before "every measured row passed" was checked. Same with a baseline.
+    no_vendor = {"baseline_status": "failed", "baseline_detail": "not wired"}
+    failed = {"status": "failed", "accuracy": "fail", "median_ms": 0}
+    rows = [
+        _row("f16", "a", **no_vendor),
+        _row("f16", "b", **no_vendor, **failed),
+        _row("f32", "a", baseline_status="ok", baseline_ms=0.06, speedup=2.0),
+        _row("f32", "b", baseline_status="ok", baseline_ms=0.06, **failed),
+        _row("f64", "a", baseline_status="ok", baseline_ms=0.06, speedup=1.5),
+    ]
+    result = _summarize(tmp_path, rows)
+
+    f16 = result["gather_f16_int"]["performance"]
+    assert f16["status"] == "Failed"
+    assert f16["data"]["fp16"]["failed_rows"] == ["b"]
+    f32 = result["gather_f32_int"]["performance"]
+    assert f32["status"] == "Failed"
+    # The speedup is still over the rows that passed, and says which did not.
+    assert f32["data"]["fp32"]["speedup"] == 2.0
+    assert f32["data"]["fp32"]["failed_rows"] == ["b"]
+    assert result["gather_f64_int"]["performance"]["status"] == "Passed"

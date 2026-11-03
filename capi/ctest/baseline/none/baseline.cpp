@@ -76,4 +76,11 @@ Status gather(const void*, void*, const void*, int64_t, int64_t,
 Status scatter(void*, const void*, const void*, int64_t, int64_t,
                flagsparseDataType_t, int, int, Timing*) { return none(); }
 
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return none();
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) { return none(); }
+
 }  // namespace fstest::baseline

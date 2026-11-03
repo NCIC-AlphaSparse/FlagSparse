@@ -3930,3 +3930,35 @@ def _dense_copy_kernel(
     if IS_COMPLEX:
         tl.store(d_re + dst_stride_r,
                  tl.load(s_re + src_stride_r, mask=mask_n, other=0.0), mask=mask_n)
+
+
+@triton.jit
+def _permute_values_kernel(
+    src_ptr,
+    order_ptr,
+    dst_ptr,
+    n,
+    BLOCK: tl.constexpr,
+    IS_COMPLEX: tl.constexpr,
+    CONJ: tl.constexpr,
+):
+    """dst[i] = src[order[i]] (conjugated when CONJ), for a permuted value array.
+
+    Another C API helper, like _dense_copy_kernel: a CSR operand with op(A) =
+    A^H is run as the CSR of A^T, whose structure is built once in preprocess
+    while its values -- reordered and conjugated -- are refreshed on every call,
+    since cuSPARSE lets a caller change values between calls. Complex values are
+    interleaved real/imag pairs of the component dtype.
+    """
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    src = tl.load(order_ptr + offs, mask=mask, other=0)
+    if IS_COMPLEX:
+        re = tl.load(src_ptr + 2 * src, mask=mask, other=0.0)
+        im = tl.load(src_ptr + 2 * src + 1, mask=mask, other=0.0)
+        if CONJ:
+            im = -im
+        tl.store(dst_ptr + 2 * offs, re, mask=mask)
+        tl.store(dst_ptr + 2 * offs + 1, im, mask=mask)
+    else:
+        tl.store(dst_ptr + offs, tl.load(src_ptr + src, mask=mask, other=0.0), mask=mask)

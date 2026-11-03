@@ -336,6 +336,26 @@ PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
         )
         for op in ("axpby", "spvv")
     },
+    # gemvi takes a dense A and a sparse x: synthetic (m, n, nnz) cases too.
+    "gemvi": (
+        "tests/test_gemvi.py",
+        "--csv-summary",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
+    "geam_csr": (
+        "tests/test_geam_csr.py",
+        "{input}",
+        "--csv",
+        "{csv}",
+        "--warmup",
+        "{warmup}",
+        "--iters",
+        "{iters}",
+    ),
     "spmv_sell": (
         "tests/test_spmv_sell.py",
         "{input}",
@@ -932,6 +952,8 @@ OP_TEST_CONFIGS: dict[str, OperatorTestConfig] = {
     "spmv_sell": OperatorTestConfig("spmv_sell", PERFORMANCE_COMMANDS["spmv_sell"]),
     "axpby": OperatorTestConfig("axpby", PERFORMANCE_COMMANDS["axpby"]),
     "spvv": OperatorTestConfig("spvv", PERFORMANCE_COMMANDS["spvv"]),
+    "gemvi": OperatorTestConfig("gemvi", PERFORMANCE_COMMANDS["gemvi"]),
+    "geam_csr": OperatorTestConfig("geam_csr", PERFORMANCE_COMMANDS["geam_csr"]),
     "gather": OperatorTestConfig("gather", PERFORMANCE_COMMANDS["gather"]),
     "scatter": OperatorTestConfig("scatter", PERFORMANCE_COMMANDS["scatter"]),
     "spmv_csr": OperatorTestConfig("spmv_csr", PERFORMANCE_COMMANDS["spmv_csr"]),
@@ -1667,6 +1689,10 @@ EXPECTED_ACCURACY_SKIP_REASONS = (
     # tests/pytest/test_spmv_csr_maca_accuracy.py is a MACA-only regression; its
     # float16/complex64 cases turned spmv_csr_f16 / _c64 "Skipped" elsewhere.
     "maca required",
+    # tests/pytest/test_sddmm_iluvatar_layout_accuracy.py runs only on Iluvatar; its
+    # f32 cases turned sddmm_csr_f32_int_non_non_row "Skipped" on CUDA (2026-11-02,
+    # 2 passed + 2 of these skips).
+    "bi-v layout specialization",
 )
 
 

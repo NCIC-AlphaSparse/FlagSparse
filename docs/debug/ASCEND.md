@@ -7,6 +7,59 @@
 今天已经做了一部分代码级别的工作，但还有明确分三档、工作量差异很大的剩余任务，不是跑一条命令就能
 验完的。`../ASCEND.md`"现在是 65 个变体"一节有同样内容的简版，这里是给要上机干活的人看的任务清单。
 
+## 2026-11-02 复测计划：105 变体
+
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。按约定，`ASCEND_Q4_VARIANTS` 要等 NPU 真机
+验证后才扩，所以这次**一个新变体都没有加进去**，`gemvi`、`geam_csr` 在 `ASCEND_PERFORMANCE_COMMANDS` 里也没有条目。
+这一轮分两步：先全量跑一遍，确认原 65 个没有退化；再按下面的清单逐步把新变体接上。
+
+### 第 1 步：105 变体全量（命令同下面的"先做"一节，只换结果目录）
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH="$PWD/src:$PWD" FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus 6,7 --timeout 3600 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+  --h800-reference \
+  --results-dir results_ascend_105_<日期> \
+  > results_ascend_105_<日期>.log 2>&1 < /dev/null &
+python3 tools/delivery_table.py results_ascend_105_<日期> --show-baseline
+```
+
+新 40 个在这一步里预期是这样（按代码路径推出来的，没在 NPU 上跑过）：
+
+| 新变体 | 精度 | 性能 | 原因 |
+|---|---|---|---|
+| spmv_csr ×5、spmm_csr ×7、sddmm_csr ×4（共 16 个） | NotFound | NotFound | 这 3 个算子的精度走 `benchmark_ascend_accuracy.py --q4-variants`，性能走 `--q4-variants`，名单都是 `ASCEND_Q4_VARIANTS` |
+| spmv_coo ×3、spmv_csc ×4、spmm_coo ×4、spmm_csc ×2（共 13 个） | 由 pytest 在 NPU 上跑 | NotFound | 精度走通用 pytest，代码里有昇腾分支；性能走 q4 基准，受 `ASCEND_Q4_VARIANTS` 限制 |
+| axpby ×2、spvv ×3 | 由 pytest 在 NPU 上跑 | 应有数据 | `test_vector_ops.py` 已复用到昇腾，不受 `ASCEND_Q4_VARIANTS` 限制 |
+| gemvi ×3、geam_csr ×2 | 由 pytest 在 NPU 上跑 | NOT_CONFIGURED | 昇腾分支用的是 torch_npu（`_torch_gemvi`、`_torch_geam`），但没有性能命令 |
+| spgemm_csr_c32 | 由 pytest 在 NPU 上跑 | 可能有数据 | `test_spgemm.py` 的 float32 进程会追加 c32 行，走 ESC，用到复数的 torch_npu 运算，这是第一次在 NPU 上跑 |
+
+确认原 65 个和 10-29 那轮相比没有退化，再把新 40 个各自的实际状态和上表对一遍，有出入的列出来。
+
+### 第 2 步：逐步接上新变体（每接一批就重跑这几个算子，用新的结果目录）
+
+1. **gemvi、geam_csr 的性能**：把 `run_flagsparse_pytest.py` 的 `ASCEND_PERFORMANCE_COMMANDS` 里
+   `for op in ("axpby", "spvv", "spmv_sell", "spgemm_csr")` 改成也包含 `"gemvi"`、`"geam_csr"`。这两个脚本和 CUDA 共用，
+   cuSPARSE 列会自动跳过。改完用 `--ops gemvi,geam_csr` 单独跑。
+2. **q4 基准的变体**：照 10-10 到 10-11 的做法，每个算子先挑 1 个最简单的新变体，在 `wave.mtx` 上用 q4 基准冒烟。
+   跑通、精度对，就加进 `ASCEND_Q4_VARIANTS[算子]`，并在下面的"实机改动记录"里追加一条。建议的顺序：
+   - 先接 trans 和 out_dtype 类：`spmv_csc_f32_int_trans`、`spmm_coo_f32_int_non_trans_row`、`spmm_csc_f16f32_int_non_non_row`、
+     `sddmm_csr_f16f32_int_non_non_row`；
+   - 再接混合精度转置：`spmv_csr_f16f32_int_trans`、`spmv_coo_f16_int_trans` 等，在昇腾上走 `_torch_spmv_rows` 交换行列下标；
+   - bf16 最后接：要先确认 torch_npu 对 bf16 `index_add_` 的支持。
+3. **CANN 基线**：q4 基准里 COO/CSR/CSC SpMM 的 CANN 计划（`cann_baseline`）对新变体同样生效（cann > pytorch >
+   h800_scaled）。新 SpMM 变体接上后，确认 `cann_status` 列。新变体没有 H800 数据，最后一级折算补不上。
+
+**跑完要确认：**
+
+1. 第 1 步：原 65 个是不是和 10-29 那轮一致（64/65 或更好）；新 40 个的实际状态和上表的差别。
+2. 上表第 2–5 行那 24 个新变体（精度由 pytest 在 NPU 上跑），精度失败的贴原始报错，尤其是 spgemm c32 和 geam c32。
+3. 第 2 步每接一批，就贴一次这几个变体的 `delivery_table.py --show-baseline` 行，以及 `performance.csv` 原始行
+   （含 `timed`、`cann_status`、`pytorch_ms`）。
+
 ## 今天（2026-10-08）在 CUDA 机器上做了什么
 
 1. `axpby`/`spvv`/`spmv_sell` 接上了路由——复用 CUDA 那套脚本（这三个脚本本身 backend-neutral），

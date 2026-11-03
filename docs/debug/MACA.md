@@ -3,6 +3,48 @@
 `FLAGSPARSE_BACKEND=metax`。环境搭建、交付复现见 [`../MACA.md`](../MACA.md)。背景见本目录
 [`README.md`](README.md)。
 
+## 2026-11-02 复测计划：105 变体
+
+注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。开跑前照旧做 `../MACA.md` 0.5 节的
+检查，然后只跑下面这条命令。它和后面"要做的事"里的命令相比只改了两处：`--ops` 加上了 `gemvi,geam_csr`，
+结果目录换成了新名字。
+
+```bash
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+  --ops gather,scatter,axpby,spvv,gemvi,spmv_sell,spmv_csr,spmv_coo,spmv_csc,spmm_csr,spmm_coo,spmm_csc,spgemm_csr,geam_csr,sddmm_csr \
+  --phase both --mode normal --gpus 0 --timeout 4500 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+  --op-benchmark-args='sddmm_csr=--no-cusparse' \
+  --h800-reference \
+  --results-dir results_metax_105_<日期> \
+  > results_metax_105_<日期>.log 2>&1 < /dev/null &
+# 跑完后
+python3 tools/delivery_table.py results_metax_105_<日期> --show-baseline
+```
+
+**这个后端的风险点（针对新增的 40 个）：**
+
+- **没有厂商列，H800 也补不上**：C550 没有厂商稀疏库，新变体只有 PyTorch 对照。它们在 H800 上没有数据，所以
+  `--h800-reference` 只能补前 65 个。
+- **SDDMM 的 PyTorch 参考是错的**：`torch.sparse.sampled_addmm` 在 C550 上会算错（7.3 节）。q4 基准会先把 PyTorch
+  的结果和 CPU 参考比一遍，所以 4 个新 SDDMM 变体（`f32_trans_trans`、`c32_non_trans`、`f16_non_trans`、`f16f32`）
+  大概率出现 `pytorch_reason = PyTorch result off by ...` 并且没有加速比，这说明校验在起作用。如果某个变体的
+  PyTorch 列没被拦下，结果却明显离谱，要报回来。
+- **spgemm c32 走 ESC**：MACA 专用的纯 Triton SpGEMM（`_spgemm_maca.py`）只支持实数，c32 跳过它；C550 又没有 TLE，
+  所以走 ESC（torch 的排序和归约）。结果是对的，但慢，CUDA 上 ESC 约为 cuSPARSE 的 0.1 倍。
+- **4KB 私有内存**：新 kernel 没有用 `tl.static_range` 做大规模展开。gemvi 的 tile 是 64×32，geam 的二分查找用的是
+  运行时循环。复数 gemvi 和 geam_c32 要优先看有没有 `memory size or pointer value too large`。
+
+**跑完要确认：**
+
+1. `missing` 是不是 0；105 个变体的精度是不是都 Passed。
+2. 复数的新变体有没有编译错误：`gemvi_c32_int_non`、`geam_csr_c32_int`、`spmv_csc_c32_int_conj`、`spmm_csr_c32_int_*`、
+   `sddmm_csr_c32_int_non_trans_row`、`spvv_c32_int_non`、`spmv_*_f32c32_*`。
+3. 新 40 个里没有加速比的变体逐个列出，附上 `pytorch_reason`。
+4. `spgemm_csr_c32_int_non_non` 的耗时（ESC 路径），以及 `performance.csv` 里是不是只有 10 行 c32。
+5. 和 10-15 那轮相比，原 65 个里加速比掉了一半以上的变体。这轮改过混合精度路径和 spmm_csc/sddmm 的公开接口，
+   原 65 个也可能受影响。
+
 ## 要做的事
 
 环境按 `../MACA.md` 第 1 节配好后，先做 `../MACA.md` 0.5 节的开跑前检查（`flagsparse.__file__` 必须指向

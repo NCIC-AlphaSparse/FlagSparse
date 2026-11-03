@@ -19,10 +19,10 @@ REQUIRED_KEYS = frozenset({"id", "operator", "format", "dtype"})
 def load_delivery_variants(path: Path | None = None) -> list[dict[str, object]]:
     """Return ordered, validated delivery variants from the canonical manifest.
 
-    One registry of 65: the 20 originally delivered to the C API plus 45 more that
-    are implemented and accuracy-tested but not yet wrapped by the C API / c_fs
-    layer. Each variant carries a ``capi`` bool (default ``False``) marking which
-    side of that line it is on -- see the comment above ``delivery_variants:`` in
+    One registry of 105: the 20 originally delivered to the C API, 45 more from
+    docs/NEW_OPERATORS_CUSPARSE_12_5.md and 40 from docs/NEW_OPERATORS_BATCH3.md.
+    Each variant carries a ``capi`` bool (default ``False``) marking whether the
+    C API implements it -- see the comment above ``delivery_variants:`` in
     conf/operators.yaml and tests/ci/test_delivery_variant_registry.py.
     """
     return _load_variant_list(path, "delivery_variants", required=True)

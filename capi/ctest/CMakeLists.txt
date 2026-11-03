@@ -140,7 +140,7 @@ endfunction()
 
 # Every operator in the spec's list. Files that do not exist yet are skipped,
 # so adding an operator is: drop in test_<op>.cpp, rebuild.
-set(FLAGSPARSE_OPS axpby spmv spmm spvv spsv spsm spgemm sddmm gather scatter)
+set(FLAGSPARSE_OPS axpby spmv spmm spvv spsv spsm spgemm sddmm gather scatter gemvi geam)
 if(FLAGSPARSE_CTEST_CAPI_BUILDABLE)
     foreach(op ${FLAGSPARSE_OPS})
         flagsparse_add_test(accuracy ${op})

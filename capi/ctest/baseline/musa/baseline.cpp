@@ -492,4 +492,15 @@ Status scatter(void* dense, const void* values, const void* indices, int64_t nnz
     return result;
 }
 
+// Legacy musparse<t>gemvi / <t>csrgeam2 are not verified on muSPARSE 4.3.5;
+// wire them on a MUSA box, the way the cuSPARSE template does.
+Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
+             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
+    return Status::no("muSPARSE: legacy <t>gemvi baseline not wired (unverified on 4.3.5)");
+}
+Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
+                void*, int64_t, int, int, Timing*) {
+    return Status::no("muSPARSE: legacy <t>csrgeam2 baseline not wired (unverified on 4.3.5)");
+}
+
 }  // namespace fstest::baseline
