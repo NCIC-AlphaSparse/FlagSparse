@@ -1390,4 +1390,58 @@ TEST_F(SpMVAccuracy, BsrRejectsUnsupportedBlockShapes) {
     }
 }
 
+// The real-by-complex scatter routes: COO A x and A^T x, and CSR A^T x, with
+// A = [[2, 0, -1], [0, 3, 4]] and complex x of non-zero imaginary part. A^T x
+// takes a 2-vector, A x a 3-vector, as op(A)'s shape says.
+TEST_F(SpMVAccuracy, RealFloat32ByComplex64ScatterRoutes) {
+    const std::vector<float> data{2.0f, -1.0f, 3.0f, 4.0f};
+    const std::vector<int32_t> rows{0, 0, 1, 1}, cols{0, 2, 1, 2}, indptr{0, 2, 4};
+    struct Case { bool coo; flagsparseOperation_t op; std::vector<float> x, expect; };
+    const std::vector<Case> cases{
+        // A x, x = [1+2i, -2+i, 0.5-3i]
+        {true, FLAGSPARSE_OPERATION_NON_TRANSPOSE, {1, 2, -2, 1, 0.5f, -3}, {1.5f, 7, -4, -9}},
+        // A^T x, x = [1+2i, -1+0.5i]: [2+4i, -3+1.5i, -5]
+        {true, FLAGSPARSE_OPERATION_TRANSPOSE, {1, 2, -1, 0.5f}, {2, 4, -3, 1.5f, -5, 0}},
+        {false, FLAGSPARSE_OPERATION_TRANSPOSE, {1, 2, -1, 0.5f}, {2, 4, -3, 1.5f, -5, 0}},
+        {false, FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, {1, 2, -1, 0.5f},
+         {2, 4, -3, 1.5f, -5, 0}},
+    };
+    const float one[2] = {1.0f, 0.0f}, zero[2] = {0.0f, 0.0f};
+    for (const Case& c : cases) {
+        DeviceBuffer d_data = DeviceBuffer::from(data), d_rows = DeviceBuffer::from(rows),
+                     d_cols = DeviceBuffer::from(cols), d_ptr = DeviceBuffer::from(indptr),
+                     d_x = DeviceBuffer::from(c.x),
+                     d_y = DeviceBuffer::from(std::vector<float>(c.expect.size(), 99.0f));
+        flagsparseSpMatDescr_t matA = nullptr;
+        flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+        ASSERT_EQ(c.coo ? flagsparseCreateCoo(&matA, 2, 3, 4, d_rows.get(), d_cols.get(),
+                                              d_data.get(), FLAGSPARSE_INDEX_32I,
+                                              FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F)
+                        : flagsparseCreateCsr(&matA, 2, 3, 4, d_ptr.get(), d_cols.get(),
+                                              d_data.get(), FLAGSPARSE_INDEX_32I,
+                                              FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                                              FLAGSPARSE_R_32F),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        flagsparseCreateDnVec(&vecX, static_cast<int64_t>(c.x.size() / 2), d_x.get(),
+                              FLAGSPARSE_C_32F);
+        flagsparseCreateDnVec(&vecY, static_cast<int64_t>(c.expect.size() / 2), d_y.get(),
+                              FLAGSPARSE_C_32F);
+        size_t bytes = 1;
+        ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, c.op, one, matA, vecX, zero, vecY,
+                                            FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        EXPECT_EQ(bytes, 0u);
+        ASSERT_EQ(flagsparseSpMV(handle.h, c.op, one, matA, vecX, zero, vecY, FLAGSPARSE_C_32F,
+                                 FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+                  FLAGSPARSE_STATUS_SUCCESS);
+        dev_sync();
+        EXPECT_EQ(d_y.download<float>(c.expect.size()), c.expect)
+            << (c.coo ? "coo" : "csr") << " op=" << c.op;
+        flagsparseDestroyDnVec(vecY);
+        flagsparseDestroyDnVec(vecX);
+        flagsparseDestroySpMat(matA);
+    }
+}
+
+
 }  // namespace
