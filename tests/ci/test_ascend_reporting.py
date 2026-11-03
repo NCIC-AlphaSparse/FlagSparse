@@ -446,3 +446,27 @@ def test_the_prose_moved_to_a_reason_column_and_is_still_written():
     assert '"SKIP"' in source
     assert '"reason": "; ".join(status_parts) if status_parts else "unknown"' in source
     assert '"status", "reason"' in source
+
+
+def test_every_delivery_operator_has_an_ascend_performance_command():
+    """A delivery operator missing from the Ascend table reports NOT_CONFIGURED.
+
+    gemvi and geam_csr (batch 3, 2026-11-02) went into PERFORMANCE_COMMANDS but
+    not ASCEND_PERFORMANCE_COMMANDS, so every Ascend run would have reported
+    their five variants without a performance result. Checked against the
+    registry, so the next operator added there cannot repeat it.
+    """
+    from tools.delivery_variants import load_delivery_variants
+
+    runner = _runner()
+    operators = {
+        variant["operator"]
+        for variant in load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    }
+    missing = sorted(operators - set(runner.ASCEND_PERFORMANCE_COMMANDS))
+    assert missing == [], missing
+    # benchmark_ascend.py has no --op for these two: they reuse the generic,
+    # backend-neutral scripts, with the matrix directory where they take one.
+    for op in ("gemvi", "geam_csr"):
+        assert runner.ASCEND_PERFORMANCE_COMMANDS[op] == runner.PERFORMANCE_COMMANDS[op]
+    assert "{input}" in runner.ASCEND_PERFORMANCE_COMMANDS["geam_csr"]

@@ -941,9 +941,13 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
     # benchmark_ascend.py routing. spgemm_csr was on the probe, which times
     # synthetic shapes (tiny_square, square_1k, ...) instead of the delivery
     # matrices -- no speedup and nothing an H800 reference could be matched to.
+    # gemvi and geam_csr (batch 3, 2026-11-02) were left out of this list when
+    # they were added, so Ascend reported them NOT_CONFIGURED; benchmark_ascend.py
+    # has no --op for them, and their scripts take no --q4-variants, so
+    # ASCEND_Q4_VARIANTS does not narrow them.
     **{
         op: PERFORMANCE_COMMANDS[op]
-        for op in ("axpby", "spvv", "spmv_sell", "spgemm_csr")
+        for op in ("axpby", "spvv", "spmv_sell", "spgemm_csr", "gemvi", "geam_csr")
     },
 }
 

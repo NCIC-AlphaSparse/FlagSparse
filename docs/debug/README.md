@@ -87,7 +87,7 @@ C API split（`results_cuda_split_105_20261102_v2`，同样 10 个交付矩阵�
 | 沐曦 MACA | [`MACA.md`](MACA.md) | 没有厂商库；spgemm c32 走 ESC；SDDMM 的 PyTorch 参考会被校验拦下 |
 | 摩尔 MUSA | [`MUSA.md`](MUSA.md) | split 的性能取自 C API；40 个新变体的 C API 路由是 11-02 新加的，第一次在 MUSA 上跑；C API 没测到的由 Python 那一半补位（要带 `--h800-reference`）；gemvi/geam 没有 muSPARSE 基线 |
 | 天数 Iluvatar | [`ILUVATAR.md`](ILUVATAR.md) | bf16 支持未知；spgemm c32 走 ESC；`torch.sparse` 会静默算错 |
-| 昇腾 Ascend | [`ASCEND.md`](ASCEND.md) | `ASCEND_Q4_VARIANTS` 没扩：16 个变体没有精度结果，约 34 个没有性能结果；gemvi/geam 没有性能命令 |
+| 昇腾 Ascend | [`ASCEND.md`](ASCEND.md) | `ASCEND_Q4_VARIANTS` 没扩：16 个变体没有精度结果，约 29 个没有性能结果；gemvi/geam 的性能命令 11-03 已接上（复用通用脚本），第一次在 NPU 上跑 |
 
 ## 背景（2026-10-08，CUDA 机器上完成）
 
