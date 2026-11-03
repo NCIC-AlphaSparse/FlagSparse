@@ -116,6 +116,16 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
                 const void* beta, flagsparseOperation_t op, int warmup, int iters,
                 Timing* out);
 
+// SpMV whose vectors are not of A's value type, with the compute type the vendor
+// takes as a separate argument: the mixed-precision variants (f16f32, bf16f32,
+// i8f32, i8i32, f32c32). alpha/beta are read at compute_dtype. spmv_csr is this
+// with all three types equal to A.dtype; a backend that has not vouched for its
+// mixed modes declines anything else.
+Status spmv_mixed(const DeviceCsr& A, const void* x, flagsparseDataType_t x_dtype,
+                  void* y, flagsparseDataType_t y_dtype,
+                  flagsparseDataType_t compute_dtype, const void* alpha,
+                  const void* beta, flagsparseOperation_t op, int warmup, int iters,
+                  Timing* out);
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,

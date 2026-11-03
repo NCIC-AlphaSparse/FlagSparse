@@ -328,9 +328,7 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
             baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
                                    A.rows, A.cols, A.nnz, dt,
                                    is_coo ? rowind.get() : nullptr};
-#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
             if (is_csc) bA.format = baseline::DeviceCsr::Format::Csc;
-#endif
             g_report.measure_vs_baseline(
                 std::move(row),
                 [&]() {
@@ -345,19 +343,16 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                         : ratio_against(y.get(), ref_variant, out_dt, relaxed);
                 },
                 [&](baseline::Timing* t) {
-                    if (is_sell || mixed
-#if !defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
-                        || is_csc
-#endif
-                    ) {
-                        return baseline::Status::no(
-                            is_sell ? "no matching cuSPARSE SELL SpMV baseline"
-                            : (mixed ? "mixed-precision SpMV has no matching vendor baseline"
-                                     : "CSC SpMV baseline is not wired in harness"));
+                    if (is_sell) {
+                        return baseline::Status::no("no matching cuSPARSE SELL SpMV baseline");
                     }
-                    return baseline::spmv_csr(bA, x.get(), y.get(), sc.alpha(out_dt),
-                                              sc.beta(out_dt), op_a, BenchReport::kWarmup,
-                                              BenchReport::kIters, t);
+                    // The same three types our call takes, so mixed variants
+                    // (f16f32, i8i32, f32c32, ...) and bf16 compare like with
+                    // like; a backend without those modes declines with a reason.
+                    return baseline::spmv_mixed(bA, x.get(), x_dt, y.get(), out_dt,
+                                                compute_dt, sc.alpha(compute_dt),
+                                                sc.beta(compute_dt), op_a,
+                                                BenchReport::kWarmup, BenchReport::kIters, t);
                 },
                 2.0 * static_cast<double>(A.nnz));
 

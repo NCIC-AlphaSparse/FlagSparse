@@ -83,10 +83,21 @@ C API split（`results_cuda_split_105_20261102_v2`，同样 10 个交付矩阵�
   csr f32 1.17、f64 1.14，coo f32 1.00、f64 1.07，c32 csr 0.77、coo 0.70。MUSA 和其他后端的路由没变。
 - 5 个 Failed 是 `capi/tools/write_summary.py` 改了规则之后如实报出来的：一个变体只要有一行没过 C API 的精度门槛，
   性能就记 Failed（和 `run_flagsparse_pytest.py` 的规则一致）。以前这一行被直接丢掉，剩下的行照常算
-  NoBaseline。这 5 个都没有厂商基线：`spmv_csc_f32_int_trans`、`spmv_csc_c32_int_conj`、`spmv_csr_f32c32_int_trans`、
-  `spmm_csc_f32_int_trans_non_row`（ASIC_680ks）和 `spmm_csc_c32_int_non_non_row`（cfd2）。原子散加的严格误差比
-  1.0–1.36，放宽后约 0.01，但规范 6.3.1 的放宽要厂商基线来证明矩阵两边都难，没有基线就只能判失败。累加顺序
-  不确定，压线的行每轮会变（`spmm_csc_f32_int_non_non_row` 上一轮失败、这一轮通过）。交付精度（pytest）都是 Passed。
+  NoBaseline。这 5 个当时都没有厂商基线：`spmv_csc_f32_int_trans`、`spmv_csc_c32_int_conj`、`spmv_csr_f32c32_int_trans`、
+  `spmm_csc_f32_int_trans_non_row`（ASIC_680ks）和 `spmm_csc_c32_int_non_non_row`（cfd2）。严格误差比 1.0–1.36，
+  放宽后约 0.01，但规范 6.3.1 的放宽要厂商基线来证明矩阵两边都难，没有基线就只能判失败。交付精度（pytest）都是 Passed。
+- 2026-11-03 起 C API 在 CUDA 上给 CSC（SpMV/SpMM，cuSPARSE 的 CSC 描述符）和混合精度 SpMV（f16f32、bf16、
+  bf16f32、i8f32、i8i32、f32c32，cuSPARSE 的 x/y/compute 三类型）接了 cuSPARSE 基线
+  （`capi/ctest/baseline/_template.inc` 的 `FS_SP_CSC`、`FS_SP_MIXED_SPMV`，只在 `cuda/baseline.cpp` 打开；
+  hipSPARSE/mcSPARSE 照旧带原因拒绝，muSPARSE 的 CSC 路径不变）。10 个交付矩阵复测这 5 个：
+  - `spmv_csr_f32c32_int_trans` 0.997、`spmm_csc_f32_int_trans_non_row` 0.791：Passed。压线的行 cuSPARSE 自己也没过严格门槛，
+    按 6.3.1 记 pass_relaxed。
+  - `spmv_csc_f32_int_trans`、`spmv_csc_c32_int_conj`（ASIC_680ks，误差比 1.36，cuSPARSE 0.07）和
+    `spmm_csc_c32_int_non_non_row`（cfd2，1.17，cuSPARSE 0.75）仍是 Failed：同一行 cuSPARSE 是过的，是我们自己的精度差距。
+    `spmm_csc_f32_int_non_non_row` 在 cfd2 上压线（1.36，cuSPARSE 0.90），这一轮也是 Failed。
+  - 接上基线后才看到 C API 的 CSC 很慢（summary 口径）：SpMV CSC 是 cuSPARSE 的 0.24–0.50 倍（amazon0601 非转置
+    2.08 ms 对 0.04 ms），SpMM CSC 非转置约 0.15 倍。Python 那边 CSC 早就改成委托给 CSR（0.326→0.909），C API 还是逐列 kernel。
+  - f16 SpMV/SpMM 仍是 NoBaseline：cuSPARSE 不接受 fp16 计算类型（status 10），要改成 fp32 计算，alpha/beta 的宽度也要跟着改。
 - split 在 CUDA 上不能带 `--h800-reference`（会报 "no card known" 退出），这个参数只给非 CUDA 后端用。
 - 105 个变体的列表写进了仓库根目录 `Q4算子列表.xlsx` 的 `delivery_105` 工作表（前 65 个已交付，后 40 个新增）。
 

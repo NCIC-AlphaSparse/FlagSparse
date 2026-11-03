@@ -36,6 +36,10 @@
 
 // Legacy API the template only binds where a backend vouches for the symbols.
 #define FS_SP_LEGACY_GEMVI_CSRGEAM2 1
+// CSC descriptors (SpMV/SpMM) and the mixed-precision SpMV modes, both verified
+// against cuSPARSE 12.x on the dev box; other template backends decline them.
+#define FS_SP_CSC 1
+#define FS_SP_MIXED_SPMV 1
 #define FS_SP_MAT_DESCR    cusparseMatDescr_t
 #define FS_SP_STATUS       cusparseStatus_t
 #define FS_SP_COMPLEX      cuComplex

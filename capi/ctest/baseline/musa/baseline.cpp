@@ -195,6 +195,16 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
     return result;
 }
 
+Status spmv_mixed(const DeviceCsr& A, const void* x, flagsparseDataType_t x_dtype,
+                  void* y, flagsparseDataType_t y_dtype,
+                  flagsparseDataType_t compute_dtype, const void* alpha,
+                  const void* beta, flagsparseOperation_t op, int warmup, int iters,
+                  Timing* out) {
+    if (x_dtype != A.dtype || y_dtype != A.dtype || compute_dtype != A.dtype)
+        return Status::no("muSPARSE: mixed-precision SpMV baseline is not wired");
+    return spmv_csr(A, x, y, alpha, beta, op, warmup, iters, out);
+}
+
 Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void* C,
                 int64_t ldc, const void* alpha, const void* beta,
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,

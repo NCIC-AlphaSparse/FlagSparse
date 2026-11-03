@@ -55,6 +55,9 @@ const char* name() { return "none"; }
 
 Status spmv_csr(const DeviceCsr&, const void*, void*, const void*, const void*,
                 flagsparseOperation_t, int, int, Timing*) { return none(); }
+Status spmv_mixed(const DeviceCsr&, const void*, flagsparseDataType_t, void*,
+                  flagsparseDataType_t, flagsparseDataType_t, const void*, const void*,
+                  flagsparseOperation_t, int, int, Timing*) { return none(); }
 Status spmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, void*, int64_t,
                 const void*, const void*, flagsparseOperation_t,
                 flagsparseOperation_t, int, int, Timing*, flagsparseOrder_t,

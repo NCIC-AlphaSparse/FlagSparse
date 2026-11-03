@@ -74,6 +74,14 @@ Status spmv_csr(const DeviceCsr&, const void*, void*, const void*, const void*,
                    "to a real SpMV");
 }
 
+Status spmv_mixed(const DeviceCsr&, const void*, flagsparseDataType_t, void*,
+                  flagsparseDataType_t, flagsparseDataType_t, const void*, const void*,
+                  flagsparseOperation_t, int, int, Timing*) {
+    return pending("aclnnMm over a sparse-to-dense conversion, or torch_npu's "
+                   "sparse mm",
+                   "CANN has no dedicated SpMV, mixed-precision or otherwise");
+}
+
 Status spmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, void*, int64_t,
                 const void*, const void*, flagsparseOperation_t,
                 flagsparseOperation_t, int, int, Timing*, flagsparseOrder_t,

@@ -85,13 +85,19 @@ bool map_dtype(flagsparseDataType_t t, FS_DT_TYPE* out) {
         // operator's business, not this table's -- it returns its own status if
         // it does not, which becomes a blank speedup with that reason.
         case FLAGSPARSE_R_8I: *out = FS_DT(R_8I); return true;
+#if defined(FS_SP_MIXED_SPMV)
+        // Only the mixed-precision SpMV produces these (bf16 input, int32 output);
+        // mapped where the backend vouches for the enum names.
+        case FLAGSPARSE_R_16BF: *out = FS_DT(R_16BF); return true;
+        case FLAGSPARSE_R_32I: *out = FS_DT(R_32I); return true;
+#endif
         default: return false;
     }
 }
 
 // The compute type cuSPARSE wants is the operand type for these operators; it is
-// a separate argument only because mixed-precision modes exist, which we do not
-// exercise here.
+// a separate argument only because mixed-precision modes exist, which only
+// spmv_mixed exercises.
 bool map_op(flagsparseOperation_t op, FS_SP_OPERATION* out) {
     switch (op) {
         case FLAGSPARSE_OPERATION_NON_TRANSPOSE:
@@ -104,11 +110,23 @@ bool map_op(flagsparseOperation_t op, FS_SP_OPERATION* out) {
     }
 }
 
-// Builds a CSR or a COO descriptor from the same operand struct; A.is_coo()
-// decides which. Both formats carry column indices in A.indices.
+// Builds a CSR, COO or CSC descriptor from the same operand struct; A.is_coo()
+// and A.is_csc() decide which. CSR and COO carry column indices in A.indices,
+// CSC carries column offsets in A.indptr and row indices in A.indices.
 Status make_csr(const DeviceCsr& A, FS_SP_SPMAT* out) {
     FS_DT_TYPE vt;
     if (!map_dtype(A.dtype, &vt)) return Status::no("baseline: unmapped value type");
+    if (A.is_csc()) {
+#if defined(FS_SP_CSC)
+        const auto s = FS_SP(CreateCsc)(
+            out, A.rows, A.cols, A.nnz, A.indptr, A.indices, A.values,
+            FS_SP_E(INDEX_32I), FS_SP_E(INDEX_32I), FS_SP_E(INDEX_BASE_ZERO), vt);
+        if (s != FS_SP_E(STATUS_SUCCESS)) return Status::no(fail("CreateCsc", s));
+        return Status::good();
+#else
+        return Status::no(std::string(FS_SP_NAME) + ": CSC baseline is not wired for this backend");
+#endif
+    }
     if (A.is_coo()) {
         const auto s = FS_SP(CreateCoo)(out, A.rows, A.cols, A.nnz, A.coo_rows,
                                         A.indices, A.values, FS_SP_E(INDEX_32I),
@@ -154,8 +172,24 @@ const char* name() { return FS_SP_NAME; }
 Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
                 const void* beta, flagsparseOperation_t op, int warmup, int iters,
                 Timing* out) {
-    FS_DT_TYPE vt;
-    if (!map_dtype(A.dtype, &vt)) return Status::no("baseline: unmapped value type");
+    return spmv_mixed(A, x, A.dtype, y, A.dtype, A.dtype, alpha, beta, op, warmup,
+                      iters, out);
+}
+
+Status spmv_mixed(const DeviceCsr& A, const void* x, flagsparseDataType_t x_dtype,
+                  void* y, flagsparseDataType_t y_dtype,
+                  flagsparseDataType_t compute_dtype, const void* alpha,
+                  const void* beta, flagsparseOperation_t op, int warmup, int iters,
+                  Timing* out) {
+#if !defined(FS_SP_MIXED_SPMV)
+    if (x_dtype != A.dtype || y_dtype != A.dtype || compute_dtype != A.dtype)
+        return Status::no(std::string(FS_SP_NAME) +
+                          ": mixed-precision SpMV baseline is not wired for this backend");
+#endif
+    FS_DT_TYPE xt, yt, ct;
+    if (!map_dtype(x_dtype, &xt) || !map_dtype(y_dtype, &yt) ||
+        !map_dtype(compute_dtype, &ct))
+        return Status::no("baseline: unmapped value type");
     FS_SP_OPERATION vop;
     if (!map_op(op, &vop)) return Status::no("baseline: unmapped operation");
 
@@ -165,11 +199,11 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
     const int64_t ylen = (op == FLAGSPARSE_OPERATION_NON_TRANSPOSE) ? A.rows : A.cols;
 
     FS_SP_DNVEC vx = nullptr, vy = nullptr;
-    FS_SP(CreateDnVec)(&vx, xlen, const_cast<void*>(x), vt);
-    FS_SP(CreateDnVec)(&vy, ylen, y, vt);
+    FS_SP(CreateDnVec)(&vx, xlen, const_cast<void*>(x), xt);
+    FS_SP(CreateDnVec)(&vy, ylen, y, yt);
 
     std::size_t bytes = 0;
-    auto st = FS_SP(SpMV_bufferSize)(vendor(), vop, alpha, mat, vx, beta, vy, vt,
+    auto st = FS_SP(SpMV_bufferSize)(vendor(), vop, alpha, mat, vx, beta, vy, ct,
                                      FS_SP_E(SPMV_ALG_DEFAULT), &bytes);
     Scratch buf;
     Status result = Status::good();
@@ -181,7 +215,7 @@ Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
         result = timed(
             [&]() -> Status {
                 const auto s = FS_SP(SpMV)(vendor(), vop, alpha, mat, vx, beta, vy,
-                                           vt, FS_SP_E(SPMV_ALG_DEFAULT), buf.p);
+                                           ct, FS_SP_E(SPMV_ALG_DEFAULT), buf.p);
                 return s == FS_SP_E(STATUS_SUCCESS) ? Status::good()
                                                     : Status::no(fail("SpMV", s));
             },
