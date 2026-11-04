@@ -1018,3 +1018,57 @@ setsid env PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/
 
 - 新目录 `results_musa_split_65_20261019_triton3/`，显式将 C API 原始数据存入该目录下 `capi/`，避免覆盖上一轮原始数据。仍按 setsid 在后台启动，不跳过精度、性能或 C API 构建。源码补丁、SHA256、矩阵指纹和命令保存在结果目录。
 - 此处是待验收记录：完整轮约需 50 分钟，完成后再检查 65 项精度、missing、基线来源和各变体平均加速比；不能提前声明全部达标。
+
+### 2026-11-04 三条 Python 慢路径实机检查
+
+- 起始提交 `e447108`；从当前仓库 `src/` 导入，后端报告 `mthreads musa None`，未使用 CUDA 模拟。环境为 torch 2.7.1、Triton 3.6.0、MTT S5000、驱动 3.3.5-server。
+- `conf/h800_reference.json` 已确认来源为 `results_cuda_105_20261103_1556`，105 个变体；`tests/data` 原 10 个矩阵的名称、字节数与本文记录一致。H800 带宽折算仍为估算，不是本机 muSPARSE 实测。
+- **口径提示（合入时补）**：这是 `f7f04f1` 之前的整体 105 参照。现行参照原 65 个变体保持 10-14 的数据、只从 11-03 补新 40 个（见文首）。
+  这轮交付表有 35 个变体用 H800 折算，其中 16 个属于新 40 个，不受影响；**19 个属于原 65 个**。已用本轮原始 CSV 离线重算
+  （同样的行、同样的补位条件；先用旧参照复现，19 个与交付表完全一致，再换现行参照）：18 个变化在 −4%～+1% 之间，
+  **只有 `spmv_coo_f16_int_non` 跨线：0.822 → 0.788**。原因是 10-14 那轮 H800 cuSPARSE 的 COO SpMV 快 5–9%（0.012–0.05 ms 的短调用），
+  同族 `spmv_coo_f16f32_int_non` 0.844 → 0.809、`spmv_coo_i8i32_int_non` 0.896 → 0.867 也降了但仍过线。其余：
+  SpMM 6 个 1.80–3.31（±1%）、`spmv_csc_f16_int_non` 5.75、`spmv_csr_*` 5 个 0.85–1.12、`spmv_sell_*` 4 个 0.84–1.01（−1.3%～−0.2%）。
+  这是离线预演，不是新口径下的实测；下次全量重跑后以实测为准。
+- 定向原始记录在 `results_musa_routes_20261104/`。先测 cage12、NACA0015，再按原 q4 的 5 warmup / 20 iters 跑全部 10 个矩阵；未改容差、规模、基线、迭代次数或跳过规则。
+
+### 2026-11-04 src/flagsparse/sparse_operations/mixed_spmx.py::_musa_csc_spmv
+
+- 改了什么：提取 MUSA CSC→CSR 版本/存储感知缓存供 FP16 和 int8 共用；缓存准备后的稀疏输入，实时读取 RHS 和输出，不缓存运算结果。计时请求覆盖当前调用的准备和计算。
+- 为什么改（附报错原文）：无算子异常；连续 5 次 int8 CSC 调用原先执行 5 次整矩阵 argsort，修复后仅首次执行一次。文档指出的缓存失效已在 S5000 复现。
+- 怎么验证的：`before_routes.json`、`after_routes.json`、`final_10_routes.json`；新增两种索引和两种输出类型的回归，覆盖 RHS、值、行索引、列指针修改、推理张量及跨步输出。
+- 其他后端是否也需要：否；仅由 MUSA 分支调用，非 MUSA 的 FP16 路线不变。
+
+### 2026-11-04 src/flagsparse/sparse_operations/spmv_csc.py::_spmv_csc_via_mixed
+
+- 改了什么：MUSA 非转置 int8 CSC 直接调用上述缓存路线，避免每次新建 col_ids 使 COO 缓存失效；后续计算仍用原 Triton CSR kernel。
+- 为什么改（附报错原文）：无异常；cage12 / NACA0015 原公开 API 为 2.173 / 8.017 ms。
+- 怎么验证的：修复后两矩阵为 0.0397 / 0.1166 ms；最终 10 矩阵该变体全部 PASS，均值 0.060724 ms。记录 `before_q4.json`、`after_q4.json`、`final_10_q4.json`。
+- 其他后端是否也需要：否；新增入口严格受 `_is_mthreads_runtime()` 保护。
+
+### 2026-11-04 src/flagsparse/sparse_operations/spmm_csc.py::flagsparse_spmm_csc
+
+- 改了什么：MUSA 默认非转置 CSC 快速路线支持 FP16→FP32，并扩展到 FP32、complex64；缓存 CSC→CSR 后使用原 Triton CSR SpMM，显式传输出类型，复数重排使用既有 `_gather_values`。新覆盖类型仅对 int32、auto 索引策略启用；int64、strict、显式调优、prepared、timing、return_meta 保留原路线，原 FP16 输出快速路线保留。
+- 为什么改（附报错原文）：FP16→FP32 原先转成 FP32 后落入通用 CSC 路线。另单独确认 FP32/complex64 的根因为 `spmm_csc_base` 逐非零元 atomic scatter（`_spmm_csc_non_real_kernel` / complex kernel）；cage12 / NACA0015 的 FP32 为 39.247 / 122.392 ms，complex64 为 83.247 / 269.961 ms。扩展回归首次发现 `Failed: DID NOT RAISE <class 'RuntimeError'>`，已通过限制新快速路线保留 int64 自动重试与 strict 行为。
+- 怎么验证的：FP16→FP32 两矩阵从 39.506 / 122.530 ms 降至 0.1247 / 0.5948 ms；FP32 降至 0.1845 / 0.8615 ms，complex64 降至 0.6909 / 2.5716 ms。最终十矩阵四个 SpMM 变体共 40/40 PASS；两项原有 int64 回退回归已通过。跨步 B/out、虚部、输入修改及推理张量回归通过。
+- 其他后端是否也需要：否；仅扩展 MUSA 分支，其他后端 AST 与起始提交一致。return_meta 仍测原路线，不能用其耗时代表快速路线。
+
+### 2026-11-04 src/flagsparse/sparse_operations/spmv_csr.py::prepare_spmv_csr
+
+- 改了什么：仅 MUSA 的 BF16、默认 auto、非转置且无显式配置时建立既有 Triton row gather plan；显式算法选择不变。
+- 为什么改（附报错原文）：无异常；S5000 上 cage12 / NACA0015 的 BF16 `legacy_segbin` 为 2.339 / 8.042 ms，`legacy_rowpar` 为 0.325 / 2.464 ms，gather 为 0.0593 / 0.151 ms，选择 gather。当前 API 的显式名称为 `legacy_segbin` / `legacy_rowpar`，不是文首排查示例中的简写。
+- 怎么验证的：公开 auto API 从 2.278 / 8.728 ms 降至 0.0556 / 0.1507 ms；最终原十矩阵全部 PASS，均值 0.093168 ms。显式算法不建立 gather plan，准备后修改值仍即时生效。
+- 其他后端是否也需要：否；BF16 条件只对 MUSA 扩展。
+
+### 2026-11-04 tests/pytest/test_musa_sparse_routes.py 与验证结果
+
+- 改了什么：新增 11 项 MUSA 实机回归，覆盖缓存复用、输入变更、推理张量、int32/int64、输出类型、跨步张量、复数虚部和显式算法。
+- 为什么改（附报错原文）：防止优化依赖旧输入或破坏索引策略。原始失败日志保留，不以过滤/跳过处理失败。
+- 怎么验证的：最终扩大回归 `822 passed, 1658 skipped`（19.58 秒），见 `regression_final.log/.xml`；跳过沿用原适用性规则。最终 8 个定向变体 × 原 10 矩阵为 80/80 PASS，见 `final_10_q4.json`。基线/后端分派 CI 为 46 passed，见 `ci_final.log/.xml`。`audit_scope.py` 四文件全部通过：移除 MUSA 分支后的 AST 与起始提交一致，已有 Triton kernel 定义未改；`git diff --check` 通过。
+- 其他后端是否也需要：否；回归文件仅在 MUSA 实机运行。本次仅改主机路由和准备缓存，计算复用已有 Triton kernel，未增加原生 MUSA 计算实现。
+
+### 2026-11-04 完整 105 变体后台复测安排
+
+- 新目录 `results_mthreads_105_20261104_035312_routes/`，日志 `results_mthreads_105_20261104_035312_routes.log`；使用 setsid、GPU 0、原 `tests/data`、新版 H800 105 参照和原 split runner。不跳过精度、性能或 C API 构建，C API 原始结果独立存入新目录的 `capi_raw/`。
+- 启动器为新目录中的 `launch.py`，保留源码快照/哈希、矩阵指纹、命令和起止状态；旧结果与归档保留。预计约 1 小时（上一完整轮约 62 分钟）。
+- 此处是复测安排，不是整轮完成声明。结束后须按本文 11-02 清单检查 105 项精度、两个补位统计、40 个新变体的 C API 状态、卡死/异常和逐变体平均加速比；不得将定向结果当作全部 >0.8x 的结论。

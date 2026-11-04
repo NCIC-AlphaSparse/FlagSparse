@@ -605,10 +605,15 @@ def flagsparse_spvv(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    # Match the ROCm PyTorch baseline for the variants whose Triton reduction
-    # is launch-bound.  Keeping the expression native is also important for
-    # complex values: the real-plane fallback needs two extra reductions.
-    if _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
+    # Small MACA complex dots fit in one block, avoiding a second reduction launch.
+    if (_is_maca_runtime() and compute == torch.complex64
+            and values.numel() <= 4096):
+        from ._vector_maca import spvv_complex
+
+        result = spvv_complex(values, kernel_idx, y, op == "conj")
+    elif _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
+        # Match the native ROCm baseline for launch-bound reductions; complex
+        # real-plane fallbacks would need two additional reduction launches.
         idx = kernel_idx.to(torch.int64)
         rhs = y.index_select(0, idx).to(compute)
         lhs = values.to(compute)

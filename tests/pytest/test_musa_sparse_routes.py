@@ -182,6 +182,109 @@ def test_musa_csc_half_spmm_strides_and_out(index_dtype):
         fs.flagsparse_spmm_csc(values, indices, indptr, rhs, (3, 3), index_fallback_policy="invalid")
 
 
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.float32])
+def test_musa_csc_int_cache_live_inputs(monkeypatch, index_dtype, out_dtype):
+    from flagsparse.sparse_operations import _spmv_csr_transpose as gather
+    dev = accelerator_device()
+    values = torch.tensor([1, 3, 2], dtype=torch.int8, device=dev)
+    indices = torch.tensor([0, 2, 0], dtype=index_dtype, device=dev)
+    ptr = torch.tensor([0, 2, 2, 3], dtype=index_dtype, device=dev)
+    rhs = torch.tensor([2, -1, 3], dtype=torch.int8, device=dev)
+    backing = torch.full((6,), -99, dtype=out_dtype, device=dev)
+    out = backing[::2]
+    calls = []
+    original = gather.prepare
+    def prepare(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(gather, "prepare", prepare)
+    def check():
+        dense = torch.zeros((3, 3), dtype=torch.int32)
+        cols = torch.repeat_interleave(torch.arange(3), (ptr[1:] - ptr[:-1]).cpu().long())
+        dense.index_put_((indices.cpu().long(), cols), values.cpu().int(), accumulate=True)
+        actual = fs.flagsparse_spmv_csc(values, indices, ptr, rhs, (3, 3), out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), (dense @ rhs.cpu().int()).to(out_dtype), rtol=0, atol=0)
+        assert (backing[1::2].cpu() == -99).all()
+    for _ in range(5):
+        check()
+    assert len(calls) == 1
+    rhs.add_(1)
+    check()
+    assert len(calls) == 1
+    values.add_(1)
+    check()
+    indices[0] = 1
+    check()
+    ptr[1] = 1
+    check()
+    assert len(calls) == 4
+    with torch.inference_mode():
+        values, indices, ptr = values.clone(), indices.clone(), ptr.clone()
+        check()
+        values.add_(1)
+        check()
+    assert len(calls) == 6
+
+
+@pytest.mark.parametrize("dtype,out_dtype", [(torch.float16, torch.float32),
+    (torch.float32, torch.float32), (torch.complex64, torch.complex64)])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_musa_csc_spmm_cached_wide_output_live_inputs(dtype, out_dtype, index_dtype):
+    dev = accelerator_device()
+    host = torch.tensor([1, 3, 2], dtype=dtype)
+    if dtype.is_complex:
+        host += torch.tensor([1j, -2j, 3j], dtype=dtype)
+    values = host.to(dev)
+    indices = torch.tensor([0, 2, 0], dtype=index_dtype, device=dev)
+    ptr = torch.tensor([0, 2, 2, 3], dtype=index_dtype, device=dev)
+    rhs = torch.arange(42, dtype=torch.float32).to(dtype).to(dev).reshape(7, 6).T[::2]
+    backing = torch.full((3, 14), -99, dtype=out_dtype).to(dev)
+    out = backing[:, ::2]
+    def check():
+        dense = torch.zeros((3, 3), dtype=torch.complex128 if dtype.is_complex else torch.float64)
+        cols = torch.repeat_interleave(torch.arange(3), (ptr[1:] - ptr[:-1]).cpu().long())
+        dense.index_put_((indices.cpu().long(), cols), values.cpu().to(dense.dtype), accumulate=True)
+        actual = fs.flagsparse_spmm_csc(values, indices, ptr, rhs, (3, 3), out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), (dense @ rhs.cpu().to(dense.dtype)).to(out_dtype), rtol=0, atol=0)
+        assert (backing[:, 1::2].cpu() == -99).all()
+    check()
+    rhs.add_(1)
+    check()
+    values.add_(1)
+    check()
+    indices[0] = 1
+    check()
+    ptr[1] = 1
+    check()
+    with torch.inference_mode():
+        values, indices, ptr = values.clone(), indices.clone(), ptr.clone()
+        check()
+        values.add_(1)
+        check()
+
+
+def test_musa_bf16_auto_gather_and_explicit_algorithm():
+    dev = accelerator_device()
+    values = torch.tensor([1, 3, 2], dtype=torch.bfloat16, device=dev)
+    cols = torch.tensor([0, 2, 1], dtype=torch.int32, device=dev)
+    ptr = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device=dev)
+    rhs = torch.tensor([2, -1, 3], dtype=torch.bfloat16, device=dev)
+    prepared = fs.prepare_spmv_csr(values, cols, ptr, (3, 3))
+    assert prepared.non_gather_plan is not None
+    for alg in ("legacy_segbin", "legacy_rowpar"):
+        explicit = fs.prepare_spmv_csr(values, cols, ptr, (3, 3), alg=alg)
+        assert explicit.non_gather_plan is None
+    for _ in range(2):
+        actual = fs.flagsparse_spmv_csr(prepared=prepared, x=rhs)
+        expected = torch.tensor([values[0].item() * rhs[0].item() + values[1].item() * rhs[2].item(),
+                                 0, values[2].item() * rhs[1].item()], dtype=torch.bfloat16)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        values.add_(1)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int8])
 @pytest.mark.parametrize("reset", [False, True])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])

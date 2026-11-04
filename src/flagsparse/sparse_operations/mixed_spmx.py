@@ -1509,6 +1509,34 @@ def _csc_spmv_mixed_kernel(A, I, P, X, Y, N, R: tl.constexpr, K: tl.constexpr):
         tl.atomic_add(Y + row, v * x[:, None], mask, sem="relaxed")
 
 
+def _musa_csc_spmv(data, indices, indptr, x, shape, *, out=None, out_dtype=None, return_time=False):
+    """Reuse CSC->CSR preparation while reading the current operands each call."""
+    _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"), (x, "x"))
+    m, n = map(int, shape)
+    if m < 0 or n < 0 or indptr.numel() != n + 1 or data.numel() != indices.numel():
+        raise ValueError("invalid CSC dimensions")
+    if x.numel() != n:
+        raise ValueError("x shape does not match CSC operation")
+    if any(t.device != data.device for t in (indices, indptr, x)):
+        raise ValueError("CSC inputs must be on the same device")
+    if indices.dtype not in (torch.int32, torch.int64) or indptr.dtype not in (torch.int32, torch.int64):
+        raise TypeError("indices and indptr must be int32 or int64")
+    result_dtype, _ = _resolve_types(data.dtype, x.dtype, out, out_dtype, False)
+    if out is not None and (out.shape != (m,) or out.device != x.device):
+        raise ValueError("out shape/device must match CSC SpMV result")
+    t0 = _start(return_time)
+    sources = (data, indices, indptr)
+    state = _MUSA_CSC_CSR_CACHE.get(sources, (m, n))
+    if state is None:
+        from . import _spmv_csr_transpose
+        cols, ptr, order, *_ = _spmv_csr_transpose.prepare(indices, indptr, (n, m))
+        state = data.index_select(0, order.long()).contiguous(), cols, ptr
+        _MUSA_CSC_CSR_CACHE.put(sources, (m, n), state)
+    values, cols, ptr = state
+    y = spmv_csr_mixed(values, cols, ptr, x, shape, out=out, out_dtype=result_dtype)
+    return _finish(y, out, t0, return_time)
+
+
 def spmv_csc_half(data, indices, indptr, x, shape, *, out=None, out_dtype=None, return_time=False):
     """Read CSC half values directly; avoid expanding column IDs every call."""
     _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"), (x, "x"))
@@ -1521,16 +1549,8 @@ def spmv_csc_half(data, indices, indptr, x, shape, *, out=None, out_dtype=None, 
     if out is not None and (out.shape != (m,) or out.device != x.device):
         raise ValueError("out shape/device must match CSC SpMV result")
     if _is_mthreads_runtime():
-        sources = (data, indices, indptr)
-        state = _MUSA_CSC_CSR_CACHE.get(sources, (m, n))
-        if state is None:
-            from . import _spmv_csr_transpose
-            cols, ptr, order, *_ = _spmv_csr_transpose.prepare(indices, indptr, (n, m))
-            state = data.index_select(0, order.long()).contiguous(), cols, ptr
-            _MUSA_CSC_CSR_CACHE.put(sources, (m, n), state)
-        values, cols, ptr = state
-        return spmv_csr_mixed(
-            values, cols, ptr, x, shape, out=out, out_dtype=result_dtype,
+        return _musa_csc_spmv(
+            data, indices, indptr, x, shape, out=out, out_dtype=result_dtype,
             return_time=return_time,
         )
     t0 = _start(return_time)

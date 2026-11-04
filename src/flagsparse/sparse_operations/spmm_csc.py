@@ -2010,6 +2010,48 @@ def flagsparse_spmm_csc(
             out_dtype=out_dtype, return_time=return_time,
         )
 
+    # MUSA non-transpose CSC atomics are expensive for real and complex values.
+    # Reuse the versioned CSC->CSR preparation and existing Triton row kernels.
+    if (
+        _is_mthreads_runtime()
+        and prepared is None and data is not None
+        and data.dtype in (torch.float16, torch.float32, torch.complex64)
+        and indices is not None and indptr is not None and shape is not None
+        and B is not None and B.dtype == data.dtype
+        and not return_meta and not timing
+        and block_n is None and block_nnz is None and max_segments is None
+        and _normalize_spmm_csc_alg(alg) == "auto"
+        and _normalize_spmm_csc_op(op, bool(transpose)) == SPMM_CSC_OP_NON
+        and (transpose is None or not bool(transpose))
+        # Keep the native route's int64 retry/strict policy for newly covered
+        # types. The original FP16-output fast path already supports int64.
+        and (
+            (data.dtype == torch.float16 and out_dtype in (None, torch.float16))
+            or (indices.dtype == torch.int32 and indptr.dtype == torch.int32
+                and str(index_fallback_policy).lower() == "auto")
+        )
+    ):
+        from . import _spmv_csr_transpose, mixed_spmx
+
+        result_dtype, _ = mixed_spmx._resolve_types(data.dtype, B.dtype, out, out_dtype, False)
+        _normalize_spmm_csc_index_fallback_policy(index_fallback_policy)
+        _validate_spmm_csc_B(B, SimpleNamespace(data=data, n_rows=int(shape[0]),
+                                               n_cols=int(shape[1])), SPMM_CSC_OP_NON)
+        sources = (data, indices, indptr)
+        options = tuple(shape)
+        t0 = mixed_spmx._start(return_time)
+        state = _MUSA_CSC_HALF_CACHE.get(sources, options)
+        if state is None:
+            validation_data = data.to(torch.float32) if data.dtype == torch.float16 else data
+            _, cols, ptr, m, n, *_ = _prepare_spmm_csc_matrix(
+                validation_data, indices, indptr, shape
+            )
+            csr_cols, csr_ptr, order, *_ = _spmv_csr_transpose.prepare(cols, ptr, (n, m))
+            state = _gather_values(data, order.long()).contiguous(), csr_cols, csr_ptr
+            _MUSA_CSC_HALF_CACHE.put(sources, options, state)
+        C = mixed_spmx.spmm_csr_mixed(*state, B, shape, out=out, out_dtype=result_dtype)
+        return mixed_spmx._finish(C, out, t0, return_time)
+
     # float16 is not in SUPPORTED_SPMM_CSC_VALUE_DTYPES: the `non` route scatters
     # into C with tl.atomic_add (see _spmm_csc_non_real_kernel), and fp16
     # atomic_add is not reliably available on every backend -- mixed_spmx.py's
@@ -2020,38 +2062,6 @@ def flagsparse_spmm_csc(
     # end" shape COO already uses) and cast back once at this public boundary.
     if prepared is None and data is not None and data.dtype == torch.float16:
         result_dtype = out_dtype or torch.float16
-        if (
-            _is_mthreads_runtime()
-            and result_dtype == torch.float16
-            and indices is not None and indptr is not None and shape is not None
-            and B is not None and B.dtype == torch.float16
-            and not return_meta and not timing
-            and block_n is None and block_nnz is None and max_segments is None
-            and _normalize_spmm_csc_alg(alg) == "auto"
-            and _normalize_spmm_csc_op(op, bool(transpose)) == SPMM_CSC_OP_NON
-            and (transpose is None or not bool(transpose))
-            and (out is None or out.dtype == torch.float16)
-        ):
-            from . import _spmv_csr_transpose, mixed_spmx
-
-            _normalize_spmm_csc_index_fallback_policy(index_fallback_policy)
-            sources = (data, indices, indptr)
-            options = tuple(shape)
-            t0 = mixed_spmx._start(return_time)
-            state = _MUSA_CSC_HALF_CACHE.get(sources, options)
-            if state is None:
-                # Retain the raw CSC validation, but only redo topology work
-                # when a sparse operand's storage or mutation signature changes.
-                _, cols, ptr, m, n, *_ = _prepare_spmm_csc_matrix(
-                    data.to(torch.float32), indices, indptr, shape
-                )
-                csr_cols, csr_ptr, order, *_ = _spmv_csr_transpose.prepare(cols, ptr, (n, m))
-                state = data.index_select(0, order.long()).contiguous(), csr_cols, csr_ptr
-                _MUSA_CSC_HALF_CACHE.put(sources, options, state)
-            if B.device != data.device:
-                raise ValueError("B must be on the same CUDA device as sparse matrix data")
-            C = mixed_spmx.spmm_csr_mixed(*state, B, shape, out=out)
-            return mixed_spmx._finish(C, out, t0, return_time)
         result = flagsparse_spmm_csc(
             data.to(torch.float32),
             indices,

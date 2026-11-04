@@ -12,6 +12,35 @@ _AXPBY_INDEX_CACHE = TensorPlanCache()
 
 
 @triton.jit
+def _spvv_complex_small(OUT, X, IDX, Y, NNZ,
+                       CONJ: tl.constexpr, BLOCK: tl.constexpr):
+    pos = tl.arange(0, BLOCK)
+    components = tl.arange(0, 2)
+    valid = pos < NNZ
+    idx = tl.load(IDX + pos, valid, 0)
+    x = tl.load(X + 2 * pos[:, None] + components[None, :], valid[:, None], 0.)
+    y = tl.load(Y + 2 * idx[:, None] + components[None, :], valid[:, None], 0.)
+    xr, xi = tl.split(x)
+    yr, yi = tl.split(y)
+    if CONJ:
+        xi = -xi
+    tl.store(OUT, tl.sum(xr * yr - xi * yi, 0))
+    tl.store(OUT + 1, tl.sum(xr * yi + xi * yr, 0))
+
+
+def spvv_complex(values, indices, y, conj):
+    """One launch for a MACA complex64 dot with at most 4096 entries."""
+    nnz = values.numel()
+    block = max(64, triton.next_power_of_2(nnz))
+    result = torch.empty((), dtype=torch.complex64, device=y.device)
+    _spvv_complex_small[(1,)](
+        torch.view_as_real(result), torch.view_as_real(values.resolve_conj().resolve_neg()),
+        indices.contiguous(), torch.view_as_real(y.resolve_conj().resolve_neg()),
+        nnz, conj, block, num_warps=4)
+    return result
+
+
+@triton.jit
 def _inverse(OWNER, INDICES, NNZ, N, BLOCK: tl.constexpr):
     pos = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row = tl.load(INDICES + pos, pos < NNZ, -1)

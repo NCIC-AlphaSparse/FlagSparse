@@ -738,3 +738,83 @@ SpMV CSR 性能阶段；本轮 Axpby complex64 的平均比值为 1.283805x。
 
 包内 `metadata/README.md`、`manifest.json` 和 `results_overview.json` 说明各组结果
 对应的代码阶段；源码保留仓库相对路径，并附源码及结果文件 SHA256 清单。
+
+## 2026-11-04：MACA `spvv_c32_int_non` 小规模归约优化
+
+同步上游到 `7299f00` 后，完整复测目录为
+`results_metax_105_20261104_upstream_7299f00/`：105/105 精度 Passed、105/105
+性能 Passed、missing=0、runner exit=0，约耗时 1 小时 39 分钟。唯一平均加速比
+低于 0.8x 的变体是 `spvv_c32_int_non`（0.559634x）。以下优化基于该提交，
+后续只定向重测 SpVV；不覆盖这份完整 105 项结果。
+
+### 改动文件、原因和范围
+
+- `src/flagsparse/sparse_operations/_vector_maca.py`：新增
+  `_spvv_complex_small` 和 `spvv_complex`。对于 nnz<=4096 的 complex64 dot，
+  单个 Triton program 完成索引取数、复数乘法和实/虚部归约，并直接写回标量。
+  实/虚部成对加载，BLOCK 为至少 64 的 nnz 向上取整二次幂，num_warps=4。
+  nnz=4096 原先需要 4 组 partial 加一次 finalize，现在只需一次 kernel launch。
+  nnz=0 同样用掩码归约写零，不读取空输入。没有数值结果缓存；每次返回独立输出。
+- `src/flagsparse/sparse_operations/vector_ops.py::flagsparse_spvv`：仅在
+  `_is_maca_runtime()`、compute 为 complex64、nnz<=4096 时分派到上述路径。
+  `non`/`conj` 共用此实现，conj 对 sparse values 生效。其余 dtype、规模和后端
+  保持原路径，原有校验、out_dtype、标量返回及 return_time 语义保持不变。
+  小规模路径处理跨步索引及输入的 lazy conjugate/negative view。
+- `tests/pytest/test_spvv_maca_accuracy.py`（新增）：61 项实机测试，覆盖
+  int32/int64、non/conj、0/1/63/65/1023/1024/1025/4095/4096/4097/16387/65539
+  的 nnz 边界、无序及重复索引、跨步与逻辑视图、实时修改 values/y/indices、
+  空向量、独立输出生命周期及非法索引。
+- `tests/ci/test_spvv_maca_dispatch.py`（新增）：14 项验证 MACA/非 MACA、
+  complex64/complex128/float32、non/conj 的隔离，以及 4096/4097 的规模边界。
+  非 MACA 没有进行本机实卡复测，隔离通过分派测试验证。
+
+原因是小规模 dot 的两次 launch 和 partial/finalize 开销。探索性单 program
+大向量循环明显变慢，未采用；最终只对收益明确的小规模启用新 kernel。全量旧结果
+nnz=4096 的 FlagSparse 时延为 2.2199996 ms，包含抖动；独立优化前重测为
+0.0520856 ms，因此不能把旧均值到新均值的全部变化都解释成 kernel 提升。
+基线、计时器、容差、用例规模和交付汇总逻辑均未修改，数值计算仍是纯 Triton。
+
+### 最终性能及验证
+
+SpVV 输入是 **4 个向量规模**，不使用矩阵。沿用原 runner 的 normal 精度、
+5 warmup / 20 iters，以及本机 PyTorch 表达式 `sum(values * y[indices])`。
+按原约定，验收统计量是 4 个逐规模加速比的算术平均，不要求每个规模均超过 0.8x。
+两轮最终代码原 runner 均退出 0：
+
+| 变体 | 第一轮平均 | 第二轮复核平均 |
+| --- | ---: | ---: |
+| `spvv_c32_int_non` | 0.890404x | 0.938705x |
+| `spvv_c32_int_conj` | 1.221201x | 1.121357x |
+
+第二轮 `spvv_c32_int_non` 原始数据：
+
+| dense length | nnz | FlagSparse ms | PyTorch ms | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 32768 | 1024 | 0.0376562 | 0.0473415 | 1.257203x |
+| 131072 | 4096 | 0.0330010 | 0.0317344 | 0.961617x |
+| 524288 | 16384 | 0.0613852 | 0.0463277 | 0.754704x |
+| 1048576 | 65536 | 0.0613811 | 0.0479568 | 0.781295x |
+
+两轮各有 73 项 SpVV 精度通过（含新增 61 项和原有 q4 用例），性能各 24/24 行
+PASS。SpVV/Axpby 分派回归为 22 passed。早期候选实现的 SpVV/Axpby 联合精度
+为 128 passed；最终范围收窄后，以两轮最终 runner 的 73 passed 为依据。
+所有性能数值均为本机 PyTorch 对照，没有 H800 折算。未删掉任何异常行。
+
+结果目录为 `results_metax_spvv_20261104_runner_final/`、
+`results_metax_spvv_20261104_confirm_final/`，各自保留 summary、accuracy 和
+performance 原始产物、stdout/stderr，根目录有同名 `.log`。
+`results_metax_spvv_20261104_optimized/` 保存独立优化前 `before.csv`、
+中间候选测量及最终 `regression_final.log`；无 `_final` 的 runner 目录也仅为中间
+候选，不当作最终实现结果。本次没有再次全量重测 105 项。
+
+复现最终 SpVV 定向测试（每次选新目录，SDK 环境先按 `docs/MACA.md` 配好）：
+
+```bash
+env -u FLAGSPARSE_ACCURACY_REFERENCE \
+  PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax \
+  FLAGSPARSE_MACA_MODEL=c550 FLAGSPARSE_MACA_VENDOR=torch \
+  python3 -u run_flagsparse_pytest.py --ops spvv --phase both --mode normal \
+  --delivery-only --gpus 0 --timeout 4500 --benchmark-input tests/data \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir results_metax_spvv_<新日期>
+```
