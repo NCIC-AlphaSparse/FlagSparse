@@ -5,6 +5,105 @@
 
 **MUSA 实现约束（用户于 2026-10-18 明确）**：算子计算内核必须使用 Triton，允许使用当前后端支持且经实测验证的 TLE 特性。禁止以手写 MUSA C++/`.mu` 内核、mcc 编译的计算库或 PyTorch 原生索引替代被测算子的计算内核。C API 主机封装、设备内存/流管理和厂商对照基线不属于计算内核；其他后端保持原实现。本文后半部保留的原生实验为撤回历史，不能用于全 Triton 验收。
 
+## 2026-11-04：H800 参照扩到 105 变体，重跑补 17 个 NoBaseline；3 条 Python 慢路径待上卡排查
+
+**为什么 11-03 整轮还剩 17 个 NoBaseline。** 那轮已经带了 `--h800-reference`，但仓库自带的
+`conf/h800_reference.json` 当时只有 10-14 那轮 H800 的 65 个变体，新 40 个变体在参照里查不到，折算无从谈起。
+2026-11-04 已用 H800 105 变体全量（`results_cuda_105_20261103_1556`，105/105 精度、性能全过）重新生成参照。
+这 17 个变体在 H800 上都有 10 个矩阵的 cuSPARSE 时间，只有 `spmv_coo_f16_int_trans` 的 amazon0601
+那一行按规则退用 H800 PyTorch 时间。命令不变，更新代码后照上面"2026-11-02 复测计划"的那一行重跑即可。开跑前先确认参照是新版：
+
+```bash
+python3 -c "import json; r=json.load(open('conf/h800_reference.json')); print(r['reference']['source_dir'], len(r['variants']))"
+# 期望：results_cuda_105_20261103_1556 105
+```
+
+**重跑后应该看到的数（在 CUDA 机器上用 11-03 整轮的原始 CSV 离线预演，不是实测）。** 补位顺序是
+C API 厂商 > Python 那一半对 H800 折算 > C API 时间对 H800 折算。重跑后 Python 那一半会给全部 17 个算出折算
+加速比，所以交付表上的数取 Python 那一列。C API 那一列只是参考：SpMM 的 C API 规模是 n=8，H800 是 N=32，对不上，所以是 `-`。
+
+| 变体 | Python 折算 | C API 折算 |
+|---|---:|---:|
+| spmm_coo_f16f32_int_non_non_row | 1.788 | - |
+| spmm_csc_f16f32_int_non_non_row | **0.008** | - |
+| spmm_csr_bf16f32_int_non_non_row | 2.014 | - |
+| spmm_csr_f16f32_int_non_non_col | 0.289 | - |
+| spmm_csr_f16f32_int_trans_non_row | 0.918 | - |
+| spmm_csr_i8f32_int_non_non_row | 2.329 | - |
+| spmm_csr_i8i32_int_non_non_col | 0.279 | - |
+| spmv_coo_f16_int_trans | 6.425 | 0.213 |
+| spmv_coo_f32c32_int_non | 0.196 | 0.182 |
+| spmv_coo_i8f32_int_non | 0.826 | 0.021 |
+| spmv_csc_f16f32_int_non | 1.725 | 0.808 |
+| spmv_csc_i8i32_int_non | **0.027** | 0.902 |
+| spmv_csr_bf16_int_non | **0.014** | 0.564 |
+| spmv_csr_bf16f32_int_non | 0.958 | 0.550 |
+| spmv_csr_f16f32_int_trans | 1.051 | 0.854 |
+| spmv_csr_f32c32_int_trans | 1.175 | 1.028 |
+| spmv_csr_i8i32_int_trans | 1.197 | 0.987 |
+
+这些是**估算**，分母是 H800 cuSPARSE 按带宽 3050/1370 折算后的时间，不是 muSPARSE。
+`spmv_coo_f16_int_trans` 的 6.4 是真实结果：cuSPARSE 的 COO 转置在 H800 上本来就慢（0.10–0.31 ms），逐矩阵 0.235–11.5。
+
+### 三条慢路径（加粗的 3 行）
+
+三项都是 MUSA 上 Python 侧比同输入的相邻变体慢 50–300 倍，不是 H800 基线的问题。在 RTX 5090 上
+用 `FLAGSPARSE_BACKEND=mthreads` 模拟 MUSA 路由，只有第 1 条能复现出缓存失效，第 2、3 条复现不出来，说明要在 S5000 上看。
+都是 Triton 路由选择问题，修法沿用已有的 Triton 路径，不违反文首的全 Triton 约束。
+
+**1. `spmv_csc_i8i32_int_non`（2.1–8.7 ms；C API 同变体 0.902）：每次调用都重做 COO→CSR，已在模拟上确认。**
+`spmv_csc.py::_spmv_csc_via_mixed` 里 int8 不进 fp16 那条带缓存的 `spmv_csc_half`，落到最后的 `else`。
+那里**每次调用**用 `torch.repeat_interleave` 新建 `col_ids`，再交给 `mixed_spmx.spmv_coo_mixed`。MUSA 分支的
+`_musa_coo_csr` 以 `(data, row, col)` 的张量身份为缓存键，`col_ids` 每次都是新张量，所以每次都 miss，
+在计时窗口里整份 `torch.argsort` 一遍。模拟上连续 5 次调用 = 5 次 argsort。
+修法方向：让 MUSA 的 int8 和 fp16 一样，以 `(data, indices, indptr)` 为键缓存 CSC→CSR，即复用 `spmv_csc_half`
+里 `_MUSA_CSC_CSR_CACHE` 那段，再走 `spmv_csr_mixed`。修完检查：连续调用只在第一次 argsort；精度回归是
+`tests/pytest/test_spmv_csc_accuracy.py`。
+
+**2. `spmm_csc_f16f32_int_non_non_row`（37–134 ms）：落进 fp32 非转置 CSC 通用路径，这条路径在 MUSA 上本身就慢。**
+`spmm_csc.py::flagsparse_spmm_csc` 开头的 fp16 分支里，MUSA 专用快速路径（`_MUSA_CSC_HALF_CACHE` 缓存
+CSC→CSR，再调 `mixed_spmx.spmm_csr_mixed`）要求 `result_dtype == torch.float16`。f16→f32 不满足，
+退到"整体转 fp32 再调一遍 `flagsparse_spmm_csc`"的通用路径。11-03 整轮原始 CSV 里同一路径的另外两个变体也一样慢：
+
+| 矩阵 | f16（MUSA 快速路径） | f32 非转置 | f16f32 | c32 非转置 | f32 转置 |
+|---|---:|---:|---:|---:|---:|
+| cage12 | 0.12 ms | 41.5 ms | 41.5 ms | 90.1 ms | 0.86 ms |
+| NACA0015 | 0.58 ms | 128.6 ms | 128.7 ms | 288.0 ms | 1.85 ms |
+
+f32/c32 的交付数取的是 C API（muSPARSE 基线），所以表上看不出来，但 Python 侧这条路径和转置方向差了约 70 倍。
+排查顺序：
+- 先在卡上打印 f32 非转置调用实际选中的 `alg` 和 kernel，`fs.prepare_spmm_csc_route(...)` 返回的 prepared 里有 `.alg`。
+  看是不是落到了逐 nnz atomic 的那条。
+- 再把 MUSA 快速路径的条件放宽到 `result_dtype in (float16, float32)`。`spmm_csr_mixed` 本身支持 fp32 输出，
+  要传 `out_dtype`，改完对 f16f32 复测。
+- f32/c32 非转置的根因单独记一条，不要只修 f16f32。
+
+**3. `spmv_csr_bf16_int_non`（2.3–8.5 ms；同样是 bf16 输入的 `spmv_csr_bf16f32_int_non` 只要 0.03–0.15 ms）：bf16 没进 row gather。**
+`spmv_csr.py::prepare_spmv_csr` 里 MUSA 只对 `torch.float16` 建 row gather plan
+（`_is_mthreads_runtime() and data.dtype == torch.float16`），bf16 落到默认的 `segbin` kernel（`_spmv_csr_default_backend`
+对 MUSA 返回 `"segbin"`）。bf16f32 走的是 `mixed_spmx` 的另一条路径，所以快。5090 上 bf16 segbin 只有 0.06 ms，
+慢是 S5000 上 bf16 segbin 的问题。
+排查顺序：
+- 在卡上对同一矩阵比较 bf16 的 `alg="segbin"` / `"rowpar"`，以及把条件改成 `data.dtype in (torch.float16, torch.bfloat16)`
+  之后的 row gather，三者的时间。
+- 选最快的一条，然后用 `tests/pytest/test_spmv_csr_accuracy.py` 和 `tests/pytest/test_musa_sparse_routes.py` 回归。
+
+**单变体复测**（每条修完先在 2 个矩阵上看时间，确认快了再跑整轮）：
+
+```bash
+FLAGSPARSE_BACKEND=mthreads PYTHONPATH=src python3 - <<'EOF'
+import sys; sys.path.insert(0, "tests")
+import q4_variant_bench as q
+paths = q.matrix_paths(["tests/data/cage12.mtx", "tests/data/NACA0015.mtx"])
+for op, names in [("spmv_csc", ["spmv_csc_i8i32_int_non", "spmv_csc_f16f32_int_non"]),
+                  ("spmm_csc", ["spmm_csc_f16f32_int_non_non_row", "spmm_csc_f16_int_non_non_row"]),
+                  ("spmv_csr", ["spmv_csr_bf16_int_non", "spmv_csr_bf16f32_int_non"])]:
+    for r in q.run_variants(op, paths, 5, 20, variant_names=names):
+        print(r["variant"], r["matrix"], "%.4f ms" % r["ours_ms"], r["status"])
+EOF
+# 修好的标准：每对里慢的那个和快的那个在同一量级（>0.8 由整轮的 H800 折算判定）
+```
+
 ## 2026-11-03：本机 muSPARSE 基线接入
 
 `capi/ctest/baseline/musa/baseline.cpp` 新接入 6 个直接厂商基线变体：

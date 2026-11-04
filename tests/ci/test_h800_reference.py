@@ -303,11 +303,12 @@ def test_bound_only_cli_defaults_to_the_bundled_file(tmp_path):
         capture_output=True,
         text=True,
     )
-    # Exit 1 only flags rows it could not judge: sddmm_csr_f16 has no cuSPARSE time on
-    # H800 (cuSPARSE SDDMM has no fp16), so those 10 rows are N/A -- not a failure.
+    # Exit 1 would only flag rows it could not judge. Since the 2026-11-03 run every
+    # sddmm_csr row has a cuSPARSE time: the q4 bench calls fp16 SDDMM with an fp32
+    # compute type and checks its output, so the old 10 fp16 N/A rows are gone.
     assert proc.returncode in (0, 1), proc.stderr
     assert "sddmm_csr" in proc.stdout
-    assert "BOUND=120, N/A=10" in proc.stderr
+    assert "BOUND=170;" in proc.stderr and "N/A" not in proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +364,11 @@ def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
     assert set(bundled["variants"]) <= delivery_ids
 
 
-# The bundle is built from the 2026-10-14 H800 run of the whole registry as it
-# stood then, its first 65 variants (conf/h800_reference.json's own "reference"
-# block); the 40 batch-3 variants appended on 2026-11-02 have no H800 run yet.
-# Pinned to the registry on purpose: a regenerated bundle that lost a variant
-# must fail here, not shrink silently.
-H800_RUN_VARIANT_COUNT = 65
+# The bundle is built from the 2026-11-03 H800 run of the whole 105-variant
+# registry (conf/h800_reference.json's own "reference" block). Pinned to the
+# registry on purpose: a regenerated bundle that lost a variant must fail here,
+# not shrink silently.
+H800_RUN_VARIANT_COUNT = 105
 
 
 def test_the_bundled_variants_are_the_registry_as_run_on_h800(bundled):
