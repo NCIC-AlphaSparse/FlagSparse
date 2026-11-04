@@ -12,31 +12,52 @@ _AXPBY_INDEX_CACHE = TensorPlanCache()
 
 
 @triton.jit
-def _spvv_complex_small(OUT, X, IDX, Y, NNZ,
-                       CONJ: tl.constexpr, BLOCK: tl.constexpr):
-    pos = tl.arange(0, BLOCK)
-    components = tl.arange(0, 2)
+def _spvv_reduce(OUT, X, IDX, Y, NNZ, COMPLEX: tl.constexpr,
+                 CONJ: tl.constexpr, ATOMIC: tl.constexpr, BLOCK: tl.constexpr):
+    pos = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = pos < NNZ
     idx = tl.load(IDX + pos, valid, 0)
-    x = tl.load(X + 2 * pos[:, None] + components[None, :], valid[:, None], 0.)
-    y = tl.load(Y + 2 * idx[:, None] + components[None, :], valid[:, None], 0.)
-    xr, xi = tl.split(x)
-    yr, yi = tl.split(y)
-    if CONJ:
-        xi = -xi
-    tl.store(OUT, tl.sum(xr * yr - xi * yi, 0))
-    tl.store(OUT + 1, tl.sum(xr * yi + xi * yr, 0))
+    if COMPLEX:
+        components = tl.arange(0, 2)
+        x = tl.load(X + 2 * pos[:, None] + components[None, :], valid[:, None], 0.)
+        y = tl.load(Y + 2 * idx[:, None] + components[None, :], valid[:, None], 0.)
+        xr, xi = tl.split(x)
+        yr, yi = tl.split(y)
+        if CONJ:
+            xi = -xi
+        real = tl.sum(xr * yr - xi * yi, 0)
+        imag = tl.sum(xr * yi + xi * yr, 0)
+        if ATOMIC:
+            tl.atomic_add(OUT, real, sem="relaxed")
+            tl.atomic_add(OUT + 1, imag, sem="relaxed")
+        else:
+            tl.store(OUT, real)
+            tl.store(OUT + 1, imag)
+    else:
+        x = tl.load(X + pos, valid, 0.)
+        y = tl.load(Y + idx, valid, 0.)
+        total = tl.sum(x * y, 0)
+        if ATOMIC:
+            tl.atomic_add(OUT, total, sem="relaxed")
+        else:
+            tl.store(OUT, total)
 
 
-def spvv_complex(values, indices, y, conj):
-    """One launch for a MACA complex64 dot with at most 4096 entries."""
+def spvv(values, indices, y, conj):
+    """MACA float32/complex64 dot; multi-block sums use independent zeroed output."""
     nnz = values.numel()
-    block = max(64, triton.next_power_of_2(nnz))
-    result = torch.empty((), dtype=torch.complex64, device=y.device)
-    _spvv_complex_small[(1,)](
-        torch.view_as_real(result), torch.view_as_real(values.resolve_conj().resolve_neg()),
-        indices.contiguous(), torch.view_as_real(y.resolve_conj().resolve_neg()),
-        nnz, conj, block, num_warps=4)
+    block = max(64, triton.next_power_of_2(nnz)) if nnz <= 4096 else 1024
+    parts = max(1, triton.cdiv(nnz, block))
+    complex_ = values.dtype == torch.complex64
+    result = (torch.zeros if parts > 1 else torch.empty)((), dtype=values.dtype, device=y.device)
+    x = values.resolve_conj().resolve_neg()
+    dense = y.resolve_conj().resolve_neg()
+    if complex_:
+        x, dense, output = map(torch.view_as_real, (x, dense, result))
+    else:
+        output = result
+    _spvv_reduce[(parts,)](output, x, indices.contiguous(), dense, nnz,
+                          complex_, conj, parts > 1, block, num_warps=4)
     return result
 
 

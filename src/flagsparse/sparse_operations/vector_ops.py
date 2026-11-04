@@ -605,12 +605,14 @@ def flagsparse_spvv(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    # Small MACA complex dots fit in one block, avoiding a second reduction launch.
-    if (_is_maca_runtime() and compute == torch.complex64
-            and values.numel() <= 4096):
-        from ._vector_maca import spvv_complex
+    # MACA dots use one-block reduction or a direct sum into independent output.
+    # Floating-point atomics are excluded when deterministic algorithms are required.
+    if (_is_maca_runtime() and values.dtype in (torch.float32, torch.complex64)
+            and values.numel() <= 65536
+            and (values.numel() <= 4096 or not torch.are_deterministic_algorithms_enabled())):
+        from ._vector_maca import spvv
 
-        result = spvv_complex(values, kernel_idx, y, op == "conj")
+        result = spvv(values, kernel_idx, y, op == "conj")
     elif _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
         # Match the native ROCm baseline for launch-bound reductions; complex
         # real-plane fallbacks would need two additional reduction launches.

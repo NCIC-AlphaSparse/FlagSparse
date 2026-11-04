@@ -818,3 +818,98 @@ env -u FLAGSPARSE_ACCURACY_REFERENCE \
   --benchmark-warmup 5 --benchmark-iters 20 \
   --results-dir results_metax_spvv_<新日期>
 ```
+
+## 2026-11-04：MACA SpVV float32/complex64 两项进一步优化
+
+本次基于 `17448bd20651e23fb128b233f09ee56d615c97bd`。完成打包前通过
+`git ls-remote origin refs/heads/main` 确认远端 main 仍为此提交，本地 HEAD 与
+origin/main 一致。优化前最新完整结果为
+`results_metax_105_20261104_upstream_17448bd/`：105/105 精度 Passed、105/105
+性能 Passed、missing=0、runner exit=0；其中 `spvv_c32_int_non` 平均
+0.676919x、`spvv_f32_int_non` 平均 0.664729x。此次针对这两项优化，完成后
+只定向复测 SpVV，不将旧完整轮解释为优化后 105 项全量验证。
+
+### 实现及后端范围
+
+- `_vector_maca.py` 将原 complex64 小规模 helper 扩展为 `spvv` /
+  `_spvv_reduce`，支持 float32 和 complex64。nnz<=4096 时单 CTA 归约并直接
+  store 标量，不分配 partial、不再启动 finalize；4096<nnz<=65536 时每 CTA
+  处理 1024 项，num_warps=4，局部归约后用 relaxed atomic add 累加到本次调用
+  独立的新建零标量。复数实/虚部分量成对加载，conj 作用于 sparse values。
+  `torch.zeros` 初始化包含在计时中；大规模路径包含清零与 Triton 计算，不能
+  称为整个调用只有一次 GPU launch。乘法和归约数值计算仍使用纯 Triton。
+- `vector_ops.py` 仅在 MACA、输入 dtype 为 float32/complex64、nnz<=65536
+  时启用。开启确定性算法时，nnz>4096 回到原有归约；小规模单 CTA 路径保留。
+  float16、int8（包括显式 float32 输出）、float64、complex128、更大规模和
+  其他后端沿用原分派。未修改 Axpby kernel、基线、计时器、容差或交付汇总规则。
+- 每次输出和原子累加目标独立，没有数值结果缓存或共享 scratch；处理实时修改
+  的输入、跨步索引、lazy conjugate/negative view，原有校验及返回语义保留。
+- `tests/pytest/test_spvv_maca_accuracy.py` 扩展为 178 项：float32/complex64、
+  int32/int64、non/conj、空输入、4096/4097 和 65536/65537 边界、无序及重复
+  索引、跨步/逻辑视图、输入实时变动、输出生命周期、多 stream、确定性回退。
+  使用 CPU float64/complex128 对照，容差仍为 atol=3e-4、rtol=2e-5。
+- `tests/ci/test_spvv_maca_dispatch.py` 为 44 项分派测试，覆盖后端、dtype、
+  输出 dtype、规模及确定性开关。非 MACA 的隔离通过分派测试验证，未进行其他
+  后端实卡测试。
+
+相对上游共修改上述 4 个源码/测试文件及本篇文档，共 5 个文件。
+
+### 三轮原 runner 结果
+
+沿用原 runner、原本机 PyTorch baseline、normal 精度、5 warmup / 20 iters。
+SpVV 不使用矩阵，而是 4 个合成向量规模（nnz=1024、4096、16384、65536）；
+统计仍为这 4 个逐规模加速比的算术平均，以平均>=0.8x 为验收条件。
+
+| 变体 | 优化前完整轮 | 第一轮 | 第二轮 | 第三轮 |
+| --- | ---: | ---: | ---: | ---: |
+| `spvv_c32_int_non` | 0.676919x | 1.181837x | 0.888300x | 0.850452x |
+| `spvv_f32_int_non` | 0.664729x | 1.244284x | 1.039473x | 1.106557x |
+| `spvv_c32_int_conj` | 1.055171x | 1.320435x | 1.002394x | 1.098633x |
+
+第三轮目标项原始数据：
+
+| 变体 | nnz | FlagSparse ms | PyTorch ms | 加速比 |
+| --- | ---: | ---: | ---: | ---: |
+| c32 non | 1024 | 0.0346947 | 0.0326533 | 0.941162x |
+| c32 non | 4096 | 0.0426865 | 0.0323811 | 0.758578x |
+| c32 non | 16384 | 0.0396255 | 0.0353863 | 0.893016x |
+| c32 non | 65536 | 0.0521100 | 0.0421597 | 0.809051x |
+| f32 non | 1024 | 0.0293759 | 0.0325185 | 1.106981x |
+| f32 non | 4096 | 0.0289632 | 0.0325920 | 1.125290x |
+| f32 non | 16384 | 0.0386463 | 0.0469743 | 1.215492x |
+| f32 non | 65536 | 0.0423976 | 0.0414846 | 0.978466x |
+
+三轮分别保存在 `results_metax_spvv2_20261104_runner1/`、`runner2/`、`runner3/`
+（后三者使用相同完整前缀），根目录有各自同名 `.log`。每轮精度 190 passed，
+性能 24/24 行 PASS，精度/性能阶段 exit_code 均为 0；所选 6 个 SpVV 注册变体
+全部 Passed，其余 99 项 NotFound 表示未选择，并非失败。
+SpVV/Axpby 联合精度为 245 passed；分派回归为 52 passed（44 SpVV + 8 Axpby），
+日志在 `results_metax_spvv2_20261104_explore/accuracy.log` 和 `regression_final.log`。
+
+原完整轮包含 c32 nnz=65536 的 3.178877 ms 及 f32 nnz=16384 的 3.651572 ms
+抖动；独立优化前重测两项均值约为 1.0113x/1.0007x，不能将完整轮到新轮的全部
+变化归因于 kernel 优化，也不能承诺抖动已消失。第二轮非目标 c32 conj 在
+nnz=65536 仍有 3.010607 ms 的记录，其他 dtype 的波动同样原样保留，不删异常行。
+
+为区分 kernel 收益与计时波动，还以同一进程、相同输入、交替前后顺序对照干净
+17448bd 与当前实现，3 次复测的大规模 c32 耗时由约 0.050–0.053 ms 降到
+0.039–0.041 ms；f32 大规模约由 0.035–0.044 ms 降到 0.033–0.041 ms。
+原始数据在 explore 目录的 `paired_before_after.json`，同时保存优化前 CSV、
+候选参数探索及原代码快照。这些诊断不替代三轮原 runner 最终结果。
+
+复现命令（先按 `docs/MACA.md` 配置 SDK 和 Python 环境，每次使用新目录）：
+
+```bash
+env -u FLAGSPARSE_ACCURACY_REFERENCE \
+  PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax \
+  FLAGSPARSE_MACA_MODEL=c550 FLAGSPARSE_MACA_VENDOR=torch \
+  /opt/conda/envs/maca312/bin/python3 -u run_flagsparse_pytest.py \
+  --ops spvv --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
+  --benchmark-input tests/data --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir results_metax_spvv2_<新日期>
+```
+
+交付包为 `flagsparse_metax_spvv2_changes_results_20261104.tar.gz`，附同名 SHA256
+校验文件。包含相对上游 17448bd 的 5 个修改文件及可应用补丁、上述最新完整
+105 项原始结果、优化后三轮定向结果及日志、探索/回归证据、文件清单和 SHA256。
+包内说明逐组标明代码阶段，不将优化前完整结果与优化后定向结果混为全量验证。
