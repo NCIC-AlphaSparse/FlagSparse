@@ -310,6 +310,15 @@ def main():
                     "gems": float(r.get("median_ms") or 0.0),
                     "speedup": float(r.get("speedup") or 0.0),
                 }
+                # Present only on explicitly labelled MUSA baseline routes.
+                # Preserve the conversion/timing boundary in the delivered report.
+                for key in (
+                    "baseline_method",
+                    "baseline_timing_scope",
+                    "baseline_prepare_ms",
+                ):
+                    if key in r:
+                        det[shape_key(r)][key] = r[key]
                 if r.get("speedup"):
                     sp.append(float(r["speedup"]))
                 elif r.get("baseline_status") != "ok" and r.get("accuracy") in (

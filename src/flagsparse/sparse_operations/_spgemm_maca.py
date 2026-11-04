@@ -79,7 +79,8 @@ def _capacity(work, sizes, counts, N: tl.constexpr, COLS: tl.constexpr, LIMIT: t
 
 
 @triton.jit
-def _products(ad, ai, ap, pref, bd, bi, bp, row, work, q, BLOCK: tl.constexpr):
+def _products(ad, ai, ap, pref, bd, bi, bp, row, work, q, BLOCK: tl.constexpr,
+              COMPLEX: tl.constexpr):
     lo = tl.full((BLOCK,), tl.load(ap + row), tl.int64)
     stop = tl.load(ap + row + 1).to(tl.int64)
     hi = tl.full((BLOCK,), stop, tl.int64)
@@ -93,14 +94,26 @@ def _products(ad, ai, ap, pref, bd, bi, bp, row, work, q, BLOCK: tl.constexpr):
     p = tl.load(pref + lo, q < work, 0)
     bpos = tl.load(bp + col, q < work, 0) + q - p
     key = tl.load(bi + bpos, q < work, -1)
-    av = tl.load(ad + lo, q < work, 0.0)
-    bv = tl.load(bd + bpos, q < work, 0.0)
-    return key, av * bv
+    if COMPLEX:
+        ar = tl.load(ad + 2 * lo, q < work, 0.0)
+        aj = tl.load(ad + 2 * lo + 1, q < work, 0.0)
+        br = tl.load(bd + 2 * bpos, q < work, 0.0)
+        bj = tl.load(bd + 2 * bpos + 1, q < work, 0.0)
+        return key, ar * br - aj * bj, ar * bj + aj * br
+    else:
+        av = tl.load(ad + lo, q < work, 0.0)
+        bv = tl.load(bd + bpos, q < work, 0.0)
+        return key, av * bv, tl.full((BLOCK,), 0, tl.float32)
 
 
 @triton.jit
 def _segment_add(ka, va, kb, vb):
     return kb, tl.where(ka == kb, va + vb, vb)
+
+
+@triton.jit
+def _segment_add_complex(ka, ra, ia, kb, rb, ib):
+    return kb, tl.where(ka == kb, ra + rb, rb), tl.where(ka == kb, ia + ib, ib)
 
 
 @triton.jit
@@ -110,19 +123,22 @@ def _scan_last_two(ka, next_a, na, kb, next_b, nb):
 
 @triton.jit
 def _sort_rows(ad, ai, ap, pref, bd, bi, bp, work, slots, keys, values, counts,
-               LOWER: tl.constexpr, BLOCK: tl.constexpr):
+               LOWER: tl.constexpr, BLOCK: tl.constexpr, COMPLEX: tl.constexpr):
     row = tl.program_id(0)
     w = tl.load(work + row)
     if (w > LOWER) & (w <= BLOCK):
         q = tl.arange(0, BLOCK)
-        key, _ = _products(ad, ai, ap, pref, bd, bi, bp, row, w, q, BLOCK)
+        key, _, _ = _products(ad, ai, ap, pref, bd, bi, bp, row, w, q, BLOCK, COMPLEX)
         # MACA cannot lower dynamic cross-lane gather. Carry product positions
         # through scalar sort, then load operands directly in the sorted order.
         order = tl.sort((key.to(tl.uint32).to(tl.uint64) << 32) | q.to(tl.uint64), descending=False)
         key = (order >> 32).to(tl.int32)
-        _, value = _products(ad, ai, ap, pref, bd, bi, bp, row, w,
-                             (order & 0xffffffff).to(tl.int32), BLOCK)
-        _, total = tl.associative_scan((key, value), 0, _segment_add)
+        _, value, imag = _products(ad, ai, ap, pref, bd, bi, bp, row, w,
+                             (order & 0xffffffff).to(tl.int32), BLOCK, COMPLEX)
+        if COMPLEX:
+            _, total, total_imag = tl.associative_scan((key, value, imag), 0, _segment_add_complex)
+        else:
+            _, total = tl.associative_scan((key, value), 0, _segment_add)
         _, following, _ = tl.associative_scan(
             (key, key, tl.full((BLOCK,), 1, tl.int32)), 0, _scan_last_two, reverse=True
         )
@@ -130,12 +146,17 @@ def _sort_rows(ad, ai, ap, pref, bd, bi, bp, work, slots, keys, values, counts,
         rank = tl.cumsum(last.to(tl.int32), 0) - 1
         base = tl.load(slots + row)
         tl.store(keys + base + rank, key, last)
-        tl.store(values + base + rank, total, last)
+        if COMPLEX:
+            tl.store(values + 2 * (base + rank), total, last)
+            tl.store(values + 2 * (base + rank) + 1, total_imag, last)
+        else:
+            tl.store(values + base + rank, total, last)
         tl.store(counts + row, tl.sum(last.to(tl.int32), 0))
 
 
 @triton.jit
-def _hash_init(work, slots, keys, values, LIMIT: tl.constexpr, BLOCK: tl.constexpr):
+def _hash_init(work, slots, keys, values, LIMIT: tl.constexpr, BLOCK: tl.constexpr,
+               COMPLEX: tl.constexpr):
     row = tl.program_id(0)
     if tl.load(work + row) > LIMIT:
         start = tl.load(slots + row)
@@ -143,12 +164,16 @@ def _hash_init(work, slots, keys, values, LIMIT: tl.constexpr, BLOCK: tl.constex
         for base in range(start, end, BLOCK):
             pos = base + tl.arange(0, BLOCK)
             tl.store(keys + pos, -1, pos < end)
-            tl.store(values + pos, 0.0, pos < end)
+            if COMPLEX:
+                tl.store(values + 2 * pos, 0.0, pos < end)
+                tl.store(values + 2 * pos + 1, 0.0, pos < end)
+            else:
+                tl.store(values + pos, 0.0, pos < end)
 
 
 @triton.jit
 def _hash_rows(ad, ai, ap, pref, bd, bi, bp, work, slots, keys, values, counts,
-               LIMIT: tl.constexpr, BLOCK: tl.constexpr):
+               LIMIT: tl.constexpr, BLOCK: tl.constexpr, COMPLEX: tl.constexpr):
     row = tl.program_id(0)
     w = tl.load(work + row)
     if w > LIMIT:
@@ -172,9 +197,17 @@ def _hash_rows(ad, ai, ap, pref, bd, bi, bp, work, slots, keys, values, counts,
             p = tl.load(pref + lo, valid, 0)
             bpos = tl.load(bp + col, valid, 0) + q - p
             key = tl.load(bi + bpos, valid, -1)
-            av = tl.load(ad + lo, valid, 0.0)
-            bv = tl.load(bd + bpos, valid, 0.0)
-            prod = av * bv
+            if COMPLEX:
+                ar = tl.load(ad + 2 * lo, valid, 0.0)
+                aj = tl.load(ad + 2 * lo + 1, valid, 0.0)
+                br = tl.load(bd + 2 * bpos, valid, 0.0)
+                bj = tl.load(bd + 2 * bpos + 1, valid, 0.0)
+                prod = ar * br - aj * bj
+                prod_imag = ar * bj + aj * br
+            else:
+                av = tl.load(ad + lo, valid, 0.0)
+                bv = tl.load(bd + bpos, valid, 0.0)
+                prod = av * bv
             h = (key.to(tl.uint32) * 2654435761).to(tl.int64) & (cap - 1)
             done = ~valid
             while tl.sum((~done).to(tl.int32), 0) > 0:
@@ -184,7 +217,11 @@ def _hash_rows(ad, ai, ap, pref, bd, bi, bp, work, slots, keys, values, counts,
                 )
                 hit = (found == -1) | (found == key)
                 count += tl.sum(((~done) & (found == -1)).to(tl.int32), 0)
-                tl.atomic_add(values + start + h, prod, (~done) & hit, sem="relaxed")
+                if COMPLEX:
+                    tl.atomic_add(values + 2 * (start + h), prod, (~done) & hit, sem="relaxed")
+                    tl.atomic_add(values + 2 * (start + h) + 1, prod_imag, (~done) & hit, sem="relaxed")
+                else:
+                    tl.atomic_add(values + start + h, prod, (~done) & hit, sem="relaxed")
                 done = done | hit
                 h = (h + 1) & (cap - 1)
         tl.store(counts + row, count)
@@ -192,7 +229,7 @@ def _hash_rows(ad, ai, ap, pref, bd, bi, bp, work, slots, keys, values, counts,
 
 @triton.jit
 def _compact(work, slots, keys, values, counts, ptr, ci, cd,
-             LIMIT: tl.constexpr, BLOCK: tl.constexpr):
+             LIMIT: tl.constexpr, BLOCK: tl.constexpr, COMPLEX: tl.constexpr):
     row = tl.program_id(0)
     base = tl.load(slots + row)
     dst = tl.load(ptr + row)
@@ -201,20 +238,32 @@ def _compact(work, slots, keys, values, counts, ptr, ci, cd,
         for offset in range(0, count, BLOCK):
             lane = offset + tl.arange(0, BLOCK)
             key = tl.load(keys + base + lane, lane < count, 0)
-            value = tl.load(values + base + lane, lane < count, 0.0)
             tl.store(ci + dst + lane, key, lane < count)
-            tl.store(cd + dst + lane, value, lane < count)
+            if COMPLEX:
+                real = tl.load(values + 2 * (base + lane), lane < count, 0.0)
+                imag = tl.load(values + 2 * (base + lane) + 1, lane < count, 0.0)
+                tl.store(cd + 2 * (dst + lane), real, lane < count)
+                tl.store(cd + 2 * (dst + lane) + 1, imag, lane < count)
+            else:
+                value = tl.load(values + base + lane, lane < count, 0.0)
+                tl.store(cd + dst + lane, value, lane < count)
     else:
         cap = tl.load(slots + row + 1) - base
         emitted = 0
         for offset in range(0, cap, BLOCK):
             lane = offset + tl.arange(0, BLOCK)
             key = tl.load(keys + base + lane, lane < cap, -1)
-            value = tl.load(values + base + lane, lane < cap, 0.0)
             valid = (lane < cap) & (key >= 0)
             rank = tl.cumsum(valid.to(tl.int32), 0) - 1
             tl.store(ci + dst + emitted + rank, key, valid)
-            tl.store(cd + dst + emitted + rank, value, valid)
+            if COMPLEX:
+                real = tl.load(values + 2 * (base + lane), valid, 0.0)
+                imag = tl.load(values + 2 * (base + lane) + 1, valid, 0.0)
+                tl.store(cd + 2 * (dst + emitted + rank), real, valid)
+                tl.store(cd + 2 * (dst + emitted + rank) + 1, imag, valid)
+            else:
+                value = tl.load(values + base + lane, valid, 0.0)
+                tl.store(cd + dst + emitted + rank, value, valid)
             emitted += tl.sum(valid.to(tl.int32), 0)
 
 
@@ -229,6 +278,9 @@ def build_metadata(indices, indptr, b_indptr):
 def compute(prepared):
     rows = prepared.n_rows
     device = prepared.a_data.device
+    complex_values = prepared.a_data.dtype.is_complex
+    ad = torch.view_as_real(prepared.a_data.resolve_conj()) if complex_values else prepared.a_data
+    bd = torch.view_as_real(prepared.b_data.resolve_conj()) if complex_values else prepared.b_data
     sizes = torch.empty(rows, dtype=torch.int64, device=device)
     counts = torch.empty(rows, dtype=torch.int64, device=device)
     limit = 4096
@@ -240,23 +292,26 @@ def compute(prepared):
     total = int(slots[-1].item())
     keys = torch.empty(total, dtype=torch.int32, device=device)
     values = torch.empty(total, dtype=prepared.a_data.dtype, device=device)
-    args = (prepared.a_data, prepared.a_indices, prepared.a_indptr, prepared.a_pref,
-            prepared.b_data, prepared.b_indices, prepared.b_indptr, prepared.a_row_work,
-            slots, keys, values, counts)
+    value_storage = torch.view_as_real(values) if complex_values else values
+    args = (ad, prepared.a_indices, prepared.a_indptr, prepared.a_pref,
+            bd, prepared.b_indices, prepared.b_indptr, prepared.a_row_work,
+            slots, keys, value_storage, counts)
     if rows:
         lower = 0
         for block, warps in ((64, 1), (256, 2), (1024, 4), (4096, 8)):
-            _sort_rows[(rows,)](*args, lower, block, num_warps=warps, enable_fp_fusion=False)
+            _sort_rows[(rows,)](*args, lower, block, complex_values,
+                                num_warps=warps, enable_fp_fusion=False)
             lower = block
-        _hash_init[(rows,)](prepared.a_row_work, slots, keys, values, limit, 256)
+        _hash_init[(rows,)](prepared.a_row_work, slots, keys, value_storage, limit, 256, complex_values)
         # C550 CAS/add loses lanes with a 128-element multi-warp layout; keep
         # each probing step within its native 64-lane warp (tested for FP64).
-        _hash_rows[(rows,)](*args, limit, 64, num_warps=1, enable_fp_fusion=False)
+        _hash_rows[(rows,)](*args, limit, 64, complex_values, num_warps=1, enable_fp_fusion=False)
     ptr = _prefix_ptr(counts)
     nnz = int(ptr[-1].item())
     data = torch.empty(nnz, dtype=prepared.a_data.dtype, device=device)
     indices = torch.empty(nnz, dtype=torch.int32, device=device)
     if rows:
-        _compact[(rows,)](prepared.a_row_work, slots, keys, values, counts, ptr,
-                         indices, data, limit, 256, num_warps=4)
+        target = torch.view_as_real(data) if complex_values else data
+        _compact[(rows,)](prepared.a_row_work, slots, keys, value_storage, counts, ptr,
+                         indices, target, limit, 256, complex_values, num_warps=4)
     return data, indices, ptr

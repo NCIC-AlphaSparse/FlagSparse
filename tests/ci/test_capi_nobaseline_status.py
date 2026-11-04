@@ -114,3 +114,31 @@ def test_a_failed_row_fails_the_variant_instead_of_dropping_out(tmp_path):
     assert f32["data"]["fp32"]["speedup"] == 2.0
     assert f32["data"]["fp32"]["failed_rows"] == ["b"]
     assert result["gather_f64_int"]["performance"]["status"] == "Passed"
+
+
+def test_baseline_preparation_scope_survives_summary_projection(tmp_path):
+    metadata = {
+        "baseline_method": "CSC(A) -> CSR(A^H); muSPARSE SpMV",
+        "baseline_timing_scope": "operator call; preparation excluded",
+        "baseline_prepare_ms": 1.25,
+    }
+    result = _summarize(
+        tmp_path,
+        [
+            _row(
+                "f32",
+                "a",
+                baseline_status="ok",
+                baseline_ms=0.06,
+                speedup=2.0,
+                **metadata,
+            ),
+            _row("f32", "b", baseline_status="ok", baseline_ms=0.09, speedup=3.0),
+        ],
+    )
+    details = result["gather_f32_int"]["performance"]["data"]["fp32"]["details"]
+    assert all(details["a"][key] == value for key, value in metadata.items())
+    assert all(key not in details["b"] for key in metadata)
+    # Preparation time is labelled separately, never silently added to the ratio.
+    assert details["a"]["base"] == 0.06
+    assert details["a"]["speedup"] == 2.0

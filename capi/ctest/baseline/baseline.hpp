@@ -100,6 +100,10 @@ struct DeviceCsr {
 // median is returned, matching BenchReport so the two numbers are commensurable.
 struct Timing {
     double median_ms = 0.0;
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+    std::string method;
+    double prepare_ms = 0.0;  // Host format/value preparation, excluded from median_ms.
+#endif
 };
 
 // ---------------------------------------------------------------- entry points
@@ -134,6 +138,9 @@ Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void*
                 flagsparseOrder_t orderC = FLAGSPARSE_ORDER_COL);
 
 #if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+Status axpby(const void* sparse_val, const void* sparse_idx, void* dense,
+             int64_t nnz, int64_t size, const void* alpha, const void* beta,
+             flagsparseDataType_t dtype, int warmup, int iters, Timing* out);
 // muSPARSE 4.3.5-specific descriptor axes, compiled only by the MUSA profile.
 Status sddmm_csr(const DeviceCsr& A, const void* Bd, int64_t k, int64_t ldb,
                  const void* Cd, int64_t ldc, const void* alpha, const void* beta,

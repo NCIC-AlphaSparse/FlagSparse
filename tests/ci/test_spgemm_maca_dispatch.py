@@ -15,7 +15,8 @@ spgemm = importlib.import_module("flagsparse.sparse_operations.spgemm_csr")
 
 @pytest.mark.parametrize("maca", [True, False])
 @pytest.mark.parametrize("tle", [True, False])
-def test_triton_dispatch_is_maca_only(monkeypatch, maca, tle):
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex64])
+def test_triton_dispatch_is_maca_only(monkeypatch, maca, tle, dtype):
     monkeypatch.setattr(spgemm, "_is_maca_runtime", lambda: maca)
     for name in ("_is_mthreads_runtime", "_is_xpu_runtime", "_is_iluvatar_runtime"):
         monkeypatch.setattr(spgemm, name, lambda: False)
@@ -24,7 +25,7 @@ def test_triton_dispatch_is_maca_only(monkeypatch, maca, tle):
     monkeypatch.setattr(spgemm, "_spgemm_esc_compute_safe", lambda p: "esc")
     monkeypatch.setattr(spgemm, "_spgemm_hash_hybrid_compute", lambda p: "hash")
     prepared = object.__new__(spgemm.SpGEMMPrepared)
-    prepared.a_data = SimpleNamespace(dtype=torch.float64)
+    prepared.a_data = SimpleNamespace(dtype=dtype)
     assert spgemm._spgemm_compute(prepared) == (
         "maca_triton" if maca else "hash" if tle else "esc"
     )
@@ -42,7 +43,9 @@ def test_maca_module_does_not_compute_with_torch():
                 attributes.append(root.attr)
                 root = root.value
             if isinstance(root, ast.Name) and root.id == "torch":
-                assert attributes == ["empty"], ast.unparse(node.func)
+                assert attributes in (["empty"], ["view_as_real"]), ast.unparse(
+                    node.func
+                )
             if node.func.attr in (
                 "sort",
                 "argsort",

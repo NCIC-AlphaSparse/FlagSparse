@@ -5,6 +5,59 @@
 
 **MUSA 实现约束（用户于 2026-10-18 明确）**：算子计算内核必须使用 Triton，允许使用当前后端支持且经实测验证的 TLE 特性。禁止以手写 MUSA C++/`.mu` 内核、mcc 编译的计算库或 PyTorch 原生索引替代被测算子的计算内核。C API 主机封装、设备内存/流管理和厂商对照基线不属于计算内核；其他后端保持原实现。本文后半部保留的原生实验为撤回历史，不能用于全 Triton 验收。
 
+## 2026-11-03：本机 muSPARSE 基线接入
+
+`capi/ctest/baseline/musa/baseline.cpp` 新接入 6 个直接厂商基线变体：
+
+| 变体 | 接口 | 对旧 0712 轮的意义 |
+|---|---|---|
+| gemvi_c32_int_non | musparseCgemvi | 补 NoBaseline |
+| geam_csr_f32_int / geam_csr_c32_int | musparseXcsrgeam_nnz + musparseScsrgeam/Ccsrgeam | 补 2 个 NoBaseline |
+| gemvi_f32_int_non | musparseSgemvi | 替代原 PyTorch 对照 |
+| axpby_f32_int / axpby_c32_int | musparseAxpby | 替代原 PyTorch / H800 折算对照 |
+
+GEAM 使用本机 legacy **csrgeam** ABI，结构 nnz 和数值计算都包含在每次计时中，
+容量不足在写 columns/values 前返回失败。Axpby 双方每次调用前恢复初始 y 并同步，恢复不计时；
+基线返回的结果仍对应原始 alpha/beta 和完整 dense y 的语义。
+GEMVI transpose 仍明确返回不支持，不能因 bufferSize 成功而宣称存在计算基线。
+
+另两条路线显式准备 CSR：
+
+- `spmm_coo_f32_int_trans_non_row`：主机将 COO(A) 转为 CSR(Aᵀ)，厂商执行 non-transpose SpMM。
+- `spmv_csc_c32_int_conj`：CSC(A) 结构直接作为 CSR(Aᵀ)，主机共轭当前值生成 CSR(Aᴴ)，厂商执行 non-transpose SpMV。
+
+这两条不是原格式原生支持。每次 baseline 调用重新读取当前输入，不跨调用缓存；
+下载、主机转换、上传、同步的时间单独写入 `baseline_prepare_ms`，不包含在 `baseline_ms` 或加速比中。
+原始 JSON 和 summary 的每个 shape 均保留 `baseline_method`、`baseline_timing_scope`、`baseline_prepare_ms`。
+若用于端到端对比，需要另计转换成本，不能将本次加速比描述为端到端加速比。
+所有厂商名称通过运行时版本查询输出，本机为 **muSPARSE 1.5.1**；4.3.5 是 SDK 版本。
+
+定向复测输出：`results_musa_baseline_integration_20261103/`，8 个变体共 50 条记录。
+GEAM 和两条 CSR 准备路线使用 `tests/data` 原 10 个矩阵、原始数值；GEMVI 使用原 4 个合成规模，Axpby 使用原向量。
+50/50 基线调用成功，48 条严格通过，ASIC_680ks 上 SpMM / CSC conj 的 2 条为 `pass_relaxed`：
+双方严格误差比均约 1.363375，FlagSparse relaxed 比约 0.013634，按原有规范 6.3.1 判定，未改容差。
+定向结果的算术平均加速比：
+
+| 变体 | 加速比 |
+|---|---:|
+| gemvi_f32_int_non | 0.609 |
+| gemvi_c32_int_non | 0.467 |
+| geam_csr_f32_int | 2.525 |
+| geam_csr_c32_int | 2.395 |
+| axpby_f32_int | 0.956 |
+| axpby_c32_int | 0.958 |
+| spmm_coo_f32_int_trans_non_row | 0.207 |
+| spmv_csc_c32_int_conj | 0.166 |
+
+性能 `Passed` 只表示按框架精度规则可报告加速比，不能理解为已达到 0.8。
+原 19 个 NoBaseline 中可补的 3 个已在本次定向复测通过，其余 16 个窄类型/混合精度不支持的事实不变；
+`spmv_csr_f32c32_int_trans` 也仍无直接厂商基线。
+这是接入定向验证，**没有重跑或改写旧 105 项整轮结果**。现有 split / 统一 runner 重建后会自动使用这些基线，
+厂商优先级、Python/H800 补位规则未变。
+
+修改范围只有测试侧 MUSA 基线、MUSA 宏保护的测试封装、summary 元数据透传、回归测试和本节文档；
+没有修改 `src/` 或 `capi/src/` 中的生产 kernel。新增 `accuracy.musa_baseline` 仅在 MUSA 构建注册。
+
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（

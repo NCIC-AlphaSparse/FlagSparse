@@ -21,12 +21,15 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > de
 
 - **没有厂商列，H800 也补不上**：C550 没有厂商稀疏库，新变体只有 PyTorch 对照。它们在 H800 上没有数据，所以
   `--h800-reference` 只能补前 65 个。
-- **SDDMM 的 PyTorch 参考是错的**：`torch.sparse.sampled_addmm` 在 C550 上会算错（7.3 节）。q4 基准会先把 PyTorch
-  的结果和 CPU 参考比一遍，所以 4 个新 SDDMM 变体（`f32_trans_trans`、`c32_non_trans`、`f16_non_trans`、`f16f32`）
-  大概率出现 `pytorch_reason = PyTorch result off by ...` 并且没有加速比，这说明校验在起作用。如果某个变体的
-  PyTorch 列没被拦下，结果却明显离谱，要报回来。
-- **spgemm c32 走 ESC**：MACA 专用的纯 Triton SpGEMM（`_spgemm_maca.py`）只支持实数，c32 跳过它；C550 又没有 TLE，
-  所以走 ESC（torch 的排序和归约）。结果是对的，但慢，CUDA 上 ESC 约为 cuSPARSE 的 0.1 倍。
+- **SDDMM 的 `sampled_addmm` 结果是错的**：该 PyTorch API 在 C550 上会算错（7.3 节）。2026-11-03
+  已为 MACA q4 基准补充取数/相乘/求和路径：API 报错、输出错误或非有限、计时输出校验失败、时延无效时
+  回退；备用路径也必须通过独立 CPU 参考校验才发布本机 `pytorch_ms`。原 API 的失败保存在
+  `pytorch_sampled_addmm_reason`，实际公式在 `pytorch_formulation`，最终备用路径失败才写 `pytorch_reason`。
+  float16 输入先转 float32 计算。该表达式会物化 nnz×K 中间张量，不是融合厂商 SDDMM，不能称为厂商加速比。
+  接线前的 `results_metax_105_20261103_1253/` 仍有 4 个新增 SDDMM 无加速比；本次定向结果不覆盖旧产物。
+- **spgemm c32 的旧 ESC 慢路径已替换**：2026-11-03 已扩展 MACA 专用纯 Triton
+  SpGEMM（`_spgemm_maca.py`）以支持 complex64；复数乘法、排序归约及长行哈希均在
+  kernel 内完成。10 矩阵复核平均为 1.640396x（本机 PyTorch），详见本文末尾四项优化记录。
 - **4KB 私有内存**：新 kernel 没有用 `tl.static_range` 做大规模展开。gemvi 的 tile 是 64×32，geam 的二分查找用的是
   运行时循环。复数 gemvi 和 geam_c32 要优先看有没有 `memory size or pointer value too large`。
 
@@ -36,7 +39,7 @@ setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > de
 2. 复数的新变体有没有编译错误：`gemvi_c32_int_non`、`geam_csr_c32_int`、`spmv_csc_c32_int_conj`、`spmm_csr_c32_int_*`、
    `sddmm_csr_c32_int_non_trans_row`、`spvv_c32_int_non`、`spmv_*_f32c32_*`。
 3. 新 40 个里没有加速比的变体逐个列出，附上 `pytorch_reason`。
-4. `spgemm_csr_c32_int_non_non` 的耗时（ESC 路径），以及 `performance.csv` 里是不是只有 10 行 c32。
+4. `spgemm_csr_c32_int_non_non` 的耗时（MACA 纯 Triton 路径），以及 `performance.csv` 里是不是只有 10 行 c32。
 5. 和 10-15 那轮相比，原 65 个里加速比掉了一半以上的变体。这轮改过混合精度路径和 spmm_csc/sddmm 的公开接口，
    原 65 个也可能受影响。
 
@@ -465,3 +468,273 @@ SpGEMM 合成精度 `39 passed`，10 矩阵 × float32/float64 的 20 行性能�
 baseline 均通过，平均加速比分别为 `1.572141x`、`1.582163x`。`39` 是精度用例数，
 不是算子数；另外 64 个交付变体未用当前修改重新测试。历史
 `results_metax_65_20261014/` 不能作为当前修改的全量 65 算子验证结果。
+
+## 2026-11-03 MACA SDDMM 本机 PyTorch baseline 补齐
+
+### `tests/q4_variant_bench.py`：仅 MACA 的校验失败回退
+
+- 改了什么：新增 `_time_maca_sddmm_pytorch`，只在 `_sddmm` 的 MACA 分支调用。
+  优先校验并计时 `torch.sparse.sampled_addmm`；异常、错误结果、NaN/Inf、形状错误、
+  计时返回值错误或无效时延，均改试已有的 `_sddmm_reference`（纯 PyTorch 取数、乘法、求和）。
+  两条路径都校验计时前的输出和实际计时返回值；最终失败不发布 `pytorch_ms`，不修改
+  FlagSparse 自身的精度状态。保留原 sampled API 的失败原因和实际公式标记。
+- 为什么改（附报错原文）：完整 105 项轮次中 4 个新增 SDDMM 变体无加速比，原因为
+  `PyTorch result off by ... (relative); baseline not used`；另外 5 个旧 SDDMM q4 变体
+  也没有本机 PyTorch baseline，仅靠 H800 折算。旧逻辑仅在 API 抛异常时改用取数求和，
+  MACA 的 API 返回错误结果却不抛异常，因此没有进入备用路径。
+- 计时口径：op/布局的转置视图、dtype 转换、Y 连续化和 CSR descriptor/指针转换仍在计时外，
+  与原有备用路径一致；逐行 row ID 构造、取数、乘法、求和及输出分配均在计时内。
+  float16 和 float16→float32 均明确使用 float32 计算；complex64 不做共轭乘法。
+  没有修改 kernel、FlagSparse 耗时、精度门槛或 H800 规则。
+- 怎么验证的：接线前 9 变体 × 10 矩阵独立诊断 90/90 通过，CPU float64/complex128
+  参考下最大归一化误差约 `1.4e-7`。接线后以同一 q4 benchmark 的 `run_variants` /
+  `append_to_csv` 路径定向验证，结果另存 `results_metax_sddmm_baseline_20261103/`，
+  warmup=5、iters=20，最终结果见下表。不把这次定向测试称为新一轮完整 105 项复测。
+- 其他后端是否也需要：否；非 MACA 仍走原 `_time_pytorch`，原 API 异常回退和 Ascend
+  复数 real-plane 路径保留。SpMV CSR cage12 float64 的历史偶发 NaN 不在本次接线范围内。
+
+### `tests/ci/test_q4_sddmm_maca_baseline.py`
+
+- 改了什么：新增 9 变体 × MACA/非 MACA × 正确/错误/异常的路由和精度隔离测试；覆盖
+  NaN/Inf、计时输出损坏、形状错误、无效时延、fallback 自身失败及历史错误字段隔离。
+- 为什么改：防止错误 API 被当作有效基线、失败结果发布时延，或者新 MACA 行为影响其他后端。
+- 怎么验证的：连同 Ascend complex reference、Iluvatar baseline/validation、SDDMM sweep
+  和 runner 结果格式回归合计 `184 passed`。
+- 其他后端是否也需要：否；回归测试同时检查非 MACA 行为保持不变。
+
+### 接线后 C550 定向实测结果
+
+`results_metax_sddmm_baseline_20261103/` 中 90/90 行算子精度 `PASS`，90/90 行有有效本机
+`pytorch_ms`，全部 `pytorch_formulation=gather/multiply/sum`，最终 `pytorch_reason` 均为空。
+原 sampled API 的 90 条失败原因仍保存在 `pytorch_sampled_addmm_reason`。CPU 高精度
+参考下 baseline 最大归一化误差约 `1.24e-7`。没有使用 H800 折算。
+
+| 变体 | 10 矩阵 PyTorch / FlagSparse 算术平均 |
+|---|---:|
+| `sddmm_csr_f32_int_non_non_col` | 20.839693x |
+| `sddmm_csr_f32_int_non_trans_row` | 17.861593x |
+| `sddmm_csr_f32_int_trans_non_row` | 18.337541x |
+| `sddmm_csr_c32_int_non_non_row` | 4.418412x |
+| `sddmm_csr_f16_int_non_non_row` | 7.059146x |
+| `sddmm_csr_f32_int_trans_trans_row` | 20.882196x |
+| `sddmm_csr_c32_int_non_trans_row` | 4.879380x |
+| `sddmm_csr_f16_int_non_trans_row` | 23.591153x |
+| `sddmm_csr_f16f32_int_non_non_row` | 6.934029x |
+
+以上仅是本机非融合 PyTorch 表达式的性能比值，不能与历史 H800 融合厂商基线的比值
+直接比较，也不能将分母变化解释为 kernel 优化。所有平均值均超过 0.8x，但不要求或
+宣称每个矩阵都超过 0.8x。输入与计时配置为 10 个交付矩阵、K=32、5 warmup / 20 iters；
+不是传统 f32/f64 的 K=32/64/128/256 完整 sweep。
+
+独立合成精度：`pytest -q tests/pytest -m sddmm_csr --mode normal --tb=short` 为
+`27 passed, 4 skipped, 5068 deselected`；4 个跳过均为非 MACA 的 BI-V 专用测试。
+相关回归为 `184 passed`。数据及日志为 `performance.csv`、`rows.json`、`performance.log`、
+`accuracy.log` 和 `regression.log`。定向复现脚本只调用仓库现有 benchmark 接口，不替换
+kernel 或修改基线函数；输出必须选新目录，例如：
+
+```bash
+env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550 \
+  FLAGSPARSE_MACA_VENDOR=torch \
+  python3 -u results_metax_sddmm_baseline_20261103/verify_wiring.py \
+  results_metax_sddmm_baseline_<新日期>
+```
+
+完整 105 项仍使用本文顶部的 `run_flagsparse_delivery.py` 命令。历史
+`results_metax_105_20261103_1253/` 和其压缩包未修改，仍如实反映接线前 4 项无加速比的状态。
+
+## 2026-11-03：四个低于 0.8x 变体的 MACA 优化
+
+基于 `39e400a6c8b5a140b9f174c2543ddbaa9d728de0` 的本地改动，保留已完成的
+SDDMM baseline 接线。优化前数据来自 `results_metax_105_20261103_pytorch_rerun1/`。
+本次只优化四个慢项，kernel/dispatch 的新分支仅在 `_is_maca_runtime()` 时启用。
+没有改动 baseline、性能比较器、容差或交付汇总算法。
+
+### 源码改动及原因
+
+- `src/flagsparse/sparse_operations/spmv_csc.py`：MACA 的 float32/complex64
+  转置及共轭转置，将 CSC(A) 直接视作 CSR(A.T)，prepare 时建立批量行 gather 计划；
+  compute 复用已有 MACA 单 wave/复数组件成对加载 kernel，替代每列一个 program 的
+  串行段循环。共轭在 kernel 中执行，避免把数值共轭副本冻结在 prepare 内，原地修改
+  values 或输入向量后仍读取当前值。float64/complex128 以及非 MACA 路径沿用原实现。
+- `src/flagsparse/sparse_operations/_spmv_csc_maca.py`（新增），以及上述 CSC 文件的
+  int8 分支：int8→int32 用缓存的输出行拓扑和纯 Triton int32 gather 归约，消除每次
+  调用的 `repeat_interleave` 列号构造及 COO atomic scatter。缓存只保存结构，按
+  indices/indptr 的身份、版本、存储及步长失效；无版本的 inference tensor 不缓存。
+  数值每次实时读取，先转 int32 再乘加，超过 2**24 的整数和仍精确。支持 int32/int64
+  结构索引、非连续输入/输出和时间/meta 返回；int8→float32 继续走原 mixed 路径。
+- `src/flagsparse/sparse_operations/_spgemm_maca.py`：在现有 MACA 实数算法上扩展
+  complex64 的实/虚部乘法、分段扫描、长行双分量 atomic_add 和结果压紧。仍使用
+  原有短行排序、长行全局哈希、递归 CSR 前缀扫描，保留 C550 的 64 元素/单 wave
+  CAS 限制。Torch 只分配存储或创建实/虚部视图，不承担稀疏乘法、排序或归约。
+- `src/flagsparse/sparse_operations/spgemm_csr.py`：移除 MACA 专用分支排除 complex64
+  的条件，使它不再落到通用 ESC；非 MACA 的 TLE/hash/ESC 分派不变。SpGEMM
+  端到端计时仍包含 prepare、分配、计算和输出写回。
+
+### 性能结果与口径
+
+同一 C550、`tests/data` 的全部 10 个 `.mtx`，5 warmup / 20 iters，仓库现有 q4
+benchmark。基线是通过独立 CPU 参考检查的本机 PyTorch；没有使用 H800 折算。
+int8 SpMV 的 PyTorch baseline 仍按原约定使用 float32 计算，本次没有改变。
+统计量为 **10 个逐矩阵 `pytorch_ms / ours_ms` 的算术平均值**，不是总时间比或几何平均。
+
+| 变体 | 优化前均值 | 优化后复核均值 | 复核精度 |
+| --- | ---: | ---: | --- |
+| `spmv_csc_f32_int_trans` | 0.264700x | 2.908067x | 10/10 PASS |
+| `spmv_csc_c32_int_conj` | 0.163333x | 2.444874x | 10/10 PASS |
+| `spmv_csc_i8i32_int_non` | 0.500280x | 2.356811x | 10/10 PASS |
+| `spgemm_csr_c32_int_non_non` | 0.349008x | 1.640396x | 10/10 PASS |
+
+首轮 `results_metax_four_20261103_optimized/` 的四项均值分别为
+5.951700x、2.170039x、2.334786x、1.639724x；wave 的 f32 PyTorch 基线以及
+cage12 的 c32 FlagSparse 耗时出现毫秒级抖动，因此完整复核了相同 40 组，没有剔除
+首轮异常行。复核数据在 `results_metax_four_20261103_confirm/`，表格使用完整复核轮。
+两轮均为 40/40 PASS，四项均值均超过 0.8x。复核时 SpGEMM 的 filter3D 仍为
+0.502126x；验收按平均值，不宣称所有单矩阵均超过 0.8x。
+
+此次未重新跑完整 105 项，不覆盖原 105 项交付结果；此前该 runner 的传统附加
+`spmm_csc / amazon0601 / float32 / conj` 行仍有精度失败，不能将本次定向通过
+写成完整 runner 零退出或全仓库无失败。
+
+### 精度、隔离和复现
+
+最终相关合成精度为 `231 passed, 136 deselected`，覆盖 CSC 原有全 dtype/op/index
+测试、新增 MACA CSC 边界、SpGEMM 实/复数、q4 相关变体以及 CSR MACA gather 回归。
+另有 `61 passed` 的 dispatch、PyTorch baseline、FP64 参考、比较器、TLE gate 和结构缓存
+回归。新增/扩展的测试文件为：
+
+- `tests/pytest/test_spmv_csc_maca_accuracy.py`（新增）：空维度、长行、live values、
+  共轭视图、精确大整数和、结构修改、inference、跨步输入/输出、时间/meta。
+- `tests/ci/test_spmv_csc_maca_dispatch.py`（新增）：18 项验证后端/dtype/op 选择隔离。
+- `tests/pytest/test_spgemm_maca_accuracy.py`：扩展 complex64，检查空维度、live
+  values、重复列及长行哈希冲突；禁用 Torch sparse 和 ESC，确保运行纯 Triton。
+- `tests/ci/test_spgemm_maca_dispatch.py`：加入复数分派检查，仅允许 Torch 存储分配
+  和 `view_as_real`，禁止数值计算替代。CUDA/ROCm 等后端未在本机实卡运行。
+
+性能脚本、两轮 `rows.json`/CSV/日志均保留；首轮目录还有 `summary.json`，记录
+逐项均值、源码 SHA256 和比较范围。再次运行必须选一个不存在结果的目录：
+
+```bash
+env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550 \
+  FLAGSPARSE_MACA_VENDOR=torch \
+  python3 -u results_metax_four_20261103_optimized/benchmark.py \
+  results_metax_four_<新日期>
+```
+
+该命令复测本节四个变体，使用与 runner 相同的 `tests/q4_variant_bench.py`
+实现和输入口径；完整 105 项仍使用本文顶部的 delivery runner。最终测试日志为
+`results_metax_four_20261103_optimized/accuracy_final.log` 和 `regression.log`。
+
+## 2026-11-04：MACA `axpby_c32_int` 融合优化
+
+前一轮完整结果 `results_metax_105_20261103_after_opt/` 为 105/105 精度和性能 Passed、
+missing=0、runner exit=0；四项 CSC/SpGEMM 优化均超过 0.8x，唯一低于目标的是
+`axpby_c32_int`（0.624039x）。本节优化该项，不修改或覆盖那一轮结果。
+
+### 改动文件和原因
+
+- `src/flagsparse/sparse_operations/_vector_maca.py`（新增）：用输出位置到 sparse
+  value 位置的 inverse map，将 `beta*y` 的全向量缩放与稀疏 `alpha*x` 更新融合为
+  单个标准 Triton kernel。按相邻实/虚部分量成对读写，支持实数或复数 alpha/beta，
+  每个输出只有一个 writer，不使用原子累加。显式屏蔽缺失项的 alpha 贡献，避免
+  NaN alpha 污染不存在 sparse 值的输出位置。
+- inverse map 通过已有 `TensorPlanCache` 缓存，绑定原始 indices 的对象、版本、
+  存储和步长；结构改变即重建，inference 无版本张量不缓存。values 和 y 从不缓存，
+  始终读取 live 数据。Torch 只用于存储和实/虚部视图，数值计算在 Triton 内完成。
+- `src/flagsparse/sparse_operations/vector_ops.py`：新分支仅用于 MACA complex64
+  且 dense length <= 4*1024*1024；避免稀疏度极低、大长度向量的 inverse map 过大，
+  单份 map 最大 16 MiB、8 项缓存最多 128 MiB。超过长度上限以及其他 dtype/后端仍用
+  原有路径。原有输入/索引校验、in-place 返回语义、时间测量均保留。
+- `tests/pytest/test_axpby_maca_accuracy.py`（新增）：49 项 MACA 实机测试，覆盖
+  int32/int64、跨步 sparse 输入、实时 values/y、索引原地修改、inference、空向量、
+  未排序全密索引、复数系数、NaN alpha 和热缓存后的索引范围校验。
+- `tests/ci/test_axpby_maca_dispatch.py`（新增）：8 项验证 MACA/非 MACA、dtype 和
+  长度边界隔离；CUDA/ROCm 等后端未进行本机实卡测试。
+
+原实现对 complex64 先启动全向量 scale，再启动 sparse axpy，存在两次 launch、两次
+读写稀疏位置以及额外 Python 调度；新实现只启动一个 fused compute kernel。冷缓存
+首次建图的成本仍属于调用本身，性能沿用原有 warmup 后 steady-state 口径。
+
+### 性能复测
+
+Axpby 不使用矩阵输入：它的交付性能是 **4 个向量规模**，与 SpMV 的 10 矩阵不同。
+沿用 runner 的 5 warmup / 20 iters、本机 PyTorch baseline、CPU complex128 精度参考，
+没有改变 `tests/test_vector_ops.py` 的 baseline、容差或计时窗口，也没有 H800 折算。
+原 runner 定向精度+性能结果 `results_metax_axpby_20261104_runner/`：
+
+| dense length | nnz | FlagSparse ms | PyTorch ms | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 32768 | 1024 | 0.031140 | 0.035692 | 1.146206x |
+| 131072 | 4096 | 0.036004 | 0.051218 | 1.422543x |
+| 524288 | 16384 | 0.036245 | 0.046459 | 1.281804x |
+| 1048576 | 65536 | 0.039894 | 0.105858 | 2.653463x |
+
+4 项均为 PASS，逐项加速比算术平均 **1.626004x**，超过 0.8x。f16 和 f32 路径未修改，
+该轮平均分别为 1.191988x、1.025935x。prototype 第一轮 complex64 平均为 1.581934x。
+首次小规模合成精度为 53 passed，增加范围校验测试后的第二轮 runner 为 55 passed。
+
+第二次原 runner 复核保存在 `results_metax_axpby_20261104_confirm/`，12 个性能用例
+全部 PASS，complex64 的 FlagSparse 耗时仍为 0.028831–0.041327 ms，但 PyTorch 在
+524288/1048576 两个规模变为 3.278335/0.338852 ms，导致平均抬到 22.718896x。
+这个比值是 baseline 抖动，**不当作真实优化幅度**；汇报用上面第一轮 1.626004x。
+优化前临时重测 `before.csv` 也在 PyTorch 端出现过 4.178638 ms 抖动，原始行均保留，
+没有删掉异常数据或修改原测试汇总。原完整 105 轮的 0.624039x 也含 FlagSparse
+131072 规模 2.797442 ms 抖动，不能把前后平均值之比全部解释为 kernel 提升。
+
+最终 `pytest tests/pytest -m 'axpby or spvv' --mode normal` 为
+**67 passed, 5129 deselected**；dispatch 和缓存回归为 **11 passed**。两轮定向 runner
+均退出 0。此次修改后只重测 Axpby 与相关 SpVV 回归，尚未再次全量复测 105 项，
+不能覆盖原 105 项交付表或宣称新一轮完整 105 项全部达标。
+
+复现时使用新目录：
+
+```bash
+env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550 \
+  FLAGSPARSE_MACA_VENDOR=torch \
+  python3 -u run_flagsparse_pytest.py --ops axpby --phase both --mode normal \
+  --delivery-only --gpus 0 --timeout 4500 --benchmark-input tests/data \
+  --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir results_metax_axpby_<新日期>
+```
+
+原始前后 CSV、日志、精度和回归日志在 `results_metax_axpby_20261104_optimized/`。
+该目录的 `summarize.py` 可核对原完整 105 轮、前后临时测量、两轮 runner 的所有
+complex64 用例，写入 `summary.json` 并记录源码 SHA256，不修改原始性能 CSV。
+
+## 2026-11-04：Axpby 优化后的 105 项全量复测及打包
+
+复测当前本地工作树（HEAD `39e400a6c8b5a140b9f174c2543ddbaa9d728de0`），
+使用 `run_flagsparse_delivery.py --gpus 0`，normal 精度、10 个交付矩阵、5 warmup /
+20 iters；Axpby/SpVV 沿用向量用例。总限时 43200 秒、单算子单阶段 4500 秒，
+沿用本机 PyTorch 优先、缺失时 H800 折算的 runner 口径。
+
+新结果为 `results_metax_105_20261104_final/`，日志为同名 `.log`。后台 workflow
+在 runner 退出后自动打包，即使测试失败也保留真实退出码、失败项和已有结果，不
+把部分结果写成全量通过。包名为 `flagsparse_metax_105_20261104_final.tar.gz`，
+旁边生成 SHA256 校验文件；进度及最终汇总在
+`bundle_metax_105_20261104_final/metadata/status.json`。
+
+本次只 fetch，不 pull/merge。比较上游固定为 fetch 后的
+`origin/main = 1976a01a67fdaa9f48bfb9e675ccbfc077787635`，比本地 HEAD 新 3 个提交。
+包内同时包含相对最新上游的全部差异文件，以及单独的本地修改清单/补丁；上游新增、
+本地未同步的 runner/文档/测试差异另行标记，不能当作本地 MACA 优化。打包使用
+开跑前文件快照，结束时复核源文件是否保持不变；结果见包内 manifest。
+
+### 本轮按用户要求中止，先交付差异与现有结果
+
+2026-11-04 用户要求先停测试、先打包。已停止本轮 workflow、runner 和测试子进程，
+不会再自动测试或生成上述 final 包。本轮 `results_metax_105_20261104_final/` 是
+**未完成的部分结果**：完成 gather、scatter、Axpby、SpVV、GEMVI，停止时正在
+SpMV CSR 性能阶段；本轮 Axpby complex64 的平均比值为 1.283805x。
+
+改为生成 `flagsparse_metax_changes_results_20261104.tar.gz`，包含：
+
+- 对比 `origin/main=1976a01` 的 25 个差异文件（16 个本地修改/新增，9 个上游
+  已更新而本地尚未同步），分开记录本地修改补丁和完整上游比较补丁。
+- 上一轮已完成的 `results_metax_105_20261103_after_opt/`（105 项全部精度/性能
+  Passed，runner exit=0；**不包含后续 Axpby 优化**），及对应完整日志。
+- Axpby 优化的两轮定向 runner、CSC/SpGEMM 四项优化的两轮定向结果、SDDMM
+  baseline 接线证据，以及新增 Axpby/SpVV、后端分派和缓存回归日志。
+- 本轮中断的部分结果、日志及中止说明。原始 CSV/JSON 不改写，不伪装成完整通过。
+
+包内 `metadata/README.md`、`manifest.json` 和 `results_overview.json` 说明各组结果
+对应的代码阶段；源码保留仓库相对路径，并附源码及结果文件 SHA256 清单。

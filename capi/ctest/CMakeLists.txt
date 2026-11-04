@@ -146,6 +146,9 @@ if(FLAGSPARSE_CTEST_CAPI_BUILDABLE)
         flagsparse_add_test(accuracy ${op})
         flagsparse_add_test(benchmark ${op})
     endforeach()
+    if(BACKEND STREQUAL "MUSA")
+        flagsparse_add_test(accuracy musa_baseline)
+    endif()
 else()
     message(STATUS
         "ctest: C API cases are disabled by the ${FLAGSPARSE_CTEST_PROFILE} "

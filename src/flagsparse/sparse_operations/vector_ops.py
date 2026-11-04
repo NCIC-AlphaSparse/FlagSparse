@@ -422,6 +422,12 @@ def flagsparse_axpby(
         _ACCEL.synchronize()
         t0 = time.perf_counter()
     if (
+        _is_maca_runtime() and y.dtype == torch.complex64
+        and y.numel() <= 4 * 1024 * 1024
+    ):
+        from ._vector_maca import axpby_complex
+        axpby_complex(values, indices, y, a_re, a_im, b_re, b_im)
+    elif (
         _is_mthreads_runtime() and y.dtype in (torch.float16, torch.bfloat16)
         and y.numel() <= 4 * 1024 * 1024
     ):

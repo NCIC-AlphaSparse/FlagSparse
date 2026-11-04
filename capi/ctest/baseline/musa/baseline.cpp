@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// muSPARSE 4.3.5 baseline.  Its generic descriptors have the same broad shape
+// muSPARSE baseline (MUSA SDK 4.3.5). Its generic descriptors have the same broad shape
 // as cuSPARSE, but SpMM/SpSV/SpSM/SpGEMM use stage arguments rather than the
 // cuSPARSE split functions.  This is intentionally a native implementation,
 // not a prefix-table instantiation: treating the two APIs as call-for-call gave
@@ -22,7 +22,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <complex>
 #include <exception>
+#include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -153,16 +156,27 @@ Status set_triangle(musparseSpMatDescr_t A, flagsparseFillMode_t fill,
 }
 
 template <typename F>
-Status timed(F&& once, int warmup, int iters, Timing* out) {
+Status timed(F&& once, int warmup, int iters, Timing* out,
+             const std::function<Status()>& prepare = {}) {
     if (!vendor()) return Status::no("muSPARSE Create failed");
+    if (!out || warmup < 0 || iters < 1) return Status::no("muSPARSE: invalid timing arguments");
+    auto reset = [&]() {
+        if (!prepare) return Status::good();
+        Status s = prepare();
+        ad::synchronize();
+        return s;
+    };
+    if (Status s = reset(); !s.ok) return s;
     if (Status s = once(); !s.ok) return s;  // JIT/setup outside measurements.
     for (int i = 0; i < warmup; ++i) {
+        if (Status s = reset(); !s.ok) return s;
         if (Status s = once(); !s.ok) return s;
     }
     ad::synchronize();
     std::vector<double> samples;
     samples.reserve(static_cast<std::size_t>(iters));
     for (int i = 0; i < iters; ++i) {
+        if (Status s = reset(); !s.ok) return s;
         const auto start = std::chrono::steady_clock::now();
         if (Status s = once(); !s.ok) return s;
         ad::synchronize();
@@ -178,14 +192,116 @@ Status native(musparseStatus_t s, const char* call) {
     return s == MUSPARSE_STATUS_SUCCESS ? Status::good() : Status::no(fail(call, s));
 }
 
+std::size_t value_bytes(flagsparseDataType_t dt) {
+    switch (dt) {
+        case FLAGSPARSE_R_32F: return sizeof(float);
+        case FLAGSPARSE_R_64F: return sizeof(double);
+        case FLAGSPARSE_C_32F: return sizeof(std::complex<float>);
+        case FLAGSPARSE_C_64F: return sizeof(std::complex<double>);
+        default: return 0;
+    }
+}
+
+// Host copies are benchmark preparation, never a replacement compute kernel.
+template <typename T>
+bool download(const void* p, std::vector<T>& v) {
+    return v.empty() || ad::memcpy_d2h(v.data(), reinterpret_cast<ad::DevicePtr>(p),
+                                      v.size() * sizeof(T)) == FLAGSPARSE_STATUS_SUCCESS;
+}
+template <typename T>
+bool upload(Scratch& dst, const std::vector<T>& v) {
+    return dst.grab(v.size() * sizeof(T)) && (v.empty() ||
+        ad::memcpy_h2d(reinterpret_cast<ad::DevicePtr>(dst.p), v.data(),
+                       v.size() * sizeof(T)) == FLAGSPARSE_STATUS_SUCCESS);
+}
+template <typename T> T conjugated(T x) { return x; }
+template <typename T> std::complex<T> conjugated(std::complex<T> x) { return std::conj(x); }
+
+struct PreparedCsr {
+    DeviceCsr matrix;
+    Scratch ptr, idx, val;
+};
+
+template <typename T>
+Status prepare_transposed(const DeviceCsr& A, bool conjugate, PreparedCsr* out) {
+    std::vector<T> values(static_cast<std::size_t>(A.nnz));
+    if (!download(A.values, values)) return Status::no("muSPARSE: preparation download failed");
+    out->matrix = A;
+    out->matrix.rows = A.cols;
+    out->matrix.cols = A.rows;
+    out->matrix.format = DeviceCsr::Format::Csr;
+    out->matrix.coo_rows = nullptr;
+    if (A.is_csc()) {
+        // CSC(A) already has the structure of CSR(A^T); only values need conjugation.
+        if (conjugate) for (auto& x : values) x = conjugated(x);
+        if (!upload(out->val, values)) return Status::no("muSPARSE: preparation upload failed");
+    } else {
+        std::vector<int> rows(A.nnz), cols(A.nnz), ptr(A.cols + 1, 0), idx(A.nnz);
+        if (!download(A.coo_rows, rows) || !download(A.indices, cols))
+            return Status::no("muSPARSE: COO preparation download failed");
+        for (int64_t i = 0; i < A.nnz; ++i) {
+            if (rows[i] < 0 || rows[i] >= A.rows || cols[i] < 0 || cols[i] >= A.cols)
+                return Status::no("muSPARSE: COO preparation index out of range");
+            ++ptr[cols[i] + 1];
+        }
+        for (int64_t i = 0; i < A.cols; ++i) ptr[i + 1] += ptr[i];
+        auto next = ptr;
+        std::vector<T> reordered(A.nnz);
+        for (int64_t i = 0; i < A.nnz; ++i) {
+            const int j = next[cols[i]]++;
+            idx[j] = rows[i];
+            reordered[j] = conjugate ? conjugated(values[i]) : values[i];
+        }
+        if (!upload(out->ptr, ptr) || !upload(out->idx, idx) || !upload(out->val, reordered))
+            return Status::no("muSPARSE: CSR preparation upload failed");
+        out->matrix.indptr = out->ptr.p;
+        out->matrix.indices = out->idx.p;
+    }
+    out->matrix.values = out->val.p;
+    return Status::good();
+}
+
+Status prepare_transposed(const DeviceCsr& A, bool conjugate, PreparedCsr* out, Timing* t) {
+    const auto start = std::chrono::steady_clock::now();
+    Status s = Status::no("muSPARSE: preparation dtype unsupported");
+    switch (A.dtype) {
+        case FLAGSPARSE_R_32F: s = prepare_transposed<float>(A, conjugate, out); break;
+        case FLAGSPARSE_R_64F: s = prepare_transposed<double>(A, conjugate, out); break;
+        case FLAGSPARSE_C_32F: s = prepare_transposed<std::complex<float>>(A, conjugate, out); break;
+        case FLAGSPARSE_C_64F: s = prepare_transposed<std::complex<double>>(A, conjugate, out); break;
+        default: break;
+    }
+    ad::synchronize();
+    t->prepare_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    return s;
+}
+
 }  // namespace
 
 bool available() { return true; }
-const char* name() { return "muSPARSE 4.3.5"; }
+const char* name() {
+    static const std::string label = [] {
+        int v = 0;
+        if (musparseGetVersion(vendor(), &v) != MUSPARSE_STATUS_SUCCESS)
+            return std::string("muSPARSE (version unavailable)");
+        return std::string("muSPARSE ") + std::to_string(v / 100000) + "." +
+            std::to_string((v / 100) % 1000) + "." + std::to_string(v % 100);
+    }();
+    return label.c_str();
+}
 
 Status spmv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
                 const void* beta, flagsparseOperation_t op, int warmup, int iters,
                 Timing* out) {
+    if (A.is_csc() && op == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE &&
+        (A.dtype == FLAGSPARSE_C_32F || A.dtype == FLAGSPARSE_C_64F)) {
+        out->method = "CSC(A) -> CSR(A^H), conjugated values; muSPARSE SpMV non-transpose";
+        PreparedCsr prepared;
+        if (Status s = prepare_transposed(A, true, &prepared, out); !s.ok) return s;
+        return spmv_csr(prepared.matrix, x, y, alpha, beta,
+                        FLAGSPARSE_OPERATION_NON_TRANSPOSE, warmup, iters, out);
+    }
     musaDataType_t type; musparseOperation_t mop;
     if (!map_dtype(A.dtype, &type) || !map_op(op, &mop))
         return Status::no("muSPARSE: unsupported SpMV type or operation");
@@ -225,6 +341,15 @@ Status spmm_csr(const DeviceCsr& A, const void* B, int64_t n, int64_t ldb, void*
                 flagsparseOperation_t opA, flagsparseOperation_t opB, int warmup,
                 int iters, Timing* out, flagsparseOrder_t orderB,
                 flagsparseOrder_t orderC) {
+    if (A.is_coo() && opA != FLAGSPARSE_OPERATION_NON_TRANSPOSE) {
+        out->method = "COO(A) -> CSR(op(A)); muSPARSE SpMM non-transpose";
+        PreparedCsr prepared;
+        if (Status s = prepare_transposed(A, opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE,
+                                          &prepared, out); !s.ok) return s;
+        return spmm_csr(prepared.matrix, B, n, ldb, C, ldc, alpha, beta,
+                        FLAGSPARSE_OPERATION_NON_TRANSPOSE, opB, warmup, iters, out,
+                        orderB, orderC);
+    }
     musaDataType_t type; musparseOperation_t ma, mb;
     if (!map_dtype(A.dtype, &type) || !map_op(opA, &ma) || !map_op(opB, &mb))
         return Status::no("muSPARSE: unsupported SpMM type or operation");
@@ -517,15 +642,109 @@ Status scatter(void* dense, const void* values, const void* indices, int64_t nnz
     return result;
 }
 
-// Legacy musparse<t>gemvi / <t>csrgeam2 are not verified on muSPARSE 4.3.5;
-// wire them on a MUSA box, the way the cuSPARSE template does.
-Status gemvi(flagsparseOperation_t, int, int, const void*, const void*, int, int, const void*,
-             const void*, const void*, void*, flagsparseDataType_t, int, int, Timing*) {
-    return Status::no("muSPARSE: legacy <t>gemvi baseline not wired (unverified on 4.3.5)");
+Status gemvi(flagsparseOperation_t op, int m, int n, const void* alpha, const void* A,
+             int lda, int nnz, const void* x_val, const void* x_ind, const void* beta,
+             void* y, flagsparseDataType_t dtype, int warmup, int iters, Timing* out) {
+    if (op != FLAGSPARSE_OPERATION_NON_TRANSPOSE)
+        return Status::no("muSPARSE: GEMVI transpose compute is not implemented");
+    if (dtype != FLAGSPARSE_R_32F && dtype != FLAGSPARSE_C_32F)
+        return Status::no("muSPARSE: GEMVI dtype not verified");
+    out->method = "musparse<t>gemvi";
+    std::size_t bytes = 0;
+    const auto mop = MUSPARSE_OPERATION_NON_TRANSPOSE;
+    auto st = dtype == FLAGSPARSE_R_32F
+        ? musparseSgemvi_bufferSize(vendor(), mop, m, n, nnz, &bytes)
+        : musparseCgemvi_bufferSize(vendor(), mop, m, n, nnz, &bytes);
+    if (Status s = native(st, "gemvi buffer size"); !s.ok) return s;
+    Scratch scratch;
+    if (!scratch.grab(bytes)) return Status::no("muSPARSE: GEMVI scratch allocation failed");
+    // Preserve beta*y semantics across repetitions; the delivery beta is zero.
+    const auto* b = static_cast<const float*>(beta);
+    const bool reset = b[0] != 0 || (dtype == FLAGSPARSE_C_32F && b[1] != 0);
+    std::vector<unsigned char> initial(reset ? m * value_bytes(dtype) : 0);
+    if (!download(y, initial)) return Status::no("muSPARSE: GEMVI initial y download failed");
+    std::function<Status()> prepare;
+    if (reset) prepare = [&] {
+        return ad::memcpy_h2d(reinterpret_cast<ad::DevicePtr>(y), initial.data(), initial.size())
+            == FLAGSPARSE_STATUS_SUCCESS ? Status::good() : Status::no("GEMVI y reset failed");
+    };
+    return timed([&] {
+        if (dtype == FLAGSPARSE_R_32F)
+            return native(musparseSgemvi(vendor(), mop, m, n, static_cast<const float*>(alpha),
+                static_cast<const float*>(A), lda, nnz, static_cast<const float*>(x_val),
+                static_cast<const int*>(x_ind), static_cast<const float*>(beta),
+                static_cast<float*>(y), MUSPARSE_INDEX_BASE_ZERO, scratch.p), "Sgemvi");
+        return native(musparseCgemvi(vendor(), mop, m, n, static_cast<const muComplex*>(alpha),
+            static_cast<const muComplex*>(A), lda, nnz, static_cast<const muComplex*>(x_val),
+            static_cast<const int*>(x_ind), static_cast<const muComplex*>(beta),
+            static_cast<muComplex*>(y), MUSPARSE_INDEX_BASE_ZERO, scratch.p), "Cgemvi");
+    }, warmup, iters, out, prepare);
 }
-Status csrgeam2(const DeviceCsr&, const DeviceCsr&, const void*, const void*, void*, void*,
-                void*, int64_t, int, int, Timing*) {
-    return Status::no("muSPARSE: legacy <t>csrgeam2 baseline not wired (unverified on 4.3.5)");
+
+Status csrgeam2(const DeviceCsr& A, const DeviceCsr& B, const void* alpha, const void* beta,
+                void* c_ptr, void* c_ind, void* c_val, int64_t capacity,
+                int warmup, int iters, Timing* out) {
+    if (A.is_coo() || A.is_csc() || B.is_coo() || B.is_csc() ||
+        A.rows != B.rows || A.cols != B.cols || A.dtype != B.dtype ||
+        (A.dtype != FLAGSPARSE_R_32F && A.dtype != FLAGSPARSE_C_32F))
+        return Status::no("muSPARSE: GEAM requires matching f32/c32 CSR inputs");
+    const auto max_index = std::numeric_limits<int>::max();
+    if (A.rows > max_index || A.cols > max_index || A.nnz > max_index || B.nnz > max_index)
+        return Status::no("muSPARSE: legacy GEAM requires int32 dimensions");
+    out->method = "musparseXcsrgeam_nnz + musparse<t>csrgeam (both timed)";
+    struct Descr {
+        musparseMatDescr_t p = nullptr;
+        ~Descr() { if (p) musparseDestroyMatDescr(p); }
+    } a, b, c;
+    for (auto* d : {&a, &b, &c}) {
+        if (Status s = native(musparseCreateMatDescr(&d->p), "CreateMatDescr"); !s.ok) return s;
+    }
+    return timed([&] {
+        int nnz = 0;
+        Status s = native(musparseXcsrgeam_nnz(vendor(), A.rows, A.cols,
+            a.p, A.nnz, static_cast<const int*>(A.indptr), static_cast<const int*>(A.indices),
+            b.p, B.nnz, static_cast<const int*>(B.indptr), static_cast<const int*>(B.indices),
+            c.p, static_cast<int*>(c_ptr), &nnz), "Xcsrgeam_nnz");
+        if (!s.ok) return s;
+        if (nnz > capacity) return Status::no("muSPARSE: GEAM output capacity exceeded");
+        if (A.dtype == FLAGSPARSE_R_32F)
+            return native(musparseScsrgeam(vendor(), A.rows, A.cols,
+                static_cast<const float*>(alpha), a.p, A.nnz, static_cast<const float*>(A.values),
+                static_cast<const int*>(A.indptr), static_cast<const int*>(A.indices),
+                static_cast<const float*>(beta), b.p, B.nnz, static_cast<const float*>(B.values),
+                static_cast<const int*>(B.indptr), static_cast<const int*>(B.indices), c.p,
+                static_cast<float*>(c_val), static_cast<int*>(c_ptr), static_cast<int*>(c_ind)), "Scsrgeam");
+        return native(musparseCcsrgeam(vendor(), A.rows, A.cols,
+            static_cast<const muComplex*>(alpha), a.p, A.nnz, static_cast<const muComplex*>(A.values),
+            static_cast<const int*>(A.indptr), static_cast<const int*>(A.indices),
+            static_cast<const muComplex*>(beta), b.p, B.nnz, static_cast<const muComplex*>(B.values),
+            static_cast<const int*>(B.indptr), static_cast<const int*>(B.indices), c.p,
+            static_cast<muComplex*>(c_val), static_cast<int*>(c_ptr), static_cast<int*>(c_ind)), "Ccsrgeam");
+    }, warmup, iters, out);
+}
+
+Status axpby(const void* sparse_val, const void* sparse_idx, void* dense,
+             int64_t nnz, int64_t size, const void* alpha, const void* beta,
+             flagsparseDataType_t dtype, int warmup, int iters, Timing* out) {
+    musaDataType_t type;
+    if (!map_dtype(dtype, &type)) return Status::no("muSPARSE: Axpby dtype unsupported");
+    out->method = "musparseAxpby; initial y restored outside each timed call";
+    std::vector<unsigned char> initial(size * value_bytes(dtype));
+    if (!download(dense, initial)) return Status::no("muSPARSE: Axpby initial y download failed");
+    musparseSpVecDescr_t x = nullptr;
+    musparseDnVecDescr_t y = nullptr;
+    auto st = musparseCreateSpVec(&x, size, nnz, const_cast<void*>(sparse_idx),
+        const_cast<void*>(sparse_val), MUSPARSE_INDEX_32I, MUSPARSE_INDEX_BASE_ZERO, type);
+    if (st == MUSPARSE_STATUS_SUCCESS) st = musparseCreateDnVec(&y, size, dense, type);
+    Status s = native(st, "Axpby descriptors");
+    if (s.ok) s = timed([&] { return native(musparseAxpby(vendor(), alpha, x, beta, y), "Axpby"); },
+        warmup, iters, out, [&] {
+            return ad::memcpy_h2d(reinterpret_cast<ad::DevicePtr>(dense), initial.data(), initial.size())
+                == FLAGSPARSE_STATUS_SUCCESS ? Status::good() : Status::no("Axpby y reset failed");
+        });
+    if (x) musparseDestroySpVec(x);
+    if (y) musparseDestroyDnVec(y);
+    return s;
 }
 
 }  // namespace fstest::baseline

@@ -55,6 +55,7 @@ from flagsparse.sparse_operations._common import (
     _benchmark_cuda_op,
     _gather_values,
     _is_ascend_runtime,
+    _is_maca_runtime,
     _is_rocm_runtime,
 )
 from flagsparse.sparse_operations._spmv_csr_benchmark import _prepared_row_tile_op
@@ -467,6 +468,39 @@ def _time_pytorch(row, build, warmup, iters, reference):
         _, row["pytorch_ms"] = _benchmark_cuda_op(op, warmup, iters)
     except Exception as exc:  # e.g. MUSA registers no sparse matmul, no sparse int8
         row["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
+
+
+def _time_maca_sddmm_pytorch(row, build, warmup, iters, reference):
+    """Publish only validated local timings; a broken sparse API is not a baseline."""
+    row.pop("pytorch_ms", None)
+    row.pop("pytorch_reason", None)
+
+    def validate(got):
+        if got.layout != torch.strided:
+            got = got.values()
+        if tuple(got.shape) != tuple(reference.shape):
+            raise ValueError("PyTorch SDDMM baseline output shape mismatch")
+        err = _error(got, reference)
+        row["pytorch_max_error"] = err
+        if not np.isfinite(err) or err > _VENDOR_MAX_ERROR:
+            raise ValueError(f"PyTorch result off by {err:.3g} (relative); baseline not used")
+
+    for fallback in (False, True):
+        try:
+            op = build(fallback=fallback)
+            validate(op())
+            got, elapsed = _benchmark_cuda_op(op, warmup, iters)
+            validate(got)  # Validate the actual timed output as well as the probe.
+            if elapsed is None or not np.isfinite(elapsed) or elapsed <= 0:
+                raise ValueError("PyTorch SDDMM baseline returned invalid latency")
+            row["pytorch_ms"] = elapsed
+            return
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            if not fallback:
+                row["pytorch_sampled_addmm_reason"] = reason
+            else:
+                row["pytorch_reason"] = reason
 
 
 def _time_cupy(row, mat, values, dense, op_a, op_b, warmup, iters, reference):
@@ -910,20 +944,14 @@ def _sddmm(v, mat, gen, warmup, iters, row):
     plan, _ = _vendor(row, build_vendor)
     _time_vendor(row, plan, warmup, iters)
 
-    def build_torch():
+    def build_torch(fallback=False):
         compute = torch.float32 if v.value == torch.float16 else v.value
-        pattern = torch.sparse_csr_tensor(
-            mat.ptr.long(), mat.cols.long(), torch.zeros(mat.csr.nnz, dtype=compute, device=mat.dev), mat.shape
-        )
         row["pytorch_compute_dtype"] = _name(compute)
         # Transposed once here, outside the timed callable, so op='trans' and
         # layout='col' are judged on the kernel rather than on a transpose --
         # exactly as the sampled_addmm path below has always done.
         a_op, b_op = _op_t(A, v.op_a).to(compute), _op_t(B, v.op_b).to(compute)
-        sampled = lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
-        try:
-            sampled()
-        except Exception as exc:
+        if fallback:
             # torch_npu registers no aten::sparse_sampled_addmm, so on Ascend
             # every op/layout variant of this operator used to carry no PyTorch
             # baseline at all and fell through to the scaled-H800 tier while the
@@ -934,7 +962,6 @@ def _sddmm(v, mat, gen, warmup, iters, row):
             # variants share one denominator. pytorch_formulation records which
             # formulation produced the number.
             row["pytorch_formulation"] = "gather/multiply/sum"
-            row["pytorch_sampled_addmm_reason"] = f"{type(exc).__name__}: {exc}"
             indices = mat.cols
             indptr = mat.ptr.to(torch.int64)
             # _sddmm_reference indexes y by COLUMN id, so it wants (n, K).
@@ -947,10 +974,23 @@ def _sddmm(v, mat, gen, warmup, iters, row):
             return lambda: sddmm_csr._sddmm_reference(
                 indices, indptr, a_op, y_rows, None, 1.0, 0.0
             )
+        pattern = torch.sparse_csr_tensor(
+            mat.ptr.long(), mat.cols.long(), torch.zeros(mat.csr.nnz, dtype=compute, device=mat.dev), mat.shape
+        )
+        sampled = lambda: torch.sparse.sampled_addmm(pattern, a_op, b_op, beta=0.0)
         row["pytorch_formulation"] = "sampled_addmm"
+        if not _is_maca_runtime():
+            try:
+                sampled()
+            except Exception as exc:
+                row["pytorch_sampled_addmm_reason"] = f"{type(exc).__name__}: {exc}"
+                return build_torch(fallback=True)
         return sampled
 
-    _time_pytorch(row, build_torch, warmup, iters, ref)
+    if _is_maca_runtime():
+        _time_maca_sddmm_pytorch(row, build_torch, warmup, iters, ref)
+    else:
+        _time_pytorch(row, build_torch, warmup, iters, ref)
     if os.environ.get("FLAGSPARSE_BENCH_CUPY") == "1":
         _time_cupy_sddmm(row, mat, A, B, v.op_a, v.op_b, warmup, iters, ref)
     return v.out
