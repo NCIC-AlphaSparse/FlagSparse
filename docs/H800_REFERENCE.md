@@ -5,9 +5,11 @@
 ## 来源
 
 - 设备：NVIDIA H800 × 8
-- 原始结果目录：`results_cuda_105_20261103_1556`（被 git 忽略，不随仓库）
-- FlagSparse commit：`bc586355e027+dirty`；torch 2.8.0a0+5228986c39.nv25.05；triton 3.6.0
-- 生成日期：2026-11-04
+- 原始结果目录：`results_65_cuda_1014`（被 git 忽略，不随仓库）
+- FlagSparse commit：`643e9c6b7e45+dirty`；torch 2.8.0a0+5228986c39.nv25.05；triton 3.6.0
+- 生成日期：2026-10-14
+- 补充轮：`results_cuda_105_20261103_1556`（`bc586355e027+dirty`，2026-11-03 16:25:37）只补了上面那轮没有的 37 个变体；上面那轮已有的变体一行未动（`tools/h800_reference.py --keep-variants-from`）。
+- 另有 3 个变体（`axpby_c32_int`、`axpby_f32_int`、`spvv_f32_int_non`）上面那轮已经测过、只是当时不在注册表里：保留那轮的行，只从补充轮取变体结果汇总。
 
 ## 用途
 
@@ -37,6 +39,7 @@ C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑
   为 0 的算子（当时只有 CuPy 基线、没有对应格式的库）**没有折算基线**，行会保持 `N/A`。
 - FlagSparse commit 带 `+dirty` 表示那轮 H800 是在有未提交改动的工作树上跑的。
 - “来源”一列不是本轮的算子，是从上一份参考文件带过来的（新一轮没测它们），数据来自那一轮。
+- “补充轮”的行来自上面的补充轮，只含本轮没有的变体；同一算子里本轮的行原样排在前面。
 
 ## 各算子收录情况
 
@@ -44,30 +47,30 @@ C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑
 |---|---:|---:|---|---|
 | `axpby` | 12 | 12 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch`, `cupy_ms`, `triton_speedup_vs_cupy` |
 | `gather` | 20 | 20 | 本轮 | `triton_ms`, `pytorch_ms`, `cusparse_ms`, `triton_speedup_vs_pytorch`, `triton_speedup_vs_cusparse` |
-| `geam_csr` | 20 | 20 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
-| `gemvi` | 12 | 12 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
+| `geam_csr` | 20 | 20 | 补充轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
+| `gemvi` | 12 | 12 | 补充轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
 | `scatter` | 24 | 24 | 本轮 | `triton_ms`, `pytorch_ms`, `cusparse_ms`, `triton_speedup_vs_pytorch`, `triton_speedup_vs_cusparse` |
-| `sddmm_csr` | 170 | 170 | 本轮 | `triton_ms`, `pytorch_api_ms`, `triton_speedup_vs_pytorch_api`, `triton_speedup_vs_pytorch`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse` |
-| `spgemm_csr` | 30 | 30 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
+| `sddmm_csr` | 170 | 160 | 本轮 + 补充轮 40 行 | `triton_ms`, `pytorch_api_ms`, `triton_speedup_vs_pytorch_api`, `triton_speedup_vs_pytorch`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse` |
+| `spgemm_csr` | 30 | 30 | 本轮 + 补充轮 10 行 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
 | `spmm_bell` | 240 | 0 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `ms`, `vendor_ms`, `torch_bell_ms`, `cupy_bell_ms` |
 | `spmm_bsr` | 513 | 0 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `ms`, `torch_ms`, `cusparse_ms`, `torch_vs_alg_speedup`, `cusparse_vs_alg_speedup`, `scipy_vs_alg_speedup` |
-| `spmm_coo` | 90 | 90 | 本轮 | `ms`, `torch_ms`, `cusparse_ms`, `triton_speedup_vs_pytorch`, `cusparse_vs_alg_speedup` |
-| `spmm_csc` | 290 | 130 | 本轮 | `ms`, `pytorch_ms`, `triton_speedup_vs_pytorch`, `cusparse_ms`, `cusparse_vs_alg_speedup` |
-| `spmm_csr` | 160 | 160 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
+| `spmm_coo` | 90 | 90 | 本轮 + 补充轮 40 行 | `ms`, `torch_ms`, `cusparse_ms`, `triton_speedup_vs_pytorch`, `cusparse_vs_alg_speedup` |
+| `spmm_csc` | 290 | 130 | 本轮 + 补充轮 20 行 | `ms`, `pytorch_ms`, `triton_speedup_vs_pytorch`, `cusparse_ms`, `cusparse_vs_alg_speedup` |
+| `spmm_csr` | 160 | 160 | 本轮 + 补充轮 70 行 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
 | `spmv_bsr` | 960 | 0 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `bsr_ms`, `pytorch_ms`, `bsr_speedup_vs_pytorch`, `pytorch_padded_ms`, `cusparse_ms` |
-| `spmv_coo` | 110 | 109 | 本轮 | `base_ms`, `opt_ms`, `cusparse_ms`, `pytorch_ms`, `opt_speedup_vs_cusparse`, `opt_speedup_vs_pytorch` |
-| `spmv_csc` | 310 | 310 | 本轮 | `csc_ms`, `pytorch_ms`, `csc_speedup_vs_pytorch`, `cusparse_ms`, `csc_speedup_vs_cusparse` |
-| `spmv_csr` | 150 | 150 | 本轮 | `ms`, `vendor_ms`, `speedup_vs_vendor`, `pytorch_ms`, `triton_speedup_vs_pytorch` |
+| `spmv_coo` | 110 | 109 | 本轮 + 补充轮 30 行 | `base_ms`, `opt_ms`, `cusparse_ms`, `pytorch_ms`, `opt_speedup_vs_cusparse`, `opt_speedup_vs_pytorch` |
+| `spmv_csc` | 310 | 310 | 本轮 + 补充轮 40 行 | `csc_ms`, `pytorch_ms`, `csc_speedup_vs_pytorch`, `cusparse_ms`, `csc_speedup_vs_cusparse` |
+| `spmv_csr` | 150 | 150 | 本轮 + 补充轮 50 行 | `ms`, `vendor_ms`, `speedup_vs_vendor`, `pytorch_ms`, `triton_speedup_vs_pytorch` |
 | `spmv_sell` | 50 | 50 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `cupy_ms`, `triton_speedup_vs_cupy`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch` |
 | `spsm_coo` | 120 | 92 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `FlagSparse_ms`, `cuSPARSE_ms`, `hipSPARSE_ms`, `FlagSparse_vs_vendor_speedup` |
 | `spsv_coo` | 720 | 600 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `FlagSparse_ms`, `CuPy/cuSPARSE_ms`, `PyTorch_ms`, `FlagSparse_vs_CuPy/cuSPARSE_speedup`, `FlagSparse_vs_PyTorch_speedup` |
 | `spsv_csr` | 720 | 600 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `FlagSparse_ms`, `CuPy/cuSPARSE_ms`, `PyTorch_ms`, `FlagSparse_vs_CuPy/cuSPARSE_speedup`, `FlagSparse_vs_PyTorch_speedup` |
 | `spsv_sell` | 240 | 200 | `pytest_results_sparse_202609221038` (`47a441e6c810+dirty`) | `FlagSparse_ms`, `cuSPARSE_ms`, `PyTorch_ms`, `FlagSparse_vs_cuSPARSE_speedup`, `FlagSparse_vs_PyTorch_speedup` |
-| `spvv` | 24 | 24 | 本轮 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch`, `cupy_ms`, `triton_speedup_vs_cupy` |
+| `spvv` | 24 | 24 | 本轮 + 补充轮 8 行 | `triton_ms`, `cusparse_ms`, `pytorch_ms`, `triton_speedup_vs_cusparse`, `triton_speedup_vs_pytorch`, `cupy_ms`, `triton_speedup_vs_cupy` |
 
 ## 各交付变体能否折算
 
-按变体统计本轮 H800 上带厂商库时间的矩阵数；为 0 的变体只能退到 H800 PyTorch 的时间（见上）。
+按变体统计 H800 上带厂商库时间的矩阵数（本轮和补充轮合计）；为 0 的变体只能退到 H800 PyTorch 的时间（见上）。
 
 | 变体 | 可作基线的矩阵 / 总矩阵 |
 |---|---|
@@ -94,7 +97,7 @@ C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑
 | `sddmm_csr float64 (legacy)` | 40 / 40 |
 | `sddmm_csr_c32_int_non_non_row` | 10 / 10 |
 | `sddmm_csr_c32_int_non_trans_row` | 10 / 10 |
-| `sddmm_csr_f16_int_non_non_row` | 10 / 10 |
+| `sddmm_csr_f16_int_non_non_row` | 0 / 10 **（无 cuSPARSE，用 H800 PyTorch）** |
 | `sddmm_csr_f16_int_non_trans_row` | 10 / 10 |
 | `sddmm_csr_f16f32_int_non_non_row` | 10 / 10 |
 | `sddmm_csr_f32_int_non_non_col` | 10 / 10 |
@@ -122,7 +125,7 @@ C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑
 | `spmm_csc_f16f32_int_non_non_row` | 10 / 10 |
 | `spmm_csc_f32_int_non_non_row` | 10 / 10 |
 | `spmm_csc_f32_int_trans_non_row` | 10 / 10 |
-| `spmm_csr float32 (legacy)` | 10 / 10 |
+| `spmm_csr float32 (legacy)` | 8 / 10 |
 | `spmm_csr float64 (legacy)` | 10 / 10 |
 | `spmm_csr_bf16f32_int_non_non_row` | 10 / 10 |
 | `spmm_csr_c32_int_conj_non_row` | 10 / 10 |
@@ -189,118 +192,122 @@ C API 拆分交付（MUSA）：带 `--h800-reference` 时 pytest 那一半也跑
 
 ## H800 上 105 个交付变体的结果
 
+补充轮补的 40 个变体取补充轮的汇总，其余取本轮的汇总。
+
 | 变体 | 精度 | 性能 | 加速比（H800 vs cuSPARSE/PyTorch，runner 口径） |
 |---|---|---|---|
+| `axpby_f16_int` | Passed (2/2) | Passed | fp16: 0.410 |
+| `gather_c32_int` | Passed (2/2) | Passed | complex64: 1.475 |
+| `gather_c64_int` | Passed (3/3) | Passed | complex128: 1.258 |
+| `gather_f16_int` | Passed (2/2) | Passed | fp16: 1.131 |
+| `gather_f32_int` | Passed (2/2) | Passed | fp32: 1.057 |
+| `gather_f64_int` | Passed (2/2) | Passed | fp64: 1.469 |
+| `scatter_c32_int` | Passed (4/4) | Passed | complex64: 0.755 |
+| `scatter_c64_int` | Passed (4/4) | Passed | complex128: 0.816 |
+| `scatter_f16_int` | Passed (4/4) | Passed | fp16: 0.808 |
+| `scatter_f32_int` | Passed (4/4) | Passed | fp32: 0.986 |
+| `scatter_f64_int` | Passed (4/4) | Passed | fp64: 0.983 |
+| `scatter_i8_int` | Passed (2/2) | Passed | int8: 1.601 |
+| `sddmm_csr_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 1.186 |
+| `sddmm_csr_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 3.109 |
+| `sddmm_csr_f32_int_non_non_col` | Passed (2/2) | Passed | fp32: 2.447 |
+| `sddmm_csr_f32_int_non_non_row` | Passed (4/4) | Passed | fp32: 1.486 |
+| `sddmm_csr_f32_int_non_trans_row` | Passed (2/2) | Passed | fp32: 2.152 |
+| `sddmm_csr_f32_int_trans_non_row` | Passed (2/2) | Passed | fp32: 1.537 |
+| `sddmm_csr_f64_int_non_non_row` | Passed (4/4) | Passed | fp64: 1.159 |
+| `spgemm_csr_f32_int_non_non` | Passed (2/2) | Passed | fp32: 0.694 |
+| `spmm_coo_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 0.353 |
+| `spmm_coo_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 0.908 |
+| `spmm_coo_f32_int_non_non_row` | Passed (2/2) | Passed | fp32: 1.169 |
+| `spmm_coo_f64_int_non_non_row` | Passed (2/2) | Passed | fp64: 4.497 |
+| `spmm_coo_i8i32_int_non_non_row` | Passed (2/2) | Passed | int8: 0.211 |
+| `spmm_csc_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 0.181 |
+| `spmm_csc_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 0.530 |
+| `spmm_csc_f32_int_non_non_row` | Passed (2/2) | Passed | fp32: 0.398 |
+| `spmm_csr_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 0.328 |
+| `spmm_csr_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 2.292 |
+| `spmm_csr_f16f32_int_non_non_row` | Passed (2/2) | Passed | fp16: 1.173 |
+| `spmm_csr_f32_int_non_non_col` | Passed (2/2) | Passed | fp32: 3.331 |
+| `spmm_csr_f32_int_non_non_row` | Passed (4/4) | Passed | fp32: 3.429 |
+| `spmm_csr_f32_int_non_trans_row` | Passed (2/2) | Passed | fp32: 4.473 |
+| `spmm_csr_f32_int_trans_non_row` | Passed (2/2) | Passed | fp32: 1.691 |
+| `spmm_csr_f64_int_non_non_row` | Passed (4/4) | Passed | fp64: 3.341 |
+| `spmm_csr_i8i32_int_non_non_row` | Passed (2/2) | Passed | int8: 1.222 |
+| `spmv_coo_c32_int_conj` | Passed (2/2) | Passed | complex64: 1.298 |
+| `spmv_coo_c32_int_non` | Passed (2/2) | Passed | complex64: 0.492 |
+| `spmv_coo_f16_int_non` | Passed (2/2) | Passed | fp16: 0.341 |
+| `spmv_coo_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.334 |
+| `spmv_coo_f32_int_non` | Skipped (3/5) | Passed | fp32: 1.194 |
+| `spmv_coo_f32_int_trans` | Passed (2/2) | Passed | fp32: 0.897 |
+| `spmv_coo_f64_int_non` | Passed (3/3) | Passed | fp64: 1.211 |
+| `spmv_coo_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.357 |
+| `spmv_csc_c32_int_non` | Passed (2/2) | Passed | complex64: 1.569 |
+| `spmv_csc_f16_int_non` | Passed (2/2) | Passed | fp16: 2.717 |
+| `spmv_csc_f32_int_non` | Passed (2/2) | Passed | fp32: 0.951 |
+| `spmv_csr_c32_int_conj` | Passed (2/2) | Passed | complex64: 1.432 |
+| `spmv_csr_c32_int_non` | Passed (2/2) | Passed | complex64: 0.599 |
+| `spmv_csr_f16_int_non` | Passed (2/2) | Passed | fp16: 0.542 |
+| `spmv_csr_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.625 |
+| `spmv_csr_f32_int_non` | Passed (59/59) | Passed | fp32: 0.593 |
+| `spmv_csr_f32_int_trans` | Passed (2/2) | Passed | fp32: 1.023 |
+| `spmv_csr_f32c32_int_non` | Passed (2/2) | Passed | fp32: 0.617 |
+| `spmv_csr_f64_int_non` | Passed (55/55) | Passed | fp64: 0.670 |
+| `spmv_csr_i8f32_int_non` | Passed (2/2) | Passed | int8: 0.579 |
+| `spmv_csr_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.550 |
+| `spmv_sell_c32_int_non` | Passed (2/2) | Passed | complex64: 0.663 |
+| `spmv_sell_f16_int_non` | Passed (2/2) | Passed | fp16: 0.531 |
+| `spmv_sell_f32_int_non` | Passed (2/2) | Passed | fp32: 0.576 |
+| `spmv_sell_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.421 |
+| `spvv_c32_int_conj` | Passed (2/2) | Passed | complex64: 0.386 |
+| `spvv_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.398 |
+| `spvv_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.423 |
 | `axpby_c32_int` | Passed (2/2) | Passed | complex64: 0.206 |
-| `axpby_f16_int` | Passed (2/2) | Passed | fp16: 0.408 |
 | `axpby_f32_int` | Passed (2/2) | Passed | fp32: 0.292 |
-| `gather_c32_int` | Passed (2/2) | Passed | complex64: 1.478 |
-| `gather_c64_int` | Passed (3/3) | Passed | complex128: 1.232 |
-| `gather_f16_int` | Passed (2/2) | Passed | fp16: 1.132 |
-| `gather_f32_int` | Passed (2/2) | Passed | fp32: 1.053 |
-| `gather_f64_int` | Passed (2/2) | Passed | fp64: 1.471 |
 | `geam_csr_c32_int` | Passed (2/2) | Passed | complex64: 1.553 |
 | `geam_csr_f32_int` | Passed (2/2) | Passed | fp32: 1.543 |
 | `gemvi_c32_int_non` | Passed (2/2) | Passed | complex64: 0.817 |
 | `gemvi_f32_int_non` | Passed (2/2) | Passed | fp32: 0.791 |
 | `gemvi_f32_int_trans` | Passed (2/2) | Passed | fp32: 0.997 |
-| `scatter_c32_int` | Passed (4/4) | Passed | complex64: 0.758 |
-| `scatter_c64_int` | Passed (4/4) | Passed | complex128: 0.822 |
-| `scatter_f16_int` | Passed (4/4) | Passed | fp16: 0.808 |
-| `scatter_f32_int` | Passed (4/4) | Passed | fp32: 0.991 |
-| `scatter_f64_int` | Passed (4/4) | Passed | fp64: 0.981 |
-| `scatter_i8_int` | Passed (2/2) | Passed | int8: 1.607 |
-| `sddmm_csr_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 1.188 |
 | `sddmm_csr_c32_int_non_trans_row` | Passed (2/2) | Passed | complex64: 0.402 |
-| `sddmm_csr_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 2.068 |
 | `sddmm_csr_f16_int_non_trans_row` | Passed (2/2) | Passed | fp16: 2.634 |
 | `sddmm_csr_f16f32_int_non_non_row` | Passed (2/2) | Passed | fp16: 2.131 |
-| `sddmm_csr_f32_int_non_non_col` | Passed (2/2) | Passed | fp32: 2.447 |
-| `sddmm_csr_f32_int_non_non_row` | Passed (4/6) | Passed | fp32: 1.473 |
-| `sddmm_csr_f32_int_non_trans_row` | Passed (2/2) | Passed | fp32: 2.152 |
-| `sddmm_csr_f32_int_trans_non_row` | Passed (2/2) | Passed | fp32: 1.537 |
 | `sddmm_csr_f32_int_trans_trans_row` | Passed (2/2) | Passed | fp32: 2.449 |
-| `sddmm_csr_f64_int_non_non_row` | Passed (4/4) | Passed | fp64: 1.151 |
 | `spgemm_csr_c32_int_non_non` | Passed (2/2) | Passed | complex64: 0.759 |
-| `spgemm_csr_f32_int_non_non` | Passed (2/2) | Passed | fp32: 0.695 |
-| `spmm_coo_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 0.354 |
-| `spmm_coo_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 0.908 |
 | `spmm_coo_f16f32_int_non_non_row` | Passed (2/2) | Passed | fp16: 0.621 |
 | `spmm_coo_f32_int_non_non_col` | Passed (2/2) | Passed | fp32: 1.012 |
-| `spmm_coo_f32_int_non_non_row` | Passed (2/2) | Passed | fp32: 1.170 |
 | `spmm_coo_f32_int_non_trans_row` | Passed (2/2) | Passed | fp32: 1.407 |
 | `spmm_coo_f32_int_trans_non_row` | Passed (2/2) | Passed | fp32: 0.607 |
-| `spmm_coo_f64_int_non_non_row` | Passed (2/2) | Passed | fp64: 4.483 |
-| `spmm_coo_i8i32_int_non_non_row` | Passed (2/2) | Passed | int8: 0.210 |
-| `spmm_csc_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 0.182 |
-| `spmm_csc_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 0.537 |
 | `spmm_csc_f16f32_int_non_non_row` | Passed (2/2) | Passed | fp16: 0.375 |
-| `spmm_csc_f32_int_non_non_row` | Passed (2/2) | Passed | fp32: 0.401 |
 | `spmm_csc_f32_int_trans_non_row` | Passed (2/2) | Passed | fp32: 0.439 |
 | `spmm_csr_bf16f32_int_non_non_row` | Passed (2/2) | Passed | bf16: 1.169 |
 | `spmm_csr_c32_int_conj_non_row` | Passed (2/2) | Passed | complex64: 0.743 |
-| `spmm_csr_c32_int_non_non_row` | Passed (2/2) | Passed | complex64: 0.330 |
 | `spmm_csr_c32_int_non_trans_row` | Passed (2/2) | Passed | complex64: 0.890 |
-| `spmm_csr_f16_int_non_non_row` | Passed (2/2) | Passed | fp16: 2.313 |
 | `spmm_csr_f16f32_int_non_non_col` | Passed (2/2) | Passed | fp16: 0.572 |
-| `spmm_csr_f16f32_int_non_non_row` | Passed (2/2) | Passed | fp16: 1.173 |
 | `spmm_csr_f16f32_int_trans_non_row` | Passed (2/2) | Passed | fp16: 1.283 |
-| `spmm_csr_f32_int_non_non_col` | Passed (2/2) | Passed | fp32: 3.274 |
-| `spmm_csr_f32_int_non_non_row` | Passed (4/4) | Passed | fp32: 3.605 |
-| `spmm_csr_f32_int_non_trans_row` | Passed (2/2) | Passed | fp32: 4.569 |
-| `spmm_csr_f32_int_trans_non_row` | Passed (2/2) | Passed | fp32: 1.758 |
-| `spmm_csr_f64_int_non_non_row` | Passed (4/4) | Passed | fp64: 3.352 |
 | `spmm_csr_i8f32_int_non_non_row` | Passed (2/2) | Passed | int8: 1.163 |
 | `spmm_csr_i8i32_int_non_non_col` | Passed (2/2) | Passed | int8: 0.571 |
-| `spmm_csr_i8i32_int_non_non_row` | Passed (2/2) | Passed | int8: 1.223 |
-| `spmv_coo_c32_int_conj` | Passed (2/2) | Passed | complex64: 1.110 |
-| `spmv_coo_c32_int_non` | Passed (2/2) | Passed | complex64: 0.417 |
-| `spmv_coo_f16_int_non` | Passed (2/2) | Passed | fp16: 0.352 |
 | `spmv_coo_f16_int_trans` | Passed (2/2) | Passed | fp16: 2.493 |
-| `spmv_coo_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.373 |
-| `spmv_coo_f32_int_non` | Passed (5/5) | Passed | fp32: 1.228 |
-| `spmv_coo_f32_int_trans` | Passed (2/2) | Passed | fp32: 0.929 |
 | `spmv_coo_f32c32_int_non` | Passed (2/2) | Passed | fp32: 0.358 |
-| `spmv_coo_f64_int_non` | Passed (3/3) | Passed | fp64: 1.310 |
 | `spmv_coo_i8f32_int_non` | Passed (2/2) | Passed | int8: 0.342 |
-| `spmv_coo_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.363 |
 | `spmv_csc_c32_int_conj` | Passed (2/2) | Passed | complex64: 0.265 |
-| `spmv_csc_c32_int_non` | Passed (2/2) | Passed | complex64: 1.365 |
-| `spmv_csc_f16_int_non` | Passed (2/2) | Passed | fp16: 2.689 |
 | `spmv_csc_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.857 |
-| `spmv_csc_f32_int_non` | Passed (2/2) | Passed | fp32: 0.976 |
 | `spmv_csc_f32_int_trans` | Passed (2/2) | Passed | fp32: 0.244 |
 | `spmv_csc_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.266 |
 | `spmv_csr_bf16_int_non` | Passed (2/2) | Passed | bf16: 0.280 |
 | `spmv_csr_bf16f32_int_non` | Passed (2/2) | Passed | bf16: 0.953 |
-| `spmv_csr_c32_int_conj` | Passed (2/2) | Passed | complex64: 1.143 |
-| `spmv_csr_c32_int_non` | Passed (2/2) | Passed | complex64: 0.481 |
-| `spmv_csr_f16_int_non` | Passed (2/2) | Passed | fp16: 0.538 |
-| `spmv_csr_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.921 |
 | `spmv_csr_f16f32_int_trans` | Passed (2/2) | Passed | fp16: 0.737 |
-| `spmv_csr_f32_int_non` | Passed (59/59) | Passed | fp32: 0.607 |
-| `spmv_csr_f32_int_trans` | Passed (2/2) | Passed | fp32: 0.915 |
-| `spmv_csr_f32c32_int_non` | Passed (2/2) | Passed | fp32: 1.027 |
 | `spmv_csr_f32c32_int_trans` | Passed (2/2) | Passed | fp32: 0.852 |
-| `spmv_csr_f64_int_non` | Passed (55/55) | Passed | fp64: 0.675 |
-| `spmv_csr_i8f32_int_non` | Passed (2/2) | Passed | int8: 0.978 |
-| `spmv_csr_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.966 |
 | `spmv_csr_i8i32_int_trans` | Passed (2/2) | Passed | int8: 0.755 |
-| `spmv_sell_c32_int_non` | Passed (2/2) | Passed | complex64: 0.619 |
-| `spmv_sell_f16_int_non` | Passed (2/2) | Passed | fp16: 0.489 |
-| `spmv_sell_f32_int_non` | Passed (2/2) | Passed | fp32: 0.542 |
-| `spmv_sell_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.416 |
-| `spvv_c32_int_conj` | Passed (2/2) | Passed | complex64: 0.429 |
 | `spvv_c32_int_non` | Passed (2/2) | Passed | complex64: 0.396 |
-| `spvv_f16f32_int_non` | Passed (2/2) | Passed | fp16: 0.474 |
 | `spvv_f32_int_non` | Passed (2/2) | Passed | fp32: 0.544 |
 | `spvv_i8f32_int_non` | Passed (2/2) | Passed | int8: 0.492 |
-| `spvv_i8i32_int_non` | Passed (2/2) | Passed | int8: 0.487 |
 
 ## 重新生成
 
 ```bash
 python3 tools/h800_reference.py <H800 结果目录>
+# 只补新变体、已有变体保持不动（2026-11-04 这份就是这样生成的）：
+python3 tools/h800_reference.py <H800 结果目录> --keep-variants-from <旧 conf/h800_reference.json>
 ```
 
-只有在 H800 上重跑、且新结果确实要取代这份参考时才重新生成；生成后 diff 应当只有数值变化。
+只有在 H800 上重跑、且新结果确实要取代这份参考时才重新生成；整体重新生成后 diff 应当只有数值变化，用 `--keep-variants-from` 时 diff 应当只有新增的行和变体，旧行一字不变。

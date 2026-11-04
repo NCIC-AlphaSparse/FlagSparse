@@ -19,11 +19,17 @@ Operators the new run did not measure are carried over from the previous file
 (``--carry-over``, default: the file being replaced), each tagged with the run it came
 from, so a narrower re-run never silently drops a reference.
 
+``--keep-variants-from OLD.json`` is the other direction: OLD stays the base and keeps
+every row it has, and the new run only adds the variants OLD lacks (``supplement``).
+Use it when the registry grew and the variants already delivered must keep the
+baseline they were judged against.
+
 Usage::
 
     python3 tools/h800_reference.py <H800 results dir>                     # regenerate
     python3 tools/h800_reference.py DIR --out conf/h800_reference.json --doc docs/H800_REFERENCE.md
     python3 tools/h800_reference.py DIR --carry-over ''                    # new run only
+    python3 tools/h800_reference.py DIR --keep-variants-from OLD.json      # only add new variants
 """
 
 from __future__ import annotations
@@ -256,6 +262,8 @@ def write(doc, path):
             if table.get("source")
             else ""
         )
+        if table.get("supplement_rows"):
+            source += f'"supplement_rows": {int(table["supplement_rows"])},\n'
         op_chunks.append(
             f'{json.dumps(name)}: {{{source}"fields": {json.dumps(table["fields"])},\n"rows": [\n{body}\n]}}'
         )
@@ -271,6 +279,78 @@ def write(doc, path):
 # ---------------------------------------------------------------------------
 # load (used by tools/baseline_bound.py and the runner)
 # ---------------------------------------------------------------------------
+
+
+def supplement(base, doc):
+    """``base`` plus the variants it lacks, taken from ``doc`` (a freshly built document).
+
+    Every row ``base`` has stays exactly as it was, legacy rows (no ``variant``) and
+    carried-over tables included: only rows of variants ``base`` has NO rows for are
+    appended. A variant ``base`` already measured but never summarised (it was run
+    before it joined the registry) keeps its old rows and only gets its summary from
+    ``doc`` (``summary_only``): appending its new rows too would duplicate case keys,
+    which the scaled baseline skips as ambiguous or resolves to the newer row. When
+    the new run's table has columns the base table lacks, the base rows get them as
+    empty cells -- what the runner itself writes for a row that does not use that
+    column -- so case keys still match.
+    """
+    measured = set()
+    for table in base["operators"].values():
+        if "variant" in table["fields"]:
+            at = table["fields"].index("variant")
+            measured.update(row[at] for row in table["rows"] if row[at])
+    new_names = [name for name in doc["variants"] if name not in base["variants"]]
+    added = [name for name in new_names if name not in measured]
+    summary_only = [name for name in new_names if name in measured]
+    wanted = set(added)
+    operators = {op: dict(table) for op, table in base["operators"].items()}
+    for op, table in doc["operators"].items():
+        fields = table["fields"]
+        if table.get("source") or "variant" not in fields:
+            continue
+        at = fields.index("variant")
+        rows = [row for row in table["rows"] if row[at] in wanted]
+        if not rows:
+            continue
+        old = operators.get(op)
+        if old is None:
+            operators[op] = {
+                "fields": list(fields),
+                "rows": rows,
+                "supplement_rows": len(rows),
+            }
+            continue
+        merged = list(old["fields"]) + [f for f in fields if f not in old["fields"]]
+        pad = [_pack_cell(f, None) for f in merged[len(old["fields"]) :]]
+        new_rows = [
+            [
+                row[fields.index(f)] if f in fields else _pack_cell(f, None)
+                for f in merged
+            ]
+            for row in rows
+        ]
+        operators[op] = dict(
+            old,
+            fields=merged,
+            rows=[list(row) + pad for row in old["rows"]] + new_rows,
+            supplement_rows=old.get("supplement_rows", 0) + len(rows),
+        )
+    reference = dict(base["reference"])
+    previous = reference.get("supplement") or {}
+    reference["supplement"] = dict(
+        _source(doc["reference"]),
+        generated=doc["reference"].get("generated"),
+        variants=list(previous.get("variants", [])) + added,
+        summary_only=list(previous.get("summary_only", [])) + summary_only,
+    )
+    variants = {name: base["variants"][name] for name in base["variants"]}
+    variants.update({name: doc["variants"][name] for name in new_names})
+    return {
+        "schema": SCHEMA,
+        "reference": reference,
+        "variants": variants,
+        "operators": dict(sorted(operators.items())),
+    }
 
 
 class ReferenceTable:
@@ -372,6 +452,30 @@ def _short_commit(commit):
     )  # keep the "+dirty" marker: that run was not a clean tree
 
 
+def _supplement_lines(ref):
+    sup = ref.get("supplement")
+    if not sup:
+        return []
+    return [
+        f"- 补充轮：`{sup.get('source_dir')}`（`{_short_commit(sup.get('flagsparse_commit'))}`，"
+        f"{sup.get('run_timestamp')}）只补了上面那轮没有的 {len(sup.get('variants') or [])} 个变体；"
+        "上面那轮已有的变体一行未动（`tools/h800_reference.py --keep-variants-from`）。",
+    ] + (
+        [
+            f"- 另有 {len(sup['summary_only'])} 个变体（"
+            + "、".join(f"`{n}`" for n in sup["summary_only"])
+            + "）上面那轮已经测过、只是当时不在注册表里：保留那轮的行，只从补充轮取变体结果汇总。"
+        ]
+        if sup.get("summary_only")
+        else []
+    )
+
+
+def _supplement_names(ref):
+    sup = ref.get("supplement") or {}
+    return list(sup.get("variants") or []) + list(sup.get("summary_only") or [])
+
+
 def render_markdown(doc):
     ref = doc["reference"]
     out = [
@@ -387,6 +491,7 @@ def render_markdown(doc):
         f"- FlagSparse commit：`{_short_commit(ref.get('flagsparse_commit'))}`；"
         f"torch {ref.get('torch') or '?'}；triton {ref.get('triton') or '?'}",
         f"- 生成日期：{ref.get('generated')}",
+        *_supplement_lines(ref),
         "",
         "## 用途",
         "",
@@ -421,6 +526,11 @@ def render_markdown(doc):
         "  为 0 的算子（当时只有 CuPy 基线、没有对应格式的库）**没有折算基线**，行会保持 `N/A`。",
         "- FlagSparse commit 带 `+dirty` 表示那轮 H800 是在有未提交改动的工作树上跑的。",
         "- “来源”一列不是本轮的算子，是从上一份参考文件带过来的（新一轮没测它们），数据来自那一轮。",
+        *(
+            ["- “补充轮”的行来自上面的补充轮，只含本轮没有的变体；同一算子里本轮的行原样排在前面。"]
+            if ref.get("supplement")
+            else []
+        ),
         "",
         "## 各算子收录情况",
         "",
@@ -437,6 +547,13 @@ def render_markdown(doc):
             if src
             else "本轮"
         )
+        extra = table.get("supplement_rows") or 0
+        if extra:
+            origin = (
+                "补充轮"
+                if extra == len(table["rows"])
+                else f"{origin} + 补充轮 {extra} 行"
+            )
         out.append(
             f"| `{op}` | {len(table['rows'])} | {_usable_rows(op, table)} | {origin} | {cols} |"
         )
@@ -444,7 +561,9 @@ def render_markdown(doc):
         "",
         "## 各交付变体能否折算",
         "",
-        "按变体统计本轮 H800 上带厂商库时间的矩阵数；为 0 的变体只能退到 H800 PyTorch 的时间（见上）。",
+        "按变体统计 H800 上带厂商库时间的矩阵数（本轮"
+        + ("和补充轮合计" if ref.get("supplement") else "")
+        + "）；为 0 的变体只能退到 H800 PyTorch 的时间（见上）。",
         "",
         "| 变体 | 可作基线的矩阵 / 总矩阵 |",
         "|---|---|",
@@ -456,6 +575,14 @@ def render_markdown(doc):
         "",
         f"## H800 上 {len(doc['variants'])} 个交付变体的结果",
         "",
+        *(
+            [
+                f"补充轮补的 {len(_supplement_names(ref))} 个变体取补充轮的汇总，其余取本轮的汇总。",
+                "",
+            ]
+            if ref.get("supplement")
+            else []
+        ),
         "| 变体 | 精度 | 性能 | 加速比（H800 vs cuSPARSE/PyTorch，runner 口径） |",
         "|---|---|---|---|",
     ]
@@ -472,9 +599,12 @@ def render_markdown(doc):
         "",
         "```bash",
         "python3 tools/h800_reference.py <H800 结果目录>",
+        "# 只补新变体、已有变体保持不动（2026-11-04 这份就是这样生成的）：",
+        "python3 tools/h800_reference.py <H800 结果目录> --keep-variants-from <旧 conf/h800_reference.json>",
         "```",
         "",
-        "只有在 H800 上重跑、且新结果确实要取代这份参考时才重新生成；生成后 diff 应当只有数值变化。",
+        "只有在 H800 上重跑、且新结果确实要取代这份参考时才重新生成；整体重新生成后 diff 应当只有数值变化，"
+        "用 `--keep-variants-from` 时 diff 应当只有新增的行和变体，旧行一字不变。",
         "",
     ]
     return "\n".join(out)
@@ -501,11 +631,23 @@ def main(argv=None):
             "(default: the --out file if it exists; '' to keep nothing)"
         ),
     )
+    parser.add_argument(
+        "--keep-variants-from",
+        default=None,
+        help=(
+            "reference JSON to keep as the base: every row it has stays, the new run "
+            "only adds the variants it lacks (--carry-over is then ignored)"
+        ),
+    )
     args = parser.parse_args(argv)
 
-    carry_path = args.out if args.carry_over is None else args.carry_over
-    carry = load(carry_path) if carry_path and Path(carry_path).is_file() else None
-    doc = build(args.results_dir, carry_over=carry)
+    if args.keep_variants_from:
+        base = load(args.keep_variants_from)
+        doc = supplement(base, build(args.results_dir))
+    else:
+        carry_path = args.out if args.carry_over is None else args.carry_over
+        carry = load(carry_path) if carry_path and Path(carry_path).is_file() else None
+        doc = build(args.results_dir, carry_over=carry)
     out = write(doc, args.out)
     rows = sum(len(t["rows"]) for t in doc["operators"].values())
     print(

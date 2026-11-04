@@ -9,13 +9,15 @@
 
 **为什么 11-03 整轮还剩 17 个 NoBaseline。** 那轮已经带了 `--h800-reference`，但仓库自带的
 `conf/h800_reference.json` 当时只有 10-14 那轮 H800 的 65 个变体，新 40 个变体在参照里查不到，折算无从谈起。
-2026-11-04 已用 H800 105 变体全量（`results_cuda_105_20261103_1556`，105/105 精度、性能全过）重新生成参照。
+2026-11-04 用 H800 105 变体全量（`results_cuda_105_20261103_1556`，105/105 精度、性能全过）补了参照：
+**原 65 个变体保持 10-14 那轮的数据一行不动**，只补新 40 个（`tools/h800_reference.py --keep-variants-from`）。
+其中 `axpby_f32_int`、`axpby_c32_int`、`spvv_f32_int_non` 10-14 那轮已经测过，也保留旧行，只补了变体汇总。
 这 17 个变体在 H800 上都有 10 个矩阵的 cuSPARSE 时间，只有 `spmv_coo_f16_int_trans` 的 amazon0601
 那一行按规则退用 H800 PyTorch 时间。命令不变，更新代码后照上面"2026-11-02 复测计划"的那一行重跑即可。开跑前先确认参照是新版：
 
 ```bash
-python3 -c "import json; r=json.load(open('conf/h800_reference.json')); print(r['reference']['source_dir'], len(r['variants']))"
-# 期望：results_cuda_105_20261103_1556 105
+python3 -c "import json; r=json.load(open('conf/h800_reference.json'))['reference']; print(r['source_dir'], r['supplement']['source_dir'], len(r['supplement']['variants']) + len(r['supplement']['summary_only']))"
+# 期望：results_65_cuda_1014 results_cuda_105_20261103_1556 40
 ```
 
 **重跑后应该看到的数（在 CUDA 机器上用 11-03 整轮的原始 CSV 离线预演，不是实测）。** 补位顺序是

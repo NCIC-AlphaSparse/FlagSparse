@@ -354,12 +354,15 @@ speedup_vs_h800_scaled  = h800_scaled_ms / T_FlagSparse@BI-V150      # 1.0 = 和
     --results-dir biv150_delivery
 ```
 
-- 自带的数据在 [`conf/h800_reference.json`](../conf/h800_reference.json)（约 1 MB，一个文件），说明见
-  [H800_REFERENCE.md](H800_REFERENCE.md)：2026-10-14 起是 H800 ×8 上**全部 65 个变体**的一轮（提交 `643e9c6`，
-  脏工作树），13 个交付算子；spsv/spsm/bsr/bell 新一轮没测，沿用 09-22 那轮（`47a441e`）并在文件里标了来源。共 20 个算子 4645 行，
+- 自带的数据在 [`conf/h800_reference.json`](../conf/h800_reference.json)（约 700 KB，一个文件），说明见
+  [H800_REFERENCE.md](H800_REFERENCE.md)：原 65 个变体是 2026-10-14 H800 ×8 上的一轮（提交 `643e9c6`，
+  脏工作树）；2026-11-04 用 11-03 那轮 105 变体全量（`bc58635`，脏工作树）**只补了新增的 40 个**，原 65 个的数据一行未动
+  （其中 `axpby_f32_int`、`axpby_c32_int`、`spvv_f32_int_non` 10-14 那轮已测过，只补了变体汇总）。spsv/spsm/bsr/bell
+  两轮都没测，沿用 09-22 那轮（`47a441e`）并在文件里标了来源。共 22 个算子 4985 行，
   每行保留算例键、各 `*_ms` 时间、加速比和状态列。想换成自己的一轮 H800 结果，`--h800-reference 目录或json文件`
-  都行；重新生成用 `python3 tools/h800_reference.py <H800 结果目录>`。
-- **H800 没有 cuSPARSE 时间的**：65 个交付变体里只有 `sddmm_csr_f16_int_non_non_row`（cuSPARSE SDDMM 不支持
+  都行；整体重新生成用 `python3 tools/h800_reference.py <H800 结果目录>`，只补新变体、已有的保持不动再加
+  `--keep-variants-from <旧 json>`。
+- **H800 没有 cuSPARSE 时间的**：105 个交付变体里仍只有 `sddmm_csr_f16_int_non_non_row`（cuSPARSE SDDMM 不支持
   fp16），改用 H800 上 PyTorch 的时间折算。非交付的 `spmm_bsr`、`spmm_bell` 两者都没有。
   按 10-09 的天数结果预演，换成新参照后有加速比的变体从 25 个变为 55 个；剩下的是不测的 fp64 9 个，和那轮因 TLE
   编译失败全部 FAIL 的 `spgemm_csr`（已修，见 `debug/ILUVATAR.md` 改动记录，重跑后可折算）。

@@ -303,12 +303,111 @@ def test_bound_only_cli_defaults_to_the_bundled_file(tmp_path):
         capture_output=True,
         text=True,
     )
-    # Exit 1 would only flag rows it could not judge. Since the 2026-11-03 run every
-    # sddmm_csr row has a cuSPARSE time: the q4 bench calls fp16 SDDMM with an fp32
-    # compute type and checks its output, so the old 10 fp16 N/A rows are gone.
+    # Exit 1 only flags rows it could not judge: sddmm_csr_f16 has no cuSPARSE time in
+    # the 2026-10-14 base run (cuSPARSE SDDMM has no fp16), so those 10 rows are N/A --
+    # not a failure. The 40 rows the 2026-11-03 supplement added all have one.
     assert proc.returncode in (0, 1), proc.stderr
     assert "sddmm_csr" in proc.stdout
-    assert "BOUND=170;" in proc.stderr and "N/A" not in proc.stderr
+    assert "BOUND=160, N/A=10" in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+def _two_runs(tmp_path):
+    """A base doc with one legacy row, and a newer run that re-measures it and adds a variant."""
+    base_dir = _synthetic_run(tmp_path / "base", [_sddmm_row(cusparse="2.0")])
+    base = h800_reference.build(base_dir)
+    new_dir = _synthetic_run(
+        tmp_path / "new",
+        [
+            _sddmm_row(cusparse="9.0", variant="", layout=""),
+            _sddmm_row(
+                cusparse="3.0", variant="sddmm_csr_f32_int_non_trans_row", layout="row"
+            ),
+        ],
+    )
+    summary = json.loads((new_dir / "summary.json").read_text(encoding="utf-8"))
+    summary["timestamp"] = "2026-11-03 16:25:37"
+    summary["result"]["sddmm_csr_f32_int_non_trans_row"] = {
+        "accuracy": {"status": "Passed", "passed": 2, "total": 2},
+        "performance": {"status": "Passed", "data": {"fp32": {"speedup": 1.5}}},
+    }
+    (new_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return base, h800_reference.build(new_dir)
+
+
+def test_supplement_keeps_every_base_row_and_adds_only_new_variants(tmp_path):
+    base, new = _two_runs(tmp_path)
+    doc = h800_reference.supplement(base, new)
+    table = doc["operators"]["sddmm_csr"]
+    width = len(base["operators"]["sddmm_csr"]["fields"])
+    assert table["fields"][:width] == base["operators"]["sddmm_csr"]["fields"]
+    # the base row is untouched (2.0, not the re-measured 9.0), padded with empty cells
+    assert [row[:width] for row in table["rows"][:1]] == base["operators"]["sddmm_csr"][
+        "rows"
+    ]
+    assert table["rows"][0][width:] == ["", ""]
+    assert table["supplement_rows"] == 1 and len(table["rows"]) == 2
+    _, rows = h800_reference.ReferenceTable(
+        "", "sddmm_csr", table["fields"], table["rows"]
+    ).read()
+    assert [r["cusparse_ms"] for r in rows] == ["2.0", "3.0"]
+    assert (
+        doc["variants"]["sddmm_csr_f32_int_non_non_row"]
+        == base["variants"]["sddmm_csr_f32_int_non_non_row"]
+    )
+    assert doc["reference"]["source_dir"] == base["reference"]["source_dir"]
+    sup = doc["reference"]["supplement"]
+    assert sup["variants"] == ["sddmm_csr_f32_int_non_trans_row"]
+    assert sup["run_timestamp"] == "2026-11-03 16:25:37"
+
+
+def test_a_variant_the_base_measured_but_never_summarised_keeps_its_rows(tmp_path):
+    # The base run already has rows for a variant that was not in the registry yet.
+    tagged = "sddmm_csr_f32_int_non_trans_row"
+    base_dir = _synthetic_run(
+        tmp_path / "base", [_sddmm_row(cusparse="2.0", variant=tagged, layout="row")]
+    )
+    base = h800_reference.build(base_dir)
+    assert tagged not in base["variants"]
+    _, new = _two_runs(tmp_path / "pair")
+    doc = h800_reference.supplement(base, new)
+    table = doc["operators"]["sddmm_csr"]
+    assert table["rows"] == base["operators"]["sddmm_csr"]["rows"]
+    assert not table.get("supplement_rows")
+    assert doc["variants"][tagged] == new["variants"][tagged]
+    assert doc["reference"]["supplement"]["variants"] == []
+    assert doc["reference"]["supplement"]["summary_only"] == [tagged]
+
+
+def test_supplement_survives_write_and_load(tmp_path):
+    doc = h800_reference.supplement(*_two_runs(tmp_path))
+    out = h800_reference.write(doc, tmp_path / "ref.json")
+    again = h800_reference.load(out)
+    assert again["operators"] == doc["operators"]
+    assert again["reference"]["supplement"] == doc["reference"]["supplement"]
+    assert "补充轮" in h800_reference.render_markdown(again)
+
+
+def test_supplement_cli(tmp_path):
+    base, _ = _two_runs(tmp_path)
+    base_file = h800_reference.write(base, tmp_path / "base.json")
+    out = tmp_path / "ref.json"
+    h800_reference.main(
+        [
+            str(tmp_path / "new" / "pytest_results_fake"),
+            "--out",
+            str(out),
+            "--doc",
+            "",
+            "--keep-variants-from",
+            str(base_file),
+        ]
+    )
+    doc = h800_reference.load(out)
+    assert doc["reference"]["supplement"]["variants"] == [
+        "sddmm_csr_f32_int_non_trans_row"
+    ]
+    assert doc["operators"]["sddmm_csr"]["supplement_rows"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -364,16 +463,68 @@ def test_the_bundled_variants_are_a_subset_of_the_delivery_variants(bundled):
     assert set(bundled["variants"]) <= delivery_ids
 
 
-# The bundle is built from the 2026-11-03 H800 run of the whole 105-variant
-# registry (conf/h800_reference.json's own "reference" block). Pinned to the
-# registry on purpose: a regenerated bundle that lost a variant must fail here,
-# not shrink silently.
+# The bundle is the 2026-10-14 H800 run of the first 65 registry variants
+# (conf/h800_reference.json's "reference" block), with the 40 batch-3 variants
+# added from the 2026-11-03 run ("reference.supplement"); the 65 were left
+# untouched. Pinned to the registry on purpose: a regenerated bundle that lost a
+# variant must fail here, not shrink silently.
+H800_BASE_VARIANT_COUNT = 65
 H800_RUN_VARIANT_COUNT = 105
 
 
 def test_the_bundled_variants_are_the_registry_as_run_on_h800(bundled):
     delivery_ids = [v["id"] for v in load_delivery_variants()]
     assert set(bundled["variants"]) == set(delivery_ids[:H800_RUN_VARIANT_COUNT])
+
+
+def test_the_supplement_adds_only_the_variants_after_the_base_run(bundled):
+    delivery_ids = [v["id"] for v in load_delivery_variants()]
+    supplement = bundled["reference"]["supplement"]
+    # Order follows the H800 run's summary, not the registry; only membership matters.
+    # summary_only: measured in the base run before they joined the registry, so the
+    # base rows stay and only the variant summary comes from the supplement run.
+    new_ids = supplement["variants"] + supplement["summary_only"]
+    assert set(new_ids) == set(
+        delivery_ids[H800_BASE_VARIANT_COUNT:H800_RUN_VARIANT_COUNT]
+    )
+    assert len(new_ids) == H800_RUN_VARIANT_COUNT - H800_BASE_VARIANT_COUNT
+    assert sorted(supplement["summary_only"]) == [
+        "axpby_c32_int",
+        "axpby_f32_int",
+        "spvv_f32_int_non",
+    ]
+    assert "H800" in supplement["device"] and supplement["flagsparse_commit"]
+    # Every supplement row belongs to a supplement variant, and is counted.
+    added = set(supplement["variants"])
+    for op, table in bundled["operators"].items():
+        extra = table.get("supplement_rows", 0)
+        if not extra:
+            continue
+        at = table["fields"].index("variant")
+        assert all(row[at] in added for row in table["rows"][-extra:]), op
+        assert not any(row[at] in added for row in table["rows"][:-extra]), op
+
+
+def _duplicate_keys(table_doc):
+    found = {}
+    for op, table in table_doc.items():
+        fields, rows = table.read()
+        extra = [c for c in baseline_bound._OPTIONAL_KEYS if c in fields]
+        seen, dup = set(), set()
+        for row in rows:
+            key = baseline_bound._row_key(row, extra)
+            (dup if key in seen else seen).add(key)
+        if dup:
+            found[op] = len(dup)
+    return found
+
+
+def test_the_supplement_adds_no_duplicate_case_key(bundled):
+    # A duplicated key is skipped as ambiguous by the scaled baseline (or resolved to
+    # the newer row by the C API path), so a supplement row that collided with a base
+    # row would silently replace or erase the base baseline. spmv_bsr's 240 come from
+    # the 2026-09-22 run's k sweep and predate the supplement.
+    assert _duplicate_keys(h800_reference.tables(BUNDLED)) == {"spmv_bsr": 240}
 
 
 def test_no_bundled_variant_failed(bundled):
