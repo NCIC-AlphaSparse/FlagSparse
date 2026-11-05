@@ -610,6 +610,10 @@ def flagsparse_spvv(
         from ._vector_musa import spvv_half
 
         result = spvv_half(values, kernel_idx, y)
+    elif _is_mthreads_runtime() and values.dtype == torch.int8:
+        from ._vector_musa import spvv_int8
+
+        result = spvv_int8(values, kernel_idx, y, compute)
     elif (_is_maca_runtime() and values.dtype in (torch.float32, torch.complex64)
             and values.numel() <= 65536
             and (values.numel() <= 4096 or not torch.are_deterministic_algorithms_enabled())):

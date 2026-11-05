@@ -1,6 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""MUSA half-input SpVV must reduce live operands into independent FP32 scalars."""
+"""MUSA narrow-input SpVV must reduce live operands into independent scalars."""
 
 import pytest
 import torch
@@ -92,6 +92,84 @@ def test_deterministic_half_reduction(nnz):
         torch.testing.assert_close(first.cpu(), second.cpu(), rtol=0, atol=0)
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+def _check_int8(values, indices, y, out_dtype, op="non", **kwargs):
+    expected = (values.cpu().long() * y.cpu().long()[indices.cpu().long()]).sum()
+    actual = fs.flagsparse_spvv(values, indices, y, op=op, out_dtype=out_dtype, **kwargs)
+    if kwargs.get("return_time"):
+        actual, elapsed = actual
+        assert elapsed >= 0
+    assert actual.shape == () and actual.dtype == out_dtype
+    if out_dtype == torch.int32:
+        torch.testing.assert_close(actual.cpu(), expected.to(torch.int32), rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(actual.cpu().double(), expected.double(), rtol=2e-5, atol=3e-4)
+    return actual
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.float32])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("op", ["non", "conj"])
+@pytest.mark.parametrize("nnz", [0, 1, 1023, 1024, 1025, 4096, 16383, 16384,
+                                 16385, 65535, 65536, 65537, 1048577])
+def test_int8_reduction_boundaries(out_dtype, index_dtype, op, nnz):
+    gen = torch.Generator().manual_seed(271 + nnz)
+    dev = accelerator_device()
+    indices = torch.randint(0, 10007, (nnz,), dtype=index_dtype, generator=gen).to(dev)
+    values = torch.randint(-128, 128, (nnz,), dtype=torch.int8, generator=gen).to(dev)
+    y = torch.randint(-128, 128, (10007,), dtype=torch.int8, generator=gen).to(dev)
+    _check_int8(values, indices, y, out_dtype, op)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.float32])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("nnz", [4093, 16385, 65539])
+def test_int8_strides_and_live_inputs(out_dtype, index_dtype, nnz):
+    gen = torch.Generator().manual_seed(73)
+    dev = accelerator_device()
+    values = torch.randint(-16, 17, (2 * nnz,), dtype=torch.int8, generator=gen).to(dev)[::2]
+    indices = torch.randint(0, 13, (2 * nnz,), dtype=index_dtype, generator=gen).to(dev)[::2]
+    y = torch.randint(-16, 17, (26,), dtype=torch.int8, generator=gen).to(dev)[::2]
+    first = _check_int8(values, indices, y, out_dtype)
+    saved = first.cpu().clone()
+    for step in (1, 2):
+        values.add_(1)
+        y.sub_(1)
+        indices.fill_(step)
+        _check_int8(values, indices, y, out_dtype, op="conj", return_time=True)
+        torch.testing.assert_close(first.cpu(), saved, rtol=0, atol=0)
+    for bad in (-1, y.numel()):
+        indices[0] = bad
+        with pytest.raises(IndexError, match="indices out of range"):
+            fs.flagsparse_spvv(values, indices, y, out_dtype=out_dtype)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.float32])
+def test_int8_large_accumulation_and_streams(out_dtype):
+    dev = accelerator_device()
+    values = torch.full((262145,), 127, dtype=torch.int8, device=dev)
+    indices = torch.zeros(values.numel(), dtype=torch.int32, device=dev)
+    y = torch.tensor([127], dtype=torch.int8, device=dev)
+    # FP32 must not overflow through an int32 accumulator; int32 wraps as before.
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        first = _check_int8(values, indices, y, out_dtype)
+        second = _check_int8(values, indices, y, out_dtype)
+        torch.testing.assert_close(first.cpu(), second.cpu(), rtol=0, atol=0)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+    _ACCEL.synchronize()
+    stream = torch.musa.Stream()
+    with torch.musa.stream(stream):
+        values.fill_(-128)
+        y.fill_(127)
+        result = fs.flagsparse_spvv(values, indices, y, out_dtype=out_dtype, validate=False)
+    stream.synchronize()
+    expected = (values.cpu().long() * 127).sum()
+    torch.testing.assert_close(result.cpu(), expected.to(out_dtype), rtol=2e-5 if out_dtype == torch.float32 else 0, atol=0)
 
 
 @pytest.mark.parametrize("nnz", [4096, 65536])

@@ -1283,3 +1283,60 @@ setsid env PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/
 
 - 定向验证通过 setsid 串行启动，避免 GPU 性能测试重叠；`launch_target.py` 的前两个阶段成功。首次 Python 阶段误传该入口不支持的 `--backend mthreads`，报 `error: unrecognized arguments: --backend mthreads`，未开始算子测试；原失败启动记录 `RUN_INFO.json` 和 `python_csr.log` 保留。移除该参数、通过原 `FLAGSPARSE_BACKEND=mthreads` 环境配置，用 setsid 在全新 `python_csr_final/` 目录重跑成功；没有修改 runner 或掩盖失败日志。最终结论以该目录实际精度/性能 exit_code 和最终 C API JUnit 为准。
 - `scope_audit.json` 确认非 MUSA C++ 路径和全部已有 codegen AST 不变；新计算全部为 Triton。`git diff --check` 通过。本次三份代码/测试文件及本记录一起提交，未推送或重写旧结果。
+
+### 2026-11-05 完整 105 项结果与三项后续优化
+
+- 起始提交为 `7a18b6f`，代码树与当轮上游 `5bad1a0` 一致。完整轮 `results_mthreads_105_20261105_032658_upstream/` 于 UTC 03:27:13–04:27:34 完成，105 项精度和性能均 Passed，missing=0；性能 Passed 表示可报告结果，不表示达到 0.8x。仍低于 0.8x 的三项是 SELL complex64 0.792618x、SpVV int8→FP32 0.794818x、SpVV int8→int32 0.788876x。
+- 用户授权仅优化上述三项。本轮证据目录 `results_musa_opt_20261105_low3/`，未再次拉取代码。原矩阵、注册表、baseline、runner、容差、warmup=5/iters=20 和基线优先级均不变；未改 C API 或已有共享 kernel。生产改动只在 MUSA 路径生效，全部计算保持 Triton。
+- 原 `run_flagsparse_pytest.py --ops spvv,spmv_sell --delivery-only --mode normal --phase both --gpus 0 --timeout 3600 --benchmark-input tests/data --h800-reference` 定向结果在 `python_targets_final/`：SpVV 精度 220 passed、178 skipped（原后端适用性规则），SELL 精度 12 passed，两个性能阶段共 74/74 原始记录 PASS。逐变体平均：SELL complex64 **0.867253x（H800 带宽折算）**，SpVV int8→FP32 **1.251736x**、int8→int32 **1.289654x**（同轮本机 PyTorch）。这些是定向结果，不是新的完整 105 项验收。
+- 同口径独立测量中 SELL 首轮为 0.866142x；SpVV 首轮为 1.221583x / 1.226363x。优化前控制组与上一完整轮有计时波动，特别是 roadNet-TX 由约 0.163 ms 变为约 0.084 ms；不能把这部分变化全部归因于优化。新旧同轮对照、全部探索和失败记录均保留，未挑选或覆盖旧数据。
+- 新完整轮使用 `results_mthreads_105_20261105_053710_low3/`，以 setsid、原 split runner、GPU 0、线程池 8、原十矩阵和现行基线启动，并重新执行 C API 构建。实际启动/结束时间和退出码以 `RUN_INFO.json` 为准；完整轮结束前不宣称全部 105 项达到 0.8x。
+
+### 2026-11-05 src/flagsparse/sparse_operations/_vector_musa.py::SpVV int8 归约
+
+- 改了什么：新增独立的 int8 Triton 分块和最终归约，nnz≤16384 单 kernel 直接写独立结果，长输入两级归约；最终 tile 有界并循环处理。int32 输出全程 int32 累加，FP32 输出全程 FP32 累加，避免 FP32 路线先发生 int32 溢出；跨步索引连续化。已有 FP16 kernel 不变，不缓存输出或输入值。
+- 为什么改（附报错原文）：无生产算子异常；原两条 int8 路线需调度通用 kernel 和 PyTorch sum，短向量的约 43–46 us 调用成本使均值略低于 0.8x。
+- 怎么验证的：上述原四个合成规模及完整 SpVV 24 条性能记录通过；新增 int8 边界、空输入、重复/乱序索引、int32/int64 索引、跨步、实时更新、独立结果、超过 int32 范围的 FP32 累加、int32 回绕、确定性和非默认流回归通过。原 FP16 回归不变。
+- 其他后端是否也需要：否；仅 MUSA int8 guard 调用，新增两个计算 kernel 都是 Triton，没有原生 MUSA 实现。
+
+### 2026-11-05 src/flagsparse/sparse_operations/vector_ops.py::MUSA int8 分派
+
+- 改了什么：仅 `_is_mthreads_runtime() and values.dtype == torch.int8` 调用新归约 helper；保留现有校验、输入连续化、compute/out_dtype、op 和 return_time 语义。
+- 为什么改（附报错原文）：无生产异常；将 int8 性能修正隔离到 MUSA，其他后端和 dtype 保持原路线。
+- 怎么验证的：SpVV GPU/分派测试合计 284 passed；原 runner 定向精度全部通过。`audit_scope.py` 验证禁用 MUSA 后 AST 与起始提交相同、原有共享 Triton kernel AST 不变。
+- 其他后端是否也需要：否；其他加速器未实测，非 MUSA 路径通过 AST 和 CPU mock 检查。
+
+### 2026-11-05 src/flagsparse/sparse_operations/spmv_sell.py::MUSA complex64 slice 调度
+
+- 改了什么：仅 MUSA、complex64、slice_size=32、非极短行配置复用已有 `_spmv_sell_complex_parallel_kernel`，使用标量 slice 边界、连续行 lanes 和 4 个稀疏槽；极短行保留原 128 行分组，其他 dtype 和 slice 大小保留原路径。没有改任何已有 kernel 定义、缓存或值更新语义。
+- 为什么改（附报错原文）：无生产异常；原通用按行分组 kernel 的向量边界/归约及访存开销偏高。成对加载、64 位打包及压缩拓扑探针未显示稳定整体收益，未接入。
+- 怎么验证的：原十矩阵及其他 SELL dtype 共 50/50 性能记录 PASS；SELL/分派回归 47 passed，覆盖非零虚部、重复列、空行、NaN padding、最后部分 slice、跨步输入/输出、实时值/列更新、存储替换和非默认流。范围审计确认非 MUSA AST 和全部原有 kernel 不变。
+- 其他后端是否也需要：否；新选择位于原 `if musa` 内，其他后端仍按原调度运行。
+
+### 2026-11-05 tests/pytest/test_spvv_musa_accuracy.py::int8 回归
+
+- 改了什么：新增 118 项仅 MUSA 的 int8 精度/语义回归，以 CPU int64 数学结果为参考；int32 按原输出规则截断，FP32 不经 int32 中间累加。保留原 90 项 FP16 回归和容差。
+- 为什么改（附报错原文）：无新增生产异常；避免单/两级归约仅对交付小输入正确，却破坏长输入、跨步、流或溢出语义。
+- 怎么验证的：连同原 FP16 和两个后端分派文件为 284 passed，日志 `spvv_regression.log/.xml`；原 runner SpVV 的 220 项精度通过。
+- 其他后端是否也需要：否；新增 GPU 用例仅在 MUSA 运行。
+
+### 2026-11-05 tests/ci/test_spvv_musa_dispatch.py::int8 分派范围
+
+- 改了什么：保留原 dtype/non/conj 组合，并增加 int8 默认、显式 int32、显式 FP32 输出的 MUSA/非 MUSA 分派断言。
+- 为什么改（附报错原文）：无算子异常；新 helper 必须只接 MUSA int8，不能误入 MACA 或其他 dtype。
+- 怎么验证的：本文件 32 passed，既有 MACA 分派 44 passed；断言仍检查实际选择的路径。
+- 其他后端是否也需要：无需生产修改；mock 可在其他后端运行。
+
+### 2026-11-05 tests/pytest/test_musa_sparse_routes.py::复数 SELL slice 边界
+
+- 改了什么：新增四项 MUSA complex64、C=32 的部分 slice/实时数据回归，包含重复列、NaN padding、跨步存储、输出哨兵和非默认流。
+- 为什么改（附报错原文）：新增 fixture 初轮将 NaN padding 的列改为合法列，却未同步设置有限值，报 `Greatest absolute difference: nan at index (0,)`；已在新 fixture 的该槽设为 `2+3j` 后再转为合法列。没有修改生产实现或放宽断言，初轮失败日志保留。
+- 怎么验证的：修正后原 SELL 回归和本文件新用例全部通过，见 `sell_regression_final.log/.xml`（连同分派 47 passed；124 deselected 是命令筛选其他算子）。
+- 其他后端是否也需要：否；本文件原已限定 MUSA。
+
+### 2026-11-05 tests/ci/test_spmv_sell_musa_dispatch.py::SELL 分派隔离
+
+- 改了什么：新增 24 项 CPU mock，交叉检查 MUSA 开关、complex64/complex128/FP32、C=16/32、短/普通行宽。
+- 为什么改（附报错原文）：无算子异常；确保只选择已验证的 MUSA complex64 C=32 路径。
+- 怎么验证的：24 passed，属于上述 SELL 合计 47 passed；`git diff --check` 与 `scope_audit.json` 通过。
+- 其他后端是否也需要：不改其他后端实现，测试可跨平台运行。

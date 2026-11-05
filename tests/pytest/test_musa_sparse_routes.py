@@ -533,6 +533,68 @@ def test_musa_sell_complex_cached_live_inputs(index_dtype):
         fs.flagsparse_spmv_sell(values, cols, offsets, rhs, (m, n), slice_size=slice_size)
 
 
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("n_rows", [33, 67])
+def test_musa_sell_complex_slice_live_padding(index_dtype, n_rows):
+    """Exercise the C=32 scalar-bound slice kernel with live, strided storage."""
+    from itertools import accumulate
+    from flagsparse.sparse_operations import spmv_sell as sell
+    from flagsparse.sparse_operations._common import _ACCEL
+
+    dev = accelerator_device()
+    n_cols, slice_size = 17, 32
+    widths = [5 + 4 * s for s in range((n_rows + 31) // 32)]
+    ptr_cpu = torch.tensor([0] + list(accumulate(w * 32 for w in widths)),
+                           dtype=index_dtype)
+    col_cpu = torch.full((int(ptr_cpu[-1]),), -1, dtype=index_dtype)
+    val_cpu = torch.full(col_cpu.shape, complex(float("nan"), float("nan")), dtype=torch.complex64)
+    for row in range(n_rows):
+        s, lane = divmod(row, slice_size)
+        for slot in range(0 if row % 7 == 0 else widths[s] - row % 3):
+            pos = int(ptr_cpu[s]) + slot * slice_size + lane
+            col_cpu[pos] = (row + slot // 2) % n_cols  # Duplicate columns are legal.
+            val_cpu[pos] = complex((slot % 5) - 2, (row % 3) - 1)
+    val_store = torch.empty(val_cpu.numel() * 2, dtype=torch.complex64, device=dev)
+    val_store[::2] = val_cpu.to(dev)
+    values = val_store[::2]
+    cols, offsets = col_cpu.to(dev), ptr_cpu.to(dev)
+    rhs = torch.arange(n_cols * 2, dtype=torch.float32, device=dev).to(torch.complex64)[::2]
+    output = torch.full((n_rows * 2,), -99, dtype=torch.complex64, device=dev)
+    out = output[::2]
+
+    def check():
+        rr = sell._sell_entry_rows(cols, offsets, slice_size).cpu()
+        cc = cols.cpu().long()
+        valid = (rr < n_rows) & (cc >= 0)
+        host = torch.zeros(n_rows, n_cols, dtype=torch.complex128)
+        host.index_put_((rr[valid], cc[valid]),
+                       values.cpu().to(torch.complex128)[valid], accumulate=True)
+        actual = fs.flagsparse_spmv_sell(values, cols, offsets, rhs, (n_rows, n_cols),
+                                         slice_size=slice_size, out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu().to(torch.complex128),
+                                   host @ rhs.cpu().to(torch.complex128))
+        torch.testing.assert_close(output[1::2].cpu(),
+                                   torch.full((n_rows,), -99, dtype=torch.complex64))
+
+    check()
+    values.mul_(1j)
+    rhs.add_(1 - 2j)
+    check()
+    values.data = (values + 3).data
+    values[0] = 2 + 3j  # This padded slot becomes a real entry below.
+    cols[0] = (int(cols[0]) + 1) % n_cols
+    check()
+    _ACCEL.synchronize()
+    stream = torch.musa.Stream()
+    with torch.musa.stream(stream):
+        rhs.mul_(1j)
+        fs.flagsparse_spmv_sell(values, cols, offsets, rhs, (n_rows, n_cols),
+                                slice_size=slice_size, out=out, validate=False)
+    stream.synchronize()
+    check()
+
+
 @pytest.mark.parametrize("sorted_rows", [False, True])
 def test_musa_coo_cache_live_storage(sorted_rows):
     dev = accelerator_device()
