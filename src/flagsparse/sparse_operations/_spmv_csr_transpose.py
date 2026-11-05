@@ -197,7 +197,7 @@ def _gather_split_dynamic(VR, VI, I, P, ROWS, X, Y, M: tl.constexpr,
 
 
 def gather(values, x, plan, n_rows, conjugate=False, out=None):
-    if _is_mthreads_runtime() and values.dtype == torch.float16 and plan[2] is None:
+    if _is_mthreads_runtime() and values.dtype in (torch.float16, torch.bfloat16) and plan[2] is None:
         from .mixed_spmx import _musa_csr_spmv
         result = _musa_csr_spmv(values.contiguous(), plan[0], plan[1], x.contiguous(),
                                 n_rows, values.dtype if out is None else out.dtype,
@@ -238,7 +238,7 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
         v, vector, target = cache["component_view"], torch.view_as_real(x), torch.view_as_real(y)
     else:
         v, vector, target = values, x, y
-    if _is_mthreads_runtime() and not complex_values and values.dtype == torch.float16:
+    if _is_mthreads_runtime() and not complex_values and values.dtype in (torch.float16, torch.bfloat16):
         from .mixed_spmx import _musa_csr_spmv
         result = _musa_csr_spmv(values, cols, ptr, x, n_rows,
                                 y.dtype, torch.float32, y)

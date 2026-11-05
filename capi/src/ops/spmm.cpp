@@ -860,7 +860,7 @@ bool transpose_gather_available(const SpMatDescr* A) {
 bool coo_transpose_gather(const SpMatDescr* A, flagsparseOperation_t opA) {
     return A->format == FLAGSPARSE_FORMAT_COO && transposes(opA) &&
         A->value_type == FLAGSPARSE_R_32F &&
-        std::strcmp(flagsparseGetBackendName(), "cuda") == 0;
+        (std::strcmp(flagsparseGetBackendName(), "cuda") == 0 || musa_backend());
 }
 
 size_t coo_offsets_bytes(const SpMatDescr* A) {
@@ -933,6 +933,11 @@ flagsparseStatus_t prepare_coo_transpose(SpMatDescr* A, flagsparseOperation_t op
     void* topology = static_cast<unsigned char*>(buffer) + coo_offsets_bytes(A);
     if (A->spmm_transpose_buffer == topology) return FLAGSPARSE_STATUS_SUCCESS;
     SpMatDescr T = coo_csr_view(A, buffer);
+    if (musa_backend()) {
+        if (flagsparseStatus_t s = prepare_sparse_gather(&T, topology)) return s;
+        A->spmm_transpose_buffer = topology;
+        return FLAGSPARSE_STATUS_SUCCESS;
+    }
     if (flagsparseStatus_t s = prepare_transpose_topology(&T, topology)) return s;
     A->spmm_transpose_buffer = topology;
     A->transpose_max_row_nnz = T.transpose_max_row_nnz;
@@ -1171,7 +1176,9 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA));
         const bool direct = A->format == FLAGSPARSE_FORMAT_CSR &&
             !transposes(opA) && ops.complex_op && ops.n == 8;
-        if ((indirect && externalBuffer) || direct)
+        const bool csc_transpose = A->format == FLAGSPARSE_FORMAT_CSC &&
+            transposes(opA) && ops.n == 8 && A->idx_base == FLAGSPARSE_INDEX_BASE_ZERO;
+        if ((indirect && externalBuffer) || direct || csc_transpose)
             return launch_sparse_gather(handle, A, B->values, C->values,
                 C->rows, ops.n, ops.stride_bk, ops.stride_bn, ops.stride_cm, ops.stride_cn,
                 ops.alpha_re, ops.alpha_im, ops.beta_re, ops.beta_im,
@@ -1201,6 +1208,13 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
         if (flagsparseStatus_t s = prepare_coo_transpose(A, opA, externalBuffer)) return s;
         SpMatDescr T = coo_csr_view(A, externalBuffer);
         if (coo_transpose_gather(A, opA)) {
+            if (musa_backend()) {
+                T.sparse_gather_buffer = A->spmm_transpose_buffer;
+                return launch_sparse_gather(handle, &T, B->values, C->values,
+                    C->rows, ops.n, ops.stride_bk, ops.stride_bn, ops.stride_cm, ops.stride_cn,
+                    ops.alpha_re, ops.alpha_im, ops.beta_re, ops.beta_im,
+                    false, A->spmm_transpose_buffer, true);
+            }
             return run_csr_transpose_gather(handle, &T, B, C, ops, A->spmm_transpose_buffer);
         }
         return run_csr_transpose_atomic(handle, &T, B, C, ops);
@@ -1263,6 +1277,11 @@ flagsparseStatus_t flagsparseSpMM_bufferSize(
             *bufferSize = (transpose_ptr_count(A) + 2 * transpose_nnz_count(A)) * sizeof(int64_t);
         }
         if (A->format == FLAGSPARSE_FORMAT_COO) {
+            if (musa_backend() && coo_transpose_gather(A, opA)) {
+                SpMatDescr T = coo_csr_view(A, nullptr);
+                *bufferSize = coo_offsets_bytes(A) + gather_bytes(&T);
+                return FLAGSPARSE_STATUS_SUCCESS;
+            }
             *bufferSize = coo_transpose_gather(A, opA)
                 ? coo_offsets_bytes(A) + transpose_topology_bytes(A)
                 : static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t);

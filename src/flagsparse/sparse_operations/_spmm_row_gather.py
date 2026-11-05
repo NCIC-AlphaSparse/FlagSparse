@@ -8,6 +8,15 @@ from ._common import _is_mthreads_runtime
 
 
 @triton.jit
+def _pack_dense(B, C, M, N, BM, BN, BLOCK: tl.constexpr):
+    rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = (cols[:, None] < N) & (rows[None, :] < M)
+    values = tl.load(B + rows[None, :] * BM + cols[:, None] * BN, mask, other=0)
+    tl.store(C + rows[None, :] * N + cols[:, None], values, mask)
+
+
+@triton.jit
 def _kernel(V, I, P, B, C, M, N, BK, BN, CM, CN,
             COMPLEX: tl.constexpr, R: tl.constexpr, K: tl.constexpr,
             TILE_N: tl.constexpr, ACC: tl.constexpr = tl.float32):
@@ -50,6 +59,15 @@ def compute(values, cols, ptr, b, out):
     if not m or not n:
         return out
     is_complex = values.is_complex()
+    if (_is_mthreads_runtime() and values.dtype in (torch.float16, torch.int8)
+            and b.stride(0) == 1 and b.stride(1) != 1):
+        # Read the current RHS every call. Packing is included in call timing;
+        # it replaces repeated uncoalesced loads inside the sparse row loop.
+        dense_copy = torch.empty(b.shape, dtype=b.dtype, device=b.device)
+        _pack_dense[(triton.cdiv(b.shape[0], 32), triton.cdiv(b.shape[1], 32))](
+            b, dense_copy, *b.shape, *b.stride(), 32, num_warps=4,
+        )
+        b = dense_copy
     # Preserve logical strides for row/column-major and padded dense operands.
     v, dense, target = (torch.view_as_real(t.resolve_conj()) for t in (values, b, out)) if is_complex else (values, b, out)
     mean = values.numel() / max(m, 1)

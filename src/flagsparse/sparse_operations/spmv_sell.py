@@ -533,14 +533,23 @@ def flagsparse_spmv_sell(
                 (torch.view_as_real(t) for t in (y, values, x))
                 if complex_values else (y, values, x)
             )
-            _launch_musa_spmv(
-                _musa_spmv_sell_kernel, ((n_rows + rows - 1) // rows,),
-                (target, matrix, cols, offsets, vector), (n_rows,),
-                (slice_size, rows, slots, complex_values,
-                 tl.float64 if acc_dtype == torch.complex128 else (
-                    tl.float32 if complex_values else _TL[acc_dtype]
-                 )),
-            )
+            if values.dtype == torch.complex64 and slice_size == 32 and rows != 128:
+                # One slice shares scalar bounds and contiguous row lanes. Keep
+                # the grouped-row kernel for very short slices and other types.
+                _launch_musa_spmv(
+                    _spmv_sell_complex_parallel_kernel, (n_slices,),
+                    (target, matrix, cols, offsets, vector), (n_rows,),
+                    (slice_size, 32, 4),
+                )
+            else:
+                _launch_musa_spmv(
+                    _musa_spmv_sell_kernel, ((n_rows + rows - 1) // rows,),
+                    (target, matrix, cols, offsets, vector), (n_rows,),
+                    (slice_size, rows, slots, complex_values,
+                     tl.float64 if acc_dtype == torch.complex128 else (
+                        tl.float32 if complex_values else _TL[acc_dtype]
+                     )),
+                )
     elif _is_ascend_runtime():
         y = _torch_spmv_sell(values, cols, offsets, x, n_rows, slice_size, acc_dtype)
         y = y if y.dtype == out_dtype else y.to(out_dtype)

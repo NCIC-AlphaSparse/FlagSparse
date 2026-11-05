@@ -20,7 +20,7 @@ def _triple(matrix, device, ptr_dtype):
             sparse.crow_indices().to(device=device, dtype=ptr_dtype), tuple(matrix.shape))
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.complex64])
 @pytest.mark.parametrize("ptr_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("shape", [(0, 7, 9), (7, 0, 9), (1, 128, 128), (1100, 3, 5)])
 def test_pure_triton_edges_and_live_values(monkeypatch, dtype, ptr_dtype, shape):
@@ -45,8 +45,8 @@ def test_pure_triton_edges_and_live_values(monkeypatch, dtype, ptr_dtype, shape)
         data, indices, ptr, result_shape = csr.flagsparse_spgemm_csr(prepared=prepared)
         result = torch.sparse_csr_tensor(ptr.cpu(), indices.cpu(), data.cpu(), result_shape)
         torch.testing.assert_close(result.to_dense(), (a * scale) @ b,
-                                   atol=1e-5 if dtype == torch.float32 else 1e-11,
-                                   rtol=1e-4 if dtype == torch.float32 else 1e-11)
+                                   atol=1e-5 if dtype in (torch.float32, torch.complex64) else 1e-11,
+                                   rtol=1e-4 if dtype in (torch.float32, torch.complex64) else 1e-11)
         out = (torch.empty_like(data), torch.empty_like(indices), torch.empty_like(ptr))
         got = csr.flagsparse_spgemm_csr(prepared=prepared, out=out)
         for actual, expected in zip(got[:3], out):
@@ -54,7 +54,7 @@ def test_pure_triton_edges_and_live_values(monkeypatch, dtype, ptr_dtype, shape)
         torch.testing.assert_close(got[0], data)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.complex64])
 def test_duplicate_columns_and_empty_rhs_rows(dtype):
     device = accelerator_device()
     a = (torch.tensor([1., -1., 2., 3.], dtype=dtype, device=device),
@@ -69,7 +69,7 @@ def test_duplicate_columns_and_empty_rhs_rows(dtype):
     torch.testing.assert_close(result.to_dense(), expected)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.complex64])
 def test_long_row_hash_collisions(dtype):
     device = accelerator_device()
     inner, width = 128, 64
@@ -77,9 +77,13 @@ def test_long_row_hash_collisions(dtype):
     # same slot, exercising probing and duplicate insertion across iterations.
     columns = torch.arange(width, dtype=torch.int32, device=device) * 16384
     ad = torch.ones(inner, dtype=dtype, device=device)
+    if dtype.is_complex:
+        ad.mul_(1 + 2j)
     ai = torch.arange(inner, dtype=torch.int32, device=device)
     ap = torch.tensor([0, inner], dtype=torch.int64, device=device)
     bd = torch.ones(inner * width, dtype=dtype, device=device)
+    if dtype.is_complex:
+        bd.mul_(3 - 1j)
     bi = columns.repeat(inner)
     bp = torch.arange(inner + 1, dtype=torch.int64, device=device) * width
     data, indices, ptr, _ = csr.flagsparse_spgemm_csr(
@@ -87,7 +91,8 @@ def test_long_row_hash_collisions(dtype):
     )
     assert ptr.cpu().tolist() == [0, width]
     assert sorted(indices.cpu().tolist()) == columns.cpu().tolist()
-    torch.testing.assert_close(data.cpu(), torch.full((width,), float(inner), dtype=dtype))
+    expected = inner * (5 + 5j) if dtype.is_complex else float(inner)
+    torch.testing.assert_close(data.cpu(), torch.full((width,), expected, dtype=dtype))
 
 
 @pytest.mark.parametrize("n", [0, 1, 1023, 1024, 1025, 1048579])

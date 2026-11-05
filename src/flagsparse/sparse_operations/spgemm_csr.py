@@ -1330,7 +1330,6 @@ def _spgemm_compute(prepared):
     if (
         _is_maca_runtime()
         and isinstance(prepared, SpGEMMPrepared)
-        and not prepared.a_data.dtype.is_complex
     ):
         return _maca_triton_spgemm_compute(prepared)
 

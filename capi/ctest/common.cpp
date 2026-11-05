@@ -334,9 +334,16 @@ bool BenchReport::measure_vs_baseline(
     BenchRow row, const std::function<flagsparseStatus_t()>& once,
     const std::function<double(bool)>& verify,
     const std::function<baseline::Status(baseline::Timing*)>& base, double flops,
-    bool baseline_writes_output) {
+    bool baseline_writes_output
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+    , const std::function<void()>& prepare
+#endif
+    ) {
     // 1. Our side. The first call also pays JIT compilation; it decides the
     //    status and stays out of the samples.
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+    if (prepare) { prepare(); dev_sync(); }
+#endif
     const flagsparseStatus_t first = once();
     if (first == FLAGSPARSE_STATUS_NOT_SUPPORTED) {
         row.status = "not_supported";
@@ -367,11 +374,19 @@ bool BenchReport::measure_vs_baseline(
     // 3. Our timing. Done even when the answer is out of tolerance: a wrong
     //    result that is also slow is worth knowing about, and the row records
     //    both rather than hiding the timing behind the accuracy verdict.
-    for (int i = 0; i < kWarmup; ++i) once();
+    for (int i = 0; i < kWarmup; ++i) {
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+        if (prepare) { prepare(); dev_sync(); }
+#endif
+        once();
+    }
     dev_sync();
     std::vector<double> samples;
     samples.reserve(kIters);
     for (int i = 0; i < kIters; ++i) {
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+        if (prepare) { prepare(); dev_sync(); }
+#endif
         const auto t0 = std::chrono::steady_clock::now();
         once();
         dev_sync();
@@ -385,6 +400,13 @@ bool BenchReport::measure_vs_baseline(
     // 4. The vendor. Same warmup/iters and the same median, so the two divide.
     baseline::Timing bt;
     const baseline::Status bs = base(&bt);
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+    if (!bt.method.empty()) {
+        row.tag("baseline_method", bt.method)
+           .tag("baseline_timing_scope", "operator call; preparation excluded")
+           .num("baseline_prepare_ms", bt.prepare_ms);
+    }
+#endif
     if (!bs.ok) {
         row.baseline_status = baseline::available() ? "failed" : "unavailable";
         row.baseline_detail = bs.reason;

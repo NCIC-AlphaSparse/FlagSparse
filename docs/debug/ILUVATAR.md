@@ -16,8 +16,8 @@
 排在交付收窄参数后面，所以 dtype 限制照样生效。因机器而异的只有下面的环境准备。
 
 ```bash
-export FLAGSPARSE_GPUS=0   # 物理卡号；识别不出 Iluvatar 时（CoreX 标签和 COREX_HOME 都没有）再加 FLAGSPARSE_BACKEND=iluvatar
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+# 识别不出 Iluvatar 时（CoreX 标签和 COREX_HOME 都没有）在前面加 FLAGSPARSE_BACKEND=iluvatar
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 0 > delivery_105.log 2>&1 < /dev/null &   # 物理卡号，逗号分隔；多卡如 --gpus 0,1
 # 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
 # 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```

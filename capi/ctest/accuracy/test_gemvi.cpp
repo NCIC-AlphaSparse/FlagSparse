@@ -157,6 +157,11 @@ TEST_F(GemviAccuracy, SplitRouteMatchesTheOracle) {
                                nnz, 0, cd(1.0, 0.5), cd(0.0, 0.0), 1e-4);
 }
 
+TEST_F(GemviAccuracy, ComplexNonTransposeSplitWithPaddedLdaAndBeta) {
+    check<std::complex<float>>(handle.h, FLAGSPARSE_C_32F, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                               4096, 2048, 1024, 5, cd(1.25, -0.5), cd(-0.25, 0.75), 1e-4);
+}
+
 TEST_F(GemviAccuracy, RejectsWhatCusparseGemviDoesNot) {
     size_t bytes = 0;
     EXPECT_EQ(flagsparseGemvi_bufferSize(handle.h, FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, 4, 4,

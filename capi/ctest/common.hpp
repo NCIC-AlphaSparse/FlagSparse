@@ -348,11 +348,17 @@ class BenchReport {
     //            result where verify can see it (SpGEMM allocates its own C and
     //            frees it). Then baseline_accuracy stays "unchecked" instead of
     //            re-reading OUR result and calling the baseline correct.
+    // MUSA's optional prepare restores in-place inputs before every call,
+    // synchronized outside the timer, matching the vendor adapter's reset.
     bool measure_vs_baseline(
         BenchRow row, const std::function<flagsparseStatus_t()>& once,
         const std::function<double(bool)>& verify,
         const std::function<baseline::Status(baseline::Timing*)>& base, double flops,
-        bool baseline_writes_output = true);
+        bool baseline_writes_output = true
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+        , const std::function<void()>& prepare = {}
+#endif
+        );
 
     // Record a case that was never measured -- no descriptor, unsupported shape.
     void skip(BenchRow row, const std::string& status, const std::string& detail);

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "adaptor/adaptor.hpp"
 
 using namespace fstest;
 
@@ -1193,5 +1194,83 @@ TEST_F(SpMMAccuracy, CsrComplex64TransposeAndConjugateTranspose) {
     }
 }
 
+
+
+TEST_F(SpMMAccuracy, MusaTransposeGatherLiveOperandsAndLayouts) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    for (bool coo : {false, true}) for (int repeat : {1, 10, 40})
+    for (bool padded : {false, true}) {
+        const float alpha = coo ? 1.25f : 1.f, beta = coo ? -0.5f : 0.f;
+        SCOPED_TRACE("coo=" + std::to_string(coo) + " repeat=" + std::to_string(repeat) + " padded=" + std::to_string(padded));
+        std::vector<int32_t> rr, cc, cp{0};
+        std::vector<float> av;
+        for (int r = 0; r < 4; ++r) {
+            for (int j = 0; j < repeat; ++j) {
+                rr.push_back(r); cc.push_back((r + j) % 5);
+                av.push_back(float((r + j) % 7 - 3));
+            }
+        }
+        std::vector<int32_t> ri;
+        std::vector<float> cv;
+        for (int c = 0; c < 5; ++c) {
+            for (size_t z = 0; z < cc.size(); ++z) if (cc[z] == c) {
+                ri.push_back(rr[z]); cv.push_back(av[z]);
+            }
+            cp.push_back(static_cast<int32_t>(ri.size()));
+        }
+        auto dr = DeviceBuffer::from(coo ? rr : cp);
+        auto dc = DeviceBuffer::from(coo ? cc : ri);
+        auto values = coo ? av : cv;
+        auto dv = DeviceBuffer::from(values);
+        const int ld = padded ? 11 : 8;
+        std::vector<float> bv(4 * ld), initial(5 * ld, -99.f);
+        for (int r = 0; r < 4; ++r) for (int j = 0; j < 8; ++j) bv[r * ld + j] = float(r - j);
+        for (int r = 0; r < 5; ++r) for (int j = 0; j < 8; ++j) initial[r * ld + j] = float(r + j);
+        auto db = DeviceBuffer::from(bv), dy = DeviceBuffer::from(initial);
+        flagsparseSpMatDescr_t a = nullptr;
+        flagsparseDnMatDescr_t b = nullptr, y = nullptr;
+        ASSERT_EQ(coo ? flagsparseCreateCoo(&a, 4, 5, av.size(), dr.get(), dc.get(), dv.get(),
+            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F)
+            : flagsparseCreateCsc(&a, 4, 5, av.size(), dr.get(), dc.get(), dv.get(),
+            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F),
+            FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnMat(&b, 4, 8, ld, db.get(), FLAGSPARSE_R_32F, FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnMat(&y, 5, 8, ld, dy.get(), FLAGSPARSE_R_32F, FLAGSPARSE_ORDER_ROW), FLAGSPARSE_STATUS_SUCCESS);
+        if (!coo) {
+            const float unsupported_alpha = 1.25f;
+            EXPECT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+                FLAGSPARSE_OPERATION_NON_TRANSPOSE, &unsupported_alpha, a, b, &beta, y,
+                FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_NOT_SUPPORTED);
+        }
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+            FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, a, b, &beta, y, FLAGSPARSE_R_32F,
+            FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+        DeviceBuffer scratch(bytes ? bytes : 1), second(bytes ? bytes : 1);
+        ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+            FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, a, b, &beta, y, FLAGSPARSE_R_32F,
+            FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+        for (int step = 0; step < 2; ++step) {
+            SCOPED_TRACE("step=" + std::to_string(step));
+            if (step) {
+                for (auto& v : values) v += 1.f;
+                for (auto& v : av) v += 1.f;
+                for (auto& v : bv) v -= 2.f;
+                ASSERT_EQ(to_device(dv.get(), values.data(), values.size() * sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(to_device(db.get(), bv.data(), bv.size() * sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+            }
+            ASSERT_EQ(to_device(dy.get(), initial.data(), initial.size() * sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(flagsparseSpMM(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE,
+                FLAGSPARSE_OPERATION_NON_TRANSPOSE, &alpha, a, b, &beta, y, FLAGSPARSE_R_32F,
+                FLAGSPARSE_SPMM_ALG_DEFAULT, step ? second.get() : scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+            auto expected = initial;
+            for (int r = 0; r < 5; ++r) for (int j = 0; j < 8; ++j) expected[r * ld + j] *= beta;
+            for (size_t z = 0; z < av.size(); ++z) for (int j = 0; j < 8; ++j)
+                expected[cc[z] * ld + j] += alpha * av[z] * bv[rr[z] * ld + j];
+            EXPECT_EQ(dy.download<float>(initial.size()), expected) << "coo=" << coo << " repeat=" << repeat << " padded=" << padded;
+        }
+        flagsparseDestroyDnMat(y); flagsparseDestroyDnMat(b); flagsparseDestroySpMat(a);
+    }
+}
 
 }  // namespace

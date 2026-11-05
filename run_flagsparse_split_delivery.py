@@ -93,6 +93,30 @@ CAPI_BACKEND_BY_PYTEST_BACKEND = {
     "iluvatar": "IX",
 }
 
+# The variable each backend's runtime reads to pick the C API's device: the
+# runtime's own name (MUSA_VISIBLE_DEVICES for the MUSA runtime, not yet checked
+# with more than one card on the S5000). Any other backend keeps whatever the
+# caller exported.
+CAPI_DEVICE_MASK_BY_PYTEST_BACKEND = {
+    "mthreads": "MUSA_VISIBLE_DEVICES",
+    "cuda": "CUDA_VISIBLE_DEVICES",
+    "iluvatar": "CUDA_VISIBLE_DEVICES",
+}
+
+
+def capi_device_env(backend: str, gpus: str) -> dict[str, str]:
+    """The device mask for the C API half: the FIRST card of --gpus.
+
+    ctest runs the benchmark families one after another in one build tree, so the
+    C API half uses a single card; the pytest half spreads its operators over all
+    of --gpus. Without this the C API ran on device 0 whatever --gpus said, i.e.
+    on a card the caller had not asked for.
+    """
+    first = next((item.strip() for item in gpus.split(",") if item.strip()), "0")
+    key = CAPI_DEVICE_MASK_BY_PYTEST_BACKEND.get(backend)
+    return {key: first} if key else {}
+
+
 # --h800-reference: the card each backend's C API run is rescaled to (the keys of
 # tools/baseline_bound.py's VENDOR_BANDWIDTH_GBS). --vendor-card overrides it.
 H800_CARD_BY_PYTEST_BACKEND = {
@@ -229,6 +253,10 @@ def run_capi_benchmark(args: argparse.Namespace, bench_out: Path) -> int:
     )
     env["FLAGSPARSE_MATRIX_DIR"] = str(matrix_dir)
     env["FLAGSPARSE_BENCH_OUT"] = str(bench_out.resolve())
+    device_env = capi_device_env(args.backend, args.gpus)
+    env.update(device_env)
+    for key, value in device_env.items():
+        print(f"C API device: {key}={value} (first card of --gpus {args.gpus})", flush=True)
     # Only the entries tagged with a delivery variant id run, each in the exact
     # configuration its id names; the ordinary per-dtype sweep rows would measure
     # the same kernels a second time under the benchmark's default layout/op.
@@ -519,7 +547,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", default="quick", choices=("quick", "normal"),
                          help="Same as run_flagsparse_pytest.py --mode; pytest side only.")
     parser.add_argument("--gpus", default="0",
-                         help="Same as run_flagsparse_pytest.py --gpus; pytest side only.")
+                         help="Same as run_flagsparse_pytest.py --gpus for the pytest side "
+                              "(operators spread over the cards); the C API side runs on "
+                              "the first card.")
     parser.add_argument("--results-dir", default=None,
                          help="pytest accuracy results dir (default: pytest_results_<backend>_split_accuracy).")
     parser.add_argument(

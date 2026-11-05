@@ -422,6 +422,12 @@ def flagsparse_axpby(
         _ACCEL.synchronize()
         t0 = time.perf_counter()
     if (
+        _is_maca_runtime() and y.dtype == torch.complex64
+        and y.numel() <= 4 * 1024 * 1024
+    ):
+        from ._vector_maca import axpby_complex
+        axpby_complex(values, indices, y, a_re, a_im, b_re, b_im)
+    elif (
         _is_mthreads_runtime() and y.dtype in (torch.float16, torch.bfloat16)
         and y.numel() <= 4 * 1024 * 1024
     ):
@@ -599,10 +605,26 @@ def flagsparse_spvv(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    # Match the ROCm PyTorch baseline for the variants whose Triton reduction
-    # is launch-bound.  Keeping the expression native is also important for
-    # complex values: the real-plane fallback needs two extra reductions.
-    if _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
+    # MUSA half dots use one/two deterministic Triton reductions with FP32 output.
+    if _is_mthreads_runtime() and values.dtype == torch.float16:
+        from ._vector_musa import spvv_half
+
+        result = spvv_half(values, kernel_idx, y)
+    elif _is_mthreads_runtime() and values.dtype == torch.int8:
+        from ._vector_musa import spvv_int8
+
+        result = spvv_int8(values, kernel_idx, y, compute)
+    elif (_is_maca_runtime() and values.dtype in (torch.float32, torch.complex64)
+            and values.numel() <= 65536
+            and (values.numel() <= 4096 or not torch.are_deterministic_algorithms_enabled())):
+        # MACA dots use one-block reduction or a direct sum into independent output.
+        # Floating-point atomics are excluded when deterministic algorithms are required.
+        from ._vector_maca import spvv
+
+        result = spvv(values, kernel_idx, y, op == "conj")
+    elif _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
+        # Match the native ROCm baseline for launch-bound reductions; complex
+        # real-plane fallbacks would need two additional reduction launches.
         idx = kernel_idx.to(torch.int64)
         rhs = y.index_select(0, idx).to(compute)
         lhs = values.to(compute)

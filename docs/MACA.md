@@ -604,6 +604,13 @@ nnz x K 的中间张量，因此这个加速比高于与真正厂商 SDDMM 对�
 CSV 的有效字段为
 `pytorch_ms` 与 `triton_speedup_vs_pytorch`；仅精度 `PASS` 且两侧时延有效的行参与加速比汇总。
 
+2026-11-03 起，MACA 的 9 个 q4 SDDMM 变体也接入上述取数/相乘/求和备用基线。
+`sampled_addmm` 异常或校验不通过时启用备用路径，备用输出（含实际计时返回值）仍须通过 CPU
+高精度参考校验；最终失败不发布时延。CSV 用 `pytorch_formulation=gather/multiply/sum`
+标识实际公式，`pytorch_sampled_addmm_reason` 保留原 API 失败原因。float16 输入以 float32
+计算，`pytorch_compute_dtype` 明确记录；不把该表达式或 H800 折算当作本机厂商基线。
+此改动只影响 MACA 的性能基准接线，不修改算子 kernel 或其他后端行为。
+
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --gpus 0 \
   --ops sddmm_csr --benchmark-input /root/gcx/matrix \
@@ -632,10 +639,13 @@ env PYTHONPATH=src FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch \
   --results-dir results_metax_spgemm_<日期>
 ```
 
-本节 SpGEMM 只使用本机 PyTorch CSR baseline，不开启 H800 折算。MACA 的 float32/float64
+本节 SpGEMM 只使用本机 PyTorch CSR baseline，不开启 H800 折算。MACA 的 float32/float64/complex64
 计算路径为纯 Triton：metadata、行内排序归并、长行全局哈希、CSR 前缀扫描和结果压紧均不依赖
 TLE，也不调用 `torch.sparse.mm` 或旧的 PyTorch ESC。PyTorch 仅用于存储分配和独立 baseline；
-公共接口仍执行原有输入校验、输入 contiguous 和 out 写回。
+公共接口仍执行原有输入校验、输入 contiguous 和 out 写回。2026-11-03 已将 complex64
+接入同一个纯 Triton 实现，复数的实部/虚部乘法、归约和输出均在 kernel 内完成；
+`torch.view_as_real` 只用于存储视图。与三个 CSC 慢项的优化及 10 矩阵复测结果见
+[`debug/MACA.md`](debug/MACA.md) 的“2026-11-03：四个低于 0.8x 变体的 MACA 优化”一节。
 CUDA、ROCm 及其他后端的 baseline 路径不变。
 
 ### 7.4 交付性能：只跑交付范围（2026-09-18 实测）

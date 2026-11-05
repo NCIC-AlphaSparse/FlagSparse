@@ -18,9 +18,16 @@
 #include <gtest/gtest.h>
 
 #include <complex>
+#include <cstring>
+#include <limits>
 #include <memory>
 
 #include "common.hpp"
+#include "adaptor/adaptor.hpp"
+
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+#include <musa.h>
+#endif
 
 using namespace fstest;
 
@@ -1430,9 +1437,14 @@ TEST_F(SpMVAccuracy, RealFloat32ByComplex64ScatterRoutes) {
         ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, c.op, one, matA, vecX, zero, vecY,
                                             FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes),
                   FLAGSPARSE_STATUS_SUCCESS);
-        EXPECT_EQ(bytes, 0u);
+        const bool musa_csr = !c.coo &&
+            std::string(flagsparse::adaptor::backend_name()) == "musa";
+        if (musa_csr) EXPECT_GT(bytes, 0u);
+        else EXPECT_EQ(bytes, 0u);
+        DeviceBuffer scratch(bytes);
+        // Preprocessing is optional: the MUSA CSR gather builds lazily here.
         ASSERT_EQ(flagsparseSpMV(handle.h, c.op, one, matA, vecX, zero, vecY, FLAGSPARSE_C_32F,
-                                 FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr),
+                                 FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get()),
                   FLAGSPARSE_STATUS_SUCCESS);
         dev_sync();
         EXPECT_EQ(d_y.download<float>(c.expect.size()), c.expect)
@@ -1443,5 +1455,181 @@ TEST_F(SpMVAccuracy, RealFloat32ByComplex64ScatterRoutes) {
     }
 }
 
+
+
+template <typename Index>
+void check_musa_real_complex_transpose(flagsparseHandle_t handle) {
+    using C = std::complex<float>;
+    const auto index_type = sizeof(Index) == 4 ? FLAGSPARSE_INDEX_32I : FLAGSPARSE_INDEX_64I;
+    constexpr int m = 337, n = 131;
+    for (auto op : {FLAGSPARSE_OPERATION_TRANSPOSE, FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE}) {
+        SCOPED_TRACE(static_cast<int>(op));
+        std::vector<Index> ptr(m + 1, 0), cols;
+        std::vector<float> values;
+        for (int row = 0; row < m; ++row) {
+            auto add = [&](int col, float value) { cols.push_back(col); values.push_back(value); };
+            if (row == 0) add(130, 0.0746898427605629f);
+            if (row == 1) { add(0, 2.f); add(0, -1.f); }  // duplicate column
+            if (row == 2) add(130, -37.02705764770508f);
+            if (row == m - 1) add(130, 37.02705764770508f);
+            if (row == 111) {
+                for (int i = 0; i < 131; ++i) add(7, (i % 3 - 1) * .01f);
+            }
+            ptr[row + 1] = static_cast<Index>(cols.size());
+        }
+        std::vector<C> rhs(m, C(2.f, -2.f));
+        rhs[0] = C(1.5f, -1.5f);
+        const std::vector<C> initial(n, C(std::numeric_limits<float>::quiet_NaN(), 99.f));
+        auto dp = DeviceBuffer::from(ptr), di = DeviceBuffer::from(cols);
+        auto dv = DeviceBuffer::from(values), dx = DeviceBuffer::from(rhs), dy = DeviceBuffer::from(initial);
+        flagsparseSpMatDescr_t a = nullptr;
+        flagsparseDnVecDescr_t x = nullptr, y = nullptr;
+        ASSERT_EQ(flagsparseCreateCsr(&a, m, n, values.size(), dp.get(), di.get(), dv.get(),
+            index_type, index_type, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnVec(&x, m, dx.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnVec(&y, n, dy.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        const C one(1, 0), zero(0, 0), two(2, 0);
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMV_bufferSize(handle, op, &one, a, x, &zero, y, FLAGSPARSE_C_32F,
+            FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_GT(bytes, 0u);
+        DeviceBuffer scratch_a(bytes), scratch_b(bytes);
+        ASSERT_EQ(flagsparseSpMV_preprocess(handle, op, &one, a, x, &zero, y, FLAGSPARSE_C_32F,
+            FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_INVALID_VALUE);
+        ASSERT_EQ(flagsparseSpMV(handle, op, &one, a, x, &zero, y, FLAGSPARSE_C_32F,
+            FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_INVALID_VALUE);
+        ASSERT_EQ(flagsparseSpMV(handle, op, &two, a, x, &zero, y, FLAGSPARSE_C_32F,
+            FLAGSPARSE_SPMV_ALG_DEFAULT, scratch_a.get()), FLAGSPARSE_STATUS_NOT_SUPPORTED);
+        ASSERT_EQ(flagsparseSpMV_preprocess(handle, op, &one, a, x, &zero, y, FLAGSPARSE_C_32F,
+            FLAGSPARSE_SPMV_ALG_DEFAULT, scratch_a.get()), FLAGSPARSE_STATUS_SUCCESS);
+        for (int step = 0; step < 6; ++step) {
+            SCOPED_TRACE(step);
+            if (step == 1) {
+                for (auto& value : values) value *= .5f;
+                for (auto& value : rhs) value += C(.25f, -.5f);
+                ASSERT_EQ(to_device(dv.get(), values.data(), values.size() * sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(to_device(dx.get(), rhs.data(), rhs.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+            }
+            if (step == 2 || step == 3) {
+                for (auto& col : cols) if (col == (step == 2 ? 130 : 129)) --col;
+                ASSERT_EQ(to_device(di.get(), cols.data(), cols.size() * sizeof(Index)), FLAGSPARSE_STATUS_SUCCESS);
+                if (step == 2) {
+                    ASSERT_EQ(flagsparseSpMV_preprocess(handle, op, &one, a, x, &zero, y, FLAGSPARSE_C_32F,
+                        FLAGSPARSE_SPMV_ALG_DEFAULT, scratch_a.get()), FLAGSPARSE_STATUS_SUCCESS);
+                } else {
+                    ASSERT_EQ(flagsparseCsrSetPointers(a, dp.get(), di.get(), dv.get()), FLAGSPARSE_STATUS_SUCCESS);
+                }
+            }
+            std::vector<std::complex<double>> ref(n);
+            for (int row = 0; row < m; ++row) {
+                for (Index p = ptr[row]; p < ptr[row + 1]; ++p)
+                    ref[cols[p]] += static_cast<double>(values[p]) * std::complex<double>(rhs[row]);
+            }
+            std::vector<double> expected;
+            for (const auto& value : ref) {
+                expected.push_back(static_cast<float>(value.real()));
+                expected.push_back(static_cast<float>(value.imag()));
+            }
+            void* scratch = step == 4 ? scratch_b.get() : scratch_a.get();
+            std::vector<C> first;
+            for (int repeat = 0; repeat < 16; ++repeat) {
+                ASSERT_EQ(to_device(dy.get(), initial.data(), initial.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(flagsparseSpMV(handle, op, &one, a, x, &zero, y, FLAGSPARSE_C_32F,
+                    FLAGSPARSE_SPMV_ALG_DEFAULT, scratch), FLAGSPARSE_STATUS_SUCCESS);
+                dev_sync();
+                const auto got = dy.download<C>(n);
+                std::vector<double> actual;
+                for (const auto& value : got) { actual.push_back(value.real()); actual.push_back(value.imag()); }
+                ASSERT_LE(max_error_ratio(actual, expected, default_tolerance(FLAGSPARSE_C_32F)), 1.0);
+                if (repeat == 0) first = got;
+                else EXPECT_EQ(std::memcmp(first.data(), got.data(), n * sizeof(C)), 0);
+            }
+        }
+        flagsparseDestroyDnVec(y); flagsparseDestroyDnVec(x); flagsparseDestroySpMat(a);
+    }
+}
+
+TEST_F(SpMVAccuracy, MusaRealComplexTransposeCancellationAndLiveTopology) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    check_musa_real_complex_transpose<int32_t>(handle.h);
+    check_musa_real_complex_transpose<int64_t>(handle.h);
+}
+
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+TEST_F(SpMVAccuracy, MusaRealComplexTransposeNondefaultStream) {
+    struct Stream {
+        MUstream value = nullptr;
+        ~Stream() { if (value) muStreamDestroy(value); }
+    } stream;
+    ASSERT_EQ(muStreamCreate(&stream.value, MU_STREAM_NON_BLOCKING), MUSA_SUCCESS);
+    ASSERT_EQ(flagsparseSetStream(handle.h, reinterpret_cast<flagsparseStream_t>(stream.value)),
+              FLAGSPARSE_STATUS_SUCCESS);
+    check_musa_real_complex_transpose<int32_t>(handle.h);
+    ASSERT_EQ(flagsparseSetStream(handle.h, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+}
+#endif
+
+TEST_F(SpMVAccuracy, MusaRealComplexTransposeEmptyInputs) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    using C = std::complex<float>;
+    for (const auto& shape : {std::pair<int, int>{0, 5}, {7, 5}, {7, 0}}) {
+        const int m = shape.first, n = shape.second;
+        auto dp = DeviceBuffer::from(std::vector<int32_t>(m + 1, 0));
+        auto dx = DeviceBuffer::from(std::vector<C>(m, C(1, 2)));
+        auto dy = DeviceBuffer::from(std::vector<C>(n, C(99, 99)));
+        flagsparseSpMatDescr_t a = nullptr;
+        flagsparseDnVecDescr_t x = nullptr, y = nullptr;
+        ASSERT_EQ(flagsparseCreateCsr(&a, m, n, 0, dp.get(), nullptr, nullptr, FLAGSPARSE_INDEX_32I,
+            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnVec(&x, m, dx.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnVec(&y, n, dy.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+        const C one(1, 0), zero(0, 0);
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMV_bufferSize(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, &one, a, x,
+            &zero, y, FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+        DeviceBuffer scratch(bytes);
+        ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_TRANSPOSE, &one, a, x, &zero, y,
+            FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+        EXPECT_EQ(dy.download<C>(n), std::vector<C>(n, C(0, 0)));
+        flagsparseDestroyDnVec(y); flagsparseDestroyDnVec(x); flagsparseDestroySpMat(a);
+    }
+}
+
+TEST_F(SpMVAccuracy, MusaCscConjugateDirectReadsLiveValues) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    using C = std::complex<float>;
+    const std::vector<int32_t> ptr{0, 2, 2, 3, 4}, idx{0, 0, 2, 1};
+    std::vector<C> values{C(1, 2), C(-2, 1), C(3, -1), C(2, 4)};
+    std::vector<C> rhs{C(2, 1), C(-1, 3), C(1, -2), C(4, 1), C(2, -3)};
+    const std::vector<C> initial(4, C(1, -1));
+    const C alpha(1.25f, -0.75f), beta(-0.5f, 0.25f);
+    auto dp = DeviceBuffer::from(ptr), di = DeviceBuffer::from(idx), dv = DeviceBuffer::from(values);
+    auto dx = DeviceBuffer::from(rhs), dy = DeviceBuffer::from(initial);
+    flagsparseSpMatDescr_t a = nullptr;
+    flagsparseDnVecDescr_t x = nullptr, y = nullptr;
+    ASSERT_EQ(flagsparseCreateCsc(&a, 5, 4, 4, dp.get(), di.get(), dv.get(), FLAGSPARSE_INDEX_32I,
+        FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&x, 5, dx.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    ASSERT_EQ(flagsparseCreateDnVec(&y, 4, dy.get(), FLAGSPARSE_C_32F), FLAGSPARSE_STATUS_SUCCESS);
+    for (int step = 0; step < 2; ++step) {
+        if (step) {
+            for (auto& v : values) v *= C(0.5f, 0.25f);
+            for (auto& v : rhs) v += C(2, -1);
+            ASSERT_EQ(to_device(dv.get(), values.data(), values.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(to_device(dx.get(), rhs.data(), rhs.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+        }
+        ASSERT_EQ(to_device(dy.get(), initial.data(), initial.size() * sizeof(C)), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseSpMV(handle.h, FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE, &alpha, a, x,
+            &beta, y, FLAGSPARSE_C_32F, FLAGSPARSE_SPMV_ALG_DEFAULT, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+        auto got = dy.download<C>(4);
+        for (int col = 0; col < 4; ++col) {
+            C expected = beta * initial[col];
+            for (int p = ptr[col]; p < ptr[col + 1]; ++p) expected += alpha * std::conj(values[p]) * rhs[idx[p]];
+            EXPECT_NEAR(got[col].real(), expected.real(), 1e-5);
+            EXPECT_NEAR(got[col].imag(), expected.imag(), 1e-5);
+        }
+    }
+    flagsparseDestroyDnVec(y); flagsparseDestroyDnVec(x); flagsparseDestroySpMat(a);
+}
 
 }  // namespace

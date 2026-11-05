@@ -101,6 +101,7 @@ class PreparedCscSpmv:
         "col_ids",
         "csr_delegate",
         "non_gather_plan",
+        "maca_trans_plan",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -148,6 +149,13 @@ class PreparedCscSpmv:
         self.col_ids = col_ids
         self.csr_delegate = csr_delegate
         self.non_gather_plan = None
+        self.maca_trans_plan = None
+        if (_is_maca_runtime() and _spmv_csc_op_transposes(
+                _normalize_spmv_csc_op(op, transpose=transpose))
+                and data.dtype in (torch.float32, torch.complex64)):
+            from . import _spmv_csr_transpose
+            self.maca_trans_plan = _spmv_csr_transpose.make_plan(
+                kernel_indices, kernel_indptr, None, self.n_cols)
         if (_normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_NON
                 and ((_SPMV_CSC_CUDA and data.dtype == torch.complex64)
                      or (_is_rocm_runtime() and not _is_ascend_runtime()
@@ -692,6 +700,11 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if trans and prepared.maca_trans_plan is not None:
+        from . import _spmv_csr_transpose
+        return _spmv_csr_transpose.gather(
+            prepared.data, x, prepared.maca_trans_plan, out_len,
+            conjugate=op_code == SPMV_CSC_OP_CONJ_TRANS)
     if not trans and prepared.non_gather_plan is not None:
         from . import _spmv_csr_transpose
         return _spmv_csr_transpose.gather(prepared.data, x, prepared.non_gather_plan, out_len)
@@ -871,6 +884,7 @@ def _run_spmv_csc_prepared_with_fallback(prepared, x, op_code):
 
 _SPMV_CSC_VIA_MIXED_DTYPES = (torch.float16, torch.bfloat16, torch.int8)
 _ROCM_CSC_GATHER_CACHE = TensorPlanCache()
+_MACA_CSC_INT_CACHE = TensorPlanCache()
 
 
 def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype,
@@ -887,6 +901,40 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
     if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
         raise ValueError("invalid CSC dimensions")
     timed = bool(return_time or return_meta)
+    if (_is_maca_runtime() and data.dtype == torch.int8
+            and _mixed_spmx._requested_out_dtype(out, out_dtype) in (None, torch.int32)):
+        from . import _spmv_csr_transpose
+        from ._spmv_csc_maca import int_gather
+
+        _mixed_spmx._check_1d((data, "data"), (indices, "indices"),
+                              (indptr, "indptr"), (x, "x"))
+        trans = _spmv_csc_op_transposes(op_code)
+        length, input_length = (n_cols, n_rows) if trans else (n_rows, n_cols)
+        if x.numel() != input_length:
+            raise ValueError("x shape does not match CSC operation")
+        if any(t.device != data.device for t in (indices, indptr, x)):
+            raise ValueError("CSC inputs must be on the same device")
+        if indices.dtype not in SUPPORTED_INDEX_DTYPES or indptr.dtype not in SUPPORTED_INDEX_DTYPES:
+            raise TypeError("indices and indptr must be int32 or int64")
+        result_dtype, _ = _mixed_spmx._resolve_types(data.dtype, x.dtype, out, out_dtype, False)
+        if out is not None and (out.shape != (length,) or out.device != data.device):
+            raise ValueError("out shape/device must match the CSC SpMV result")
+        t0 = _mixed_spmx._start(timed)
+        sources, options = (indices, indptr), (n_rows, n_cols, trans)
+        plan = _MACA_CSC_INT_CACHE.get(sources, options)
+        if plan is None:
+            plan = (_spmv_csr_transpose.make_plan(indices.contiguous(), indptr.contiguous(), None, n_cols)
+                    if trans else _spmv_csr_transpose.prepare(indices, indptr, (n_cols, n_rows)))
+            _MACA_CSC_INT_CACHE.put(sources, options, plan)
+        y = int_gather(data, x, plan, length, result_dtype, out)
+        y = _mixed_spmx._finish(y, out, t0, timed)
+        if not timed:
+            return y
+        y, elapsed = y
+        if return_meta:
+            meta = {"route": "maca_csc_int_gather", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     if (
         _is_iluvatar_runtime()
         and data.dtype == torch.float16
@@ -959,6 +1007,9 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
             data, indices, indptr, x, (n_cols, n_rows),
             out=out, out_dtype=out_dtype, return_time=timed,
         )
+    elif _is_mthreads_runtime() and data.dtype == torch.int8:
+        y = _mixed_spmx._musa_csc_spmv(
+            data, indices, indptr, x, shape, out=out, out_dtype=out_dtype, return_time=timed)
     elif (_SPMV_CSC_CUDA or _is_maca_runtime() or _is_mthreads_runtime()) and data.dtype == torch.float16:
         y = _mixed_spmx.spmv_csc_half(
             data, indices, indptr, x, shape, out=out, out_dtype=out_dtype, return_time=timed)

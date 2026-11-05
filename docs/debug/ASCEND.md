@@ -22,8 +22,7 @@
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh   # 没 source 的话入口找不到 NPU，会直接报错退出
-export FLAGSPARSE_GPUS=6,7
-setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py > delivery_105.log 2>&1 < /dev/null &
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_delivery.py --gpus 6,7 > delivery_105.log 2>&1 < /dev/null &
 # 日志第一行是 [delivery] backend=… results=<结果目录>；先用 --dry-run 看一眼解析出的命令也行
 # 跑完后交付表已经打在日志末尾，也写进了 <结果目录>/delivery_table.txt
 ```

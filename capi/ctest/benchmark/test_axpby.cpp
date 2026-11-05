@@ -46,6 +46,10 @@ TEST(AxpbyBenchmark, SparseVector) {
             g_report.skip(std::move(row), "skipped_memory", "device allocation failed");
             continue;
         }
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+        const auto initial_bytes = d_y.download<unsigned char>(4 * elem_bytes(dt));
+        auto reset_y = [&] { to_device(d_y.get(), initial_bytes.data(), initial_bytes.size()); };
+#endif
         flagsparseSpVecDescr_t x = nullptr;
         flagsparseDnVecDescr_t y = nullptr;
         if (flagsparseCreateSpVec(&x, 4, 3, d_idx.get(), d_x.get(), FLAGSPARSE_INDEX_32I,
@@ -60,10 +64,21 @@ TEST(AxpbyBenchmark, SparseVector) {
             std::move(row),
             [&]() { return flagsparseAxpby(handle.h, alpha, x, beta, y); },
             [&](bool relaxed) { return ratio_against(d_y.get(), ref, dt, relaxed); },
-            [&](baseline::Timing*) {
+            [&](baseline::Timing* t) {
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+                reset_y();
+                dev_sync();
+                return baseline::axpby(d_x.get(), d_idx.get(), d_y.get(), 3, 4, alpha, beta,
+                                       dt, BenchReport::kWarmup, BenchReport::kIters, t);
+#else
                 return baseline::Status::no("no matching cuSPARSE Axpby baseline in harness");
+#endif
             },
-            0.0);
+            0.0, true
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+            , reset_y
+#endif
+            );
         flagsparseDestroyDnVec(y);
         flagsparseDestroySpVec(x);
     }

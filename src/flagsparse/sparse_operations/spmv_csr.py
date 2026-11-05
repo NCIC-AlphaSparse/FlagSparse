@@ -1184,10 +1184,11 @@ def prepare_spmv_csr(
     # enough entries per row to amortize the reduction. Very sparse complex
     # matrices retain segbin, which avoids long-row imbalance in this regime.
     elif (not transpose and requested_alg == "auto" and config is None
-          and data.dtype in (torch.float16, torch.complex64)
+          and (data.dtype in (torch.float16, torch.complex64)
+               or (_is_mthreads_runtime() and data.dtype == torch.bfloat16))
           and (_backend_name() == "cuda" or
                (_is_iluvatar_runtime() and data.dtype in (torch.float16, torch.complex64)) or
-               (_is_mthreads_runtime() and data.dtype == torch.float16) or
+               (_is_mthreads_runtime() and data.dtype in (torch.float16, torch.bfloat16)) or
                (_is_maca_runtime() and
                 (data.dtype == torch.float16 or data.numel() > 4 * n_rows)))):
         from . import _spmv_csr_transpose
