@@ -11,6 +11,78 @@ import triton.language as tl
 
 
 @triton.jit
+def musa_csr_spmv_trans_real_complex_f64(V, P, ORDER, ROWS, X, Y, M,
+                                       R: tl.constexpr, K: tl.constexpr,
+                                       WIDE: tl.constexpr = False):
+    # One owner per output column. FP64 products/sums preserve small terms when
+    # large FP32 contributions cancel, independently of source scheduling.
+    row = (tl.program_id(0).to(tl.int64) if WIDE else tl.program_id(0)) * R + tl.arange(0, R)
+    active = row < M
+    start = tl.load(P + row, active, other=0)
+    end = tl.load(P + row + 1, active, other=0)
+    if WIDE:
+        start = start.to(tl.int64)
+        end = end.to(tl.int64)
+    lane = tl.arange(0, K)
+    re = tl.zeros((R, K), tl.float64)
+    im = tl.zeros((R, K), tl.float64)
+    for base in range(0, tl.max(end - start, 0), K):
+        pos = start[:, None] + base + lane[None, :]
+        valid = active[:, None] & (pos < end[:, None])
+        src = tl.load(ORDER + pos, valid, other=0)
+        col = tl.load(ROWS + pos, valid, other=0)
+        if WIDE:
+            src = src.to(tl.int64)
+            col = col.to(tl.int64)
+        value = tl.load(V + src, valid, other=0.).to(tl.float64)
+        xr = tl.load(X + 2 * col, valid, other=0.).to(tl.float64)
+        xi = tl.load(X + 2 * col + 1, valid, other=0.).to(tl.float64)
+        re += value * xr
+        im += value * xi
+    tl.store(Y + 2 * row, tl.sum(re, 1).to(tl.float32), active)
+    tl.store(Y + 2 * row + 1, tl.sum(im, 1).to(tl.float32), active)
+
+
+@triton.jit
+def sparse_gather_spmm_row_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
+                              SBK, SBN, SCM, SCN,
+                              R: tl.constexpr, K: tl.constexpr, BN: tl.constexpr,
+                              COMPLEX: tl.constexpr, CONJ: tl.constexpr,
+                              INDIRECT: tl.constexpr, HAS_BETA: tl.constexpr,
+                              WIDE: tl.constexpr = False):
+    # MUSA, real FP32, eight contiguous dense columns. Keep sparse lanes
+    # independent through the loop and reduce once per output tile.
+    row = (tl.program_id(0).to(tl.int64) if WIDE else tl.program_id(0)) * R + tl.arange(0, R)
+    active = row < M
+    start = tl.load(P + row, active, other=0)
+    end = tl.load(P + row + 1, active, other=0)
+    if WIDE:
+        start = start.to(tl.int64)
+        end = end.to(tl.int64)
+    ns = tl.arange(0, BN)
+    ks = tl.arange(0, K)
+    acc = tl.zeros((R, K, BN), tl.float32)
+    for offset in range(0, tl.max(end-start, 0), K):
+        pos = start[:, None] + offset + ks[None, :]
+        valid = active[:, None] & (pos < end[:, None])
+        src = tl.load(ORDER + pos, valid, other=0) if INDIRECT else pos
+        col = tl.load(COLS + pos, valid, other=0)
+        if WIDE:
+            src = src.to(tl.int64)
+            col = col.to(tl.int64)
+        value = tl.load(V + src, valid, other=0.)
+        dense = tl.load(B + col[:, :, None] * 8 + ns[None, None, :],
+                        valid[:, :, None] & (ns[None, None, :] < 8), other=0.)
+        acc += value[:, :, None] * dense
+    result = ar * tl.sum(acc, 1)
+    out = C + row[:, None] * 8 + ns[None, :]
+    mask = active[:, None] & (ns[None, :] < 8)
+    if HAS_BETA:
+        result += br * tl.load(out, mask, other=0.)
+    tl.store(out, result, mask)
+
+
+@triton.jit
 def sparse_gather_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
                       SBK, SBN, SCM, SCN,
                       R: tl.constexpr, K: tl.constexpr, BN: tl.constexpr,

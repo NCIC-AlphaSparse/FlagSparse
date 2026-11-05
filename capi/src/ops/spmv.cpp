@@ -862,6 +862,47 @@ struct ScatterPlan {
     bool via_scratch = false;   // result narrower than the float32 accumulator
 };
 
+bool musa_csr_real_complex_gather(const SpMatDescr* A, const ScatterPlan& plan) {
+    return plan.real_by_complex && A->format == FLAGSPARSE_FORMAT_CSR &&
+        std::strcmp(adaptor::backend_name(), "musa") == 0;
+}
+
+flagsparseStatus_t run_musa_csr_real_complex_gather(flagsparseHandle_t handle, SpMatDescr* A,
+    const DnVecDescr* X, DnVecDescr* Y, void* buffer) {
+    if (Y->size == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    if (!buffer) {
+        ctx(handle)->last_error =
+            "MUSA real-by-complex CSR transpose requires the topology externalBuffer "
+            "reported by flagsparseSpMV_bufferSize";
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    if (A->sparse_gather_buffer != buffer) {
+        if (auto s = prepare_sparse_gather(A, buffer)) return s;
+    }
+    const double average = static_cast<double>(A->nnz) / std::max<int64_t>(Y->size, 1);
+    const int rows = average <= 4. ? 128 : 16;
+    const int lanes = average <= 4. ? 4 : 8;
+    const size_t ib = gather_index_bytes(A);
+    auto* topology = static_cast<unsigned char*>(buffer);
+    void* order = topology + gather_ptr_count(A) * ib;
+    void* source_rows = topology + (gather_ptr_count(A) + gather_nnz_count(A)) * ib;
+    const char* index_type = gather_i32(A) ? "i32" : "i64";
+    // No alignment hints: user-owned values, vectors and scratch may be views.
+    std::string sig = std::string("*fp32,*") + index_type + ",*" + index_type + ",*" +
+        index_type + ",*fp32,*fp32,i64," + std::to_string(rows) + "," +
+        std::to_string(lanes) + "," + (gather_i32(A) ? "False" : "True");
+    std::vector<jit::Arg> args;
+    for (void* p : {A->values, buffer, order, source_rows, X->values, Y->values})
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p)));
+    args.push_back(jit::Arg::i64v(Y->size));
+    std::string err;
+    auto s = jit::launch(jit::codegen_module("sparse_gather.py"),
+        "musa_csr_spmv_trans_real_complex_f64", sig, ctx(handle)->stream,
+        (Y->size + rows - 1) / rows, 1, 1, 4, 1, args, &err);
+    if (s != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return s;
+}
+
 bool scatter_types(flagsparseDataType_t a, flagsparseDataType_t x, flagsparseDataType_t y,
                    ScatterPlan* plan) {
     if (a == FLAGSPARSE_R_32F && x == FLAGSPARSE_C_32F && y == FLAGSPARSE_C_32F) {
@@ -1340,8 +1381,10 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA));
         const bool direct = A->format == FLAGSPARSE_FORMAT_CSR &&
             !transposes(opA) && ops.complex_op;
+        const bool csc_transpose = A->format == FLAGSPARSE_FORMAT_CSC &&
+            transposes(opA) && A->idx_base == FLAGSPARSE_INDEX_BASE_ZERO;
         const int unit = ops.complex_op ? 2 : 1;
-        if ((indirect && externalBuffer) || direct)
+        if ((indirect && externalBuffer) || direct || csc_transpose)
             return launch_sparse_gather(handle, A, X->values, Y->values,
                 ops.y_len, 1, unit, unit, unit, unit,
                 ops.alpha_re, ops.alpha_im, ops.beta_re, ops.beta_im,
@@ -1379,7 +1422,9 @@ flagsparseStatus_t flagsparseSpMV_bufferSize(
         ScatterPlan scatter;
         if (is_scatter_request(opA, matA, vecX, vecY, &scatter)) {
             if (flagsparseStatus_t s = validate_scatter(handle, opA, matA, vecX, vecY)) return s;
-            if (scatter.via_scratch) {
+            if (musa_csr_real_complex_gather(spmat(matA), scatter)) {
+                *bufferSize = gather_bytes(spmat(matA));
+            } else if (scatter.via_scratch) {
                 *bufferSize = static_cast<size_t>(dnvec(vecY)->size) * sizeof(float);
             }
             return FLAGSPARSE_STATUS_SUCCESS;
@@ -1426,7 +1471,10 @@ flagsparseStatus_t flagsparseSpMV_preprocess(
         bool acc_is_i32 = false;
         ScatterPlan scatter;
         if (is_scatter_request(opA, matA, vecX, vecY, &scatter)) {
-            return validate_scatter(handle, opA, matA, vecX, vecY);  // nothing to precompute
+            if (auto s = validate_scatter(handle, opA, matA, vecX, vecY)) return s;
+            if (musa_csr_real_complex_gather(spmat(matA), scatter))
+                return prepare_sparse_gather(const_cast<SpMatDescr*>(spmat(matA)), externalBuffer);
+            return FLAGSPARSE_STATUS_SUCCESS;  // nothing to precompute
         }
         if (is_mixed_sell_request(opA, matA, vecX, vecY)) {
             return validate_mixed_sell(handle, opA, matA, vecX, vecY,
@@ -1474,6 +1522,9 @@ flagsparseStatus_t flagsparseSpMV(
             if (!is_identity_alpha_beta(handle, computeType, alpha, beta)) {
                 return FLAGSPARSE_STATUS_NOT_SUPPORTED;
             }
+            if (musa_csr_real_complex_gather(spmat(matA), scatter))
+                return run_musa_csr_real_complex_gather(handle,
+                    const_cast<SpMatDescr*>(spmat(matA)), dnvec(vecX), dnvec(vecY), externalBuffer);
             return run_scatter(handle, opA, spmat(matA), dnvec(vecX), dnvec(vecY), scatter,
                                externalBuffer);
         }

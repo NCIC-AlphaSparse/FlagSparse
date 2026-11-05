@@ -85,3 +85,55 @@ __all__ = [
     "gemvi_complex",
     "gemvi_reduce",
 ]
+
+
+@triton.jit
+def gemvi_musa_col(
+    Y, A, X, I, M, NNZ, SO, SK, ar, ai, br, bi, CHUNK, PART,
+    HAS_BETA: tl.constexpr, COMPLEX: tl.constexpr,
+    BO: tl.constexpr, BK: tl.constexpr,
+):
+    # Keep contiguous dense rows on the last tensor axis. Accumulate sparse
+    # lanes separately and reduce once, instead of reducing every loop step.
+    row = tl.program_id(0) * BO + tl.arange(0, BO)
+    split = tl.program_id(1)
+    end = tl.minimum(NNZ, (split + 1) * CHUNK)
+    re = tl.zeros((BK, BO), tl.float32)
+    if COMPLEX:
+        im = tl.zeros((BK, BO), tl.float32)
+    for start in range(split * CHUNK, end, BK):
+        k = start + tl.arange(0, BK)
+        valid = k < end
+        col = tl.load(I + k, valid, other=0)
+        pos = col[:, None].to(tl.int64) * SK + row[None, :] * (2 if COMPLEX else 1)
+        mask = valid[:, None] & (row[None, :] < M)
+        if COMPLEX:
+            av = tl.load(A + pos, mask, other=0.)
+            av_im = tl.load(A + pos + 1, mask, other=0.)
+            xv = tl.load(X + 2 * k, valid, other=0.)
+            xv_im = tl.load(X + 2 * k + 1, valid, other=0.)
+            re += av * xv[:, None] - av_im * xv_im[:, None]
+            im += av * xv_im[:, None] + av_im * xv[:, None]
+        else:
+            av = tl.load(A + pos, mask, other=0.)
+            xv = tl.load(X + k, valid, other=0.)
+            re += av * xv[:, None]
+    vr = tl.sum(re, 0)
+    if COMPLEX:
+        vi = tl.sum(im, 0)
+        rr = ar * vr - ai * vi
+        ri = ar * vi + ai * vr
+        out = Y + split * PART + 2 * row
+        if HAS_BETA:
+            yr = tl.load(out, row < M, other=0.)
+            yi = tl.load(out + 1, row < M, other=0.)
+            rr += br * yr - bi * yi
+            ri += br * yi + bi * yr
+        tl.store(out, rr, row < M)
+        tl.store(out + 1, ri, row < M)
+    else:
+        result = ar * vr
+        out = Y + split * PART + row
+        if HAS_BETA:
+            result += br * tl.load(out, row < M, other=0.)
+        tl.store(out, result, row < M)

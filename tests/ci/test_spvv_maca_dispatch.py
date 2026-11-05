@@ -26,6 +26,7 @@ maca_vector = importlib.import_module("flagsparse.sparse_operations._vector_maca
 )
 @pytest.mark.parametrize("op", ["non", "conj"])
 def test_backend_and_dtype_scope(monkeypatch, maca, dtype, out_dtype, op):
+    monkeypatch.setattr(vector, "_is_mthreads_runtime", lambda: False)
     monkeypatch.setattr(vector, "_is_maca_runtime", lambda: maca)
     monkeypatch.setattr(vector, "_is_rocm_runtime", lambda: False)
     monkeypatch.setattr(vector, "_is_ascend_runtime", lambda: False)

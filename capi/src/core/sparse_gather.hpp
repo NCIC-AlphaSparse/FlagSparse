@@ -125,9 +125,18 @@ inline flagsparseStatus_t launch_sparse_gather(flagsparseHandle_t handle, SpMatD
     if (n == 1 && indirect && !complex && average < 12.)
         return launch_sparse_scatter(handle, A, B, C, m, ar, br, buffer);
     const bool stream = n == 8;
-    const int r = n == 1 ? (average <= 4. ? 128 : 16) : (stream ? (average <= 8. ? 8 : 16) : 4);
-    const int k = n == 1 ? (average <= 4. ? 4 : 8) : (stream ? 1 : 16);
-    const int warps = stream && r == 8 ? 2 : 4;
+    const bool packed_rows = std::strcmp(adaptor::backend_name(), "musa") == 0 &&
+        !complex && n == 8 && sbk == 8 && sbn == 1 && scm == 8 && scn == 1;
+    int r = n == 1 ? (average <= 4. ? 128 : 16) : (stream ? (average <= 8. ? 8 : 16) : 4);
+    int k = n == 1 ? (average <= 4. ? 4 : 8) : (stream ? 1 : 16);
+    int warps = stream && r == 8 ? 2 : 4;
+    if (packed_rows) {
+        r = average <= 3. ? 32 : average <= 12. ? 8 : 16;
+        // Long rows use serial FMA to limit cancellation error. Short rows
+        // keep independent sparse lanes and reduce once after the loop.
+        k = average <= 3. ? 1 : average <= 4. ? 4 : average <= 12. ? 8 : average > 24. ? 1 : 4;
+        warps = average <= 4. ? 2 : 4;
+    }
     int bn = 1;
     while (bn < n && bn < 32) bn *= 2;
     auto* ptr = static_cast<unsigned char*>(buffer);
@@ -155,7 +164,10 @@ inline flagsparseStatus_t launch_sparse_gather(flagsparseHandle_t handle, SpMatD
     for (double x : {ar, ai, br, bi}) args.push_back(jit::Arg::f(static_cast<float>(x)));
     for (int64_t x : {m, n, sbk, sbn, scm, scn}) args.push_back(jit::Arg::i64v(x));
     std::string err;
-    auto s = jit::launch(jit::codegen_module("sparse_gather.py"), n == 1 ? "sparse_gather_spmv_f32" : (stream ? "sparse_gather_spmm_stream_f32" : "sparse_gather_f32"),
+    const char* kernel = packed_rows ? "sparse_gather_spmm_row_f32"
+        : n == 1 ? "sparse_gather_spmv_f32"
+        : stream ? "sparse_gather_spmm_stream_f32" : "sparse_gather_f32";
+    auto s = jit::launch(jit::codegen_module("sparse_gather.py"), kernel,
         sig, ctx(handle)->stream, (m + r - 1) / r, (n + bn - 1) / bn,
         1, warps, 1, args, &err);
     if (s != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;

@@ -605,11 +605,16 @@ def flagsparse_spvv(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
-    # MACA dots use one-block reduction or a direct sum into independent output.
-    # Floating-point atomics are excluded when deterministic algorithms are required.
-    if (_is_maca_runtime() and values.dtype in (torch.float32, torch.complex64)
+    # MUSA half dots use one/two deterministic Triton reductions with FP32 output.
+    if _is_mthreads_runtime() and values.dtype == torch.float16:
+        from ._vector_musa import spvv_half
+
+        result = spvv_half(values, kernel_idx, y)
+    elif (_is_maca_runtime() and values.dtype in (torch.float32, torch.complex64)
             and values.numel() <= 65536
             and (values.numel() <= 4096 or not torch.are_deterministic_algorithms_enabled())):
+        # MACA dots use one-block reduction or a direct sum into independent output.
+        # Floating-point atomics are excluded when deterministic algorithms are required.
         from ._vector_maca import spvv
 
         result = spvv(values, kernel_idx, y, op == "conj")

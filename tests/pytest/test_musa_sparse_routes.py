@@ -84,23 +84,24 @@ def test_musa_real_by_complex_row_tiles(dtype, shape):
 
 
 @pytest.mark.parametrize("indirect", [False, True])
-def test_musa_half_gather_strided_output(indirect):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_musa_half_gather_strided_output(indirect, dtype):
     from flagsparse.sparse_operations import _spmv_csr_transpose as gather
     dev = accelerator_device()
-    values = torch.tensor([1, 2, 3], dtype=torch.float16, device=dev)
+    values = torch.tensor([1, 2, 3], dtype=dtype, device=dev)
     cols = torch.tensor([0, 2, 1], dtype=torch.int32, device=dev)
     ptr = torch.tensor([0, 2, 3, 3], dtype=torch.int32, device=dev)
     order = torch.tensor([2, 1, 0], dtype=torch.int32, device=dev) if indirect else None
     if indirect:
         values = values.flip(0)
-    rhs = torch.tensor([2, 3, 4], dtype=torch.float16, device=dev)
-    backing = torch.full((6,), -99, dtype=torch.float16, device=dev)
+    rhs = torch.tensor([2, 3, 4], dtype=dtype, device=dev)
+    backing = torch.full((6,), -99, dtype=dtype, device=dev)
     out = backing[::2]
     plan = gather.make_plan(cols, ptr, order, 3)
     actual = gather.gather(values, rhs, plan, 3, out=out)
     assert actual is out
-    torch.testing.assert_close(actual.cpu(), torch.tensor([10, 9, 0], dtype=torch.float16))
-    assert torch.equal(backing[1::2].cpu(), torch.full((3,), -99, dtype=torch.float16))
+    torch.testing.assert_close(actual.cpu(), torch.tensor([10, 9, 0], dtype=dtype))
+    assert torch.equal(backing[1::2].cpu(), torch.full((3,), -99, dtype=dtype))
 
 
 @pytest.mark.parametrize("fmt", ["coo", "csc"])
@@ -964,7 +965,8 @@ def test_musa_triton_coo_live_partial_rows(monkeypatch, dtype, out_dtype, width)
 
 @pytest.mark.parametrize("kind", ["fixed", "nnz", "short"])
 @pytest.mark.parametrize("strided_out", [False, True])
-def test_musa_half_coo_bound_launch_live_storage_and_stream(kind, strided_out):
+@pytest.mark.parametrize("complex_rhs", [False, True])
+def test_musa_half_coo_bound_launch_live_storage_and_stream(kind, strided_out, complex_rhs):
     from flagsparse.sparse_operations._common import _ACCEL
     from flagsparse.sparse_operations import mixed_spmx as mixed
 
@@ -974,27 +976,32 @@ def test_musa_half_coo_bound_launch_live_storage_and_stream(kind, strided_out):
     if kind == "nnz":
         rows.zero_()
     cols = (torch.arange(nnz) % n).int().to(dev)
-    values = (torch.arange(nnz) % 5 - 2).half().to(dev)
-    backing = torch.full((m * 2 + 2,), -99, dtype=torch.float32, device=dev)
+    value_dtype = torch.float32 if complex_rhs else torch.float16
+    result_dtype = torch.complex64 if complex_rhs else torch.float32
+    reference_dtype = torch.complex128 if complex_rhs else torch.float64
+    values = (torch.arange(nnz) % 5 - 2).to(value_dtype).to(dev)
+    backing = torch.full((m * 2 + 2,), -99, dtype=result_dtype, device=dev)
     out = backing[1:2 * m:2] if strided_out else backing[1:m + 1]
     stream = _ACCEL.Stream()
     stream.wait_stream(_ACCEL.current_stream())
 
     def check(rhs, target=None):
-        reference = torch.zeros(m, dtype=torch.float64)
+        reference = torch.zeros(m, dtype=reference_dtype)
         reference.index_add_(0, rows.cpu().long(), values.cpu().double() *
-                             rhs.cpu().double()[cols.cpu().long()])
+                             rhs.cpu().to(reference_dtype)[cols.cpu().long()])
         result = fs.flagsparse_spmv_coo(values, rows, cols, rhs, (m, n),
-                                        out=target, out_dtype=torch.float32)
+                                        out=target, out_dtype=result_dtype)
         _ACCEL.synchronize()
         if target is not None:
             assert result is target
-        torch.testing.assert_close(result.cpu().double(), reference, rtol=0, atol=0)
+        torch.testing.assert_close(result.cpu().to(reference_dtype), reference, rtol=0, atol=0)
         return result
 
     for offset in (0, 1):
         with _ACCEL.stream(stream):
-            rhs = torch.arange(n + offset, device=dev).half()[offset:]
+            rhs = torch.arange(n + offset, device=dev).to(value_dtype)[offset:]
+            if complex_rhs:
+                rhs = torch.complex(rhs, rhs - 2)
             first = check(rhs)
             preserved = first.clone()
             rhs.add_(1)
@@ -1004,8 +1011,8 @@ def test_musa_half_coo_bound_launch_live_storage_and_stream(kind, strided_out):
         check(rhs)
         # Unsupported operand types must still fail after warming the cache.
         with pytest.raises(TypeError, match="not a supported combination"):
-            fs.flagsparse_spmv_coo(values, rows, cols, rhs.float(), (m, n),
-                                   out_dtype=torch.float32)
+            fs.flagsparse_spmv_coo(values, rows, cols, rhs.half() if complex_rhs else rhs.float(), (m, n),
+                                   out_dtype=result_dtype)
         check(rhs)
         values.add_(1)
         rows[0] = m - 1
@@ -1015,8 +1022,16 @@ def test_musa_half_coo_bound_launch_live_storage_and_stream(kind, strided_out):
         cols.data = ((cols + 1) % n).data
         check(rhs, out)
     state = mixed._MUSA_COO_CSR_CACHE.get((values, rows, cols), (m, n))
-    assert state is not None and state[3]["half_f32"][-1]
-    assert torch.equal(backing[:1].cpu(), torch.tensor([-99.]))
+    assert state is not None and state[3]["real_complex_f32" if complex_rhs else "half_f32"][-1]
+    assert torch.equal(backing[:1].cpu(), torch.tensor([-99.], dtype=result_dtype))
+
+    if complex_rhs:
+        with torch.inference_mode():
+            values, rows, cols = values.clone(), rows.clone(), cols.clone()
+            check(rhs, out)
+            values.add_(1)
+            cols[0] = (int(cols[0].item()) + 2) % n
+            check(rhs, out)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int8, torch.complex64])
@@ -1045,3 +1060,27 @@ def test_musa_indexed_copies_never_call_native_indexing(monkeypatch, dtype, inde
     fs.flagsparse_scatter(target, indices, sparse, reset_output=True)
     assert torch.equal(sparse.cpu(), torch.tensor([14, 4, 0], dtype=dtype))
     assert torch.equal(target.cpu(), torch.tensor([0, 0, 4, 0, 0, 0, 0, 14, 0], dtype=dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int8])
+@pytest.mark.parametrize("strided_out", [False, True])
+def test_musa_mixed_spmm_column_major_reads_live_rhs(dtype, strided_out):
+    dev = accelerator_device()
+    m, k, n = 37, 29, 8
+    cols = (torch.arange(m * 5) % k).int().to(dev)
+    ptr = torch.arange(m + 1, dtype=torch.int32, device=dev) * 5
+    values = (torch.arange(m * 5) % 7 - 3).to(dtype).to(dev)
+    rhs = (torch.arange(n * (k + 3)) % 5 - 2).to(dtype).to(dev).reshape(n, k + 3).T[:k]
+    out_dtype = torch.int32 if dtype == torch.int8 else torch.float32
+    backing = torch.full((m, n * 2), -99, dtype=out_dtype, device=dev)
+    out = backing[:, ::2] if strided_out else torch.empty(m, n, dtype=out_dtype, device=dev)
+    for _ in range(3):
+        host = torch.sparse_csr_tensor(ptr.cpu().long(), cols.cpu().long(), values.cpu().double(), (m, k))
+        expected = host @ rhs.cpu().double()
+        actual = fs.flagsparse_spmm_csr(values, cols, ptr, rhs, (m, k), out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu().double(), expected, rtol=0, atol=0)
+        if strided_out:
+            assert torch.equal(backing[:, 1::2].cpu(), torch.full((m, n), -99, dtype=out_dtype))
+        rhs.add_(1)
+        values.add_(1)
