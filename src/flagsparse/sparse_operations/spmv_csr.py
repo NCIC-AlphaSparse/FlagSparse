@@ -1185,9 +1185,9 @@ def prepare_spmv_csr(
     # matrices retain segbin, which avoids long-row imbalance in this regime.
     elif (not transpose and requested_alg == "auto" and config is None
           and (data.dtype in (torch.float16, torch.complex64)
-               or (_is_mthreads_runtime() and data.dtype == torch.bfloat16))
+               or ((_is_mthreads_runtime() or _is_iluvatar_runtime()) and data.dtype == torch.bfloat16))
           and (_backend_name() == "cuda" or
-               (_is_iluvatar_runtime() and data.dtype in (torch.float16, torch.complex64)) or
+               (_is_iluvatar_runtime() and data.dtype in (torch.float16, torch.bfloat16, torch.complex64)) or
                (_is_mthreads_runtime() and data.dtype in (torch.float16, torch.bfloat16)) or
                (_is_maca_runtime() and
                 (data.dtype == torch.float16 or data.numel() > 4 * n_rows)))):
@@ -1983,12 +1983,6 @@ def _spmv_execution_matrix(prepared):
 
 
 def _execute_spmv_route(prepared, x, out=None, timing=False):
-    complex_short_rows = (
-        _is_iluvatar_runtime()
-        and prepared.data.dtype == torch.complex64
-        and prepared.data.numel() / max(1, prepared.n_rows) <= 3.0
-        and prepared.max_row_nnz <= 16
-    )
     complex_nnz_plan = getattr(prepared, "iluvatar_c32_nnz_plan", None)
     complex_route = os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto")
     if (
@@ -2052,13 +2046,7 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
         and not (
             _is_iluvatar_runtime()
             and prepared.data.dtype == torch.complex64
-            and (
-                os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE") == "row_tile"
-                or (
-                    os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto") == "auto"
-                    and complex_short_rows
-                )
-            )
+            and os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE") == "row_tile"
         )
     ):
         from . import _spmv_csr_transpose

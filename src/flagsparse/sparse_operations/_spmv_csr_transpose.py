@@ -196,6 +196,27 @@ def _gather_split_dynamic(VR, VI, I, P, ROWS, X, Y, M: tl.constexpr,
     tl.store(Y + 2 * rows[:, None] + parts[None, :], result, valid_rows[:, None])
 
 
+@triton.jit
+def _gather_int32(V, I, P, ORDER, ROWS, X, Y, M: tl.constexpr,
+                  INDIRECT: tl.constexpr, R: tl.constexpr, K: tl.constexpr):
+    ids = tl.program_id(0) * R + tl.arange(0, R)
+    valid_rows = ids < M
+    rows = tl.load(ROWS + ids, valid_rows, other=0)
+    starts = tl.load(P + rows, valid_rows, other=0)
+    ends = tl.load(P + rows + 1, valid_rows, other=0)
+    slots = tl.arange(0, K)
+    acc = tl.zeros((R, K), dtype=tl.int32)
+    for base in range(0, tl.max(ends - starts, 0), K):
+        pos = starts[:, None] + base + slots[None, :]
+        valid = valid_rows[:, None] & (pos < ends[:, None])
+        source = tl.load(ORDER + pos, valid, other=0) if INDIRECT else pos
+        col = tl.load(I + pos, valid, other=0)
+        value = tl.load(V + source, valid, other=0).to(tl.int32)
+        vector = tl.load(X + col, valid, other=0).to(tl.int32)
+        acc += value * vector
+    tl.store(Y + rows, tl.sum(acc, axis=1), valid_rows)
+
+
 def gather(values, x, plan, n_rows, conjugate=False, out=None):
     if _is_mthreads_runtime() and values.dtype in (torch.float16, torch.bfloat16) and plan[2] is None:
         from .mixed_spmx import _musa_csr_spmv
@@ -232,6 +253,18 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
                 )
             values = cache["values"]
             order = None
+    if _is_iluvatar_runtime() and complex_values and order is None:
+        from . import _spmv_iluvatar_ell
+
+        if _spmv_iluvatar_ell.run(values, cols, ptr, x, y, n_rows, cache, conjugate):
+            return y
+        from . import _spmv_iluvatar_pair
+
+        result = _spmv_iluvatar_pair.run(
+            values, cols, ptr, x, n_rows, cache, conjugate, y,
+        )
+        if result is not None:
+            return result
     if complex_values:
         if cache.get("component_source") is not values:
             cache.update(component_source=values, component_view=torch.view_as_real(values))
@@ -247,6 +280,10 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
         return y
     gather_warps = 1 if maca else 4
     gather_stages = None
+    if (_is_iluvatar_runtime() and values.dtype == torch.float32
+            and values.numel() / max(1, n_rows) <= 3
+            and int(cache.get("max_row_nnz", 0)) <= 16):
+        batch, lanes, gather_warps, gather_stages = 64, 2, 1, 1
     if _is_iluvatar_runtime() and complex_values:
         mean = values.numel() / max(1, n_rows)
         max_row_nnz = int(cache.get("max_row_nnz", 0))
@@ -266,6 +303,8 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
             batch, lanes = (4, 32) if row_spread <= 2.0 else (8, 16)
         gather_warps = 1
         gather_stages = 1
+        if mean <= 3.0 and max_row_nnz <= 16:
+            batch, lanes = 32, 4
         split_warps = 1
         batch_override = os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_BATCH")
         lanes_override = os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_LANES")
@@ -282,7 +321,10 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
     elif _is_iluvatar_runtime():
         mean = float(cache.get("avg_row_nnz", values.numel() / max(1, n_rows)))
         max_row_nnz = int(cache.get("max_row_nnz", 0))
-        if mean <= 4.0 and max_row_nnz > 128:
+        if values.dtype == torch.bfloat16 or (values.dtype == torch.float16 and y.dtype == torch.float32):
+            batch, lanes = (64, 4) if mean <= 3 else (16, 8)
+            gather_warps, gather_stages = 1, 1
+        elif mean <= 4.0 and max_row_nnz > 128:
             batch, lanes, gather_warps, gather_stages = 32, 8, 4, 1
         elif 4.0 < mean <= 16.0 and max_row_nnz <= 128:
             batch, lanes, gather_warps, gather_stages = 32, 8, 2, 1
@@ -311,19 +353,19 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
         and order is None
         and os.environ.get("FLAGSPARSE_ILUVATAR_GATHER_SPLIT", "1") != "0"
     ):
-        if cache.get("split_source") is not values:
-            cache.update(split_source=values)
         try:
             value_version = values._version
         except RuntimeError:
             value_version = None
-        if cache.get("split_version") != value_version:
-            cache.update(
-                split_version=value_version,
-                split_real=values.real.contiguous(),
-                split_imag=values.imag.contiguous(),
-            )
-        split_values = cache["split_real"], cache["split_imag"]
+        if value_version is not None:
+            if cache.get("split_source") is not values or cache.get("split_version") != value_version:
+                cache.update(
+                    split_source=values,
+                    split_version=value_version,
+                    split_real=values.real.contiguous(),
+                    split_imag=values.imag.contiguous(),
+                )
+            split_values = cache["split_real"], cache["split_imag"]
     if split_values is not None and fixed_steps is not None:
         _gather_split_fixed[(triton.cdiv(n_rows, batch),)](
             split_values[0],
@@ -380,6 +422,38 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
             _gather_fixed[(triton.cdiv(n_rows, batch),)](
                 *args, STEPS=fixed_steps, **launch
             )
+    return y
+
+
+def gather_int32(values, x, plan, n_rows, out=None):
+    y = out if out is not None else torch.empty(n_rows, dtype=torch.int32, device=values.device)
+    if not n_rows:
+        return y
+    cols, ptr, order, rows, lanes, batch, cache = plan
+    if order is not None:
+        try:
+            version = values._version
+        except RuntimeError:
+            version = None
+        if version is not None:
+            if cache.get("version") != version or cache.get("source") is not values:
+                cache.update(source=values, version=version,
+                             values=_gather_values(values, order).contiguous())
+            values, order = cache["values"], None
+    mean = float(cache.get("avg_row_nnz", 0))
+    batch, lanes = (64, 2) if mean <= 3 else (32, 4) if mean <= 4 else (16, 8) if mean <= 16 else (8, 16)
+    if 8 < mean <= 16 and int(cache.get("max_row_nnz", 0)) > 128:
+        batch, lanes = 8, 16
+    if order is not None:
+        _gather_int32[(triton.cdiv(n_rows, batch),)](
+            values, cols, ptr, order, rows, x, y, n_rows, True, batch, lanes,
+            num_warps=1, num_stages=1,
+        )
+    else:
+        _gather_int32[(triton.cdiv(n_rows, batch),)](
+            values, cols, ptr, cols, rows, x, y, n_rows, False, batch, lanes,
+            num_warps=1, num_stages=1,
+        )
     return y
 
 

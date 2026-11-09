@@ -4,16 +4,25 @@
 import torch
 import triton
 import triton.language as tl
-from ._common import _is_mthreads_runtime
+from ._common import _is_iluvatar_runtime, _is_mthreads_runtime
 
 
 @triton.jit
-def _pack_dense(B, C, M, N, BM, BN, BLOCK: tl.constexpr):
+def _pack_dense(B, C, M, N, BM, BN, BLOCK: tl.constexpr,
+                COMPLEX: tl.constexpr = False):
     rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     cols = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = (cols[:, None] < N) & (rows[None, :] < M)
-    values = tl.load(B + rows[None, :] * BM + cols[:, None] * BN, mask, other=0)
-    tl.store(C + rows[None, :] * N + cols[:, None], values, mask)
+    source = rows[None, :] * BM + cols[:, None] * BN
+    target = rows[None, :] * N + cols[:, None]
+    if COMPLEX:
+        real = tl.load(B + 2 * source, mask, other=0)
+        imag = tl.load(B + 2 * source + 1, mask, other=0)
+        tl.store(C + 2 * target, real, mask)
+        tl.store(C + 2 * target + 1, imag, mask)
+    else:
+        values = tl.load(B + source, mask, other=0)
+        tl.store(C + target, values, mask)
 
 
 @triton.jit
@@ -59,13 +68,19 @@ def compute(values, cols, ptr, b, out):
     if not m or not n:
         return out
     is_complex = values.is_complex()
-    if (_is_mthreads_runtime() and values.dtype in (torch.float16, torch.int8)
+    iluvatar = _is_iluvatar_runtime()
+    if iluvatar and is_complex:
+        b = b.resolve_conj()
+    if (((_is_mthreads_runtime() and values.dtype in (torch.float16, torch.int8))
+         or (iluvatar and values.dtype in (torch.float16, torch.int8, torch.complex64)))
             and b.stride(0) == 1 and b.stride(1) != 1):
         # Read the current RHS every call. Packing is included in call timing;
         # it replaces repeated uncoalesced loads inside the sparse row loop.
         dense_copy = torch.empty(b.shape, dtype=b.dtype, device=b.device)
         _pack_dense[(triton.cdiv(b.shape[0], 32), triton.cdiv(b.shape[1], 32))](
-            b, dense_copy, *b.shape, *b.stride(), 32, num_warps=4,
+            torch.view_as_real(b.resolve_conj()) if is_complex else b,
+            torch.view_as_real(dense_copy) if is_complex else dense_copy,
+            *b.shape, *b.stride(), 32, is_complex, num_warps=4,
         )
         b = dense_copy
     # Preserve logical strides for row/column-major and padded dense operands.
@@ -75,11 +90,15 @@ def compute(values, cols, ptr, b, out):
     musa = _is_mthreads_runtime()
     if musa:
         batch, lanes = 8, 4
-    acc = tl.int32 if musa and values.dtype == torch.int8 and out.dtype == torch.int32 else tl.float32
+    if iluvatar:
+        batch, lanes = (8, 4) if values.dtype == torch.int8 else (4, 4)
+        if values.dtype == torch.complex64:
+            batch, lanes = 4, 1
+    acc = tl.int32 if (musa or iluvatar) and values.dtype == torch.int8 and out.dtype == torch.int32 else tl.float32
     tile_n = min(32, triton.next_power_of_2(n))
     _kernel[(triton.cdiv(m, batch), triton.cdiv(n, tile_n))](
         v, cols, ptr, dense, target, m, n, b.stride(0), b.stride(1),
         out.stride(0), out.stride(1), is_complex, batch, lanes, tile_n,
-        ACC=acc, num_warps=4, num_stages=1,
+        ACC=acc, num_warps=1 if iluvatar else 4, num_stages=1,
     )
     return out

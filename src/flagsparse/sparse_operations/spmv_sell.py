@@ -79,6 +79,62 @@ _TL = {
 _ROCM_SELL_CSR_CACHE = TensorPlanCache(maxsize=16)
 _MUSA_SELL_PLAN_CACHE = TensorPlanCache(maxsize=16)
 _ILUVATAR_SELL_CSC_CACHE = TensorPlanCache(maxsize=16)
+_ILUVATAR_SELL_PLAN_CACHE = TensorPlanCache(maxsize=16)
+
+
+def _iluvatar_sell_plan(values, cols, offsets, shape, slice_size, out_dtype):
+    sources = (values, cols, offsets)
+    options = (tuple(shape), int(slice_size), out_dtype)
+    plan = _ILUVATAR_SELL_PLAN_CACHE.get(sources, options)
+    if plan is not None:
+        return plan
+    if _ILUVATAR_SELL_PLAN_CACHE._signature(sources) is None:
+        return ()
+    rows = _sell_entry_rows(cols, offsets, slice_size)
+    valid = (cols >= 0) & (rows < shape[0])
+    nnz = int(valid.sum().item())
+    padding = values.numel() / max(nnz, 1)
+    plan = ()
+    complex_regular = False
+    if values.dtype == torch.complex64:
+        from ._spmv_iluvatar_ell import eligible
+        from ._spmv_iluvatar_pair import eligible as pair_eligible
+
+        counts = torch.bincount(rows[valid].long(), minlength=shape[0])
+        maximum = int(counts.max()) if shape[0] else 0
+        mean = nnz / max(1, shape[0])
+        complex_regular = (eligible(shape[0], mean, maximum)
+                           or pair_eligible(shape[0], mean, maximum)
+                           or (4 < mean <= 12 and maximum <= 16))
+    if values.dtype == torch.complex64 and (padding >= 2 or complex_regular):
+        from .spmv_csr import prepare_spmv_csr
+
+        row_ids = rows[valid].to(torch.int64)
+        positions = torch.nonzero(valid).flatten()
+        order = torch.argsort(row_ids, stable=True)
+        positions = positions[order]
+        ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(cols.dtype)
+        prepared = prepare_spmv_csr(
+            values[positions].contiguous(), cols[positions].contiguous(), ptr, shape,
+        )
+        if prepared.non_gather_plan is not None:
+            prepared.non_gather_plan[-1]["sell_c32_non"] = True
+        plan = "csr", prepared
+    elif values.dtype != torch.complex64 and (
+        padding >= 2 or (shape[0] <= 262144 and padding >= 1.2)
+    ):
+        dense_float = values.dtype == torch.float32 and nnz > 12 * shape[0]
+        dense_integer = (values.dtype == torch.int8 and out_dtype == torch.int32
+                         and nnz > 16 * shape[0])
+        prepared = prepare_spmv_sell(
+            values, cols, offsets, shape, slice_size=slice_size, out_dtype=out_dtype,
+            route="sigma", sigma=4096, c=16 if dense_float or dense_integer else 32,
+            group=1, num_warps=1, k=8 if dense_float else 4,
+            paired=False, reorder="none", validate=False,
+        )
+        plan = "sigma", prepared
+    _ILUVATAR_SELL_PLAN_CACHE.put(sources, options, plan)
+    return plan
 
 
 def _iluvatar_sell_csc_plan(values, cols, offsets, n_rows, n_cols, slice_size):
@@ -229,6 +285,45 @@ def _spmv_sell_complex_kernel(
     mask = rmask & (row < n_rows)
     tl.store(y_ri_ptr + 2 * row, acc_re, mask=mask)
     tl.store(y_ri_ptr + 2 * row + 1, acc_im, mask=mask)
+
+
+@triton.jit
+def _spmv_sell_wide_kernel(
+    y_ptr, values_ptr, indices_ptr, offsets_ptr, x_ptr, n_rows: tl.constexpr, SLICE: tl.constexpr,
+    BLOCK_R: tl.constexpr, K: tl.constexpr, COMPLEX: tl.constexpr,
+    ACC: tl.constexpr,
+):
+    slice_id = tl.program_id(0)
+    rows = tl.arange(0, BLOCK_R)
+    slots = tl.arange(0, K)
+    start = tl.load(offsets_ptr + slice_id)
+    width = (tl.load(offsets_ptr + slice_id + 1) - start) // SLICE
+    real = tl.zeros((K, BLOCK_R), ACC)
+    imag = tl.zeros((K, BLOCK_R), ACC)
+    for base in range(0, width, K):
+        offset = base + slots
+        pos = start + offset[:, None] * SLICE + rows[None, :]
+        active = (offset[:, None] < width) & (rows[None, :] < SLICE)
+        cols = tl.load(indices_ptr + pos, active, other=-1)
+        valid = active & (cols >= 0)
+        if COMPLEX:
+            vr = tl.load(values_ptr + 2 * pos, valid, other=0).to(ACC)
+            vi = tl.load(values_ptr + 2 * pos + 1, valid, other=0).to(ACC)
+            xr = tl.load(x_ptr + 2 * cols, valid, other=0).to(ACC)
+            xi = tl.load(x_ptr + 2 * cols + 1, valid, other=0).to(ACC)
+            real += vr * xr - vi * xi
+            imag += vr * xi + vi * xr
+        else:
+            value = tl.load(values_ptr + pos, valid, other=0).to(ACC)
+            vector = tl.load(x_ptr + cols, valid, other=0).to(ACC)
+            real += value * vector
+    target = slice_id * SLICE + rows
+    output_mask = (target < n_rows) & (rows < SLICE)
+    if COMPLEX:
+        tl.store(y_ptr + 2 * target, tl.sum(real, 0), output_mask)
+        tl.store(y_ptr + 2 * target + 1, tl.sum(imag, 0), output_mask)
+    else:
+        tl.store(y_ptr + target, tl.sum(real, 0), output_mask)
 
 
 @triton.jit
@@ -506,6 +601,25 @@ def flagsparse_spmv_sell(
     if return_time and not cached_musa:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
+    if (_is_iluvatar_runtime() and slice_size == 32 and n_slices <= 32768
+            and values.dtype in (torch.float16, torch.float32, torch.int8, torch.complex64)):
+        plan = _iluvatar_sell_plan(values, cols, offsets, shape, slice_size, out_dtype)
+        if plan:
+            route, prepared_plan = plan
+            if route == "csr":
+                from .spmv_csr import flagsparse_spmv_csr
+
+                target = out if out is None or out.is_contiguous() else None
+                result = flagsparse_spmv_csr(prepared=prepared_plan, x=x, out=target)
+                if out is not None and result is not out:
+                    out.copy_(result)
+                    result = out
+            else:
+                result = spmv_sell_prepared(prepared_plan, x, out=out)
+            if return_time:
+                _ACCEL.synchronize()
+                return result, (time.perf_counter() - t0) * 1000.0
+            return result
     if musa:
         y = out if out is not None and out.is_contiguous() else torch.empty(
             n_rows, dtype=out_dtype, device=x.device
@@ -618,7 +732,27 @@ def flagsparse_spmv_sell(
                 block_r = 64
         grid = (triton.cdiv(n_slices, group),)
         if n_slices:
-            if _is_complex_dtype(values.dtype):
+            if (_is_iluvatar_runtime() and slice_size == 32
+                    and values.dtype == torch.int8 and out_dtype == torch.int32
+                    and ((n_rows <= 262144 and values.numel() > 12 * n_rows)
+                         or (n_slices > 32768 and values.numel() <= 5 * n_rows))):
+                _musa_spmv_sell_kernel[(triton.cdiv(n_rows, 64),)](
+                    y, values, cols, offsets, x, n_rows,
+                    SLICE=slice_size, ROWS=64, SLOTS=4,
+                    COMPLEX=False, ACC=tl.int32, num_warps=1,
+                )
+            elif (_is_iluvatar_runtime() and slice_size <= 32
+                    and values.dtype in (torch.float16, torch.float32, torch.int8, torch.complex64)
+                    and (values.dtype == torch.complex64 or n_slices <= 32768)):
+                complex_values = values.dtype == torch.complex64
+                tensors = tuple(torch.view_as_real(t) for t in (y, values, x)) if complex_values else (y, values, x)
+                _spmv_sell_wide_kernel[(n_slices,)](
+                    tensors[0], tensors[1], cols, offsets, tensors[2], n_rows,
+                    SLICE=slice_size, BLOCK_R=triton.next_power_of_2(slice_size),
+                    K=2 if complex_values else 4, COMPLEX=complex_values,
+                    ACC=tl.float32 if complex_values else _TL[acc_dtype], num_warps=1,
+                )
+            elif _is_complex_dtype(values.dtype):
                 complex_args = (
                     torch.view_as_real(y),
                     torch.view_as_real(values),

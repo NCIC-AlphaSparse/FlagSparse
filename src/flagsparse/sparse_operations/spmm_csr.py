@@ -3106,12 +3106,15 @@ def flagsparse_spmm_csr_run(
             prepared.kernel_indptr,
             B,
             prepared.shape,
+            out=out,
             return_time=return_time,
         )
 
     if (
         _is_iluvatar_runtime()
-        and prepared.data.dtype == torch.float32
+        and (prepared.data.dtype == torch.float32
+             or (prepared.data.dtype == torch.complex64
+                 and prepared.data.numel() <= 32 * max(1, prepared.n_cols)))
         and op_name in ("trans", "conj")
         and dense_layout in ("auto", "row")
         and not return_meta
@@ -3122,12 +3125,34 @@ def flagsparse_spmm_csr_run(
         runtime_prepared, _ = _materialize_spmm_csr_route_op(
             prepared, op_name, timing=False
         )
+        if prepared.data.dtype == torch.complex64:
+            from . import _spmm_row_gather
+
+            if B.shape[0] != runtime_prepared.n_cols:
+                raise ValueError("B shape does not match CSR operation")
+            if out is not None:
+                _validate_spmm_out(runtime_prepared, B, out, dense_layout)
+            target = out if out is not None else torch.empty(
+                runtime_prepared.n_rows, B.shape[1], dtype=B.dtype, device=B.device
+            )
+            if return_time:
+                _ACCEL.synchronize()
+                start_time = time.perf_counter()
+            result = _spmm_row_gather.compute(
+                runtime_prepared.data, runtime_prepared.kernel_indices,
+                runtime_prepared.kernel_indptr, B, target,
+            )
+            if return_time:
+                _ACCEL.synchronize()
+                return result, (time.perf_counter() - start_time) * 1000.0
+            return result
         return mixed_spmx.spmm_csr_mixed(
             runtime_prepared.data,
             runtime_prepared.kernel_indices,
             runtime_prepared.kernel_indptr,
             B,
             runtime_prepared.shape,
+            out=out,
             return_time=return_time,
         )
 

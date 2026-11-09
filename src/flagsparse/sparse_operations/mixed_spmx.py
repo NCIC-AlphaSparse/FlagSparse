@@ -54,6 +54,8 @@ _TL_ACC = {torch.float32: tl.float32, torch.float64: tl.float64, torch.int32: tl
 _ROCM_CSR_MIXED_CACHE = {}
 _ROCM_COO_CSR_CACHE = TensorPlanCache()
 _ILUVATAR_COO_SPMM_CSR_CACHE = TensorPlanCache()
+_ILUVATAR_COO_COMPLEX_SPMV_CACHE = TensorPlanCache()
+_ILUVATAR_CSR_TRANS_SPMV_CACHE = TensorPlanCache()
 _MUSA_COO_CSR_CACHE = TensorPlanCache()
 _MUSA_CSC_CSR_CACHE = TensorPlanCache()
 _MUSA_CSR_NNZ_CACHE = TensorPlanCache(maxsize=16)
@@ -89,11 +91,13 @@ class PreparedCsrMixedSpmv:
         "route", "bucket_plan", "nnz_plan", "ascend_rows",
         "ascend_cols", "ascend_data", "rhs_source",
         "rhs_compute", "rhs_version",
+        "iluvatar_ell_plan",
     )
 
     def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype,
                  rows_per, block, num_warps, route, bucket_plan=None,
                  nnz_plan=None):
+        self.iluvatar_ell_plan = {}
         self.data = data
         self.indices = indices
         self.indptr = indptr
@@ -657,6 +661,13 @@ def prepare_spmv_csr_mixed(data, indices, indptr, x_dtype, shape, *,
         raise ValueError("route is unsupported for this mixed CSR dtype combination")
     if selected == "auto":
         selected = "cached"
+    if _is_iluvatar_runtime() and real_by_complex64 and selected == "cached":
+        mean = data.numel() / max(1, n_rows)
+        maximum = int((indptr[1:] - indptr[:-1]).max()) if n_rows else 0
+        if (9 < mean <= 12 and maximum <= 32
+                and not any(os.environ.get("FLAGSPARSE_ILUVATAR_MIXED_" + option)
+                            for option in ("ROWS", "BLOCK", "WARPS"))):
+            rows_per, block, num_warps = 8, 8, 1
     return PreparedCsrMixedSpmv(
         data, indices, indptr, shape, result_dtype, acc_dtype,
         rows_per, block, num_warps, selected, bucket_plan, nnz_plan,
@@ -749,6 +760,22 @@ def spmv_csr_mixed_prepared(prepared, x, *, out=None, return_time=False):
                     _TL_ACC[prepared.acc_dtype], num_warps=warps,
                 )
         elif _is_complex_dtype(prepared.result_dtype):
+            if (_is_iluvatar_runtime() and prepared.data.dtype == torch.float32
+                    and prepared.route == "cached"):
+                from . import _spmv_iluvatar_ell
+
+                if _spmv_iluvatar_ell.run(
+                    prepared.data, prepared.indices, prepared.indptr, x, y,
+                    prepared.n_rows, prepared.iluvatar_ell_plan,
+                ):
+                    return _finish(y, out, t0, return_time)
+                from . import _spmv_iluvatar_pair
+
+                if _spmv_iluvatar_pair.run_mixed(
+                    prepared.data, prepared.indices, prepared.indptr, x, y,
+                    prepared.n_rows, prepared.iluvatar_ell_plan,
+                ):
+                    return _finish(y, out, t0, return_time)
             cached = prepared.route == "cached"
             kernel = (
                 _csr_spmv_real_by_complex_cached_kernel if cached
@@ -1311,10 +1338,14 @@ def _csr_spmm_trans(data, cols, ptr, B, n_rows, n_cols, acc_dtype):
     if n_rows and n_dense and data.numel():
         block_n = min(128, max(16, triton.next_power_of_2(n_dense)))
         rows_per = max(1, 128 // block_n)
+        num_warps = 4
+        if (_is_iluvatar_runtime() and data.dtype == torch.float16
+                and acc_dtype == torch.float32 and n_dense == 32):
+            rows_per, num_warps = 4, 1
         _csr_spmm_trans_atomic_kernel[(triton.cdiv(n_rows, rows_per), triton.cdiv(n_dense, block_n))](
             C, data, cols, ptr, B, n_rows, n_dense,
             B.stride(0), B.stride(1), C.stride(0), C.stride(1),
-            ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK_N=block_n, num_warps=4,
+            ACC=_TL_ACC[acc_dtype], ROWS=rows_per, BLOCK_N=block_n, num_warps=num_warps,
         )
     return C
 
@@ -1325,6 +1356,30 @@ def _complex_acc(n, real_dtype, device):
 
 def _csr_spmv_trans(data, cols, ptr, x, n_rows, n_cols, result_dtype, acc_dtype):
     """y = A^T x for CSR A without materialising A^T."""
+    if _is_iluvatar_runtime() and data.dtype == torch.float16 and result_dtype == torch.float32:
+        from . import _spmv_csr_transpose
+
+        sources, options = (cols, ptr), (n_rows, n_cols)
+        plan = _ILUVATAR_CSR_TRANS_SPMV_CACHE.get(sources, options)
+        if plan is None:
+            plan = _spmv_csr_transpose.prepare(cols, ptr, (n_rows, n_cols))
+            _ILUVATAR_CSR_TRANS_SPMV_CACHE.put(sources, options, plan)
+        mean = data.numel() / max(1, n_cols)
+        if plan[6]["max_row_nnz"] <= max(128, 16 * mean):
+            target = torch.empty(n_cols, dtype=result_dtype, device=x.device)
+            return _spmv_csr_transpose.gather(data, x, plan, n_cols, out=target)
+    if _is_iluvatar_runtime() and data.dtype == torch.int8 and result_dtype == torch.int32:
+        from . import _spmv_csr_transpose
+
+        sources, options = (cols, ptr), (n_rows, n_cols, "int32")
+        plan = _ILUVATAR_CSR_TRANS_SPMV_CACHE.get(sources, options)
+        if plan is None:
+            plan = _spmv_csr_transpose.prepare(cols, ptr, (n_rows, n_cols))
+            _ILUVATAR_CSR_TRANS_SPMV_CACHE.put(sources, options, plan)
+        mean = data.numel() / max(1, n_cols)
+        if mean > 4 or plan[6]["max_row_nnz"] <= 128:
+            target = torch.empty(n_cols, dtype=torch.int32, device=x.device)
+            return _spmv_csr_transpose.gather_int32(data, x, plan, n_cols, out=target)
     nnz = data.numel()
     rows_per, block = _csr_row_tile(nnz, n_rows)
     grid = (triton.cdiv(n_rows, rows_per),) if n_rows else (0,)
@@ -1432,6 +1487,23 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
             rhs = x.to(rhs_dtype).contiguous()
         y = _torch_spmv_rows(compute_data, rows, cols, rhs, n_out, acc_dtype)
         return _finish(y.to(result_dtype), out, t0, return_time)
+    if (_is_iluvatar_runtime() and op == "non"
+            and data.dtype == torch.float32 and x.dtype == torch.complex64):
+        options = (n_rows, n_cols, result_dtype)
+        plan = _ILUVATAR_COO_COMPLEX_SPMV_CACHE.get(sources, options)
+        if plan is None:
+            rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
+            order = torch.argsort(rows, stable=True)
+            sorted_data = data.index_select(0, order).contiguous()
+            sorted_cols = cols.index_select(0, order).contiguous()
+            counts = torch.bincount(rows.to(torch.int64), minlength=n_rows)
+            ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32)
+            plan = prepare_spmv_csr_mixed(
+                sorted_data, sorted_cols, ptr, x.dtype, shape, out_dtype=result_dtype,
+            )
+            _ILUVATAR_COO_COMPLEX_SPMV_CACHE.put(sources, options, plan)
+        y = spmv_csr_mixed_prepared(plan, x, out=out)
+        return _finish(y, out, t0, return_time)
     if op == "trans" or complex_rhs:
         rows, cols = _index32(row.contiguous()), _index32(col.contiguous())
         out_idx, in_idx = (rows, cols) if op == "non" else (cols, rows)
@@ -1713,6 +1785,16 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
     if op == "trans":
         C = _csr_spmm_trans(data, cols, ptr, B, n_rows, n_cols, acc_dtype)
         C = C if C.dtype == result_dtype else C.to(result_dtype)
+        return _finish(C, out, t0, return_time)
+    if (_is_iluvatar_runtime() and n_dense == 32
+            and B.stride(0) == 1 and B.stride(1) != 1
+            and data.dtype in (torch.float16, torch.int8, torch.complex64)):
+        from . import _spmm_row_gather
+
+        C = out if out is not None else torch.empty(
+            n_rows, n_dense, dtype=result_dtype, device=B.device
+        )
+        _spmm_row_gather.compute(data, cols, ptr, B, C)
         return _finish(C, out, t0, return_time)
     if data.dtype in (torch.complex64, torch.complex128):
         C = out if out is not None else torch.empty(

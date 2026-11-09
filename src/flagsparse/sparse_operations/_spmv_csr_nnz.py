@@ -19,7 +19,11 @@ def _musa_segmented_add(left_row, left_value, right_row, right_value):
 
 @triton.jit
 def _complex_nnz_kernel(A, CI, RP, ROW, X, Y, EMPTY, NE: tl.constexpr,
-                        NNZ: tl.constexpr, B: tl.constexpr):
+                        NNZ: tl.constexpr, B: tl.constexpr,
+                        CONJUGATE: tl.constexpr = False,
+                        CACHE_MODIFIER: tl.constexpr = "",
+                        PAIR_LOADS: tl.constexpr = False,
+                        PREFIX_BLOCK: tl.constexpr = 128):
     pid = tl.program_id(0)
     lane = tl.arange(0, B)
     pos = pid * B + lane
@@ -27,17 +31,26 @@ def _complex_nnz_kernel(A, CI, RP, ROW, X, Y, EMPTY, NE: tl.constexpr,
     tl.store(Y + 2 * empty_row, 0., pos < NE)
     tl.store(Y + 2 * empty_row + 1, 0., pos < NE)
     valid = pos < NNZ
-    row = tl.load(ROW + pos, valid, -1)
-    col = tl.load(CI + pos, valid, 0)
-    ar = tl.load(A + 2 * pos, valid, 0).to(tl.float32)
-    ai = tl.load(A + 2 * pos + 1, valid, 0).to(tl.float32)
-    xr = tl.load(X + 2 * col, valid, 0).to(tl.float32)
-    xi = tl.load(X + 2 * col + 1, valid, 0).to(tl.float32)
+    row = tl.load(ROW + pos, valid, -1, cache_modifier=CACHE_MODIFIER)
+    col = tl.load(CI + pos, valid, 0, cache_modifier=CACHE_MODIFIER)
+    if PAIR_LOADS:
+        parts = tl.arange(0, 2)
+        values = tl.load(A + 2 * pos[:, None] + parts[None, :], valid[:, None], 0., cache_modifier=CACHE_MODIFIER)
+        vector = tl.load(X + 2 * col[:, None] + parts[None, :], valid[:, None], 0.)
+        ar, ai = tl.split(values)
+        xr, xi = tl.split(vector)
+    else:
+        ar = tl.load(A + 2 * pos, valid, 0, cache_modifier=CACHE_MODIFIER).to(tl.float32)
+        ai = tl.load(A + 2 * pos + 1, valid, 0, cache_modifier=CACHE_MODIFIER).to(tl.float32)
+        xr = tl.load(X + 2 * col, valid, 0).to(tl.float32)
+        xi = tl.load(X + 2 * col + 1, valid, 0).to(tl.float32)
+    if CONJUGATE:
+        ai = -ai
     product_real = ar * xr - ai * xi
     product_imag = ar * xi + ai * xr
     _, total_real = tl.associative_scan((row, product_real), 0, _segmented_add)
     _, total_imag = tl.associative_scan((row, product_imag), 0, _segmented_add)
-    next_row = tl.load(ROW + pos + 1, pos + 1 < NNZ, -1)
+    next_row = tl.load(ROW + pos + 1, pos + 1 < NNZ, -1, cache_modifier=CACHE_MODIFIER)
     boundary = valid & (row != next_row)
     first_row = tl.load(ROW + pid * B, pid * B < NNZ, 0)
     start = tl.load(RP + first_row)
@@ -45,12 +58,14 @@ def _complex_nnz_kernel(A, CI, RP, ROW, X, Y, EMPTY, NE: tl.constexpr,
     prefix_real = tl.full((), 0., tl.float32)
     prefix_imag = tl.full((), 0., tl.float32)
     if (start < pid * B) & (end <= (pid + 1) * B) & (pid * B < NNZ):
-        for offset in range(start, pid * B, 128):
-            index = offset + tl.arange(0, 128)
+        for offset in range(start, pid * B, PREFIX_BLOCK):
+            index = offset + tl.arange(0, PREFIX_BLOCK)
             active = index < pid * B
-            column = tl.load(CI + index, active, 0)
-            left_real = tl.load(A + 2 * index, active, 0).to(tl.float32)
-            left_imag = tl.load(A + 2 * index + 1, active, 0).to(tl.float32)
+            column = tl.load(CI + index, active, 0, cache_modifier=CACHE_MODIFIER)
+            left_real = tl.load(A + 2 * index, active, 0, cache_modifier=CACHE_MODIFIER).to(tl.float32)
+            left_imag = tl.load(A + 2 * index + 1, active, 0, cache_modifier=CACHE_MODIFIER).to(tl.float32)
+            if CONJUGATE:
+                left_imag = -left_imag
             right_real = tl.load(X + 2 * column, active, 0).to(tl.float32)
             right_imag = tl.load(X + 2 * column + 1, active, 0).to(tl.float32)
             prefix_real += tl.sum(left_real * right_real - left_imag * right_imag, 0)

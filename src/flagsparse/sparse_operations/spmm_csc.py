@@ -759,7 +759,7 @@ def prepare_spmm_csc_route(
         alg=resolved_alg,
         index_fallback_policy=index_fallback_policy,
         musa_trans_gather=(
-            _is_mthreads_runtime()
+            (_is_mthreads_runtime() or (_is_iluvatar_runtime() and data.dtype == torch.float32))
             and _spmm_csc_op_transposes(op_code)
             and data.dtype in (torch.float32, torch.complex64)
             and block_n is None and block_nnz is None and max_segments is None
@@ -2104,9 +2104,12 @@ def flagsparse_spmm_csc(
             raise ValueError(
                 "data, indices, indptr, and shape are required when prepared is not provided"
             )
-        cacheable = (_is_rocm_runtime() and not _is_ascend_runtime()
+        cacheable = ((_is_rocm_runtime() and not _is_ascend_runtime()
                      and data.dtype == torch.complex64
                      and op_code == SPMM_CSC_OP_NON)
+                     or (_is_iluvatar_runtime() and data.dtype == torch.float32
+                         and _spmm_csc_op_transposes(op_code)
+                         and not timing and not return_meta))
         if cacheable:
             sources = (data, indices, indptr)
             options = (tuple(shape), block_n, block_nnz, max_segments,
