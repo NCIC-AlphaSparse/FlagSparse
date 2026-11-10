@@ -629,6 +629,47 @@ def test_musa_coo_cache_live_storage(sorted_rows):
         check()
 
 
+@pytest.mark.parametrize("dtype,out_dtype", [
+    (torch.float16, torch.float32), (torch.int8, torch.int32),
+    (torch.float32, torch.complex64),
+])
+def test_musa_mixed_csr_cached_strided_sources_and_storage(dtype, out_dtype):
+    """A cached contiguous copy must follow edits to its strided source."""
+    dev = accelerator_device()
+    values = torch.tensor([1, 99, 2, 99, 3, 99, 4, 99], dtype=dtype, device=dev)[::2]
+    cols = torch.tensor([0, 99, 2, 99, 1, 99, 2, 99], dtype=torch.int32, device=dev)[::2]
+    ptr = torch.tensor([0, 99, 2, 99, 2, 99, 4, 99], dtype=torch.int32, device=dev)[::2]
+    rhs = torch.tensor([2, 3, -1], dtype=out_dtype if out_dtype.is_complex else dtype,
+                       device=dev)
+    out = torch.empty(3, dtype=out_dtype, device=dev)
+    wide = torch.complex128 if out_dtype.is_complex else torch.float64
+
+    def check():
+        expected = torch.zeros(3, dtype=wide)
+        pv, cv, vv = ptr.cpu(), cols.cpu().long(), values.cpu().to(wide)
+        for row in range(3):
+            begin, end = int(pv[row]), int(pv[row + 1])
+            expected[row] = (vv[begin:end] * rhs.cpu().to(wide)[cv[begin:end]]).sum()
+        result = fs.flagsparse_spmv_csr(values, cols, ptr, rhs, (3, 3), out=out)
+        assert result is out
+        torch.testing.assert_close(out.cpu().to(wide), expected, rtol=0, atol=0)
+
+    check()
+    check()
+    values.add_(1)
+    rhs.add_(1)
+    check()
+    values.data = (values + 2).data
+    cols.data = ((cols + 1) % 3).data
+    ptr[1] = 1
+    check()
+    # .data replacement does not bump the version counter, including a change
+    # of shape that must invalidate cached dimension validation.
+    values.data = values.reshape(2, 2).data
+    with pytest.raises(ValueError, match="1D"):
+        fs.flagsparse_spmv_csr(values, cols, ptr, rhs, (3, 3), out=out)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int8])
 def test_musa_nnz_route_mutation_and_strided_output(dtype):
     dev = accelerator_device()
@@ -1146,3 +1187,83 @@ def test_musa_mixed_spmm_column_major_reads_live_rhs(dtype, strided_out):
             assert torch.equal(backing[:, 1::2].cpu(), torch.full((m, n), -99, dtype=out_dtype))
         rhs.add_(1)
         values.add_(1)
+
+
+@pytest.mark.parametrize('dtype,out_dtype', [
+    (torch.float16, torch.float32), (torch.int8, torch.int32),
+])
+@pytest.mark.parametrize('inference', [False, True])
+def test_musa_mixed_csr_transpose_live_topology_and_storage(dtype, out_dtype, inference):
+    from flagsparse.sparse_operations._common import _ACCEL
+
+    dev = accelerator_device()
+    with torch.inference_mode(inference):
+        values = torch.tensor([2, -1, 3, 4], dtype=dtype, device=dev)
+        cols = torch.tensor([0, 2, 1, 2], dtype=torch.int32, device=dev)
+        ptr = torch.tensor([0, 2, 2, 4], dtype=torch.int32, device=dev)
+        rhs = torch.tensor([3, 2, -1], dtype=dtype, device=dev)
+        backing = torch.full((10,), -99, dtype=out_dtype, device=dev)
+        out = backing[1:9:2]
+        stream = _ACCEL.Stream()
+        stream.wait_stream(_ACCEL.current_stream())
+
+        def check():
+            host = torch.sparse_csr_tensor(ptr.cpu().long(), cols.cpu().long(),
+                                           values.cpu().double(), (3, 4))
+            expected = host.to_dense().T @ rhs.cpu().double()
+            actual = fs.flagsparse_spmv_csr(values, cols, ptr, rhs, (3, 4),
+                                             op='trans', out=out)
+            assert actual is out
+            torch.testing.assert_close(actual.cpu().double(), expected, rtol=0, atol=0)
+            assert torch.equal(backing[::2].cpu(), torch.full((5,), -99, dtype=out_dtype))
+
+        with _ACCEL.stream(stream):
+            check()
+            rhs.add_(1)
+            check()
+            values.add_(1)
+            cols[0] = 3
+            ptr[1] = 1
+            check()
+            values.data = (values - 1).data
+            cols.data = ((cols + 1) % 4).data
+            check()
+        stream.synchronize()
+        check()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int8, torch.complex64])
+@pytest.mark.parametrize("width", [33, 141])
+def test_musa_padded_sell_compaction_live_values(dtype, width):
+    from flagsparse.sparse_operations import spmv_sell as sell
+    dev = accelerator_device()
+    m, n = 129, 17
+    ptr = torch.tensor([0, width] + [width + i for i in range(1, m)], dtype=torch.int32, device=dev)
+    cols = (torch.arange(int(ptr[-1]), device=dev) % n).int()
+    values = (torch.arange(cols.numel(), device=dev) % 5 - 2).to(dtype)
+    if dtype.is_complex:
+        values = values + 1j * values
+    sv, sc, offsets = fs.csr_to_sell(values, cols, ptr, m, 32)
+    rhs = torch.ones(n, dtype=dtype, device=dev)
+    out_dtype = torch.int32 if dtype == torch.int8 else dtype
+    backing = torch.full((2 * m,), -99, dtype=out_dtype, device=dev)
+    out = backing[::2]
+    wide = torch.complex128 if dtype.is_complex else torch.float64
+    for _ in range(3):
+        host_values, host_cols, host_offsets = sv.cpu(), sc.cpu(), offsets.cpu()
+        expected = torch.zeros(m, dtype=wide)
+        for row in range(m):
+            begin, end = int(host_offsets[row // 32]), int(host_offsets[row // 32 + 1])
+            positions = torch.arange(begin + row % 32, end, 32)
+            columns = host_cols[positions].long()
+            valid = columns >= 0
+            expected[row] = (host_values[positions[valid]].to(wide) * rhs.cpu().to(wide)[columns[valid]]).sum()
+        actual = fs.flagsparse_spmv_sell(sv, sc, offsets, rhs, (m, n), slice_size=32, out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu().to(wide), expected, rtol=0, atol=0)
+        assert (backing[1::2].cpu() == -99).all()
+        state = sell._MUSA_SELL_PLAN_CACHE.get((sv, sc, offsets), (m, n, 32))
+        assert state is not None and state["csr"]
+        sv.add_(1)
+        sc[0] = (int(sc[0]) + 1) % n
+        rhs.add_(1)

@@ -357,11 +357,14 @@ def _musa_indexed_copy(dst, src, indices, gather, block_size):
     constants = (dst_view.stride(0), src_view.stride(0), indices.stride(0),
                  components, gather, block_size)
     addresses = (dst_view.data_ptr(), src_view.data_ptr(), indices.data_ptr())
-    signature = tuple((t.dtype, t.device, p % 16) for t, p in
-                      zip((dst_view, src_view, indices), addresses))
     aliases = (addresses[0] == addresses[1], addresses[0] == addresses[2],
                addresses[1] == addresses[2])
-    key = (signature, aliases, nnz, constants)
+    # A flat specialization key avoids rebuilding three nested signatures on
+    # every short indexed copy. Pointers and the current stream remain live.
+    key = (dst_view.dtype, src_view.dtype, indices.dtype,
+           dst_view.device, src_view.device, indices.device,
+           addresses[0] % 16, addresses[1] % 16, addresses[2] % 16,
+           aliases, nnz, constants)
     entry = _MUSA_COPY_RUNNERS.get(key)
     if entry is not None:
         entry((dst_view, src_view, indices), scalars, constants, addresses)

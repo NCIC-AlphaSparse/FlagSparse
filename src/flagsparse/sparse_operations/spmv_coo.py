@@ -1434,6 +1434,14 @@ def flagsparse_spmv_coo(
                 op if op is not None else prepared.op,
                 transpose=transpose_flag if op is None else False,
             )
+            if _is_mthreads_runtime() and op_code == SPMV_COO_OP_NON:
+                # The mixed MUSA route validates and caches the same original
+                # operands; constructing an intermediate launch adds no work.
+                return _mixed_spmx.spmv_coo_mixed(
+                    mixed_data, prepared.row_non, prepared.col_non, x,
+                    prepared.shape, out=out, out_dtype=out_dtype,
+                    return_time=return_time,
+                )
             if _is_iluvatar_runtime() and op_code == SPMV_COO_OP_NON:
                 result_dtype, _ = _mixed_spmx._resolve_types(
                     mixed_data.dtype, x.dtype, out, out_dtype, True
