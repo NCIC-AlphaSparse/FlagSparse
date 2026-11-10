@@ -25,6 +25,7 @@ gather routes additionally store row pointers; callers still provide COO arrays.
 
 from ._common import *
 from . import mixed_spmx as _mixed_spmx
+from ._rocm_sparse_cache import TensorPlanCache
 
 import os
 import time
@@ -116,6 +117,7 @@ class PreparedCoo:
         "sell_plans",
         "sell_choices",
         "sell_times",
+        "mixed_plans",
         "index_fallback_policy",
         "index_fallback_applied",
         "index_fallback_reason",
@@ -164,6 +166,7 @@ class PreparedCoo:
         self.sell_plans = {}
         self.sell_choices = {}
         self.sell_times = {}
+        self.mixed_plans = TensorPlanCache(maxsize=2) if _is_iluvatar_runtime() else None
         if self.sort_by_row and self.data_trans.dtype in (
             torch.float32,
             torch.complex64,
@@ -228,6 +231,7 @@ class PreparedCoo:
                         self.non_csr_plan = (
                             cols, plan_ptr, order, rows, 16, 16, cache
                         )
+                        cache["coo_c32_non"] = True
                 if _is_rocm_runtime():
                     # gfx936's wave64 complex gather is register-pressure
                     # bound at the default 8-lane row tile. Four lanes and a
@@ -260,7 +264,7 @@ class PreparedCoo:
                     self.non_csr_plan = _CooNnzPlan(
                         self.data_non, self.col_non, ptr, row_ids, empty, self.n_rows,
                     )
-                elif mean <= 4.0 and maximum <= 512:
+                elif mean <= 4.0 and maximum <= 512 and not (mean <= 3.0 and maximum <= 16):
                     self.non_csr_plan = _CooCsrRowTilePlan(
                         self.data_non, self.col_non, ptr, self.n_rows, maximum,
                     )
@@ -278,6 +282,7 @@ class PreparedCoo:
                     self.non_csr_plan = (
                         cols, plan_ptr, order, rows, 16, 16, cache
                     )
+                    cache["coo_c32_non"] = True
             if (
                 _is_iluvatar_runtime()
                 and self.transpose
@@ -1098,6 +1103,8 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
                 plan.empty.numel(),
                 plan.data.numel(),
                 block,
+                PAIR_LOADS=True,
+                PREFIX_BLOCK=64,
                 num_warps=warps,
             )
             return y
@@ -1427,6 +1434,14 @@ def flagsparse_spmv_coo(
                 op if op is not None else prepared.op,
                 transpose=transpose_flag if op is None else False,
             )
+            if _is_mthreads_runtime() and op_code == SPMV_COO_OP_NON:
+                # The mixed MUSA route validates and caches the same original
+                # operands; constructing an intermediate launch adds no work.
+                return _mixed_spmx.spmv_coo_mixed(
+                    mixed_data, prepared.row_non, prepared.col_non, x,
+                    prepared.shape, out=out, out_dtype=out_dtype,
+                    return_time=return_time,
+                )
             if _is_iluvatar_runtime() and op_code == SPMV_COO_OP_NON:
                 result_dtype, _ = _mixed_spmx._resolve_types(
                     mixed_data.dtype, x.dtype, out, out_dtype, True
@@ -1434,6 +1449,30 @@ def flagsparse_spmv_coo(
                 plan = prepared.sell_plans.get(result_dtype)
                 if plan is not None:
                     return plan.run(x, out, return_time)
+                if mixed_data.dtype == torch.float32 and x.dtype == torch.complex64:
+                    sources = (mixed_data, prepared.row_non, prepared.col_non)
+                    options = (prepared.shape, result_dtype)
+                    plan = prepared.mixed_plans.get(sources, options)
+                    if plan is None:
+                        rows, cols = prepared.row_non, prepared.col_non
+                        sorted_rows = prepared.sort_by_row and (
+                            rows.numel() < 2 or bool(torch.all(rows[1:] >= rows[:-1]))
+                        )
+                        if sorted_rows:
+                            values = mixed_data
+                        else:
+                            order = torch.argsort(rows, stable=True)
+                            values = mixed_data.index_select(0, order)
+                            cols = cols.index_select(0, order)
+                        counts = torch.bincount(rows.long(), minlength=prepared.n_rows)
+                        ptr = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(rows.dtype)
+                        plan = _mixed_spmx.prepare_spmv_csr_mixed(
+                            values, cols, ptr, x.dtype, prepared.shape, out_dtype=result_dtype,
+                        )
+                        prepared.mixed_plans.put(sources, options, plan)
+                    return _mixed_spmx.spmv_csr_mixed_prepared(
+                        plan, x, out=out, return_time=return_time,
+                    )
             launch = _resolve_spmv_coo_launch(prepared, op_code)
             return _mixed_spmx.spmv_coo_mixed(
                 launch.data,
@@ -1521,7 +1560,9 @@ def flagsparse_spmv_coo(
     else:
         # The gather kernel owns its R/K/warp geometry. COO atomic launch
         # overrides are unused on this route, so avoid resolving them per call.
-        if _is_rocm_runtime() and launch.csr_plan is not None:
+        if ((_is_rocm_runtime() or (_is_iluvatar_runtime()
+                and block_size is None and num_warps is None))
+                and launch.csr_plan is not None):
             block_size = 256 if block_size is None else block_size
             num_warps = 2 if num_warps is None else num_warps
         else:

@@ -48,6 +48,7 @@ class SpGEMMPrepared:
         "a_row_work",
         "a_pref",
         "row_work_ready",
+        "symbolic_sources",
     )
 
     def __init__(
@@ -80,6 +81,7 @@ class SpGEMMPrepared:
         # lets a kernel map a flat product index q -> (A nonzero, B position)
         self.a_pref = a_pref
         self.row_work_ready = bool(row_work_ready)
+        self.symbolic_sources = None
 
 
 def _validate_csr(data, indices, indptr, shape, tag):
@@ -246,7 +248,9 @@ def prepare_spgemm_csr(
         row_work = torch.empty(0, dtype=torch.int32, device=a_data.device)
         a_pref = torch.empty(0, dtype=torch.int32, device=a_data.device)
         row_work_ready = True
-    elif _is_maca_runtime():
+    elif _is_maca_runtime() or (
+        _is_iluvatar_runtime() and a_data.dtype in (torch.float32, torch.complex64)
+    ):
         from ._spgemm_maca import build_metadata
 
         row_work, a_pref = build_metadata(a_indices, a_indptr, b_indptr)
@@ -1314,6 +1318,13 @@ def _spgemm_hash_hybrid_compute(prepared):
 
 def _spgemm_compute(prepared):
     """Dispatch: hybrid hash when worthwhile, otherwise memory-safe ESC."""
+    if (isinstance(prepared, SpGEMMPrepared) and _is_iluvatar_runtime()
+            and prepared.a_data.dtype in (torch.float32, torch.complex64)):
+        from . import _spgemm_iluvatar
+
+        result = _spgemm_iluvatar.compute(prepared)
+        if result is not None:
+            return result
     # The MUSA backend can compile and launch the TLE hash kernels, but the
     # completion/synchronization of their shared-memory CAS path wedges on MTT
     # S5000 for ordinary random CSR inputs.  The capability probes for the
@@ -1328,7 +1339,10 @@ def _spgemm_compute(prepared):
     # C550 has no TLE. Its product, reductions and CSR construction use the
     # MACA-only standard Triton implementation, never torch.sparse.mm or ESC.
     if (
-        _is_maca_runtime()
+        (_is_maca_runtime() or (
+            _is_iluvatar_runtime()
+            and prepared.a_data.dtype in (torch.float32, torch.complex64)
+        ))
         and isinstance(prepared, SpGEMMPrepared)
     ):
         return _maca_triton_spgemm_compute(prepared)
@@ -1471,6 +1485,9 @@ def flagsparse_spgemm_csr(
             b_indptr,
             b_shape,
         )
+        if (_is_iluvatar_runtime()
+                and prepared.a_data.dtype in (torch.float32, torch.complex64)):
+            prepared.symbolic_sources = (a_indices, a_indptr, b_indices, b_indptr)
         if return_meta:
             _ACCEL.synchronize()
             prepare_ms = (time.perf_counter() - t_prepare0) * 1000.0

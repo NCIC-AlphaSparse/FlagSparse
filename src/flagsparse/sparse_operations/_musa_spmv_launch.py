@@ -9,6 +9,54 @@ Triton's JIT dispatch costs more host time than a short SpMV kernel runs:
 from collections import OrderedDict
 import os
 
+from ._rocm_sparse_cache import TensorPlanCache
+
+
+class MusaTensorPlanCache(TensorPlanCache):
+    """Keep the usual mutation checks without rebuilding a hot identity key."""
+
+    def __init__(self, maxsize=8):
+        super().__init__(maxsize)
+        self._hot = None
+
+    @staticmethod
+    def _signature(tensors):
+        if len(tensors) != 3:
+            return TensorPlanCache._signature(tensors)
+        # CSR/COO/SELL all have three source arrays. Retain every metadata
+        # check, avoiding a generator frame and duplicate shape tuples.
+        a, b, c = tensors
+        try:
+            return (
+                (a._version, a.data_ptr(), a.dtype, a.device, a.shape, a.stride()),
+                (b._version, b.data_ptr(), b.dtype, b.device, b.shape, b.stride()),
+                (c._version, c.data_ptr(), c.dtype, c.device, c.shape, c.stride()),
+            )
+        except RuntimeError:
+            return None
+
+    def get(self, tensors, options=()):
+        hot = self._hot
+        if hot is not None:
+            sources, previous_options, signature, plan = hot
+            if (options == previous_options and len(tensors) == 3
+                    and sources[0] is tensors[0] and sources[1] is tensors[1]
+                    and sources[2] is tensors[2]):
+                if signature == self._signature(tensors):
+                    return plan
+                self._hot = None
+        plan = super().get(tensors, options)
+        if plan is not None:
+            entry = self._entries[(tuple(id(t) for t in tensors), options)]
+            self._hot = (entry[0], options, entry[1], plan)
+        return plan
+
+    def put(self, tensors, options, plan):
+        super().put(tensors, options, plan)
+        entry = self._entries.get((tuple(id(t) for t in tensors), options))
+        self._hot = ((entry[0], options, entry[1], plan)
+                     if entry is not None else None)
+
 
 _LAUNCHERS = OrderedDict()
 _MAX_LAUNCHERS = 64
@@ -59,6 +107,18 @@ class _Launch:
         self.runner = compiled[grid]
         self.cuda = cuda
         self.direct = hasattr(compiled, "run") and (device.type == "musa" or cuda)
+        # MUSA's compiled entry and module metadata are immutable. Resolving
+        # these lazy properties on every short call adds host launch overhead.
+        self.musa_entry = None
+        if self.direct and not cuda:
+            entry = compiled.run
+            # Use the compiled Triton launcher directly only when its Python
+            # wrapper has no descriptor expansion or scratch allocation to do.
+            if (hasattr(entry, "launch")
+                    and getattr(entry, "_needs_runtime_expansion", True) is False
+                    and getattr(entry, "global_scratch_size", None) == 0):
+                entry = entry.launch
+            self.musa_entry = (entry, compiled.function, compiled.packed_metadata)
 
     def __call__(self, tensors, scalars, constants, addresses=None, checked=False):
         global _RAW_STREAM, _CUDA_RAW_STREAM
@@ -84,9 +144,14 @@ class _Launch:
         # This is Triton's normal compiled launcher, including scratch handling.
         # Only pointer validation and empty profiling metadata are redundant.
         try:
-            self.compiled.run(
-                *self.grid, stream, self.compiled.function,
-                self.compiled.packed_metadata, None, None, None,
+            if self.musa_entry is not None:
+                entry, function, metadata = self.musa_entry
+            else:
+                entry, function, metadata = (self.compiled.run, self.compiled.function,
+                                              self.compiled.packed_metadata)
+            entry(
+                *self.grid, stream, function,
+                metadata, None, None, None,
                 *addresses, *scalars, *constants,
             )
         except TypeError:

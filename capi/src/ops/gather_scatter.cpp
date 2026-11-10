@@ -30,6 +30,9 @@
 #include "adaptor/adaptor.hpp"
 #include "core/internal.hpp"
 #include "core/jit.hpp"
+#if defined(BACKEND_MUSA)
+#include "triton_jit/triton_jit_function.h"
+#endif
 
 using namespace flagsparse;
 
@@ -110,6 +113,43 @@ flagsparseStatus_t run(flagsparseHandle_t handle, const char* kernel_name,
                        void* dst, const void* src, const void* indices,
                        int64_t nnz, flagsparseDataType_t value_type,
                        flagsparseIndexType_t idx_type, int64_t grid) {
+#if defined(BACKEND_MUSA)
+    // Reuse only host dispatch metadata. Every invocation supplies the live
+    // pointers and stream; libtriton_jit still selects the current device's
+    // compiled Triton kernel. The cold path initializes the Python environment
+    // and reports missing modules through the ordinary bridge.
+    struct CachedCopy {
+        std::string module, kernel, signature;
+        flagsparseDataType_t value_type;
+        flagsparseIndexType_t idx_type;
+        triton_jit::TritonJITFunction* fn;
+    };
+    static thread_local std::vector<CachedCopy> copies;
+    const std::string module = jit::codegen_module("gather_scatter.py");
+    const int warps = kNumWarps;
+    const int stages = kNumStages;
+    for (const auto& copy : copies) {
+        if (copy.value_type != value_type || copy.idx_type != idx_type ||
+            copy.kernel != kernel_name || copy.module != module) continue;
+        auto dst_ptr = reinterpret_cast<adaptor::DevicePtr>(dst);
+        auto src_ptr = reinterpret_cast<adaptor::DevicePtr>(src);
+        auto idx_ptr = reinterpret_cast<adaptor::DevicePtr>(indices);
+        auto count = static_cast<std::int32_t>(nnz);
+        adaptor::DevicePtr global_scratch = 0, profile_scratch = 0;
+        void* raw[] = {&dst_ptr, &src_ptr, &idx_ptr, &count,
+                       &global_scratch, &profile_scratch};
+        try {
+            copy.fn->launch_with_raw_args(
+                reinterpret_cast<triton_jit::DefaultStreamType>(ctx(handle)->stream),
+                static_cast<unsigned int>(grid), 1, 1, warps, stages,
+                copy.signature, raw, 6);
+            return FLAGSPARSE_STATUS_SUCCESS;
+        } catch (const std::exception& exc) {
+            ctx(handle)->last_error = exc.what();
+            return FLAGSPARSE_STATUS_EXECUTION_FAILED;
+        }
+    }
+#endif
     std::vector<jit::Arg> args;
     args.reserve(4);
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(dst)));
@@ -121,7 +161,17 @@ flagsparseStatus_t run(flagsparseHandle_t handle, const char* kernel_name,
     const flagsparseStatus_t st = jit::launch(
         jit::codegen_module("gather_scatter.py"), kernel_name,
         build_signature(value_type, idx_type), ctx(handle)->stream,
+#if defined(BACKEND_MUSA)
+        grid, 1, 1, warps, stages, args, &err);
+    if (st == FLAGSPARSE_STATUS_SUCCESS) {
+        if (copies.size() >= 32) copies.erase(copies.begin());
+        copies.push_back({module, kernel_name, build_signature(value_type, idx_type),
+                          value_type, idx_type,
+                          &triton_jit::TritonJITFunction::get_instance(module, kernel_name)});
+    }
+#else
         grid, 1, 1, kNumWarps, kNumStages, args, &err);
+#endif
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
 }

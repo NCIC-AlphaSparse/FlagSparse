@@ -1185,9 +1185,9 @@ def prepare_spmv_csr(
     # matrices retain segbin, which avoids long-row imbalance in this regime.
     elif (not transpose and requested_alg == "auto" and config is None
           and (data.dtype in (torch.float16, torch.complex64)
-               or (_is_mthreads_runtime() and data.dtype == torch.bfloat16))
+               or ((_is_mthreads_runtime() or _is_iluvatar_runtime()) and data.dtype == torch.bfloat16))
           and (_backend_name() == "cuda" or
-               (_is_iluvatar_runtime() and data.dtype in (torch.float16, torch.complex64)) or
+               (_is_iluvatar_runtime() and data.dtype in (torch.float16, torch.bfloat16, torch.complex64)) or
                (_is_mthreads_runtime() and data.dtype in (torch.float16, torch.bfloat16)) or
                (_is_maca_runtime() and
                 (data.dtype == torch.float16 or data.numel() > 4 * n_rows)))):
@@ -1983,12 +1983,6 @@ def _spmv_execution_matrix(prepared):
 
 
 def _execute_spmv_route(prepared, x, out=None, timing=False):
-    complex_short_rows = (
-        _is_iluvatar_runtime()
-        and prepared.data.dtype == torch.complex64
-        and prepared.data.numel() / max(1, prepared.n_rows) <= 3.0
-        and prepared.max_row_nnz <= 16
-    )
     complex_nnz_plan = getattr(prepared, "iluvatar_c32_nnz_plan", None)
     complex_route = os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto")
     if (
@@ -2052,13 +2046,7 @@ def _execute_spmv_route(prepared, x, out=None, timing=False):
         and not (
             _is_iluvatar_runtime()
             and prepared.data.dtype == torch.complex64
-            and (
-                os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE") == "row_tile"
-                or (
-                    os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE", "auto") == "auto"
-                    and complex_short_rows
-                )
-            )
+            and os.environ.get("FLAGSPARSE_SPMV_CSR_COMPLEX_ROUTE") == "row_tile"
         )
     ):
         from . import _spmv_csr_transpose
@@ -2206,6 +2194,20 @@ def flagsparse_spmv_csr_run(
         _spmv_check_output(out, prepared, x)
         x = checked_x
         if not (return_time or return_meta or timing):
+            if (prepared.non_gather_plan is not None
+                    and prepared.alg_requested == "auto"
+                    and _is_mthreads_runtime()
+                    and prepared.data.dtype in (torch.float16, torch.bfloat16)
+                    and prepared.kernel_indices.dtype == torch.int32
+                    and prepared.kernel_indptr.dtype == torch.int32
+                    and not prepared.transpose):
+                # This prepared route is already fixed. Avoid constructing
+                # diagnostic phase dictionaries for an untimed gather call.
+                return _mixed_spmx._musa_csr_spmv(
+                    prepared.data.contiguous(), prepared.non_gather_plan[0],
+                    prepared.non_gather_plan[1], x.contiguous(), prepared.n_rows,
+                    prepared.data.dtype, torch.float32, out,
+                )
             return _execute_spmv_route_with_fallback(prepared, x, out)[0]
         _ACCEL.synchronize()
         result, gpu_ms = _spmv_phase(
@@ -2324,6 +2326,19 @@ def flagsparse_spmv_csr(
     bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
     ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
     """
+    if (isinstance(prepared, PreparedCsrSpmv)
+            and prepared.alg_requested == "auto" and prepared.non_gather_plan is not None
+            and prepared.data.dtype in (torch.float16, torch.bfloat16)
+            and _is_mthreads_runtime()
+            and all(value is None for value in (
+                data, indices, indptr, shape, alg, config, use_opt, op, transpose,
+            )) and out_dtype is None):
+        # The fixed prepared route validates x/out in run(). No route options
+        # were supplied, so resolving the default algorithm again is redundant.
+        return flagsparse_spmv_csr_run(
+            prepared, x, out=out, timing=timing,
+            return_time=return_time, return_meta=return_meta,
+        )
     if isinstance(prepared, _mixed_spmx.PreparedCsrMixedSpmv):
         if any(value is not None for value in (data, indices, indptr, shape)):
             raise ValueError("prepared mixed CSR calls must not also pass raw CSR arguments")

@@ -83,6 +83,12 @@ def _normalize_spmv_csc_index_fallback_policy(index_fallback_policy):
     return policy
 
 
+def _iluvatar_csc_nnz_enabled(data, n_cols, max_col_nnz):
+    mean = data.numel() / max(1, n_cols)
+    return (_is_iluvatar_runtime() and data.dtype in (torch.float32, torch.complex64)
+            and mean <= 16 and max_col_nnz > max(128, 16 * mean))
+
+
 class PreparedCscSpmv:
     """Prepared CSC metadata for repeated SpMV calls."""
 
@@ -102,6 +108,7 @@ class PreparedCscSpmv:
         "csr_delegate",
         "non_gather_plan",
         "maca_trans_plan",
+        "iluvatar_nnz_plan",
         "op",
         "transpose",
         "index_fallback_policy",
@@ -150,12 +157,27 @@ class PreparedCscSpmv:
         self.csr_delegate = csr_delegate
         self.non_gather_plan = None
         self.maca_trans_plan = None
-        if (_is_maca_runtime() and _spmv_csc_op_transposes(
+        self.iluvatar_nnz_plan = None
+        if (_is_iluvatar_runtime() and _spmv_csc_op_transposes(
                 _normalize_spmv_csc_op(op, transpose=transpose))
-                and data.dtype in (torch.float32, torch.complex64)):
+                and _iluvatar_csc_nnz_enabled(data, self.n_cols, max_col_nnz)):
+            row_ids = torch.repeat_interleave(
+                torch.arange(self.n_cols, device=data.device, dtype=torch.int32),
+                col_lengths, output_size=self.nnz,
+            )
+            empty = torch.nonzero(col_lengths == 0).flatten().to(torch.int32)
+            self.iluvatar_nnz_plan = row_ids, empty
+        if ((_is_maca_runtime() or _is_iluvatar_runtime()) and _spmv_csc_op_transposes(
+                _normalize_spmv_csc_op(op, transpose=transpose))
+                and data.dtype in (torch.float32, torch.complex64)
+                and not (_is_iluvatar_runtime()
+                         and (csr_delegate is not None or self.iluvatar_nnz_plan is not None))):
             from . import _spmv_csr_transpose
             self.maca_trans_plan = _spmv_csr_transpose.make_plan(
                 kernel_indices, kernel_indptr, None, self.n_cols)
+            if (_is_iluvatar_runtime() and data.dtype == torch.complex64
+                    and _normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_CONJ_TRANS):
+                self.maca_trans_plan[-1]["csc_c32_conj"] = True
         if (_normalize_spmv_csc_op(op, transpose=transpose) == SPMV_CSC_OP_NON
                 and ((_SPMV_CSC_CUDA and data.dtype == torch.complex64)
                      or (_is_rocm_runtime() and not _is_ascend_runtime()
@@ -475,7 +497,11 @@ def prepare_spmv_csc(
     # transpose kernel is kept.
     csr_delegate = None
     if (
-        _SPMV_CSC_CUDA
+        (_SPMV_CSC_CUDA or (
+            _is_iluvatar_runtime() and data.dtype == torch.float32
+            and (data.numel() / max(1, n_cols) > 3 or max_col_nnz > 16)
+            and not _iluvatar_csc_nnz_enabled(data, n_cols, max_col_nnz)
+        ))
         and _spmv_csc_op_transposes(op_code)
         and int(data.numel()) > 0
     ):
@@ -700,6 +726,27 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if trans and prepared.iluvatar_nnz_plan is not None:
+        from ._spmv_csr_nnz import _complex_nnz_kernel, _nnz_kernel
+
+        row_ids, empty = prepared.iluvatar_nnz_plan
+        result = torch.empty(out_len, dtype=dtype, device=prepared.data.device)
+        if dtype == torch.complex64:
+            _complex_nnz_kernel[(triton.cdiv(max(prepared.nnz, empty.numel()), 128),)](
+                torch.view_as_real(prepared.data.resolve_conj()),
+                prepared.kernel_indices, prepared.kernel_indptr, row_ids,
+                torch.view_as_real(x.contiguous().resolve_conj()), torch.view_as_real(result),
+                empty, empty.numel(), prepared.nnz, 128,
+                CONJUGATE=op_code == SPMV_CSC_OP_CONJ_TRANS,
+                CACHE_MODIFIER=".cg", num_warps=1,
+            )
+        else:
+            _nnz_kernel[(triton.cdiv(max(prepared.nnz, empty.numel()), 256),)](
+                prepared.data, prepared.kernel_indices, prepared.kernel_indptr, row_ids,
+                x.contiguous(), result, empty, empty.numel(), prepared.nnz, 256,
+                tl.float32, num_warps=1,
+            )
+        return result
     if trans and prepared.maca_trans_plan is not None:
         from . import _spmv_csr_transpose
         return _spmv_csr_transpose.gather(
@@ -717,7 +764,9 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
             # wasted memset -- that alone moved the operator 0.765 -> 0.940.
             # use_opt=False deliberately: the bucketed path measured 0.39x on fp32,
             # while the default matches the oracle over both (4.39x vs 4.41x).
-            return flagsparse_spmv_csr(prepared=csr_delegate, x=x, use_opt=False)
+            return flagsparse_spmv_csr(
+                prepared=csr_delegate, x=x, use_opt=None if _is_iluvatar_runtime() else False,
+            )
     y = torch.zeros(out_len, dtype=dtype, device=prepared.data.device)
     if prepared.nnz == 0:
         return y
@@ -885,6 +934,7 @@ def _run_spmv_csc_prepared_with_fallback(prepared, x, op_code):
 _SPMV_CSC_VIA_MIXED_DTYPES = (torch.float16, torch.bfloat16, torch.int8)
 _ROCM_CSC_GATHER_CACHE = TensorPlanCache()
 _MACA_CSC_INT_CACHE = TensorPlanCache()
+_ILUVATAR_CSC_INT_CACHE = TensorPlanCache()
 
 
 def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype,
@@ -901,7 +951,7 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
     if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
         raise ValueError("invalid CSC dimensions")
     timed = bool(return_time or return_meta)
-    if (_is_maca_runtime() and data.dtype == torch.int8
+    if ((_is_maca_runtime() or _is_iluvatar_runtime()) and data.dtype == torch.int8
             and _mixed_spmx._requested_out_dtype(out, out_dtype) in (None, torch.int32)):
         from . import _spmv_csr_transpose
         from ._spmv_csc_maca import int_gather
@@ -921,18 +971,36 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
             raise ValueError("out shape/device must match the CSC SpMV result")
         t0 = _mixed_spmx._start(timed)
         sources, options = (indices, indptr), (n_rows, n_cols, trans)
-        plan = _MACA_CSC_INT_CACHE.get(sources, options)
+        cache = _ILUVATAR_CSC_INT_CACHE if _is_iluvatar_runtime() else _MACA_CSC_INT_CACHE
+        plan = cache.get(sources, options)
         if plan is None:
             plan = (_spmv_csr_transpose.make_plan(indices.contiguous(), indptr.contiguous(), None, n_cols)
                     if trans else _spmv_csr_transpose.prepare(indices, indptr, (n_cols, n_rows)))
-            _MACA_CSC_INT_CACHE.put(sources, options, plan)
-        y = int_gather(data, x, plan, length, result_dtype, out)
+            cache.put(sources, options, plan)
+        if _is_iluvatar_runtime():
+            state = plan[6]
+            try:
+                version = data._version
+            except RuntimeError:
+                version = None
+            if (version is None or state.get("int_source") is not data
+                    or state.get("int_version") != version):
+                values = data if plan[2] is None else _gather_values(data, plan[2]).contiguous()
+                mixed_plan = _mixed_spmx.prepare_spmv_csr_mixed(
+                    values, plan[0], plan[1], x.dtype, (length, input_length),
+                    out_dtype=result_dtype,
+                )
+                state.update(int_source=data, int_version=version, int_plan=mixed_plan)
+            y = _mixed_spmx.spmv_csr_mixed_prepared(state["int_plan"], x, out=out)
+        else:
+            y = int_gather(data, x, plan, length, result_dtype, out)
         y = _mixed_spmx._finish(y, out, t0, timed)
         if not timed:
             return y
         y, elapsed = y
         if return_meta:
-            meta = {"route": "maca_csc_int_gather", "compute_ms": elapsed, "op_total_ms": elapsed}
+            route = "iluvatar_csc_int_gather" if _is_iluvatar_runtime() else "maca_csc_int_gather"
+            meta = {"route": route, "compute_ms": elapsed, "op_total_ms": elapsed}
             return (y, elapsed, meta) if return_time else (y, meta)
         return y, elapsed
     if (
