@@ -1340,3 +1340,193 @@ setsid env PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/
 - 为什么改（附报错原文）：无算子异常；确保只选择已验证的 MUSA complex64 C=32 路径。
 - 怎么验证的：24 passed，属于上述 SELL 合计 47 passed；`git diff --check` 与 `scope_audit.json` 通过。
 - 其他后端是否也需要：不改其他后端实现，测试可跨平台运行。
+
+
+### 2026-11-10 MUSA 剩余 8 项优化：验证条件和阶段结果
+
+本轮依据 `results_mthreads_105_20261110_083219_upstream_d52ac62_musa_opt_unbound_defaultthreads/summary_split.json`，该轮 105/105 精度、性能状态 Passed，8 项算子均值低于 0.8。保持原 10 个 tests/data 矩阵、基线优先级、全部慢行、精度容差和计时参数；不绑核，OMP_NUM_THREADS、MKL_NUM_THREADS、OPENBLAS_NUM_THREADS 均不设置。Python 默认 255/128 线程，未修改线程数；H800 折算项仍为估算，不改称本机厂商基线。
+
+### 2026-11-10 capi/src/ops/spmv.cpp::MUSA COO FP32 转置
+
+- 改了什么：仅 backend=musa、COO、FP32、转置/共轭转置走三个 Triton kernel，清零 FP64 工作区、按 nnz 分块累加 FP64 乘积、融合 alpha/beta 转 FP32 写回。bufferSize 报告输出长度乘 sizeof(double)，预处理不缓存值和拓扑，计算读取实时 row/col/value/x；每次从 handle 获取当前流。空输出无需工作区。撤回上一轮间接输出行 gather，因此 capi/src/core/sparse_gather.hpp 恢复到 HEAD。
+- 为什么改（附报错原文）：无异常；上一轮均值 0.646625，列长度不均及间接读取使行归约较慢。FP32 原子累加不能保留抵消项，改为 FP64 乘法/原子累加后只转换一次。
+- 怎么验证的：38/38 C API SpMV 精度通过，含 int32/int64、长列、alpha/beta、beta=0 时 NaN 输出、输入/拓扑更新及非默认流。原 10 矩阵官方定向测试 10/10 精度通过，平均 0.933926，原 warmup=10/iters=100/median 不变。证据 `results_musa_opt_20261110_low8/capi_atomic64_v1/`、`capi_final_accuracy.log`。
+- 其他后端是否也需要：否；运行时 predicate 显式要求 musa，其他后端保持原分派。
+
+### 2026-11-10 capi/flagsparse_codegen/sparse_gather.py::COO FP64 三阶段内核
+
+- 改了什么：新增 musa_coo_transpose_zero/scatter_f64/finish，全 Triton，nnz tile=128、向量 tile=512，地址提升为 int64。beta=0 不读取旧输出，累加工作区不跨调用复用数值。
+- 为什么改（附报错原文）：同上一条；替代上一轮未达标的 COO 输出行 gather。已有 CSR 实乘复数 FP64 gather 等内核保持不变。
+- 怎么验证的：同上一条 C API 精度和官方 10 矩阵定向结果；其他精度内核继续由原测试验证。
+- 其他后端是否也需要：否；新增符号只被 MUSA predicate 调用。
+
+### 2026-11-10 src/flagsparse/sparse_operations/mixed_spmx.py::分组 SELL、短行布局和成对加载
+
+- 改了什么：保留已有输入版本/存储/元数据失效和实时 RHS/流/输出语义；新增 MUSA 专用 slot-major 分组 SELL kernel，在低 padding、中等行长的大规模 int8/实乘复数路径使用。规则极短行选固定行上界归约。FP16 规则短行在支持 TLE 时使用显式 blocked layout，模块仅在 MUSA 导入，缺 TLE 保留原路径。FP16 中小矩阵可用 Triton 打包精确拓宽值和 int32 列号，每项 64 位加载；所有值打包由输入缓存版本失效重建，不缓存结果。前轮改动也保留：CSR 输入校验复用、COO helper 直接调用、CSR 转置实乘复数 FP64 归约。
+- 为什么改（附报错原文）：无算子异常；8 项均值未达 0.8，短行的访存布局、RHS 间接加载与主机调用开销限制性能。默认线程下 CPU 限额停顿仍被保留，不通过修改测试规避。
+- 怎么验证的：多组扫参及被拒候选全部保存在 `results_musa_opt_20261110_low8/`。定向 final_rows.json 保留 60 条原始计时，全部精度 PASS；FP16、实乘复数、COO i8f32/i8i32、CSR i8i32 均值分别为 0.920779、0.859470、0.806942、0.891465、1.162907。FP16->FP32 本轮仍有一次约 4.8ms 停顿，该次均值 0.745844，尚不能据此宣称 8 项全达标。完整验证结果以后续独立结果目录为准。
+- 其他后端是否也需要：否；新 kernel 和选择仅由 MUSA 专用 helper 触达，现有其他后端算法保持原实现。
+
+### 2026-11-10 src/flagsparse/sparse_operations/spmv_sell.py::规则 FP16 SELL
+
+- 改了什么：仅 MUSA FP16、大规模、平均及最大 slice 宽度满足短行条件时，准备 CSR 视图以调用上述 TLE 路径；保留高 padding 压缩、版本失效和输出存储语义。前轮 MUSA FP32 的 32 行 tile 复用原 wide kernel 改动保留。
+- 为什么改（附报错原文）：无异常；SELL FP16 上一轮均值 0.691629，规则短行可减少冗余 slice 访存。
+- 怎么验证的：原 10 矩阵 SELL 定向精度全过；TLE/成对加载集成后的最终定向和完整 105 项证据见本轮结果目录。
+- 其他后端是否也需要：否；_musa_sell_csr_plan 只在 MUSA 分支调用，TLE 导入受 MUSA 开关保护。
+
+### 2026-11-10 tests/pytest/test_musa_sparse_routes.py::新增路径语义回归
+
+- 改了什么：增加 grouped SELL 的尾部、不等行长、int32/FP32/complex64 输出及实时输入检查；大规模规则 FP16 的 COO/CSR/SELL 公共 API 检查覆盖部分 tile、不同输出、持有历史结果及输入更新；成对加载检查值/列/RHS 修改和 .data 存储替换。测试只在 MUSA 实机运行，原断言和容差不放宽。
+- 为什么改（附报错原文）：防止新拓扑和值打包造成旧值、旧存储或覆盖历史输出。初版测试误改 prepared COO 之外的原 values，已改为修改 prepared.data_non；成对加载原 FP16 CSR 未走 mixed 路径，改用实际支持此路径的 COO 公共入口验证。失败日志完整保留。
+- 怎么验证的：修正测试后的 TLE 专项 6 passed、成对加载专项 2 passed；全套最终结果保存 python_verified_regression 等后续日志，不将中途失败记作通过。
+- 其他后端是否也需要：否；原文件具有显式 MUSA 实机条件。
+
+### 2026-11-10 capi/ctest/accuracy/test_spmv.cpp::COO 转置回归
+
+- 改了什么：保留新增的 COO 转置抵消/长列/实时数据/alpha-beta/int32-int64 测试，并在 MUSA 非默认流检查中运行两种索引 COO 转置。
+- 为什么改（附报错原文）：无算子异常；FP64 原子归约需要验证抵消项、空输出及实时流语义。
+- 怎么验证的：重新构建后 38/38 SpMV 精度通过，未删除或放宽原断言。
+- 其他后端是否也需要：否；非默认流扩展受 MUSA 宏保护，其他新增用例显式检查后端。
+
+
+本轮最终精度记录（2026-11-10）：`results_musa_opt_20261110_low8/python_complete_regression.log` 为 **346 passed、4 skipped**；`capi_complete_accuracy.log` 为 **39/39 passed**，含新增 COO 空矩阵/零输出/beta 检查。`final_half_rows.json` 的追加单变体复测仍保留 amazon0601 的约 4.45ms 停顿，均值 **0.693244**；不替换或取多轮最好值。最终达标数等待后续完整 105 项实测，不能由定向结果拼出 8/8 达标。
+
+### 2026-11-11 剩余 8 项：不绑核、默认线程下继续调优
+
+上一完整轮 `results_mthreads_105_20261110_135953_upstream_d52ac62_musa_opt_unbound_defaultthreads/` 为 105/105 精度 Passed、97/105 均值大于 0.8。8 项为 scatter FP16、COO FP16/FP16→FP32/FP32×complex64、CSR BF16/BF16→FP32、SELL FP16/int8→int32。本轮仍使用原 tests/data 十矩阵、原基线优先级/容差/计时参数，不绑核，不设置 OMP_NUM_THREADS、MKL_NUM_THREADS、OPENBLAS_NUM_THREADS，也不调用线程数设置接口。
+
+### 2026-11-11 src/flagsparse/sparse_operations/mixed_spmx.py::BF16 路由与实乘复数融合扫描
+
+- 改了什么：MUSA 半精度 TLE、成对加载和低 padding SELL 选择扩展到 BF16，转换为 FP32 累加，保持原输出 dtype。MUSA FP32 实乘 complex64 的 NNZ 路径新增 Triton 三元分段扫描，共用行号比较并以 64 位加载完整复数 RHS；保留原输出行唯一所有权、跨块前缀重算和空行清零。值、索引、RHS、输出、当前流和原缓存失效语义不变，未缓存结果。
+- 为什么改（附报错原文）：无生产异常；BF16 之前未复用已验证的半精度路线，复数 NNZ 原路径分别扫描实部和虚部。原 ASIC 探针约 58.9 us，融合扫描加完整 RHS 加载候选约 53.7 us；此为定向探针，不代表完整变体均值。
+- 怎么验证的：`results_musa_opt_20261111_low8/final_v1_rows.json` 的 50/50 原矩阵精度通过，BF16/BF16→FP32/COO FP16 均值 0.845239/0.851785/0.811480；COO FP16→FP32/实乘复数仍有慢样本，均值 0.600191/0.588707，不能宣称全达标。融合扫描随后执行跨块、部分 tile、空行、随机非零虚部、int32/int64、跨步输出、输入更新和非默认流检查，并重测原十矩阵；最终日志见本轮 `regression_final.log` 和 `complex_final_*`。
+- 其他后端是否也需要：否；本轮只改 `_musa_coo_half_spmv` 及新增 MUSA kernel。原 kernel 定义 AST 不变；选择只由 MUSA helper 调用。
+
+### 2026-11-11 src/flagsparse/sparse_operations/gather_scatter.py::scatter launcher 复用
+
+- 改了什么：在已有索引版本缓存中复用 Triton launcher，按 dtype、device、对齐、alias、stride 和 debug 状态区分，实时读取当前指针和流；保留 profiling/debug 回退、推理张量不缓存、重复索引最后一个值胜出的规则。缓存仅保存拓扑和调度，最多 16 个 launcher。
+- 为什么改（附报错原文）：无生产异常；短 kernel 的重复 JIT 分派增加主机时间。
+- 怎么验证的：原 4 个合成规模全部精度 PASS，`scatter_official.csv` 保留最大规模约 0.971 ms 慢样本；正常样本约 13–15 us。新增跨步、重复索引、存储替换、非默认流和 inference 张量回归；未修改原计时方法。
+- 其他后端是否也需要：否；只改 `_musa_scatter_dense`。原 Triton kernel 定义及其他后端调用不变。
+
+### 2026-11-11 src/flagsparse/sparse_operations/spmv_sell.py::int8 条目打包
+
+- 改了什么：MUSA、C=32、列号范围允许的中等行宽 int8 SELL，将 24 位列号和原 signed int8 值由 Triton 无损打包到单个 32 位条目，低 24 位为 col+1，零表示 padding；新 Triton 计算 kernel 按原 int32/FP32 累加语义读取，支持部分 slice 和跨步输出。原版本/存储/元数据失效规则负责重建打包数据，输出不缓存；launcher 支持四个或五个张量参数。
+- 为什么改（附报错原文）：无生产异常；减少独立值/列数组的访存，amazon/auto 探针约 55→48 us、80→74 us。未将探针最好值替换正式结果。
+- 怎么验证的：原十矩阵 FP16/int8 共 20/20 精度 PASS；`sell_pairs.csv` 按上一完整轮固定基线的均值为 0.665824/0.761067，慢样本全部保留，尚未达标。新增 -128/127、padding、部分 slice、跨步输出、输入/存储更新和 return_time 回归。`scope_audit.json` 检查去掉 MUSA 分支后的公共入口 AST 与本轮开始时一致。
+- 其他后端是否也需要：否；打包和新 kernel 仅在原 `if musa` 分支调用，原有 kernel 定义不变。
+
+### 2026-11-11 tests/pytest/test_musa_sparse_routes.py::本轮语义检查
+
+- 改了什么：扩展 BF16 TLE/成对加载/SELL 准备测试，增加 scatter launcher、SELL int8 打包和实乘复数融合扫描回归，保留原精度容差及断言。
+- 为什么改（附报错原文）：防止打包缓存和 launcher 复用造成旧值或旧存储。新增复数随机测试初轮在设备执行哨兵比较报 `SetMUTensorDType Unsupported tensor dtype: ComplexFloat`，已将该比较放到 CPU；不改生产逻辑或容差，失败日志保留。
+- 怎么验证的：首阶段 `regression_v1.log` 为 363 passed、4 skipped；新增融合扫描旧语义回归 14 passed。最终更完整记录见 `regression_final.log`。所有新增实机用例受本文件 MUSA 条件限制。
+- 其他后端是否也需要：否；非 MUSA 分派同时通过静态范围审计及现有 CPU mock 回归验证。
+
+实验留档：压缩半精度列号、TLE 实乘复数布局/eviction、64 位值列对、sigma 行长重排、persistent、长短行分流和完全展开未见稳定整体收益，未接入。首次融合扫描实验有循环变量形状冲突，v2 使用独立前缀变量修正；原始失败日志保留。`bf16_launch` 与首轮 TLE 探针曾短暂重叠，相关计时仅作诊断，最终定向和完整轮保持串行。所有完整验收以新独立目录的 summary_split.json 为准，不拼接多轮最好值。
+
+### 2026-11-11 tests/ci/test_spmv_sell_musa_dispatch.py::补齐已有 FP32 wide 路由 mock
+
+- 改了什么：mock 包含 `_spmv_sell_wide_kernel`，并断言 MUSA FP32、C=32、普通宽度选择该路径；原 complex64/C=32 专用路径及非 MUSA 断言保留。
+- 为什么改（附报错原文）：扩大验证时旧 mock 报 `AttributeError: 'JITFunction' object has no attribute 'name'`；其遗漏前轮已接入的 FP32 wide kernel。与本轮 int8 打包和复数融合无关，未为此改生产逻辑。
+- 怎么验证的：`sell_dispatch_final.log` 为 24 passed；首轮扩大检查日志 `regression_final.log` 保留 420 passed、4 skipped、1 failed，其中该失败已单独修复复验。实机两文件为 365 passed、4 skipped，SpVV 分派 32 passed。
+- 其他后端是否也需要：不改任何后端生产实现；该 mock 可跨平台运行。
+
+补充（本轮冻结前）：FP16 SELL 中小矩阵、实际平均行长 >12、最大 slice 宽度 ≤128 时，MUSA compact CSR 计划进一步复用既有成对加载 kernel。原十矩阵探针对比 cfd2 约 37.8→31.1 us、wave 约 32.9→31.1 us；接入后新增跨步输出/非默认流/值与索引存储替换测试，相关合计 14 passed（`sell_half_pairs_regression.log`）。`sell_half_final.csv` 为原十矩阵 10/10 精度 PASS、固定原基线均值 **0.840969**，保留 roadNet-TX 约 4.86ms 慢样本。scatter 官方 4 个规模按同一轮固定基线均值 **1.147117**，同样保留全部慢样本。上述均为独立定向结果，不能替代完整 105 项达标数。
+
+本轮完整复测由 `results_musa_opt_20261111_low8/launch_full.py` 启动：`setsid timeout -s KILL 43200 /usr/bin/python`，官方 `run_flagsparse_delivery.py --gpus 0 --results-dir ...`；实际独立目录见 `artifacts/latest_105_retest_directory.txt` 和其 RUN_INFO.json。开始后冻结代码，原十矩阵、105 变体、基线/容差和计时设置不变，不同时运行其他 GPU 实验。启动、完成状态及最终未达标列表以该轮 RUN_INFO.json、summary_split.json、completion_audit.json 为准。
+
+最终串行复数十矩阵定向：`complex_serial_rows.json` 为 10/10 精度 PASS，均值 **0.820636**；这轮无其他 GPU 实验或 CPU mock 并行。之前 `complex_final` 的 0.767139 因曾与短时 CPU mock 并行，只作诊断且日志保留。冻结前按各自最后有效定向统计，8 项中 6 项 >0.8，COO FP16→FP32（0.600191）和 int8 SELL（0.761067）仍低于阈值；不能由这些分项测试宣称完整轮达标。
+
+### 2026-11-11 默认线程下的稳定性排查（完整轮 021131 后）
+
+完整轮 `results_mthreads_105_20261111_021131_upstream_d52ac62_musa_opt_unbound_defaultthreads/` 历时 2:57:53；105 项 accuracy 汇总为 Passed，但 C API `spmv_csr_f32_int_trans` 的 ASIC 原始精度记录失败（strict ratio 1.363375，厂商通过 strict），使 performance 为 104 Passed/1 Failed。不能把汇总 accuracy 105 Passed 解释成 C API 全通过。其余性能 9 项低于 0.8，95 项有效 Passed 且 >0.8。原 8 项中的 scatter、复数 COO 和两条 BF16 已超过阈值，同时其他相邻变体出现慢样本。
+
+新证据目录：`results_musa_opt_20261111_stability/`。保持原 10 矩阵、固定完整轮基线、容差和 wallclock warmup=5/iters=20，不绑核，不设置 OMP_NUM_THREADS/MKL_NUM_THREADS/OPENBLAS_NUM_THREADS。CPU 配额 `1500000 100000`（相当于 15 核），PyTorch 默认 255/128 线程。本轮 `diagnose_timing.json` 的原计时器未改，20 条记录中 4 条 >1ms（3.67–4.46ms）均伴随 cgroup 限流计数增长；计数范围包括预热，不能单凭此确定每个慢样本的唯一原因。GPU kernel 提速无法保证消除主机被调度暂停。
+
+显式环境候选 `OMP_WAIT_POLICY=PASSIVE` 仅让 OpenMP 空闲线程等待时休眠，不改变线程数，不绑核；生产代码和官方 runner 默认均未设置该变量。三组预先约定、交替顺序、独立进程的默认/PASSIVE 对照，原矩阵和原计时不变，全部 120 条精度 PASS：COO FP16→FP32 默认 0.792071/0.772826/0.733021，PASSIVE 0.890547/0.884785/0.887093；COO int8→int32 默认 0.966848/0.903816/0.752937，PASSIVE 0.995565/0.994515/1.003872。全部样本保留，不挑最好一轮；它是不同环境的对照，不能冒充原默认等待策略下的验收。原始记录在 `wait_*`，摘要 `wait_policy_summary.json`。尚须全部 9 项和完整 105 项验证，有限轮次的稳定不代表绝对不会波动。
+
+### 2026-11-11 src/flagsparse/sparse_operations/spmv_sell.py::TLE int8 布局和元数据上界
+
+- 改了什么：新增 MUSA Triton/TLE `_musa_sell_i8_tle`，使用版本检查保护的最大 slice 宽度和显式 row/slot 布局计算无损 packed int8 数据，保留 int32/FP32 累加。允许短行和至多 32 padded 槽/行打包；长行仍保留原 packed kernel。仅原 `if musa` 分支选择新路径，不改现有共享 kernel 定义。准备 paired/TLE 路由时，上界由阻塞复制的 offsets 元数据在主机计算，不复制矩阵值、向量或结果。
+- 为什么改（附报错原文）：正常 int8 SELL 探针 GL7d14/amazon/cfd2 约 26.6→22.7、52.8→47.0、32.5→24.8 us。完整回归还暴露旧 FP16 路由 `KeyError: 'csr_launches'`：数值 fallback 正确，但设备临时差分 max 在非默认流偶发返回 16843009，原 offsets=[0,544,1088,1632]，正确上界为 544，导致快速路径被拒。单独将 max 结果复制 CPU 和替换 row-id 生成均未解决，已撤回；从原 offsets 的阻塞主机拷贝计算冷元数据后，原 4 种 FP16 输出组合连续 10 组（120 次路径检查）全部选择成对加载。没有通过放松路线断言绕过问题。
+- 怎么验证的：`sell_tle_regression.log` 13 passed；非默认流复现及失败候选日志完整保留，最终 `reproduce_half_plan_host_bound.log` 为 10 组通过、`reproduce_half_plan.json` 为 120/120 路径选择。扩大精度与原十矩阵测量见本轮后续 `regression_host_bound.log`、`all9_*`，所有慢样本保留。首次 TLE 动态循环触发 SliceEncoding 编译异常，候选改用缓存失效保护的固定宽度，未修改后端编译器。
+- 其他后端是否也需要：否；原共享 Triton kernel 定义 AST 和去掉 MUSA 分支后的 SELL 公共入口 AST 与本轮起点一致，证据 `scope_audit.json`。
+
+### 2026-11-11 src/flagsparse/sparse_operations/mixed_spmx.py::CSR/COO int8 复用打包 SELL
+
+- 改了什么：MUSA 低 padding int8 CSR/COO 计划将 SELL 值和列号打包后复用上述 TLE kernel（mean≤12），较长行使用既有 packed grouped kernel。原源数据/拓扑版本、存储和元数据签名负责失效，不缓存数值输出。行长上界同样由原 ptr 元数据的阻塞主机拷贝计算，防止非默认流临时 max 返回错误上界。
+- 为什么改（附报错原文）：无新增生产异常；amazon 探针约 54.3→46.7 us，auto 约 84.4→73.0 us，为 int8 COO/CSR 留出更大余量。原半精度元数据异常见上一条，不修改其他后端归约实现。
+- 怎么验证的：新增 4 项公开 CSR API、262145 行、6/13 槽、int32/FP32 输出，覆盖重复列、signed int8 极值、末尾 tile、非默认流和输入/存储更新；首轮 4 项数值全通过。最终与既有回归共同执行，见 `regression_host_bound.log`。原十矩阵及三轮显式环境对照单独留档，不将 probe 最好值替换正式记录。
+- 其他后端是否也需要：否；只改 `_musa_coo_half_spmv`，所有新增选择都位于 MUSA helper；其他后端 kernel/分派不变。
+
+### 2026-11-11 tests/pytest/test_musa_sparse_routes.py::打包 CSR 与路由诊断
+
+- 改了什么：新增上述 4 项大行数 int8 CSR/COO 共用路径回归；既有 FP16 SELL 成对路径断言增加失败时的 offsets/有效条目数信息，精度和路径选择断言均保留。
+- 为什么改（附报错原文）：保证优化仍读实时输入并处理末尾 tile；明确旧 FP16 偶发 fallback 的元数据错误，不因数值正确就忽略性能路径退化。
+- 怎么验证的：原始失败、复现实验、最后通过的完整集合分别保存在本轮不同日志中，不覆盖失败记录。线程数和 affinity 从未在测试内修改。
+- 其他后端是否也需要：否；测试文件有 MUSA 实机条件，非 MUSA 隔离另外通过 CPU mock 和 AST 检查。
+
+本轮冻结结果：`regression_host_bound.log` 为 **397 passed、4 skipped**；非默认流成对计划 120/120 次选择正确。`all9_default_1_*` 原等待策略 90/90 精度通过、5/9 >0.8、13 条 >1ms。相同冻结代码在 `all9_passive_1/2/3_*` 三个独立进程中 **270/270 精度通过、9/9 每轮 >0.8、0 条 >1ms**。各变体三轮最小均值：COO FP16 0.964749、FP16→FP32 0.823719、i8→FP32 0.992841、i8→int32 1.029266；CSR FP16 1.110560、i8→int32 1.266773；SELL FP16 0.966960、FP32 1.034718、i8→int32 1.002303（精确值以 `all9_comparison_summary.json` 为准）。全部原始记录保留，不挑最好一轮或丢弃慢样本。最低项只有约 3% 阈值余量，三轮通过不构成绝对稳定保证。
+
+随后使用本轮 `launch_full.py` 的独立 `*_waitpassive` 目录后台 setsid 跑官方 runner 全 105 项，显式记录 OMP_WAIT_POLICY=PASSIVE、三个线程数变量未设置和不绑核；这是等待策略改变后的新配置，不能覆盖旧默认配置结果。代码、基线、容差及计时器冻结；当前原 C API CSR FP32 转置的 ASIC 精度问题未修复，完整结果会继续如实保留。实际目录、开始时间和完成状态见 `artifacts/latest_105_retest_directory.txt` 及新轮 RUN_INFO.json。
+
+### 2026-11-11 CSR FP32 转置严格精度修复与三轮验证
+
+用户要求复查 `spmv_csr_f32_int_trans` 能否严格通过。证据目录为
+`results_musa_fix_20261111_csr_fp32_strict/`。开始时保存了原工作区文件，不覆盖前轮未提交修改。
+原 ASIC 输入直接调用生产库连续 8 次，严格误差比均为 1.363373，失败列为 405878（0-based）。
+前一整轮 `064012_*_waitpassive` 的通过属于文档 6.3.1 的 `pass_relaxed`，不等于严格修复。
+复查还发现该整轮 SpMV 原始记录包含 COO complex64 conj 和 CSC FP32 trans 两条其他放宽项；
+此前“104 项严格通过、1 项放宽”的口头计数不准确，不能从交付汇总的 Passed 推断全部严格通过。
+
+#### capi/src/ops/spmv.cpp::MUSA CSR FP32 transpose
+
+- 改了什么：增加只匹配 MUSA、CSR、FP32、trans/conj 的分支。复用原预处理拓扑的 native source row IDs，在原拓扑后追加 `n_cols * sizeof(double)` 工作区。共享已有 COO 的 Triton zero / FP64 scatter / finish 调用器，每次清零、实时读取矩阵和 RHS、FP64 乘法/原子累加，最后融合 alpha/beta 并一次转回 FP32；beta=0 不读旧输出。原 COO 包装传入相同参数，行为保持等价。调用方须按新的 bufferSize 分配工作区；不缓存计算结果。
+- 为什么改（附报错原文）：原严格误差比 1.363373；新增大数抵消用例在旧代码报 `actual: 12413.926874212006 vs 1`。旧短列 FP32 scatter 和长列 FP32 gather 都可能丢失小项。全量 FP64 gather 十矩阵严格通过但仅 0.708952x，混合宽 scatter / gather 为 0.911157x，均作为未采用实验保留；统一 FP64 scatter 获得更好余量，不按矩阵名或参考输出选择路径。
+- 怎么验证的：最终 ASIC 生产库 8 次重放相对量化 FP64 参考误差比全为 0；官方原十矩阵的未修改 benchmark 三个独立进程每轮 10/10 strict pass，ASIC strict ratio 0.00922928，整组最大 0.119437，均小于 1，放宽使用次数为 0。同轮本机 muSPARSE 平均加速比依次为 1.076152、1.0568982、1.0572383。原 C API warmup=10、iters=100、median 计时不变。
+- 其他后端是否也需要：否；`scope_audit.json` 删除新增 MUSA 分支并还原等价 COO helper 后，非 MUSA C++ 与起始工作区逐字相同。全部已有 Triton kernel 与本轮开始时逐字相同，本次只扩展其 MUSA C API 使用范围；没有引入 MUSA 原生计算、PyTorch 计算或改动 baseline/容差。
+
+#### capi/ctest/accuracy/test_spmv.cpp::MUSA CSR FP32 严格回归
+
+- 改了什么：新增 CSR FP32 转置大数相消和空输入用例，扩展既有 MUSA 非默认流用例。覆盖 int32/int64、trans/conj、重复列、长列、空列/空行/空输出、alpha/beta、beta=0 覆盖 NaN、值/RHS 实时更新、索引显式重预处理、SetPointers 失效与双工作区切换；严格调用原 default_tolerance。读取非默认流结果前按既有回归模式 dev_sync。
+- 为什么改（附报错原文）：新用例在旧生产实现严格失败，见 `regression_before.log`；初版新测试遗漏非默认流下载前同步而得到 inf，已补同步，保留该中间失败日志，不修改数值断言。
+- 怎么验证的：最终 `regression_final.log/.xml` 为 41/41 passed。第一次正式 benchmark 没有预建输出目录，只执行了测试而没有输出 JSON，保留 `benchmark_v1.log`，不能将其作为交付记录；重跑到新目录保存所有数据。最终三轮目录为 `final_trial_1/2/3`，不选最好一轮、不删除矩阵或慢样本。
+- 其他后端是否也需要：否；新增用例仅在 MUSA 实机运行，流用例仍由既有 MUSA 编译宏保护，其他后端原断言不变。
+
+最终验证环境仍为 `OMP_WAIT_POLICY=PASSIVE`，OMP/MKL/OPENBLAS 三个线程数变量均不设置，不绑核。
+`VALIDATION_INFO.json` 确认验证期间全部已跟踪源码及原十矩阵未变化。第一轮额外执行官方
+SpMV benchmark 未过滤变体集合：570 条实际执行记录无失败（568 strict pass，另外 2 条其他变体
+pass_relaxed），另有 40 条已声明但无测试路径的原记录；这不等于全部严格通过或完整 105 项复测。
+本次只确认目标 CSR FP32 转置三轮严格通过，未重新执行完整 105 项，前次压缩包也仍对应修复前完整轮。
+
+### 2026-11-11 另外两条 SpMV 放宽项的严格修复
+
+用户要求先让 `spmv_coo_c32_int_conj` 和 `spmv_csc_f32_int_trans` 尝试严格通过，再重新打包代码。
+本轮证据保存在 `results_musa_fix_20261111_remaining_strict/`；保留上一轮 CSR FP32 严格修复。
+两项目标在原 ASIC 记录中 strict ratio 均为 1.36338。未改容差、原矩阵、baseline 优先级、计时器或 runner。
+
+#### capi/src/ops/spmv.cpp::MUSA complex COO / FP32 CSC transpose
+
+- 改了什么：MUSA COO 转置的宽累加分支扩展到 complex64，外部工作区为每个输出的两个 FP64 分量；实时读取坐标/值/RHS，先清零，再做宽复数 scatter，最后融合完整复数 alpha/beta。转置和共轭转置分别传入 CONJ，beta=0 不读旧输出。MUSA CSC FP32 转置直接复用现有 `spmv_csr_row_tile_real`，按 CSC 列作为输出行、ACC_IS_FP64=True，乘法和全程累加均为 FP64；不改变格式、不新增工作区或结果缓存。
+- 为什么改（附报错原文）：两个原 ASIC case 均 strict ratio 1.36338，分别来自 FP32 原子累加和 FP32 列内局部和的大项抵消。新增 CSC 抵消回归在旧代码报 `actual: 12413.926874212006 vs 1`；初次 COO 回归还暴露旧 preprocess 对乱序行坐标返回 INVALID_VALUE，原失败日志保留，不能将这条前置失败说成数值复现。
+- 怎么验证的：原十矩阵三个独立进程两项目标各 30/30 strict pass，CSR FP32 相邻目标也为 30/30 strict pass；本轮正式结果均未使用 relaxed。COO complex64 三轮均值 0.9124716、0.9077780、0.9099741，CSC FP32 为 0.9034054、0.9068323、0.9052082；CSR FP32 为 1.0601923、1.0681209、1.0647790。均为同轮本机 muSPARSE、原 warmup=10/iters=100/median。两个 ASIC 原始输入直接调用生产库各 8 次，相对量化 FP64 参考 strict ratio 均为 0；官方 benchmark 相对原参考的 ASIC ratio 均为 0.00922928，整组最大 0.119437，门槛均为 1。
+- 其他后端是否也需要：否；新分支均要求 backend=musa 且严格匹配格式、dtype、方向。`scope_audit.json` 还原新增 MUSA 分支后，C++ 与本轮起始工作区逐字相同；前轮 CSR 严格修复和已有实数 COO 路径保持等价。调用方对 complex COO 须按新 bufferSize 分配工作区，现有官方 harness 已遵守。
+
+#### capi/flagsparse_codegen/sparse_gather.py::complex FP64 scatter/finish
+
+- 改了什么：新增 `musa_coo_transpose_scatter_c32_f64` 和 `musa_coo_transpose_finish_c32_f64` 两个 Triton kernel，复数乘法的四个乘积及实虚累加都使用 FP64，CONJ 作用于矩阵虚部；alpha/beta 在宽精度完成后各分量只转一次 FP32。复用原 FP64 zero kernel，全部已有 kernel 定义保持不变。
+- 为什么改（附报错原文）：原复杂 COO scatter 将乘积和输出都保留在 FP32，ASIC 的 strict ratio 为 1.36338；只把最终转换改宽无法恢复此前被吞掉的小项。
+- 怎么验证的：正式十矩阵三轮、生产库重放、非零虚部、完整复数 alpha/beta、重复/乱序坐标和非默认流全部通过；AST 对比确认只新增这两个函数，没有改共享 kernel 或 Python 算子。无手写 MUSA kernel、mcc 计算库或 PyTorch 原生计算路径。
+- 其他后端是否也需要：否；新增符号只由上述 MUSA C API 分支引用；CSC 复用的 CSR row-tile kernel 源码本轮未修改。
+
+#### capi/ctest/accuracy/test_spmv.cpp::两条严格路径回归
+
+- 改了什么：新增 COO complex64 和 CSC FP32 抵消回归、两种格式空输入回归及非默认流回归。覆盖 int32/int64、trans/conj、真实非零虚部、复数 alpha/beta、长列、多 NNZ 块、重复/乱序坐标、部分 tile、空列/空行/空输出、beta=0 时 NaN 旧输出，以及值/RHS/坐标实时修改。所有精度断言使用原 default_tolerance，未加入放宽或替换预期值逻辑。
+- 为什么改（附报错原文）：保存原两个 case 的严格失败证据及上述新增回归失败，避免仅因正式 benchmark 的虚部为零而漏掉复数计算语义；同时确保精度修复没有破坏异步流和实时输入语义。
+- 怎么验证的：`regression_final.log/.xml` 为 45/45 passed。第一正式轮运行未过滤的官方 SpMV benchmark：610 条记录中 570 条实际执行全部 strict pass、0 failed、0 pass_relaxed；另 40 条为原有已声明但无测试路径记录，不算执行通过。三轮目标共 90/90 strict pass，完整原始 JSON 均保留。
+- 其他后端是否也需要：否；新用例仅 MUSA 执行，流用例使用已有编译宏保护，其他后端断言和原有所有容差保持不变。
+
+环境继续为 `OMP_WAIT_POLICY=PASSIVE`，三个线程数变量不设置，不绑核。验证期间全部已跟踪源码及
+原十矩阵未变化，见 `VALIDATION_INFO.json`；文档在验证完成后追加。本轮是 SpMV 完整集合与三项目标
+的定向复测，没有重新跑完整 105 项。重新打包的代码与新严格验证匹配，不能把旧 105 项整轮结果改写为修复后验收。

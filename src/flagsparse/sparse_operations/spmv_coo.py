@@ -1434,10 +1434,12 @@ def flagsparse_spmv_coo(
                 op if op is not None else prepared.op,
                 transpose=transpose_flag if op is None else False,
             )
-            if _is_mthreads_runtime() and op_code == SPMV_COO_OP_NON:
+            if (_is_mthreads_runtime() and op_code == SPMV_COO_OP_NON
+                    and (not x.is_complex() or
+                         (mixed_data.dtype == torch.float32 and x.dtype == torch.complex64))):
                 # The mixed MUSA route validates and caches the same original
                 # operands; constructing an intermediate launch adds no work.
-                return _mixed_spmx.spmv_coo_mixed(
+                return _mixed_spmx._musa_coo_spmv_non(
                     mixed_data, prepared.row_non, prepared.col_non, x,
                     prepared.shape, out=out, out_dtype=out_dtype,
                     return_time=return_time,

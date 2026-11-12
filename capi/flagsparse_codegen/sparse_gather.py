@@ -1,13 +1,79 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Batched output-row reduction for MUSA C API SpMV/SpMM.
+"""MUSA C API SpMV/SpMM reductions and wide COO transpose accumulation.
 
 Indirect addressing reads live values through a preprocessed topology. Direct
 addressing batches ordinary CSR rows. Alpha/beta and complex conjugation are
-fused; each output has one owner and requires no memset or atomic addition.
+fused. COO transpose instead scatters wide products into an FP64 workspace
+so short, irregular columns do not serialize an output-row loop.
 """
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def musa_coo_transpose_zero(T, M, B: tl.constexpr):
+    pos = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    tl.store(T + pos, 0., pos < M)
+
+
+@triton.jit
+def musa_coo_transpose_scatter_f64(V, ROWS, COLS, X, T, NNZ,
+                                    B: tl.constexpr):
+    pos = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    valid = pos < NNZ
+    row = tl.load(ROWS + pos, valid, other=0).to(tl.int64)
+    col = tl.load(COLS + pos, valid, other=0).to(tl.int64)
+    value = tl.load(V + pos, valid, other=0.).to(tl.float64)
+    rhs = tl.load(X + row, valid, other=0.).to(tl.float64)
+    # Wide products and sums preserve small terms during FP32 cancellation.
+    tl.atomic_add(T + col, value * rhs, valid, sem="relaxed")
+
+
+@triton.jit
+def musa_coo_transpose_finish(T, Y, M, ALPHA, BETA,
+                              B: tl.constexpr, HAS_BETA: tl.constexpr):
+    pos = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    valid = pos < M
+    result = ALPHA.to(tl.float64) * tl.load(T + pos, valid, other=0.)
+    if HAS_BETA:
+        result += BETA.to(tl.float64) * tl.load(Y + pos, valid, other=0.).to(tl.float64)
+    tl.store(Y + pos, result.to(tl.float32), valid)
+
+
+@triton.jit
+def musa_coo_transpose_scatter_c32_f64(V, ROWS, COLS, X, T, NNZ,
+                                     B: tl.constexpr, CONJ: tl.constexpr):
+    pos = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    valid = pos < NNZ
+    row = tl.load(ROWS + pos, valid, other=0).to(tl.int64)
+    col = tl.load(COLS + pos, valid, other=0).to(tl.int64)
+    vr = tl.load(V + 2 * pos, valid, other=0.).to(tl.float64)
+    vi = tl.load(V + 2 * pos + 1, valid, other=0.).to(tl.float64)
+    if CONJ:
+        vi = -vi
+    xr = tl.load(X + 2 * row, valid, other=0.).to(tl.float64)
+    xi = tl.load(X + 2 * row + 1, valid, other=0.).to(tl.float64)
+    tl.atomic_add(T + 2 * col, vr * xr - vi * xi, valid, sem="relaxed")
+    tl.atomic_add(T + 2 * col + 1, vr * xi + vi * xr, valid, sem="relaxed")
+
+
+@triton.jit
+def musa_coo_transpose_finish_c32_f64(T, Y, M, AR, AI, BR, BI,
+                                    B: tl.constexpr, HAS_BETA: tl.constexpr):
+    pos = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    valid = pos < M
+    real = tl.load(T + 2 * pos, valid, other=0.)
+    imag = tl.load(T + 2 * pos + 1, valid, other=0.)
+    yr = AR.to(tl.float64) * real - AI.to(tl.float64) * imag
+    yi = AR.to(tl.float64) * imag + AI.to(tl.float64) * real
+    if HAS_BETA:
+        cr = tl.load(Y + 2 * pos, valid, other=0.).to(tl.float64)
+        ci = tl.load(Y + 2 * pos + 1, valid, other=0.).to(tl.float64)
+        yr += BR.to(tl.float64) * cr - BI.to(tl.float64) * ci
+        yi += BR.to(tl.float64) * ci + BI.to(tl.float64) * cr
+    tl.store(Y + 2 * pos, yr.to(tl.float32), valid)
+    tl.store(Y + 2 * pos + 1, yi.to(tl.float32), valid)
 
 
 @triton.jit

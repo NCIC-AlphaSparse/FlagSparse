@@ -27,7 +27,7 @@ import triton
 import triton.language as tl
 
 from ._rocm_sparse_cache import TensorPlanCache
-from ._musa_spmv_launch import launch as _musa_launch
+from ._musa_spmv_launch import launch as _musa_launch, fast_path_allowed as _musa_fast_path_allowed
 
 _MUSA_SCATTER_INDEX_CACHE = TensorPlanCache(maxsize=16)
 _MUSA_COPY_RUNNERS = OrderedDict()
@@ -330,20 +330,39 @@ def _musa_scatter_dense(dst, src, indices, block_size):
     from ._musa_spmv_launch import launch
 
     n, nnz = dst.numel(), indices.numel()
-    inverse = _MUSA_SCATTER_INDEX_CACHE.get((indices,), (n,))
-    if inverse is None:
+    state = _MUSA_SCATTER_INDEX_CACHE.get((indices,), (n,))
+    if state is None:
         inverse = torch.empty(n, dtype=torch.int32, device=dst.device)
         launch(_musa_scatter_inverse_fill_kernel, (triton.cdiv(n, 1024),),
                (inverse,), (n,), (1024,))
         launch(_musa_scatter_inverse_kernel, (triton.cdiv(nnz, 1024),),
                (inverse, indices), (nnz, n), (indices.stride(0), 1024))
-        _MUSA_SCATTER_INDEX_CACHE.put((indices,), (n,), inverse)
+        state = inverse, {}
+        _MUSA_SCATTER_INDEX_CACHE.put((indices,), (n,), state)
+    inverse, runners = state
     components = 2 if _is_complex_dtype(src.dtype) else 1
     dst_view = torch.view_as_real(dst) if components == 2 else dst
     src_view = torch.view_as_real(src) if components == 2 else src
-    launch(_musa_scatter_dense_kernel, (triton.cdiv(n * components, block_size),),
-           (dst_view, src_view, inverse), (n,),
-           (dst_view.stride(0), src_view.stride(0), components, block_size))
+    addresses = dst_view.data_ptr(), src_view.data_ptr(), inverse.data_ptr()
+    constants = dst_view.stride(0), src_view.stride(0), components, block_size
+    key = (dst_view.dtype, src_view.dtype, dst_view.device, src_view.device,
+           addresses[0] % 16, addresses[1] % 16,
+           addresses[0] == addresses[1], constants,
+           getattr(_musa_scatter_dense_kernel, "debug", None))
+    bound = runners.get(key)
+    if bound is not None and bound.direct and _musa_fast_path_allowed(_musa_scatter_dense_kernel):
+        bound(None, (n,), constants, addresses, checked=True)
+    else:
+        tensors = dst_view, src_view, inverse
+        if bound is None:
+            bound = launch(_musa_scatter_dense_kernel, (triton.cdiv(n * components, block_size),),
+                           tensors, (n,), constants)
+            if bound is not None:
+                if len(runners) >= 16:
+                    runners.pop(next(iter(runners)))
+                runners[key] = bound
+        else:
+            bound(tensors, (n,), constants, addresses)
 
 
 def _musa_indexed_copy(dst, src, indices, gather, block_size):
