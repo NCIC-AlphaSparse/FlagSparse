@@ -49,6 +49,7 @@ def test_per_slice_scope(monkeypatch, musa, dtype, slice_size, width):
         "_spmv_sell_complex_parallel_kernel",
         "_spmv_sell_complex_kernel",
         "_spmv_sell_real_kernel",
+        "_spmv_sell_wide_kernel",
     ):
         monkeypatch.setattr(sell, name, Kernel(name))
     monkeypatch.setattr(
@@ -65,9 +66,10 @@ def test_per_slice_scope(monkeypatch, musa, dtype, slice_size, width):
     )
     expected = "generic"
     if musa:
-        expected = (
-            "_spmv_sell_complex_parallel_kernel"
-            if dtype == torch.complex64 and slice_size == 32 and width > 4.5
-            else "_musa_spmv_sell_kernel"
-        )
+        if dtype == torch.complex64 and slice_size == 32 and width > 4.5:
+            expected = "_spmv_sell_complex_parallel_kernel"
+        elif dtype == torch.float32 and slice_size == 32 and width > 4.5:
+            expected = "_spmv_sell_wide_kernel"
+        else:
+            expected = "_musa_spmv_sell_kernel"
     assert calls == [expected]

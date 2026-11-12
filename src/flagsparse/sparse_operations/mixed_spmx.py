@@ -52,6 +52,13 @@ from ._musa_spmv_launch import (
     MusaTensorPlanCache,
 )
 
+_MUSA_TLE_GPU = None
+if _is_mthreads_runtime():
+    try:
+        import triton.experimental.tle.language.gpu as _MUSA_TLE_GPU
+    except ImportError:
+        pass
+
 _HALF = (torch.float16, torch.bfloat16)
 _TL_ACC = {torch.float32: tl.float32, torch.float64: tl.float64, torch.int32: tl.int32}
 _ROCM_CSR_MIXED_CACHE = {}
@@ -721,18 +728,15 @@ def spmv_csr_mixed_prepared(prepared, x, *, out=None, return_time=False):
             ).to(prepared.result_dtype)
             return _finish(y, out, t0, return_time)
         if _is_mthreads_runtime():
-            # The prepared call above has checked its dynamic operands. Keep
-            # dimensions checked if a caller replaces prepared tensor storage.
-            _check_1d((prepared.data, "data"), (prepared.indices, "indices"),
-                      (prepared.indptr, "indptr"))
-            if (prepared.data.numel() != prepared.indices.numel()
-                    or prepared.indptr.numel() != prepared.n_rows + 1):
-                raise ValueError("invalid CSR dimensions")
+            # Reuse validated contiguous inputs while retaining source version,
+            # storage and metadata checks, including replaced prepared arrays.
+            state = _musa_csr_inputs(prepared.data, prepared.indices, prepared.indptr,
+                                     prepared.n_rows, prepared.n_cols)
             t0 = _start(return_time)
             y = _musa_csr_spmv(
-                prepared.data.contiguous(), _index32(prepared.indices.contiguous()),
-                _index32(prepared.indptr.contiguous()), x.contiguous(),
+                *state[:3], x.contiguous(),
                 prepared.n_rows, prepared.result_dtype, prepared.acc_dtype, out,
+                plans=state[3],
             )
             return _finish(y, out, t0, return_time)
         return spmv_csr_mixed(
@@ -821,6 +825,58 @@ def spmv_csr_mixed_prepared(prepared, x, *, out=None, return_time=False):
 
 
 @triton.jit
+def _musa_segmented_complex_add(lr, lv, li, rr, rv, ri):
+    same = lr == rr
+    return rr, rv + tl.where(same, lv, 0.), ri + tl.where(same, li, 0.)
+
+
+@triton.jit
+def _musa_real_complex_nnz_kernel(
+    V, C, P, ROW, X, Y, EMPTY, NE: tl.constexpr, NNZ: tl.constexpr,
+    B: tl.constexpr, ACC: tl.constexpr, MUSA: tl.constexpr, COMPLEX_RHS: tl.constexpr,
+):
+    # Keep the existing NNZ route's row ownership and prefix merge, sharing
+    # scan predicates between components and loading a complete complex RHS.
+    pid = tl.program_id(0)
+    pos = pid * B + tl.arange(0, B)
+    empty = tl.load(EMPTY + pos, pos < NE, other=0)
+    tl.store(Y + 2 * empty, 0., pos < NE)
+    tl.store(Y + 2 * empty + 1, 0., pos < NE)
+    valid = pos < NNZ
+    row = tl.load(ROW + pos, valid, other=-1)
+    col = tl.load(C + pos, valid, other=0)
+    value = tl.load(V + pos, valid, other=0.)
+    bits = tl.load(X.to(tl.pointer_type(tl.uint64)) + col, valid, other=0)
+    xr = bits.to(tl.uint32).to(tl.float32, bitcast=True)
+    xi = (bits >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+    _, real, imag = tl.associative_scan(
+        (row, value * xr, value * xi), 0, _musa_segmented_complex_add)
+    next_row = tl.load(ROW + pos + 1, pos + 1 < NNZ, other=-1)
+    boundary = valid & (row != next_row)
+    first_row = tl.load(ROW + pid * B, pid * B < NNZ, other=0)
+    start = tl.load(P + first_row)
+    end = tl.load(P + first_row + 1)
+    prefix_real = tl.full((), 0., tl.float32)
+    prefix_imag = tl.full((), 0., tl.float32)
+    if (start < pid * B) & (end <= (pid + 1) * B) & (pid * B < NNZ):
+        for offset in range(start, pid * B, 128):
+            index = offset + tl.arange(0, 128)
+            active = index < pid * B
+            column = tl.load(C + index, active, other=0)
+            left = tl.load(V + index, active, other=0.)
+            prefix_bits = tl.load(
+                X.to(tl.pointer_type(tl.uint64)) + column, active, other=0)
+            right_real = prefix_bits.to(tl.uint32).to(tl.float32, bitcast=True)
+            right_imag = (prefix_bits >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+            prefix_real += tl.sum(left * right_real, 0)
+            prefix_imag += tl.sum(left * right_imag, 0)
+    real += tl.where(row == first_row, prefix_real, 0.)
+    imag += tl.where(row == first_row, prefix_imag, 0.)
+    tl.store(Y + 2 * row, real, boundary)
+    tl.store(Y + 2 * row + 1, imag, boundary)
+
+
+@triton.jit
 def _musa_csr_real_by_complex_kernel(
     Y, V, C, P, X, M, R: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr,
 ):
@@ -834,9 +890,9 @@ def _musa_csr_real_by_complex_kernel(
         pos = start[:, None] + offset + lanes[None, :]
         valid = (rows[:, None] < M) & (pos < end[:, None])
         col = tl.load(C + pos, valid, other=0)
-        value = tl.load(V + pos, valid, other=0)
+        value = tl.load(V + pos, valid, other=0).to(ACC)
         vector = tl.load(X + 2 * col[:, :, None] + components[None, None, :],
-                         valid[:, :, None], other=0)
+                         valid[:, :, None], other=0).to(ACC)
         acc += value[:, :, None] * vector
     tl.store(Y + 2 * rows[:, None] + components[None, :], tl.sum(acc, 1), rows[:, None] < M)
 
@@ -900,22 +956,141 @@ def _musa_csr_half_fixed_kernel(
 
 
 @triton.jit
+def _musa_csr_half_tle_kernel(
+    Y, V, C, P, X, M, MAX_LENGTH: tl.constexpr, ENCODING: tl.constexpr,
+):
+    # Four lanes cooperate on a row; the remaining slots stay in registers.
+    # Fix the layout so a 16-entry row does not consume a whole half warp.
+    rows = tl.program_id(0) * 32 + tl.arange(0, 32)
+    begin = tl.load(P + rows, rows < M, other=0)
+    end = tl.load(P + rows + 1, rows < M, other=0)
+    acc = _MUSA_TLE_GPU.set_layout(tl.zeros((32, 16), tl.float32), ENCODING)
+    for offset in range(0, MAX_LENGTH, 16):
+        pos = _MUSA_TLE_GPU.set_layout(
+            begin[:, None] + offset + tl.arange(0, 16)[None, :], ENCODING)
+        valid = _MUSA_TLE_GPU.set_layout(
+            (rows[:, None] < M) & (pos < end[:, None]), ENCODING)
+        col = tl.load(C + pos, valid, other=0)
+        value = tl.load(V + pos, valid, other=0).to(tl.float32)
+        rhs = tl.load(X + col, valid, other=0).to(tl.float32)
+        acc += value * rhs
+    tl.store(Y + rows, tl.sum(acc, 1), rows < M)
+
+
+@triton.jit
+def _musa_csr_pack_pairs(V, C, T, NNZ, B: tl.constexpr):
+    pos = tl.program_id(0) * B + tl.arange(0, B)
+    valid = pos < NNZ
+    bits = tl.load(V + pos, valid, other=0).to(tl.float32).to(tl.uint32, bitcast=True)
+    col = tl.load(C + pos, valid, other=0).to(tl.uint32)
+    tl.store(T + pos, col.to(tl.uint64) | (bits.to(tl.uint64) << 32), valid)
+
+
+@triton.jit
+def _musa_csr_half_pairs_kernel(Y, T, P, X, M, MAX_LENGTH: tl.constexpr):
+    rows = tl.program_id(0) * 16 + tl.arange(0, 16)
+    begin = tl.load(P + rows, rows < M, other=0)
+    end = tl.load(P + rows + 1, rows < M, other=0)
+    acc = tl.zeros((16, 8), tl.float32)
+    for offset in range(0, MAX_LENGTH, 8):
+        pos = begin[:, None] + offset + tl.arange(0, 8)[None, :]
+        valid = (rows[:, None] < M) & (pos < end[:, None])
+        pair = tl.load(T + pos, valid, other=0)
+        col = (pair & 0xffffffff).to(tl.int32)
+        value = (pair >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+        rhs = tl.load(X + col, valid, other=0).to(tl.float32)
+        acc += value * rhs
+    tl.store(Y + rows, tl.sum(acc, 1), rows < M)
+
+
+@triton.jit
+def _musa_csr_pack_sell(V, C, P, SV, SC, SP, M, K: tl.constexpr):
+    sid = tl.program_id(0)
+    lane = tl.arange(0, 32)
+    row = sid * 32 + lane
+    begin = tl.load(P + row, row < M, other=0)
+    end = tl.load(P + row + 1, row < M, other=0)
+    target = tl.load(SP + sid)
+    width = (tl.load(SP + sid + 1) - target) // 32
+    for base in range(0, width, K):
+        slot = base + tl.arange(0, K)
+        source = begin[None, :] + slot[:, None]
+        valid = (row[None, :] < M) & (source < end[None, :])
+        value = tl.load(V + source, valid, other=0)
+        col = tl.load(C + source, valid, other=-1)
+        dest = target + slot[:, None] * 32 + lane[None, :]
+        tl.store(SV + dest, value, slot[:, None] < width)
+        tl.store(SC + dest, col, slot[:, None] < width)
+
+
+def _musa_csr_sell_arrays(data, cols, ptr, lengths, n_rows):
+    slices = (n_rows + 31) // 32
+    padded = torch.zeros(slices * 32, dtype=torch.int32, device=ptr.device)
+    padded[:n_rows] = lengths
+    widths = padded.view(slices, 32).amax(1)
+    offsets = torch.zeros(slices + 1, dtype=torch.int64, device=ptr.device)
+    offsets[1:] = (widths.long() * 32).cumsum(0)
+    count = int(offsets[-1].item())
+    if count >= 2**31 or count > data.numel() * 1.5:
+        return None
+    offsets = offsets.to(torch.int32)
+    values = torch.empty(count, dtype=data.dtype, device=data.device)
+    indices = torch.empty(count, dtype=cols.dtype, device=cols.device)
+    _musa_csr_pack_sell[(slices,)](data, cols, ptr, values, indices, offsets,
+                                 n_rows, 4, num_warps=4, num_stages=1)
+    return values, indices, offsets
+
+
+@triton.jit
+def _musa_csr_sell_grouped_kernel(
+    Y, V, C, P, X, M, R: tl.constexpr, K: tl.constexpr,
+    COMPLEX_RHS: tl.constexpr, ACC: tl.constexpr,
+):
+    # Slot-major storage gives adjacent row lanes contiguous values/indices.
+    # Several slots per lane overlap independent RHS gathers for int8 rows.
+    rows = tl.program_id(0) * R + tl.arange(0, R)
+    begin = tl.load(P + rows // 32, rows < M, other=0)
+    end = tl.load(P + rows // 32 + 1, rows < M, other=0)
+    width = (end - begin) // 32
+    acc = tl.zeros((K, R), ACC)
+    if COMPLEX_RHS:
+        imag = tl.zeros((K, R), ACC)
+    for offset in range(0, tl.max(width, 0), K):
+        slot = offset + tl.arange(0, K)
+        pos = begin[None, :] + slot[:, None] * 32 + (rows % 32)[None, :]
+        active = (rows[None, :] < M) & (slot[:, None] < width[None, :])
+        col = tl.load(C + pos, active, other=-1)
+        valid = active & (col >= 0)
+        value = tl.load(V + pos, valid, other=0).to(ACC)
+        if COMPLEX_RHS:
+            acc += value * tl.load(X + 2 * col, valid, other=0.).to(ACC)
+            imag += value * tl.load(X + 2 * col + 1, valid, other=0.).to(ACC)
+        else:
+            acc += value * tl.load(X + col, valid, other=0).to(ACC)
+    if COMPLEX_RHS:
+        tl.store(Y + 2 * rows, tl.sum(acc, 0), rows < M)
+        tl.store(Y + 2 * rows + 1, tl.sum(imag, 0), rows < M)
+    else:
+        tl.store(Y + rows, tl.sum(acc, 0), rows < M)
+
+
+@triton.jit
 def _musa_csr_complex_fixed_kernel(
     Y, V, C, P, X, M, ROWS: tl.constexpr, BLOCK: tl.constexpr,
-    MAX_LENGTH: tl.constexpr,
+    MAX_LENGTH: tl.constexpr, ACC: tl.constexpr = tl.float32,
 ):
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     begin = tl.load(P + rows, rows < M, other=0)
     end = tl.load(P + rows + 1, rows < M, other=0)
     parts = tl.arange(0, 2)
-    acc = tl.zeros((ROWS, BLOCK, 2), tl.float32)
+    acc = tl.zeros((ROWS, BLOCK, 2), ACC)
     for offset in range(0, MAX_LENGTH, BLOCK):
         pos = begin[:, None] + offset + tl.arange(0, BLOCK)[None, :]
         valid = (rows[:, None] < M) & (pos < end[:, None])
         col = tl.load(C + pos, valid, other=0)
-        value = tl.load(V + pos, valid, other=0)
+        value = tl.load(V + pos, valid, other=0).to(ACC)
         rhs = tl.load(X + 2 * col[:, :, None] + parts[None, None, :],
-                      valid[:, :, None], other=0.)
+                      valid[:, :, None], other=0.).to(ACC)
         acc += value[:, :, None] * rhs
     tl.store(Y + 2 * rows[:, None] + parts[None, :], tl.sum(acc, 1), rows[:, None] < M)
 
@@ -924,7 +1099,8 @@ def _musa_coo_half_spmv(data, cols, ptr, x, n_rows, plans, out=None, *, complex_
                         result_dtype=torch.float32, acc_dtype=torch.float32):
     """Reuse topology and launch specializations; always read live operands."""
     plan_key = "real_complex_f32" if complex_rhs else "half_f32"
-    if result_dtype != torch.float32 or acc_dtype != torch.float32:
+    if (result_dtype not in ((torch.float32, torch.complex64) if complex_rhs else (torch.float32,))
+            or acc_dtype != torch.float32):
         plan_key = (plan_key, result_dtype, acc_dtype)
     tile_override = os.environ.get("FLAGSPARSE_MUSA_CSR_TILE")
     if tile_override:
@@ -932,10 +1108,75 @@ def _musa_coo_half_spmv(data, cols, ptr, x, n_rows, plans, out=None, *, complex_
     plan = plans.get(plan_key)
     if plan is None:
         lengths = ptr[1:] - ptr[:-1]
-        maximum = int(lengths.max().item())
+        host_ptr = ptr.cpu().numpy()
+        maximum = int((host_ptr[1:] - host_ptr[:-1]).max())
         mean = data.numel() / n_rows
+        use_tle = (_MUSA_TLE_GPU is not None and not complex_rhs
+                   and data.dtype in _HALF and acc_dtype == torch.float32
+                   and maximum <= 16
+                   and 4 < mean <= 8 and n_rows >= 524288)
+        use_pairs = (not complex_rhs and data.dtype in _HALF
+                     and acc_dtype == torch.float32
+                     and maximum <= 128 and mean > 12 and n_rows <= 262144)
+        sell = None
+        if (not (use_tle or use_pairs) and (not complex_rhs and data.dtype in (*_HALF, torch.int8)
+             or complex_rhs and data.dtype == torch.float32 and 12 < mean <= 17)
+                and maximum <= 128 and 4 < mean <= 17
+                and (n_rows >= 262144 or (mean <= 12 and data.dtype in _HALF))):
+            sell = _musa_csr_sell_arrays(data, cols, ptr, lengths, n_rows)
         nnz_mode = maximum > 128 and mean <= 4
-        if nnz_mode:
+        if use_pairs:
+            # A single 64-bit load supplies each index and exact widened value.
+            # The owning source cache discards this packing on every mutation.
+            pairs = torch.empty(data.numel(), dtype=torch.int64, device=data.device)
+            _musa_csr_pack_pairs[((data.numel() + 511) // 512,)](
+                data, cols, pairs, data.numel(), 512, num_warps=4, num_stages=1)
+            kernel, sparse = _musa_csr_half_pairs_kernel, (pairs, ptr)
+            grid, scalars = ((n_rows + 15) // 16,), (n_rows,)
+            constants = (maximum,)
+        elif use_tle:
+            kernel = _musa_csr_half_tle_kernel
+            sparse = (data, cols, ptr)
+            grid = ((n_rows + 31) // 32,)
+            scalars = (n_rows,)
+            constants = (maximum, _MUSA_TLE_GPU.BlockEncoding([1, 1], [8, 4], [4, 1], [1, 0]))
+        elif sell is not None:
+            from .spmv_sell import _spmv_sell_wide_kernel, _musa_spmv_sell_kernel
+
+            sparse = sell
+            if data.dtype == torch.int8 and not complex_rhs and x.numel() < 0xffffff:
+                from .spmv_sell import (
+                    _musa_sell_pack_i8, _musa_sell_i8_pairs, _musa_sell_i8_tle,
+                )
+
+                packed = torch.empty(sell[0].numel(), dtype=torch.int32, device=data.device)
+                _musa_sell_pack_i8[((packed.numel() + 511) // 512,)](
+                    sell[0], sell[1], packed, packed.numel(), 512,
+                    num_warps=4, num_stages=1)
+                sparse = packed, sell[2]
+                if mean <= 12 and _MUSA_TLE_GPU is not None:
+                    kernel = _musa_sell_i8_tle
+                    grid = ((n_rows + 31) // 32,)
+                    encoding = _MUSA_TLE_GPU.BlockEncoding([1, 1], [4, 8], [1, 4], [1, 0])
+                    constants = (32, 4, _TL_ACC[acc_dtype], maximum, encoding)
+                else:
+                    kernel = _musa_sell_i8_pairs
+                    grid = ((n_rows + 127) // 128,)
+                    constants = (128, 4, _TL_ACC[acc_dtype])
+            elif mean > 12 and (complex_rhs or data.dtype == torch.int8):
+                kernel = _musa_csr_sell_grouped_kernel
+                grid = ((n_rows + 127) // 128,)
+                constants = (128, 1 if complex_rhs else 4, complex_rhs, _TL_ACC[acc_dtype])
+            elif mean > 12:
+                kernel = _musa_spmv_sell_kernel
+                grid = ((n_rows + 127) // 128,)
+                constants = (32, 128, 1, False, _TL_ACC[acc_dtype])
+            else:
+                kernel = _spmv_sell_wide_kernel
+                grid = ((n_rows + 31) // 32,)
+                constants = (32, 32, 4, False, _TL_ACC[acc_dtype])
+            scalars = (n_rows,)
+        elif nnz_mode:
             # Keep row ownership and the existing cross-block prefix merge.
             from ._spmv_csr_nnz import _nnz_kernel
 
@@ -945,20 +1186,24 @@ def _musa_coo_half_spmv(data, cols, ptr, x, n_rows, plans, out=None, *, complex_
             )
             empty = torch.nonzero(lengths == 0).flatten().to(torch.int32)
             sparse = (data, cols, ptr, row_ids, empty)
-            kernel = _nnz_kernel
+            kernel = (_musa_real_complex_nnz_kernel if complex_rhs
+                      and data.dtype == torch.float32 and acc_dtype == torch.float32
+                      else _nnz_kernel)
             grid = ((max(data.numel(), empty.numel()) + 511) // 512,)
             scalars = ()
             constants = (empty.numel(), data.numel(), 512, _TL_ACC[acc_dtype], True, complex_rhs)
         else:
             sparse = (data, cols, ptr)
-            if maximum <= 128 and mean > 4:
+            if maximum <= 16 and mean <= 3 and n_rows >= 262144:
+                rows, block = (128, 1) if data.dtype == torch.int8 else (64, 2)
+                kernel = _musa_csr_complex_fixed_kernel if complex_rhs else _musa_csr_half_fixed_kernel
+                constants = (rows, block, maximum, _TL_ACC[acc_dtype])
+            elif maximum <= 128 and mean > 4:
                 rows, block = (32, 4) if mean <= 12 and n_rows >= 262144 else (16, 8)
                 if complex_rhs:
                     rows, block = (8, 16) if mean > 24 else (16, 8)
                 kernel = _musa_csr_complex_fixed_kernel if complex_rhs else _musa_csr_half_fixed_kernel
-                constants = (rows, block, maximum)
-                if not complex_rhs:
-                    constants += (_TL_ACC[acc_dtype],)
+                constants = (rows, block, maximum, _TL_ACC[acc_dtype])
             else:
                 rows, block = _musa_row_tile(data.numel(), n_rows, data.dtype == torch.int8)
                 kernel = _musa_csr_real_by_complex_kernel if complex_rhs else _csr_spmv_mixed_kernel
@@ -1163,21 +1408,25 @@ def _torch_spmv_rows(data, rows, cols, x, n_out, acc_dtype):
     return y
 
 
+def _musa_csr_inputs(data, indices, indptr, n_rows, n_cols):
+    sources, options = (data, indices, indptr), (n_rows, n_cols)
+    state = _MUSA_CSR_INPUT_CACHE.get(sources, options)
+    if state is None:
+        _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+        if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
+            raise ValueError("invalid CSR dimensions")
+        state = (data.contiguous(), _index32(indices.contiguous()),
+                 _index32(indptr.contiguous()), {})
+        _MUSA_CSR_INPUT_CACHE.put(sources, options, state)
+    return state
+
+
 def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
                    out=None, out_dtype=None, return_time=False):
     if (_is_mthreads_runtime() and not transpose and op in (None, "non", "n", "non_trans", 0)):
         _check_1d((x, "x"))
         n_rows, n_cols = int(shape[0]), int(shape[1])
-        sources = (data, indices, indptr)
-        options = (n_rows, n_cols)
-        state = _MUSA_CSR_INPUT_CACHE.get(sources, options)
-        if state is None:
-            _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
-            if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
-                raise ValueError("invalid CSR dimensions")
-            state = (data.contiguous(), _index32(indices.contiguous()),
-                     _index32(indptr.contiguous()), {})
-            _MUSA_CSR_INPUT_CACHE.put(sources, options, state)
+        state = _musa_csr_inputs(data, indices, indptr, n_rows, n_cols)
         if x.numel() != n_cols:
             raise ValueError("x shape does not match CSR operation")
         result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, True)
@@ -1433,7 +1682,8 @@ def _csr_spmv_trans(data, cols, ptr, x, n_rows, n_cols, result_dtype, acc_dtype)
     """y = A^T x for CSR A without materialising A^T."""
     if (_is_mthreads_runtime() and n_cols and
             ((data.dtype == torch.float16 and result_dtype == torch.float32)
-             or (data.dtype == torch.int8 and result_dtype == torch.int32))):
+             or (data.dtype == torch.int8 and result_dtype == torch.int32)
+             or (data.dtype == torch.float32 and result_dtype == torch.complex64))):
         from . import _spmv_csr_transpose
         from .gather_scatter import _musa_indexed_copy
 
@@ -1449,7 +1699,10 @@ def _csr_spmv_trans(data, cols, ptr, x, n_rows, n_cols, result_dtype, acc_dtype)
         values, indices, indptr, plans = state
         return _musa_coo_half_spmv(
             values, indices, indptr, x, n_cols, plans,
-            result_dtype=result_dtype, acc_dtype=acc_dtype,
+            complex_rhs=result_dtype == torch.complex64,
+            result_dtype=result_dtype,
+            # Preserve cancellation-sensitive FP32 products and small terms.
+            acc_dtype=torch.float64 if result_dtype == torch.complex64 else acc_dtype,
         )
     if _is_iluvatar_runtime() and data.dtype == torch.float16 and result_dtype == torch.float32:
         from . import _spmv_csr_transpose
@@ -1534,6 +1787,30 @@ def _coo_spmv_atomic_kernel(
     tl.atomic_add(acc_ptr + row, v * xv, mask=mask)
 
 
+def _musa_coo_spmv_non(data, row, col, x, shape, out=None, out_dtype=None,
+                         return_time=False):
+    """Validated prepared/non-prepared MUSA COO non-transpose entry."""
+    _check_1d((x, "x"))
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    if x.numel() != n_cols:
+        raise ValueError("x shape does not match COO operation")
+    result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, True)
+    if out is not None and (out.shape != (n_rows,) or out.device != x.device):
+        raise ValueError("out shape/device must match the COO SpMV result")
+    t0 = _start(return_time)
+    values, cols, ptr, plans = _musa_coo_csr(data, row, col, shape, spmv=True)
+    if n_rows and acc_dtype in (torch.float32, torch.int32):
+        y = _musa_coo_half_spmv(
+            values, cols, ptr, x.contiguous(), n_rows, plans, out,
+            complex_rhs=result_dtype == torch.complex64,
+            result_dtype=result_dtype, acc_dtype=acc_dtype,
+        )
+    else:
+        y = _musa_csr_spmv(values, cols, ptr, x.contiguous(), n_rows,
+                           result_dtype, acc_dtype, out)
+    return _finish(y, out, t0, return_time)
+
+
 def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
                    out=None, out_dtype=None, return_time=False):
     op = _normalize_mixed_op(op, transpose, data.dtype)
@@ -1542,38 +1819,17 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     musa = (_is_mthreads_runtime() and op == "non"
             and (not complex_rhs or (data.dtype == torch.float32 and x.dtype == torch.complex64)))
     if musa:
-        # Cached sparse operands retain their metadata and mutation signature.
-        _check_1d((x, "x"))
-    else:
-        _check_1d((data, "data"), (row, "row"), (col, "col"), (x, "x"))
+        return _musa_coo_spmv_non(data, row, col, x, shape, out, out_dtype, return_time)
+    _check_1d((data, "data"), (row, "row"), (col, "col"), (x, "x"))
     n_rows, n_cols = int(shape[0]), int(shape[1])
     n_in, n_out = (n_cols, n_rows) if op == "non" else (n_rows, n_cols)
-    if not musa and not (data.numel() == row.numel() == col.numel()):
+    if not (data.numel() == row.numel() == col.numel()):
         raise ValueError("data, row and col must have the same length")
     if x.numel() != n_in:
         raise ValueError("x shape does not match COO operation")
     result_dtype, acc_dtype = _resolve_types(data.dtype, x.dtype, out, out_dtype, True)
     if out is not None and (out.shape != (n_out,) or out.device != x.device):
         raise ValueError("out shape/device must match the COO SpMV result")
-    if musa:
-        t0 = _start(return_time)
-        values, cols, ptr, plans = _musa_coo_csr(data, row, col, shape, spmv=True)
-        if data.dtype == torch.float16 and result_dtype == torch.float32 and n_rows:
-            y = _musa_coo_half_spmv(values, cols, ptr, x.contiguous(), n_rows, plans, out)
-        elif complex_rhs and result_dtype == torch.complex64 and n_rows:
-            y = _musa_coo_half_spmv(values, cols, ptr, x.contiguous(), n_rows, plans, out,
-                                     complex_rhs=True)
-        elif n_rows and acc_dtype in (torch.float32, torch.int32):
-            # The COO cache has already validated these sparse operands. Reuse
-            # its launch plans instead of checking a second CSR cache.
-            y = _musa_coo_half_spmv(
-                values, cols, ptr, x.contiguous(), n_rows, plans, out,
-                result_dtype=result_dtype, acc_dtype=acc_dtype,
-            )
-        else:
-            y = _musa_csr_spmv(values, cols, ptr, x.contiguous(), n_rows,
-                               result_dtype, acc_dtype, out)
-        return _finish(y, out, t0, return_time)
     sources = (data, row, col)
     data, x = data.contiguous(), x.contiguous()
     t0 = _start(return_time)

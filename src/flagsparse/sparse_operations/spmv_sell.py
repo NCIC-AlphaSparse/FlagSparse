@@ -43,7 +43,7 @@ from ._musa_spmv_launch import (
     launch as _launch_musa_spmv, MusaTensorPlanCache,
     fast_path_allowed as _musa_fast_path_allowed,
 )
-from .mixed_spmx import _CUDA_DIRECT_LAUNCH
+from .mixed_spmx import _CUDA_DIRECT_LAUNCH, _MUSA_TLE_GPU
 
 SPMV_SELL_VALUE_DTYPES = (
     torch.float16,
@@ -166,7 +166,17 @@ def _musa_sell_csr_plan(values, cols, offsets, n_rows, slice_size):
     rows = _sell_entry_rows(cols, offsets, slice_size)
     positions = torch.nonzero((cols >= 0) & (rows < n_rows)).flatten()
     plan = ()
-    if values.numel() > max(positions.numel(), 1) * 2:
+    # Device max of temporary offsets has returned an incorrect width on a
+    # MUSA non-default stream. Read topology once; never copy matrix values.
+    host_offsets = offsets.cpu().numpy()
+    maximum_slice_entries = int((host_offsets[1:] - host_offsets[:-1]).max())
+    regular_half = (_MUSA_TLE_GPU is not None and values.dtype == torch.float16
+                    and n_rows >= 524288 and 4.5 * n_rows < values.numel() <= 12 * n_rows
+                    and maximum_slice_entries <= 16 * slice_size)
+    paired_half = (values.dtype == torch.float16 and n_rows <= 262144
+                   and positions.numel() > 12 * n_rows
+                   and maximum_slice_entries <= 128 * slice_size)
+    if values.numel() > max(positions.numel(), 1) * 2 or regular_half or paired_half:
         rows = rows.index_select(0, positions)
         order = torch.argsort(rows, stable=True)
         rows = rows.index_select(0, order)
@@ -370,6 +380,61 @@ def _musa_spmv_sell_kernel(
 
 
 @triton.jit
+def _musa_sell_pack_i8(V, C, T, N, B: tl.constexpr):
+    pos = tl.program_id(0) * B + tl.arange(0, B)
+    valid = pos < N
+    col = tl.load(C + pos, valid, other=-1)
+    value = tl.load(V + pos, valid, other=0).to(tl.uint8).to(tl.uint32)
+    pair = (value << 24) | tl.where(col >= 0, col + 1, 0).to(tl.uint32)
+    tl.store(T + pos, pair, valid)
+
+
+@triton.jit
+def _musa_sell_i8_pairs(Y, T, P, X, M, R: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr):
+    rows = tl.program_id(0) * R + tl.arange(0, R)
+    begin = tl.load(P + rows // 32, rows < M, other=0)
+    end = tl.load(P + rows // 32 + 1, rows < M, other=0)
+    width = (end - begin) // 32
+    acc = tl.zeros((K, R), ACC)
+    for offset in range(0, tl.max(width, 0), K):
+        slot = offset + tl.arange(0, K)
+        pos = begin[None, :] + slot[:, None] * 32 + (rows % 32)[None, :]
+        active = (rows[None, :] < M) & (slot[:, None] < width[None, :])
+        pair = tl.load(T + pos, active, other=0).to(tl.uint32)
+        col = (pair & 0xffffff).to(tl.int32) - 1
+        value = (pair >> 24).to(tl.int8).to(ACC)
+        rhs = tl.load(X + col, active & (col >= 0), other=0).to(ACC)
+        acc += value * rhs
+    tl.store(Y + rows, tl.sum(acc, 0), rows < M)
+
+
+@triton.jit
+def _musa_sell_i8_tle(
+    Y, T, P, X, M, R: tl.constexpr, K: tl.constexpr, ACC: tl.constexpr,
+    MAX_WIDTH: tl.constexpr, ENCODING: tl.constexpr,
+):
+    rows = tl.program_id(0) * R + tl.arange(0, R)
+    begin = tl.load(P + rows // 32, rows < M, other=0)
+    end = tl.load(P + rows // 32 + 1, rows < M, other=0)
+    width = (end - begin) // 32
+    acc = _MUSA_TLE_GPU.set_layout(tl.zeros((K, R), ACC), ENCODING)
+    # The source-version-checked global bound avoids a reduction of slice
+    # widths and fixes the row/slot layout for coalesced packed loads.
+    for offset in range(0, MAX_WIDTH, K):
+        slot = offset + tl.arange(0, K)
+        pos = _MUSA_TLE_GPU.set_layout(
+            begin[None, :] + slot[:, None] * 32 + (rows % 32)[None, :], ENCODING)
+        active = _MUSA_TLE_GPU.set_layout(
+            (rows[None, :] < M) & (slot[:, None] < width[None, :]), ENCODING)
+        pair = tl.load(T + pos, active, other=0).to(tl.uint32)
+        col = (pair & 0xffffff).to(tl.int32) - 1
+        value = (pair >> 24).to(tl.int8).to(ACC)
+        rhs = tl.load(X + col, active & (col >= 0), other=0).to(ACC)
+        acc += value * rhs
+    tl.store(Y + rows, tl.sum(acc, 0), rows < M)
+
+
+@triton.jit
 def _spmv_sell_complex_parallel_kernel(
     Y, V, C, P, X, M,
     SLICE: tl.constexpr, BLOCK_R: tl.constexpr, SLOTS: tl.constexpr,
@@ -531,11 +596,11 @@ def _musa_sell_tile(n_values, n_rows, n_slices, slice_size, complex_values):
 def _musa_sell_launch(state, kernel, grid, tensors, scalars, constants,
                       complex_values=False):
     """Bind a specialization to validated SELL storage, with live x and y."""
-    target, matrix, cols, offsets, vector = tensors
+    target, vector = tensors[0], tensors[-1]
     yp, xp = target.data_ptr(), vector.data_ptr()
-    addresses = (yp, matrix.data_ptr(), cols.data_ptr(), offsets.data_ptr(), xp)
-    aliases = (tuple((p == yp, p == xp) for p in addresses[1:4]) + (yp == xp,)
-               if yp == xp or yp in addresses[1:4] or xp in addresses[1:4] else ())
+    addresses = (yp, *(t.data_ptr() for t in tensors[1:-1]), xp)
+    aliases = (tuple((p == yp, p == xp) for p in addresses[1:-1]) + (yp == xp,)
+               if yp == xp or yp in addresses[1:-1] or xp in addresses[1:-1] else ())
     key = (id(kernel), getattr(kernel, "debug", None), target.dtype, vector.dtype,
            target.device, vector.device, yp % 16, xp % 16, aliases, constants)
     runners = state.setdefault("runners", {})
@@ -545,6 +610,7 @@ def _musa_sell_launch(state, kernel, grid, tensors, scalars, constants,
         runner(None, scalars, constants, addresses, checked=True)
         return
     if complex_values:
+        _, matrix, cols, offsets, _ = tensors
         tensors = (torch.view_as_real(target), torch.view_as_real(matrix),
                    cols, offsets, torch.view_as_real(vector))
     if runner is None:
@@ -754,12 +820,50 @@ def flagsparse_spmv_sell(
             rows, slots = _musa_sell_tile(
                 values.numel(), n_rows, n_slices, slice_size, complex_values
             )
-            if values.dtype == torch.complex64 and slice_size == 32 and rows != 128:
+            pair_i8 = (cached_musa and values.dtype == torch.int8 and slice_size == 32
+                       and _n_cols < 0xffffff and values.numel() < 2**31
+                       and 0 < values.numel() <= 32 * n_rows)
+            if pair_i8:
+                packed = state.get("i8_pairs")
+                if packed is None:
+                    packed = torch.empty(values.numel(), dtype=torch.int32, device=values.device)
+                    _musa_sell_pack_i8[((values.numel() + 511) // 512,)](
+                        values, cols, packed, values.numel(), 512, num_warps=4, num_stages=1)
+                    state["i8_pairs"] = packed
+                rows, slots = (128, 1) if rows == 128 else (64, 4)
+                kernel = _musa_sell_i8_pairs
+                constants = (rows, slots, _TL[acc_dtype])
+                if (_MUSA_TLE_GPU is not None
+                        and (values.numel() <= 16 * n_rows or n_rows <= 262144)):
+                    maximum = state.get("i8_max_width")
+                    if maximum is None:
+                        host_offsets = offsets.cpu().numpy()
+                        maximum = int((host_offsets[1:] - host_offsets[:-1]).max()) // 32
+                        state["i8_max_width"] = maximum
+                    if maximum <= 128:
+                        rows, slots = (128, 1) if rows == 128 else (32, 4)
+                        lanes = 32 if rows == 128 else 8
+                        encoding = _MUSA_TLE_GPU.BlockEncoding(
+                            [1, 1], [32 // lanes, lanes], [1, 4], [1, 0])
+                        kernel = _musa_sell_i8_tle
+                        constants = (rows, slots, _TL[acc_dtype], maximum, encoding)
+                grid = ((n_rows + rows - 1) // rows,)
+                tensors = (y, packed, offsets, x)
+                _musa_sell_launch(state, kernel, grid, tensors, (n_rows,), constants)
+                if out is not None and y is not out:
+                    out.copy_(y)
+                    y = out
+                if return_time:
+                    _ACCEL.synchronize()
+                    return y, (time.perf_counter() - t0) * 1000.0
+                return y
+            elif values.dtype == torch.complex64 and slice_size == 32 and rows != 128:
                 # One slice shares scalar bounds and contiguous row lanes. Keep
                 # the grouped-row kernel for very short slices and other types.
                 kernel, grid = _spmv_sell_complex_parallel_kernel, (n_slices,)
                 constants = (slice_size, 32, 4)
-            elif (values.dtype in (torch.float16, torch.int8) and slice_size == 32
+            elif ((values.dtype in (torch.float16, torch.int8)
+                   or (values.dtype == torch.float32 and rows == 32)) and slice_size == 32
                     and rows != 128
                     and (values.dtype == torch.int8 or values.numel() <= n_rows * 24)):
                 # Coalesce the row lanes within each slice before reducing its

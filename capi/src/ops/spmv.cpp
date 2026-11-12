@@ -867,6 +867,133 @@ bool musa_csr_real_complex_gather(const SpMatDescr* A, const ScatterPlan& plan) 
         std::strcmp(adaptor::backend_name(), "musa") == 0;
 }
 
+bool musa_coo_transpose_f64(const SpMatDescr* A, flagsparseOperation_t op) {
+    return A->format == FLAGSPARSE_FORMAT_COO && transposes(op) &&
+        (A->value_type == FLAGSPARSE_R_32F || A->value_type == FLAGSPARSE_C_32F) &&
+        std::strcmp(adaptor::backend_name(), "musa") == 0;
+}
+
+bool musa_csr_fp32_transpose(const SpMatDescr* A, flagsparseOperation_t op) {
+    return A->format == FLAGSPARSE_FORMAT_CSR && transposes(op) &&
+        A->value_type == FLAGSPARSE_R_32F &&
+        std::strcmp(adaptor::backend_name(), "musa") == 0;
+}
+
+flagsparseStatus_t launch_musa_transpose_scatter_f64(flagsparseHandle_t handle, SpMatDescr* A,
+    void* source_rows, const char* source_index_type, const DnVecDescr* X, DnVecDescr* Y,
+    const Operands& ops, void* buffer, bool conjugate = false);
+
+flagsparseStatus_t run_musa_csr_fp32_transpose(flagsparseHandle_t handle, SpMatDescr* A,
+    const DnVecDescr* X, DnVecDescr* Y, const Operands& ops, void* buffer) {
+    if (!buffer) {
+        ctx(handle)->last_error = "MUSA FP32 CSR transpose requires the externalBuffer reported by flagsparseSpMV_bufferSize";
+        return FLAGSPARSE_STATUS_INVALID_VALUE;
+    }
+    if (A->sparse_gather_buffer != buffer) {
+        if (auto s = prepare_sparse_gather(A, buffer)) return s;
+    }
+    auto* topology = static_cast<unsigned char*>(buffer);
+    void* native_rows = topology +
+        (gather_ptr_count(A) + 2 * gather_nnz_count(A)) * gather_index_bytes(A);
+    return launch_musa_transpose_scatter_f64(handle, A, native_rows,
+        gather_i32(A) ? "i32" : "i64", X, Y, ops, topology + gather_bytes(A));
+}
+
+flagsparseStatus_t launch_musa_transpose_scatter_f64(flagsparseHandle_t handle, SpMatDescr* A,
+    void* source_rows, const char* source_index_type, const DnVecDescr* X, DnVecDescr* Y,
+    const Operands& ops, void* buffer, bool conjugate) {
+    if (!buffer) return FLAGSPARSE_STATUS_INVALID_VALUE;
+    const std::string module = jit::codegen_module("sparse_gather.py");
+    std::string err;
+    auto workspace = reinterpret_cast<adaptor::DevicePtr>(buffer);
+    if (ops.complex_op) {
+        const int64_t components = Y->size * 2;
+        auto status = jit::launch(module, "musa_coo_transpose_zero", "*fp64,i64,512",
+            ctx(handle)->stream, (components + 511) / 512, 1, 1, 4, 1,
+            {jit::Arg::ptr(workspace), jit::Arg::i64v(components)}, &err);
+        if (status != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return status; }
+        std::string signature = std::string("*fp32,*") + source_index_type + ",*" +
+            triton_index_dtype(A->indices_type) + ",*fp32,*fp64,i64,128," + (conjugate ? "True" : "False");
+        std::vector<jit::Arg> args;
+        for (void* p : {A->values, source_rows, A->indices, X->values, buffer})
+            args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p)));
+        args.push_back(jit::Arg::i64v(A->nnz));
+        status = jit::launch(module, "musa_coo_transpose_scatter_c32_f64", signature,
+            ctx(handle)->stream, (A->nnz + 127) / 128, 1, 1, 4, 1, args, &err);
+        if (status != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return status; }
+        args = {jit::Arg::ptr(workspace),
+            jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)),
+            jit::Arg::i64v(Y->size)};
+        for (double value : {ops.alpha_re, ops.alpha_im, ops.beta_re, ops.beta_im})
+            args.push_back(jit::Arg::f(static_cast<float>(value)));
+        status = jit::launch(module, "musa_coo_transpose_finish_c32_f64",
+            std::string("*fp64,*fp32,i64,fp32,fp32,fp32,fp32,512,") + (ops.has_beta ? "True" : "False"),
+            ctx(handle)->stream, (Y->size + 511) / 512, 1, 1, 4, 1, args, &err);
+        if (status != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+        return status;
+    }
+    auto status = jit::launch(module, "musa_coo_transpose_zero", "*fp64,i64,512",
+        ctx(handle)->stream, (Y->size + 511) / 512, 1, 1, 4, 1,
+        {jit::Arg::ptr(workspace), jit::Arg::i64v(Y->size)}, &err);
+    if (status != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return status; }
+    const char* index_type = triton_index_dtype(A->indices_type);
+    std::string signature = std::string("*fp32,*") + source_index_type + ",*" + index_type +
+        ",*fp32,*fp64,i64,128";
+    std::vector<jit::Arg> args;
+    for (void* p : {A->values, source_rows, A->indices, X->values, buffer})
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p)));
+    args.push_back(jit::Arg::i64v(A->nnz));
+    status = jit::launch(module, "musa_coo_transpose_scatter_f64", signature,
+        ctx(handle)->stream, (A->nnz + 127) / 128, 1, 1, 4, 1, args, &err);
+    if (status != FLAGSPARSE_STATUS_SUCCESS) { ctx(handle)->last_error = err; return status; }
+    args = {jit::Arg::ptr(workspace),
+        jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)),
+        jit::Arg::i64v(Y->size), jit::Arg::f(static_cast<float>(ops.alpha_re)),
+        jit::Arg::f(static_cast<float>(ops.beta_re))};
+    status = jit::launch(module, "musa_coo_transpose_finish",
+        std::string("*fp64,*fp32,i64,fp32,fp32,512,") + (ops.beta_re != 0. ? "True" : "False"),
+        ctx(handle)->stream, (Y->size + 511) / 512, 1, 1, 4, 1, args, &err);
+    if (status != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return status;
+}
+
+flagsparseStatus_t run_musa_coo_transpose_f64(flagsparseHandle_t handle, SpMatDescr* A,
+    const DnVecDescr* X, DnVecDescr* Y, const Operands& ops, void* buffer,
+    bool conjugate) {
+    return launch_musa_transpose_scatter_f64(handle, A, A->row_ind,
+        triton_index_dtype(A->indices_type), X, Y, ops, buffer, conjugate);
+}
+
+bool musa_csc_fp32_transpose(const SpMatDescr* A, flagsparseOperation_t op) {
+    return A->format == FLAGSPARSE_FORMAT_CSC && transposes(op) &&
+        A->value_type == FLAGSPARSE_R_32F &&
+        std::strcmp(adaptor::backend_name(), "musa") == 0;
+}
+
+flagsparseStatus_t run_musa_csc_fp32_transpose(flagsparseHandle_t handle, SpMatDescr* A,
+    const DnVecDescr* X, DnVecDescr* Y, const Operands& ops) {
+    // A CSC column is already one output row of A^T. Read its live storage
+    // directly and use the existing Triton row tile with an FP64 accumulator.
+    const double average = static_cast<double>(A->nnz) / std::max<int64_t>(A->cols, 1);
+    const int rows = average <= 4. ? 128 : 16;
+    const int lanes = average <= 4. ? 4 : 8;
+    std::string sig = std::string("*fp32,*") + triton_index_dtype(A->indices_type) + ",*" +
+        triton_index_dtype(A->offsets_type) + ",*fp32,*fp32,fp32,fp32,i64," +
+        std::to_string(rows) + "," + std::to_string(lanes) + ",True," +
+        (ops.has_beta ? "True," : "False,") + (gather_i32(A) ? "False" : "True");
+    std::vector<jit::Arg> args;
+    for (void* p : {A->values, A->indices, A->offsets, X->values, Y->values})
+        args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p)));
+    args.push_back(jit::Arg::f(static_cast<float>(ops.alpha_re)));
+    args.push_back(jit::Arg::f(static_cast<float>(ops.beta_re)));
+    args.push_back(jit::Arg::i64v(A->cols));
+    std::string err;
+    auto status = jit::launch(jit::codegen_module("spmv_csr.py"), "spmv_csr_row_tile_real", sig,
+        ctx(handle)->stream, (A->cols + rows - 1) / rows, 1, 1, 4, 1, args, &err);
+    if (status != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return status;
+}
+
 flagsparseStatus_t run_musa_csr_real_complex_gather(flagsparseHandle_t handle, SpMatDescr* A,
     const DnVecDescr* X, DnVecDescr* Y, void* buffer) {
     if (Y->size == 0) return FLAGSPARSE_STATUS_SUCCESS;
@@ -1376,6 +1503,13 @@ flagsparseStatus_t run(flagsparseHandle_t handle, flagsparseOperation_t opA,
         return s;
     }
     if (ops.y_len == 0) return FLAGSPARSE_STATUS_SUCCESS;
+    if (musa_coo_transpose_f64(A, opA))
+        return run_musa_coo_transpose_f64(handle, A, X, Y, ops, externalBuffer,
+            opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE);
+    if (musa_csr_fp32_transpose(A, opA))
+        return run_musa_csr_fp32_transpose(handle, A, X, Y, ops, externalBuffer);
+    if (musa_csc_fp32_transpose(A, opA))
+        return run_musa_csc_fp32_transpose(handle, A, X, Y, ops);
     if (musa_gather_type(A)) {
         const bool indirect = (A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
             (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA));
@@ -1448,6 +1582,15 @@ flagsparseStatus_t flagsparseSpMV_bufferSize(
         // segments. COO has to be given one -- rows + 1 int32 for the row-offsets
         // array its segment route runs on.
         const SpMatDescr* A = spmat(matA);
+        if (musa_coo_transpose_f64(A, opA)) {
+            *bufferSize = static_cast<size_t>(dnvec(vecY)->size) * sizeof(double) *
+                (A->value_type == FLAGSPARSE_C_32F ? 2 : 1);
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
+        if (musa_csr_fp32_transpose(A, opA)) {
+            *bufferSize = gather_bytes(A) + static_cast<size_t>(dnvec(vecY)->size) * sizeof(double);
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
         if (musa_gather_type(A) &&
             ((A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
              (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA)))) {
@@ -1495,6 +1638,9 @@ flagsparseStatus_t flagsparseSpMV_preprocess(
         // get their segment count from it; COO gets the row-offsets array it
         // cannot run without, and an unsorted COO is rejected right here.
         auto* A = const_cast<SpMatDescr*>(spmat(matA));
+        if (musa_coo_transpose_f64(A, opA))
+            return dnvec(vecY)->size == 0 || externalBuffer
+                ? FLAGSPARSE_STATUS_SUCCESS : FLAGSPARSE_STATUS_INVALID_VALUE;
         if (musa_gather_type(A) && externalBuffer &&
             ((A->format == FLAGSPARSE_FORMAT_CSC && !transposes(opA)) ||
              (A->format == FLAGSPARSE_FORMAT_CSR && transposes(opA))))
