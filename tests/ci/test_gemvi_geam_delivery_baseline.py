@@ -7,7 +7,6 @@ import pytest
 
 from tests.ci.test_ascend_cann_baseline_policy import _row, _runner
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 

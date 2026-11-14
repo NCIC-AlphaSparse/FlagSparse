@@ -25,26 +25,8 @@ def csr_operand(values, columns, pointer, shape, dtype, device):
     return (data.to(device), columns.to(device), pointer.to(device), shape), dense
 
 
-@pytest.mark.parametrize("dtype", ["f32", "c32"])
-def test_h800_comparison_uses_full_call_for_target(dtype):
-    from tools.ascend_spgemm_opt_bench import h800_comparison
-
-    result = h800_comparison("GL7d14", dtype, full_ms=1000, prepared_ms=1)
-    assert result["h800_reference_available"]
-    assert result["h800_scaled_ms"] == pytest.approx(result["h800_vendor_ms"] * 3050 / 1600)
-    assert result["full_h800_scaled_speedup"] == pytest.approx(result["h800_scaled_ms"] / 1000)
-    assert result["prepared_h800_scaled_speedup"] > 0.8
-    assert not result["full_target_met"]
-    boundary = h800_comparison("GL7d14", dtype, result["target_full_ms"], prepared_ms=1)
-    assert boundary["full_h800_scaled_speedup"] == pytest.approx(0.8)
 
 
-def test_h800_comparison_does_not_substitute_unmatched_matrix():
-    from tools.ascend_spgemm_opt_bench import h800_comparison
-
-    result = h800_comparison("unmatched_spgemm_matrix", "f32", full_ms=1, prepared_ms=1)
-    assert not result["h800_reference_available"]
-    assert "full_target_met" not in result
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
@@ -187,7 +169,7 @@ def test_row_local_spgemm_prepared_structure_is_not_exposed(device, dtype):
 def test_row_local_spgemm_underflow_and_cancellation_validation(device, dtype):
     import numpy as np
     import scipy.sparse
-    from tools.ascend_spgemm_opt_bench import structural_reference, validate
+    from tests.pytest.spgemm_reference import structural_reference, validate
 
     first, _ = csr_operand([1e-30, 1, -1], [0, 1, 2], [0, 3], (1, 3), dtype, device)
     second, _ = csr_operand([1e-20, 1, 1], [0, 1, 1], [0, 1, 2, 3], (3, 2), dtype, device)

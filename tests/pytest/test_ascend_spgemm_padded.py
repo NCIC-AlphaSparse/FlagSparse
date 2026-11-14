@@ -85,7 +85,7 @@ def test_padded_spgemm_rejects_excessive_padding(device, dtype):
 def test_padded_spgemm_underflow_and_cancellation(device, dtype):
     import numpy as np
     import scipy.sparse
-    from tools.ascend_spgemm_opt_bench import structural_reference, validate
+    from tests.pytest.spgemm_reference import structural_reference, validate
 
     first, unused = csr_operand([1e-30, 1, -1], [0, 1, 2], [0, 3], (1, 3), dtype, device)
     second, unused = csr_operand([1e-20, 1, 1], [0, 1, 1], [0, 1, 2, 3], (3, 2), dtype, device)
