@@ -31,6 +31,11 @@ class SpGEMMPrepared:
     (``sum_k nnz(B[A_col_k, :])``), which the compute path uses to size hash
     tables and to route over-wide rows to the ESC fallback. ``a_pref`` is the
     matching within-row exclusive prefix sum over those per-nonzero counts.
+
+    Ascend's row-local plan stores symbolic output structure and product source
+    mappings in ``ascend_plan``. Prepared structures require unchanged indices
+    and pointers; values are read again on every execution, and output buffers
+    never alias the prepared structure or a previous execution.
     """
 
     __slots__ = (
@@ -49,6 +54,7 @@ class SpGEMMPrepared:
         "a_pref",
         "row_work_ready",
         "symbolic_sources",
+        "ascend_plan",
     )
 
     def __init__(
@@ -82,6 +88,7 @@ class SpGEMMPrepared:
         self.a_pref = a_pref
         self.row_work_ready = bool(row_work_ready)
         self.symbolic_sources = None
+        self.ascend_plan = None
 
 
 def _validate_csr(data, indices, indptr, shape, tag):
@@ -244,7 +251,18 @@ def prepare_spgemm_csr(
         b_shape,
     )
     n_rows = int(a_shape[0])
-    if n_rows == 0:
+    ascend_plan = None
+    if (_is_ascend_runtime() and a_data.device.type == "npu"
+            and a_data.dtype in (torch.float32, torch.complex64)
+            and int(b_shape[1]) <= 2**24):
+        from ._spgemm_ascend import prepare_structure
+
+        ascend_plan = prepare_structure(a_indices, a_indptr, b_indptr)
+    if ascend_plan is not None:
+        row_work = ascend_plan["work"]
+        a_pref = torch.empty(0, dtype=torch.int32, device=a_data.device)
+        row_work_ready = True
+    elif n_rows == 0:
         row_work = torch.empty(0, dtype=torch.int32, device=a_data.device)
         a_pref = torch.empty(0, dtype=torch.int32, device=a_data.device)
         row_work_ready = True
@@ -263,7 +281,7 @@ def prepare_spgemm_csr(
         row_work = torch.zeros(n_rows, dtype=torch.int32, device=a_data.device)
         a_pref = _build_row_product_metadata(a_indices, a_indptr, b_indptr)[1]
         row_work_ready = False
-    return SpGEMMPrepared(
+    prepared = SpGEMMPrepared(
         a_data=a_data,
         a_indices=a_indices,
         a_indptr=a_indptr,
@@ -276,6 +294,12 @@ def prepare_spgemm_csr(
         a_pref=a_pref,
         row_work_ready=row_work_ready,
     )
+    prepared.ascend_plan = ascend_plan
+    if ascend_plan is not None:
+        from ._spgemm_ascend import prepare_symbolic
+
+        prepare_symbolic(prepared)
+    return prepared
 
 
 def _esc_gather(values, index):
@@ -1362,7 +1386,11 @@ def _spgemm_compute(prepared):
 
 
 def _ascend_spgemm_compute(prepared):
-    """Ascend-safe SpGEMM path; ESC uses ordinary torch tensor primitives."""
+    """Row-local SpGEMM, retaining bounded ESC for unsupported row widths."""
+    if prepared.ascend_plan is not None:
+        from ._spgemm_ascend import compute
+
+        return compute(prepared)
     return _spgemm_esc_compute_safe(prepared)
 
 

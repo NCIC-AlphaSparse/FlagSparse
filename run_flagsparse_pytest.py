@@ -790,6 +790,11 @@ ASCEND_Q4_VARIANTS: dict[str, tuple[str, ...]] = {
         "spmv_csr_i8f32_int_non",
         "spmv_csr_i8i32_int_non",
         "spmv_csr_c32_int_conj",
+        "spmv_csr_bf16f32_int_non",
+        "spmv_csr_bf16_int_non",
+        "spmv_csr_f16f32_int_trans",
+        "spmv_csr_f32c32_int_trans",
+        "spmv_csr_i8i32_int_trans",
     ),
     "spmv_coo": (
         "spmv_coo_f16_int_non",
@@ -798,6 +803,9 @@ ASCEND_Q4_VARIANTS: dict[str, tuple[str, ...]] = {
         "spmv_coo_c32_int_non",
         "spmv_coo_c32_int_conj",
         "spmv_coo_i8i32_int_non",
+        "spmv_coo_i8f32_int_non",
+        "spmv_coo_f32c32_int_non",
+        "spmv_coo_f16_int_trans",
     ),
     "spmm_csr": (
         "spmm_csr_f16f32_int_non_non_row",
@@ -807,11 +815,22 @@ ASCEND_Q4_VARIANTS: dict[str, tuple[str, ...]] = {
         "spmm_csr_c32_int_non_non_row",
         "spmm_csr_i8i32_int_non_non_row",
         "spmm_csr_f32_int_trans_non_row",
+        "spmm_csr_bf16f32_int_non_non_row",
+        "spmm_csr_f16f32_int_non_non_col",
+        "spmm_csr_i8f32_int_non_non_row",
+        "spmm_csr_c32_int_non_trans_row",
+        "spmm_csr_i8i32_int_non_non_col",
+        "spmm_csr_c32_int_conj_non_row",
+        "spmm_csr_f16f32_int_trans_non_row",
     ),
     "spmm_coo": (
         "spmm_coo_c32_int_non_non_row",
         "spmm_coo_f16_int_non_non_row",
         "spmm_coo_i8i32_int_non_non_row",
+        "spmm_coo_f16f32_int_non_non_row",
+        "spmm_coo_f32_int_non_non_col",
+        "spmm_coo_f32_int_trans_non_row",
+        "spmm_coo_f32_int_non_trans_row",
     ),
     "sddmm_csr": (
         "sddmm_csr_f32_int_non_non_col",
@@ -819,16 +838,26 @@ ASCEND_Q4_VARIANTS: dict[str, tuple[str, ...]] = {
         "sddmm_csr_f32_int_trans_non_row",
         "sddmm_csr_c32_int_non_non_row",
         "sddmm_csr_f16_int_non_non_row",
+        "sddmm_csr_f32_int_trans_trans_row",
+        "sddmm_csr_c32_int_non_trans_row",
+        "sddmm_csr_f16_int_non_trans_row",
+        "sddmm_csr_f16f32_int_non_non_row",
     ),
     "spmv_csc": (
         "spmv_csc_f32_int_non",
         "spmv_csc_c32_int_non",
         "spmv_csc_f16_int_non",
+        "spmv_csc_f32_int_trans",
+        "spmv_csc_c32_int_conj",
+        "spmv_csc_f16f32_int_non",
+        "spmv_csc_i8i32_int_non",
     ),
     "spmm_csc": (
         "spmm_csc_f32_int_non_non_row",
         "spmm_csc_c32_int_non_non_row",
         "spmm_csc_f16_int_non_non_row",
+        "spmm_csc_f32_int_trans_non_row",
+        "spmm_csc_f16f32_int_non_non_row",
     ),
 }
 
@@ -2508,6 +2537,8 @@ def _cann_baseline_usable(row: dict[str, str]) -> bool:
 
 
 def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | None]:
+    if str(row.get("baseline_required") or "").strip().lower() == "cann":
+        return "speedup_vs_cann", "cann_ms", "cann_flagsparse_ms"
     if _BIV_BASELINE_POLICY:
         if _to_float(row.get("biv_speedup")) is not None:
             return "biv_speedup", "biv_baseline_ms", "biv_flagsparse_ms"
@@ -2660,6 +2691,9 @@ def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
 
     if not _performance_row_status_is_usable(row):
         return False
+    if str(row.get("baseline_required") or "").strip().lower() == "cann":
+        if not _cann_baseline_usable(row) or not row.get("cann_status"):
+            return False
     speedup_key, base_key, latency_key = _performance_schema(row)
     speedup = _to_float(_row_value(row, speedup_key))
     if speedup is None or speedup <= 0:
@@ -3036,6 +3070,21 @@ def _recompute_variant_speedup(
     """
     for key in _SPEEDUP_AGGREGATE_KEYS:
         result.pop(key, None)
+    missing_cann = [
+        row for row in (rows or [])
+        if str(row.get("baseline_required") or "").strip().lower() == "cann"
+        and not _performance_row_has_complete_speedup(row)
+    ]
+    if missing_cann:
+        if result.get("status") != "TIMEOUT":
+            result["status"] = "FAIL"
+        result["reason"] = "required local CANN baseline failed or has missing measurements"
+        result["required_baseline_missing"] = [
+            str(row.get("matrix") or row.get("case_id") or "?") for row in missing_cann
+        ]
+        result["data"] = {}
+        result["speedup"] = ""
+        return
     if rows:
         result.update(_speedup_aggregates(rows))
     elif isinstance(data, dict):
@@ -3128,6 +3177,8 @@ def _apply_biv_local_baseline(
             row.setdefault(column, "")
         for column in _BIV_BASELINE_COLUMNS:
             row[column] = ""
+        if str(row.get("baseline_required") or "").strip().lower() == "cann":
+            continue
         if not _performance_row_status_is_usable(row):
             info["no_local_baseline"] += 1
             continue
@@ -3187,7 +3238,8 @@ def _apply_scaled_baseline(
         config["reference"],
         config["card"],
         reference=config["reference_peaks"],
-        needs_baseline=lambda row: not _performance_row_has_complete_speedup(row),
+        needs_baseline=lambda row: str(row.get("baseline_required") or "").strip().lower()
+        != "cann" and not _performance_row_has_complete_speedup(row),
     )
     if local_info is not None:
         info["local_baseline"] = local_info
@@ -4061,7 +4113,7 @@ def _set_aside_parent_failure(
 def _q4_expected_row_count(
     phase_result: dict[str, object], records: list[dict[str, object]]
 ) -> int:
-    """Rows a complete q4 variant has: one per input matrix.
+    """Rows a complete q4 variant has: one per input matrix or synthetic case.
 
     Falls back to the largest per-variant matrix count in the CSV for a result
     produced before ``input_matrix_count`` was recorded.
@@ -4073,7 +4125,9 @@ def _q4_expected_row_count(
     for row in records:
         variant = str(row.get("variant") or "")
         if variant:
-            matrices.setdefault(variant, set()).add(str(row.get("matrix") or ""))
+            matrices.setdefault(variant, set()).add(
+                str(row.get("matrix") or row.get("case_id") or "")
+            )
     return max((len(names) for names in matrices.values()), default=0)
 
 

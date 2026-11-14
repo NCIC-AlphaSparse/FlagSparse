@@ -267,12 +267,43 @@ def _validate_gemvi(A, values, indices, y, op, beta, check_range):
     return n_out
 
 
+def _torch_gemvi_contract(matrix, values):
+    if matrix.dtype != torch.float64:
+        return matrix @ values
+    block_rows = max(1, (1 << 20) // max(1, values.numel()))
+    if not matrix.shape[0]:
+        return torch.empty(0, dtype=matrix.dtype, device=matrix.device)
+    return torch.cat([
+        (matrix[start:start + block_rows] * values).sum(dim=1)
+        for start in range(0, matrix.shape[0], block_rows)
+    ])
+
+
 def _torch_gemvi(A, values, indices, y, op, alpha, beta):
     idx = indices.to(torch.int64)
-    if op == "non":
-        result = A.index_select(1, idx) @ values
+    if A.is_complex():
+        matrix = torch.view_as_real(A.resolve_conj())
+        matrix = matrix.index_select(1 if op == "non" else 0, idx)
+        if op == "trans":
+            matrix = matrix.transpose(0, 1)
+        vector = torch.view_as_real(values.resolve_conj())
+        real = (_torch_gemvi_contract(matrix[..., 0], vector[:, 0])
+                - _torch_gemvi_contract(matrix[..., 1], vector[:, 1]))
+        imag = (_torch_gemvi_contract(matrix[..., 0], vector[:, 1])
+                + _torch_gemvi_contract(matrix[..., 1], vector[:, 0]))
+        alpha, beta = complex(alpha), complex(beta)
+        out_real = real * alpha.real - imag * alpha.imag
+        out_imag = real * alpha.imag + imag * alpha.real
+        if y is not None and beta != 0:
+            target = torch.view_as_real(y.resolve_conj())
+            out_real = out_real + target[:, 0] * beta.real - target[:, 1] * beta.imag
+            out_imag = out_imag + target[:, 0] * beta.imag + target[:, 1] * beta.real
+        return torch.view_as_complex(torch.stack((out_real, out_imag), dim=-1))
+    matrix = A.index_select(1 if op == "non" else 0, idx)
+    if A.dtype == torch.float32:
+        result = matrix @ values if op == "non" else values @ matrix
     else:
-        result = values @ A.index_select(0, idx)
+        result = _torch_gemvi_contract(matrix if op == "non" else matrix.t(), values)
     result = result * alpha
     if y is not None and beta != 0:
         result = result + y * beta

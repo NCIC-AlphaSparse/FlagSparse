@@ -186,6 +186,44 @@ def test_geam_rejects_unsorted_or_mismatched_input():
     with pytest.raises(ValueError, match="sorted"):
         fs.flagsparse_geam_csr(vals, unsorted, ptr, vals, sorted_cols, ptr, (1, 2))
     with pytest.raises(TypeError):
-        fs.flagsparse_geam_csr(vals, sorted_cols, ptr, vals.double(), sorted_cols, ptr, (1, 2))
+        other = torch.ones(2, dtype=torch.float64).to(dev)
+        fs.flagsparse_geam_csr(vals, sorted_cols, ptr, other, sorted_cols, ptr, (1, 2))
     with pytest.raises(TypeError, match="complex"):
         fs.flagsparse_geam_csr(vals, sorted_cols, ptr, vals, sorted_cols, ptr, (1, 2), alpha=1j)
+
+
+@pytest.mark.geam_csr
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@pytest.mark.parametrize("ptr_dtype", [torch.int32, torch.int64], ids=str)
+def test_geam_large_sorted_keys_and_empty_rows(dtype, ptr_dtype):
+    dev = accelerator_device()
+    values = _rand((3,), dtype, torch.Generator().manual_seed(67))
+    other_values = _rand((3,), dtype, torch.Generator().manual_seed(71))
+    columns = torch.tensor([7, 11, 90000], dtype=torch.int32)
+    other_columns = torch.tensor([0, 11, 99999], dtype=torch.int32)
+    pointer = torch.zeros(70001, dtype=ptr_dtype)
+    pointer[30001:] = 2
+    pointer[60001:] = 3
+    other_pointer = torch.zeros_like(pointer)
+    other_pointer[1:] = 1
+    other_pointer[30001:] = 2
+    other_pointer[60001:] = 3
+    alpha, beta = (1.25 - 0.5j, -2 + 1j) if dtype.is_complex else (1.25, -2)
+    expected_values = torch.stack((
+        beta * other_values[0], alpha * values[0],
+        alpha * values[1] + beta * other_values[1],
+        alpha * values[2], beta * other_values[2],
+    ))
+    expected_columns = torch.tensor([0, 7, 11, 90000, 99999], dtype=torch.int32)
+    expected_pointer = torch.zeros_like(pointer)
+    expected_pointer[1:] = 1
+    expected_pointer[30001:] = 3
+    expected_pointer[60001:] = 5
+    operands = tuple(tensor.to(dev) for tensor in (
+        values, columns, pointer, other_values, other_columns, other_pointer,
+    ))
+    result = fs.flagsparse_geam_csr(
+        *operands, (70000, 100000), alpha=alpha, beta=beta)
+    _close(result[0], _wide(expected_values), dtype)
+    torch.testing.assert_close(result[1].cpu(), expected_columns)
+    torch.testing.assert_close(result[2].cpu(), expected_pointer)

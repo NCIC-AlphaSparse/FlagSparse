@@ -23,6 +23,8 @@ with the delivery variant id -- with three timings:
   cusparse_ms  cusparse<t>csrgeam2: bufferSizeExt, Nnz, then the sum, with C
                allocated per call as FlagSparse does (CUDA only)
   pytorch_ms   torch.sparse CSR addition
+  cann_ms      CANN SparseAdd with per-call CSR/COO conversion and allocation
+               (required local baseline on Ascend)
 
 Each result is checked against SciPy in float64 / complex128.
 """

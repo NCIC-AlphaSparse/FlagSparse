@@ -9,6 +9,8 @@ when another variant's failing row fully explains a plain ``exit 1`` -- never
 for a timeout, a signal, a traceback or a variant with missing rows.
 """
 
+import pytest
+
 import run_flagsparse_pytest as runner
 
 VARIANT = "spmm_csc_f32_int_non_non_row"
@@ -189,3 +191,22 @@ def test_input_matrix_count_matches_q4_variant_bench(tmp_path):
     assert runner._input_matrix_count(tmp_path) == 2
     assert runner._input_matrix_count(tmp_path / "a.mtx") == 1
     assert runner._input_matrix_count(None) is None
+
+
+@pytest.mark.parametrize("missing_case", [False, True])
+def test_synthetic_variant_counts_case_ids_instead_of_missing_matrix(missing_case):
+    rows = []
+    variant = "gemvi_f32_int_non"
+    for name, status in ((variant, "PASS"), ("gemvi_c32_int_non", "ERROR")):
+        for index in range(4):
+            if missing_case and name == variant and index == 3:
+                continue
+            row = _q4_row("", status=status, variant=name)
+            row["case_id"] = f"{name}|m={index + 1}|n=8|nnz=2"
+            rows.append(row)
+    phase = _phase(rows)
+    phase["input_matrix_count"] = None
+
+    result = runner._q4_performance_phase(phase, variant, "f32")
+
+    assert result["status"] == ("FAIL" if missing_case else "PASS")

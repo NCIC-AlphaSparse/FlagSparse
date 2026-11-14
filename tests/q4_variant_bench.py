@@ -26,8 +26,8 @@ Timing matches the scripts' own rows: where the operator has a prepare step
 once outside the timed window, as cuSPARSE's descriptor setup does; the mixed
 precision / int8 paths have no prepare step and are timed as one call. The row's
 ``timed`` column says which.
-Ascend CSR, COO and CSC variants use their prepared paths; CSC also prepares
-reusable RHS dtype conversion outside the timed computation.
+Ascend mixed CSR transpose and CSC int8 variants prepare their scatter/gather
+indices and arithmetic conversion once, outside the timed computation.
 
 Per row: FlagSparse, native cuSPARSE with the same type combination (CUDA only;
 ``tests/cusparse_generic_baseline.py``), and PyTorch on the same matrix. Accuracy
@@ -38,6 +38,7 @@ import csv
 import gc
 import glob
 import os
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -46,6 +47,7 @@ import torch
 
 import cusparse_generic_baseline as cusparse_baseline
 import ascend_sparse_baseline as cann_baseline
+import ascend_gemvi_geam_baseline as cann_sparse_result_baseline
 import flagsparse as fs
 from benchmark_utils import accelerator_device
 from flagsparse.sparse_operations import mixed_spmx
@@ -532,6 +534,19 @@ def _time_cupy(row, mat, values, dense, op_a, op_b, warmup, iters, reference):
         row["cupy_reason"] = f"{type(exc).__name__}: {exc}"
 
 
+def _ascend_prepare(row, device, build):
+    synchronize = torch.device(device).type == "npu"
+    if synchronize:
+        torch.npu.synchronize(device)
+    started = time.perf_counter()
+    prepared = build()
+    if synchronize:
+        torch.npu.synchronize(device)
+    row["ours_prepare_ms"] = (time.perf_counter() - started) * 1000
+    row["ours_timing_scope"] = "prepared_compute; structural expansion and conversion excluded"
+    return prepared
+
+
 def _spmv(v, mat, gen, warmup, iters, row):
     m, n = mat.shape
     x_len = n if v.op_a == "non" else m
@@ -564,9 +579,11 @@ def _spmv(v, mat, gen, warmup, iters, row):
                 )
             elif _is_ascend_runtime():
                 if mixed:
-                    prepared = mixed_spmx.prepare_spmv_csr_mixed(
-                        vals, mat.cols, mat.ptr, x.dtype, mat.shape,
-                        out_dtype=v.out,
+                    prepared = _ascend_prepare(
+                        row, mat.dev, lambda: mixed_spmx.prepare_spmv_csr_mixed(
+                            vals, mat.cols, mat.ptr, x.dtype, mat.shape,
+                            out_dtype=v.out, op=v.op_a,
+                        ),
                     )
                 else:
                     prepared = fs.prepare_spmv_csr(
@@ -591,8 +608,10 @@ def _spmv(v, mat, gen, warmup, iters, row):
             )
         else:
             if _is_ascend_runtime():
-                prepared = fs.prepare_spmv_csc(
-                    csc_vals, mat.csc_rows, mat.csc_ptr, mat.shape, op=v.op_a, x=x
+                prepared = _ascend_prepare(
+                    row, mat.dev, lambda: fs.prepare_spmv_csc(
+                        csc_vals, mat.csc_rows, mat.csc_ptr, mat.shape, op=v.op_a, x=x
+                    ),
                 )
                 row["timed"] = "prepared"
                 ours = lambda: fs.flagsparse_spmv_csc(  # noqa: E731
@@ -635,7 +654,9 @@ def _spmv(v, mat, gen, warmup, iters, row):
     first = ours()
     row["max_error"] = _error(first, ref)
     row["out_dtype"] = _name(first.dtype)
-    _, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    last, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    post_error = _error(last, ref)
+    row["max_error"] = max(row["max_error"], post_error) if np.isfinite(post_error) else float("inf")
 
     def build_vendor():
         y = torch.empty(y_len, dtype=v.out, device=mat.dev)
@@ -685,6 +706,7 @@ def _spmv(v, mat, gen, warmup, iters, row):
 
 
 def _spmm(v, mat, gen, warmup, iters, row):
+    prepared = None
     m, n = mat.shape
     k_eff, m_eff = (n, m) if v.op_a == "non" else (m, n)
     vals_cpu = _matrix_values(mat.csr, v.value, gen)
@@ -727,8 +749,10 @@ def _spmm(v, mat, gen, warmup, iters, row):
     ):
         if _is_ascend_runtime() and v.fmt == "csr":
             row["timed"] = "prepared"
-            prepared = mixed_spmx.prepare_spmm_csr_mixed(
-                vals, mat.cols, mat.ptr, mat.shape, out_dtype=v.out
+            prepared = _ascend_prepare(
+                row, mat.dev, lambda: mixed_spmx.prepare_spmm_csr_mixed(
+                    vals, mat.cols, mat.ptr, mat.shape, out_dtype=v.out, op=v.op_a
+                ),
             )
             B_eff = _op_t(B, v.op_b).to(prepared.acc_dtype)
             ours = lambda: mixed_spmx.spmm_csr_mixed_prepared(prepared, B_eff)
@@ -773,7 +797,10 @@ def _spmm(v, mat, gen, warmup, iters, row):
     first = first[0] if isinstance(first, tuple) else first
     row["max_error"] = _error(first, ref)
     row["out_dtype"] = _name(first.dtype)
-    _, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    last, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    last = last[0] if isinstance(last, tuple) else last
+    post_error = _error(last, ref)
+    row["max_error"] = max(row["max_error"], post_error) if np.isfinite(post_error) else float("inf")
 
     if _is_ascend_runtime():
         row.update(_ascend_execution_meta(
@@ -1084,6 +1111,9 @@ def _second_operand(v, mat, vals, vals_cpu, gen):
 
 
 def _sparse_result(v, mat, gen, warmup, iters, row):
+    native_geam = _is_ascend_runtime() and v.kind == "geam"
+    if native_geam:
+        cann_sparse_result_baseline.mark_row(row, "geam")
     m, n = mat.shape
     vals_cpu = _matrix_values(mat.csr, v.value, gen)
     vals = vals_cpu.to(mat.dev)
@@ -1120,7 +1150,13 @@ def _sparse_result(v, mat, gen, warmup, iters, row):
     _, row["ours_ms"] = _benchmark_cuda_op(ours, warmup, iters)
 
     reason = cusparse_baseline.skip_reason()
-    if reason is None:
+    if native_geam:
+        cann_sparse_result_baseline.measure(
+            row, lambda: cann_sparse_result_baseline.prepare_geam_csr(A, B, mat.shape),
+            lambda output: _sparse_error(output, reference), v.out,
+            row["ours_ms"], warmup, iters,
+        )
+    elif reason is None:
         _sparse_baseline(row, "vendor", vendor, warmup, iters, reference)
     else:
         row["vendor_reason"] = reason

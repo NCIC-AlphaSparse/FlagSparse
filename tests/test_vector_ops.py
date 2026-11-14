@@ -32,6 +32,7 @@ or FAIL per row, ERROR when FlagSparse raised.
 
 import argparse
 import csv
+import math
 import os
 import sys
 from pathlib import Path
@@ -46,6 +47,7 @@ import torch  # noqa: E402
 from benchmark_utils import accelerator_device  # noqa: E402
 
 import cusparse_generic_baseline as cusparse_baseline  # noqa: E402
+import ascend_axpby_baseline as cann_axpby  # noqa: E402
 import flagsparse as fs  # noqa: E402
 from flagsparse.sparse_operations._common import (  # noqa: E402
     _benchmark_cuda_op,
@@ -97,9 +99,12 @@ FIELDS = [
     "cupy_method",
     "triton_speedup_vs_cupy",
     "triton_max_error",
+    "triton_post_max_error",
+    "pytorch_max_error",
     "cusparse_max_error",
     "cusparse_reason",
     "pytorch_reason",
+    *cann_axpby.PERF_FIELDS,
     "status",
     "error",
 ]
@@ -201,15 +206,53 @@ def _run_case(op, dtype, spvv_op, dense_size, nnz, warmup, iters, gen, out_dtype
                 x, idx, y, alpha=_ALPHA, beta=_BETA, validate=False
             )
         y_torch = y_cpu.to(dev).to(compute)
+        torch_calls = 0
 
         def torch_op():
-            y_torch.mul_(_BETA).index_add_(0, idx.long(), x.to(compute) * _ALPHA)
+            nonlocal torch_calls
+            y_torch.mul_(_BETA)
+            scaled = x.to(compute) * _ALPHA
+            if _is_ascend_runtime() and y_torch.is_complex():
+                torch.view_as_real(y_torch).index_add_(
+                    0, idx.long(), torch.view_as_real(scaled)
+                )
+            else:
+                y_torch.index_add_(0, idx.long(), scaled)
+            torch_calls += 1
             return y_torch
 
     row["triton_max_error"] = err
     _, row["triton_ms"] = _benchmark_cuda_op(ours, warmup, iters)
+    validate_axpby = op == "axpby" and _is_ascend_runtime() and dtype == torch.complex64
+    if validate_axpby:
+        expected = cann_axpby.expected_after(
+            y_cpu, x_cpu, idx_cpu, _ALPHA, _BETA,
+            max(0, int(warmup)) + max(1, int(iters)),
+        )
+        post_error = _error(y, expected)
+        row["triton_post_max_error"] = post_error
+        err = max(err, post_error) if math.isfinite(post_error) else float("inf")
+        row["triton_max_error"] = err
+        cann_axpby.measure(
+            row, x, idx, y_cpu.to(dev), _ALPHA, _BETA,
+            row["triton_ms"], warmup, iters,
+        )
     try:
-        _, row["pytorch_ms"] = _benchmark_cuda_op(torch_op, warmup, iters)
+        def check_torch_axpby(result):
+            expected = cann_axpby.expected_after(
+                y_cpu, x_cpu, idx_cpu, _ALPHA, _BETA, torch_calls
+            )
+            error = _error(result, expected)
+            if not math.isfinite(error) or not _passes(dtype, error):
+                raise RuntimeError(f"PyTorch AXPBY correctness check failed: {error}")
+            return error
+
+        if validate_axpby:
+            before = check_torch_axpby(torch_op())
+        result, elapsed = _benchmark_cuda_op(torch_op, warmup, iters)
+        if validate_axpby:
+            row["pytorch_max_error"] = max(before, check_torch_axpby(result))
+        row["pytorch_ms"] = elapsed
     except Exception as exc:  # e.g. a backend without complex index/sum kernels
         row["pytorch_reason"] = f"{type(exc).__name__}: {exc}"
 

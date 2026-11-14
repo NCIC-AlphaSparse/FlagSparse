@@ -50,7 +50,10 @@ def record_result(row, plan, elapsed_ms, error, flagsparse_ms):
 
 class SparsePlan:
     def __init__(self, coordinates, values, shape, dense, output, transpose,
-                 rhs_shared=False):
+                 rhs_shared=False, *, operator="SparseTensorDenseMatMul"):
+        if operator not in ("SparseTensorDenseMatMul", "SparseTensorDenseAdd"):
+            raise ValueError(f"Unsupported CANN sparse operator: {operator}")
+        self.operator = operator
         self.descriptors = []
         self.buffers = []
         self.attribute = None
@@ -79,11 +82,12 @@ class SparsePlan:
                 if not buffer:
                     raise RuntimeError("acl.create_data_buffer failed")
                 self.buffers.append(buffer)
-            self.attribute = self.acl.op.create_attr()
-            for key, value in (("adjoint_a", transpose), ("adjoint_b", False)):
-                status = self.acl.op.set_attr_bool(self.attribute, key, value)
-                if status:
-                    raise RuntimeError(f"acl.op.set_attr_bool({key}) returned {status}")
+            if operator == "SparseTensorDenseMatMul":
+                self.attribute = self.acl.op.create_attr()
+                for key, value in (("adjoint_a", transpose), ("adjoint_b", False)):
+                    status = self.acl.op.set_attr_bool(self.attribute, key, value)
+                    if status:
+                        raise RuntimeError(f"acl.op.set_attr_bool({key}) returned {status}")
             compiler = home / "lib64/libacl_op_compiler.so"
             self.library = ctypes.CDLL(str(compiler) if compiler.exists() else "libacl_op_compiler.so")
             self.execute = self.library.aclopCompileAndExecute
@@ -103,12 +107,12 @@ class SparsePlan:
     def run(self):
         if self.closed:
             raise RuntimeError("CANN sparse baseline plan is closed")
-        status = self.execute(b"SparseTensorDenseMatMul", 4, self.input_desc, self.input_buffers,
+        self.launched = True
+        status = self.execute(self.operator.encode(), 4, self.input_desc, self.input_buffers,
                               1, self.output_desc, self.output_buffers, self.attribute, 0, 0, None,
                               torch.npu.current_stream(self.output.device).npu_stream)
         if status:
-            raise RuntimeError(f"{NAME} returned {status}: {self.acl.get_recent_err_msg()}")
-        self.launched = True
+            raise RuntimeError(f"CANN {self.operator} returned {status}: {self.acl.get_recent_err_msg()}")
         return self.output
 
     def close(self):

@@ -1,5 +1,33 @@
 # 昇腾 910B：65 变体剩余工作（实机上做）
 
+2026-11-13 SpGEMM 继续优化：结构 prepare、32 位内部映射、无原子分段数值归约；
+ASIC 跨精度下溢模式已单独调查，验证与复测见
+[`ASCEND_SPGEMM_PREPARED_OPT_20261113.md`](ASCEND_SPGEMM_PREPARED_OPT_20261113.md)。
+
+2026-11-12 CSR SpGEMM f32/c32 已改为分桶行内归约，去除 repeat_interleave 展开和
+全局排序；44 项精度/边界回归通过，十矩阵专项已结束（18/20），见
+[`ASCEND_SPGEMM_OPT_20261112.md`](ASCEND_SPGEMM_OPT_20261112.md)。
+
+2026-11-12 上轮 77 项已完成（72 项平均性能达标）；五项剩余问题已补齐 prepared
+路径，专项实机回归通过并后台定向复测，见
+[`ASCEND_PREPARED_MIXED_OPT_20261112.md`](ASCEND_PREPARED_MIXED_OPT_20261112.md)。
+
+2026-11-12 已修五处基准接线、SDDMM fp16 累加精度，并接入 AXPBY c32 本机 CANN；
+29 个新增变体实机预检通过，77 项定向交付复测已后台启动，见
+[`ASCEND_BASELINE_FIXES_20261112.md`](ASCEND_BASELINE_FIXES_20261112.md)。
+
+2026-11-12 缺基线/29 个未接线变体的实机调查，见
+[`ASCEND_BASELINE_AUDIT_20261112.md`](ASCEND_BASELINE_AUDIT_20261112.md)。
+
+2026-11-12 GEAM 实数/复数路径已改为有序 CSR 秩归并；定位、验证和复测目录见
+[`ASCEND_GEAM_OPT_20261112.md`](ASCEND_GEAM_OPT_20261112.md)。
+
+2026-11-12 已在本机找到并实测 GEMVI / GEAM 的 CANN 原生基线候选，见
+[`ASCEND_LOCAL_BASELINES_20261112.md`](ASCEND_LOCAL_BASELINES_20261112.md)。
+
+2026-11-11 的 105 项实机复测、GEMVI/GEAM 失败修复、SpGEMM 超时与定向验证，见
+[`ASCEND_FAILURES_20261111.md`](ASCEND_FAILURES_20261111.md)。下文保留历史计划和记录。
+
 `FLAGSPARSE_BACKEND=ascend`。环境搭建、交付复现见 [`../ASCEND.md`](../ASCEND.md)。背景见本目录
 [`README.md`](README.md)。
 

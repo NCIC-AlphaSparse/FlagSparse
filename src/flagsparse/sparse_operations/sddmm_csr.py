@@ -28,7 +28,11 @@ _ASCEND_SDDMM_CHUNK_NNZ = 1 << 20
 
 def _ascend_sddmm_dot(x, y, rows, cols):
     if not _is_complex_dtype(x.dtype):
-        return (x.index_select(0, rows) * y.index_select(0, cols)).sum(dim=1)
+        x_rows = x.index_select(0, rows)
+        y_rows = y.index_select(0, cols)
+        if x.dtype == torch.float16:
+            x_rows, y_rows = x_rows.float(), y_rows.float()
+        return (x_rows * y_rows).sum(dim=1)
     x_pair = torch.view_as_real(x).index_select(0, rows)
     y_pair = torch.view_as_real(y).index_select(0, cols)
     real = (x_pair[..., 0] * y_pair[..., 0] - x_pair[..., 1] * y_pair[..., 1]).sum(dim=1)
@@ -1015,7 +1019,8 @@ def _run_sddmm_prepared(
     if _is_ascend_runtime() or _is_xpu_runtime():
         row_ids = prepared.row_ids.to(torch.int64)
         cols = prepared.ascend_cols if _is_ascend_runtime() else prepared.indices.to(torch.int64)
-        vals = torch.empty((nnz,), device=x.device, dtype=x.dtype)
+        acc_dtype = torch.float32 if x.dtype == torch.float16 else x.dtype
+        vals = torch.empty((nnz,), device=x.device, dtype=acc_dtype)
         for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
             end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
             vals[begin:end] = _ascend_sddmm_dot(
@@ -1023,7 +1028,8 @@ def _run_sddmm_prepared(
             )
         vals = vals * float(alpha)
         if data is not None:
-            vals = vals + float(beta) * data
+            data_acc = data.float() if x.dtype == torch.float16 else data
+            vals = vals + float(beta) * data_acc
         out.copy_(vals.to(out.dtype))
         return out, {
             "block_p": None,
@@ -1252,7 +1258,8 @@ def flagsparse_sddmm_csr(
         # chunk bounds the temporaries to _ASCEND_SDDMM_CHUNK_NNZ x K.
         cols = indices.to(torch.int64)
         nnz = int(indices.numel())
-        vals = torch.empty((nnz,), device=x.device, dtype=out_dtype or x.dtype)
+        acc_dtype = torch.float32 if x.dtype == torch.float16 else x.dtype
+        vals = torch.empty((nnz,), device=x.device, dtype=acc_dtype)
         for begin in range(0, nnz, _ASCEND_SDDMM_CHUNK_NNZ):
             end = min(begin + _ASCEND_SDDMM_CHUNK_NNZ, nnz)
             vals[begin:end] = _ascend_sddmm_dot(
@@ -1260,10 +1267,13 @@ def flagsparse_sddmm_csr(
             )
         vals = vals * float(alpha)
         if beta != 0.0:
-            vals = vals + float(beta) * data
+            data_acc = data.float() if x.dtype == torch.float16 else data
+            vals = vals + float(beta) * data_acc
         if out is not None:
             out.copy_(vals)
             vals = out
+        else:
+            vals = vals.to(out_dtype or x.dtype)
         if ascend_timed:
             _ACCEL.synchronize()
             elapsed = (time.perf_counter() - t0) * 1000.0

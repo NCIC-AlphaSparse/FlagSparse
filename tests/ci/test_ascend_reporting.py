@@ -179,6 +179,11 @@ def test_ascend_csr_bringup_routes_measured_q4_variants_to_both_phases():
             "spmv_csr_i8f32_int_non",
             "spmv_csr_i8i32_int_non",
             "spmv_csr_c32_int_conj",
+            "spmv_csr_bf16f32_int_non",
+            "spmv_csr_bf16_int_non",
+            "spmv_csr_f16f32_int_trans",
+            "spmv_csr_f32c32_int_trans",
+            "spmv_csr_i8i32_int_trans",
         ),
         "spmv_coo": (
             "spmv_coo_f16_int_non",
@@ -187,6 +192,9 @@ def test_ascend_csr_bringup_routes_measured_q4_variants_to_both_phases():
             "spmv_coo_c32_int_non",
             "spmv_coo_c32_int_conj",
             "spmv_coo_i8i32_int_non",
+            "spmv_coo_i8f32_int_non",
+            "spmv_coo_f32c32_int_non",
+            "spmv_coo_f16_int_trans",
         ),
         "spmm_csr": (
             "spmm_csr_f16f32_int_non_non_row",
@@ -196,11 +204,22 @@ def test_ascend_csr_bringup_routes_measured_q4_variants_to_both_phases():
             "spmm_csr_c32_int_non_non_row",
             "spmm_csr_i8i32_int_non_non_row",
             "spmm_csr_f32_int_trans_non_row",
+            "spmm_csr_bf16f32_int_non_non_row",
+            "spmm_csr_f16f32_int_non_non_col",
+            "spmm_csr_i8f32_int_non_non_row",
+            "spmm_csr_c32_int_non_trans_row",
+            "spmm_csr_i8i32_int_non_non_col",
+            "spmm_csr_c32_int_conj_non_row",
+            "spmm_csr_f16f32_int_trans_non_row",
         ),
         "spmm_coo": (
             "spmm_coo_c32_int_non_non_row",
             "spmm_coo_f16_int_non_non_row",
             "spmm_coo_i8i32_int_non_non_row",
+            "spmm_coo_f16f32_int_non_non_row",
+            "spmm_coo_f32_int_non_non_col",
+            "spmm_coo_f32_int_trans_non_row",
+            "spmm_coo_f32_int_non_trans_row",
         ),
         "sddmm_csr": (
             "sddmm_csr_f32_int_non_non_col",
@@ -208,16 +227,26 @@ def test_ascend_csr_bringup_routes_measured_q4_variants_to_both_phases():
             "sddmm_csr_f32_int_trans_non_row",
             "sddmm_csr_c32_int_non_non_row",
             "sddmm_csr_f16_int_non_non_row",
+            "sddmm_csr_f32_int_trans_trans_row",
+            "sddmm_csr_c32_int_non_trans_row",
+            "sddmm_csr_f16_int_non_trans_row",
+            "sddmm_csr_f16f32_int_non_non_row",
         ),
         "spmv_csc": (
             "spmv_csc_f32_int_non",
             "spmv_csc_c32_int_non",
             "spmv_csc_f16_int_non",
+            "spmv_csc_f32_int_trans",
+            "spmv_csc_c32_int_conj",
+            "spmv_csc_f16f32_int_non",
+            "spmv_csc_i8i32_int_non",
         ),
         "spmm_csc": (
             "spmm_csc_f32_int_non_non_row",
             "spmm_csc_c32_int_non_non_row",
             "spmm_csc_f16_int_non_non_row",
+            "spmm_csc_f32_int_trans_non_row",
+            "spmm_csc_f16f32_int_non_non_row",
         ),
     }
     command = runner.ASCEND_PERFORMANCE_COMMANDS["spmv_csr"]
@@ -225,7 +254,10 @@ def test_ascend_csr_bringup_routes_measured_q4_variants_to_both_phases():
         "spmv_csr_f16_int_non,spmv_csr_f16f32_int_non,"
         "spmv_csr_f32c32_int_non,spmv_csr_c32_int_non,"
         "spmv_csr_f32_int_trans,spmv_csr_i8f32_int_non,"
-        "spmv_csr_i8i32_int_non,spmv_csr_c32_int_conj"
+        "spmv_csr_i8i32_int_non,spmv_csr_c32_int_conj,"
+        "spmv_csr_bf16f32_int_non,spmv_csr_bf16_int_non,"
+        "spmv_csr_f16f32_int_trans,spmv_csr_f32c32_int_trans,"
+        "spmv_csr_i8i32_int_trans"
     )
     accuracy_source = (ROOT / "benchmark" / "benchmark_ascend_accuracy.py").read_text(
         encoding="utf-8"
@@ -239,7 +271,8 @@ def test_ascend_coo_bringup_routes_measured_q4_variants_to_performance():
     assert command[command.index("--q4-variants") + 1] == (
         "spmv_coo_f16_int_non,spmv_coo_f16f32_int_non,"
         "spmv_coo_f32_int_trans,spmv_coo_c32_int_non,"
-        "spmv_coo_c32_int_conj,spmv_coo_i8i32_int_non"
+        "spmv_coo_c32_int_conj,spmv_coo_i8i32_int_non,"
+        "spmv_coo_i8f32_int_non,spmv_coo_f32c32_int_non,spmv_coo_f16_int_trans"
     )
     assert "spmv_coo" not in runner.ASCEND_ACCURACY_OPS
 

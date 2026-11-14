@@ -105,17 +105,19 @@ class PreparedCsrMixedSpmv:
         "ascend_cols", "ascend_data", "rhs_source",
         "rhs_compute", "rhs_version",
         "iluvatar_ell_plan",
+        "op",
     )
 
     def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype,
                  rows_per, block, num_warps, route, bucket_plan=None,
-                 nnz_plan=None):
+                 nnz_plan=None, op="non"):
         self.iluvatar_ell_plan = {}
         self.data = data
         self.indices = indices
         self.indptr = indptr
         self.shape = (int(shape[0]), int(shape[1]))
         self.n_rows, self.n_cols = self.shape
+        self.op = op
         self.result_dtype = result_dtype
         self.acc_dtype = acc_dtype
         self.rows_per = rows_per
@@ -128,6 +130,9 @@ class PreparedCsrMixedSpmv:
             self.ascend_rows = _csr_row_ids(indptr, self.n_rows, data.numel())
             self.ascend_cols = indices.to(torch.int64).contiguous()
             self.ascend_data = data.to(acc_dtype).contiguous()
+            if op == "trans":
+                self.ascend_rows, self.ascend_cols = self.ascend_cols, self.ascend_rows
+                self.n_rows, self.n_cols = self.n_cols, self.n_rows
         else:
             self.ascend_rows = None
             self.ascend_cols = None
@@ -152,19 +157,24 @@ class PreparedCsrSpmmMixed:
         "acc_data",
         "runner",
         "ascend_meta",
+        "op",
     )
 
-    def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype):
+    def __init__(self, data, indices, indptr, shape, result_dtype, acc_dtype, op="non"):
         self.data = data.contiguous()
         self.indices = indices.contiguous()
         self.indptr = indptr.contiguous()
         self.shape = (int(shape[0]), int(shape[1]))
         self.n_rows, self.n_cols = self.shape
+        self.op = op
         self.result_dtype = result_dtype
         self.acc_dtype = acc_dtype
         self.rows = _csr_row_ids(indptr, self.n_rows, data.numel()).to(torch.int64)
         self.cols = indices.to(torch.int64).contiguous()
         self.acc_data = data.to(acc_dtype).contiguous()
+        if op == "trans":
+            self.rows, self.cols = self.cols, self.rows
+            self.n_rows, self.n_cols = self.n_cols, self.n_rows
         self.runner = None
         self.ascend_meta = {}
 
@@ -597,17 +607,23 @@ def _prepared_mixed_uses_call(data_dtype, result_dtype):
 
 
 def prepare_spmv_csr_mixed(data, indices, indptr, x_dtype, shape, *,
-                           out=None, out_dtype=None, route="auto"):
+                           out=None, out_dtype=None, route="auto", op=None):
     """Plan a mixed-precision / real-by-complex CSR SpMV once; run it with
     ``spmv_csr_mixed_prepared`` or ``flagsparse_spmv_csr(prepared=...)``.
 
     Row statistics, the short/long bucket order and the per-nonzero row ids are
     built here (synchronizing) and held by the plan. The plan keeps the CSR
-    tensors, not copies: later in-place writes to their values are seen, but a
-    changed sparsity structure needs a new plan. MUSA, Ascend and ROCm f16->f16
+    tensors. Ascend snapshots converted values; changed values or structure
+    require a new plan. Ascend additionally supports real-matrix trans/conj by
+    swapping the prepared scatter/gather indices, without materializing A.T.
+    ``shape`` records the original matrix; ``n_rows``/``n_cols`` describe op(A).
+    MUSA, Ascend and ROCm f16->f16
     keep their own call routes (``route == "call"``).
     """
     _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+    op = _normalize_mixed_op(op, False, data.dtype)
+    if op != "non" and not _is_ascend_runtime():
+        raise NotImplementedError("prepared mixed CSR transpose requires Ascend")
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
         raise ValueError("invalid CSR dimensions")
@@ -684,6 +700,7 @@ def prepare_spmv_csr_mixed(data, indices, indptr, x_dtype, shape, *,
     return PreparedCsrMixedSpmv(
         data, indices, indptr, shape, result_dtype, acc_dtype,
         rows_per, block, num_warps, selected, bucket_plan, nnz_plan,
+        op=op,
     )
 
 
@@ -2282,8 +2299,16 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
     return C
 
 
-def prepare_spmm_csr_mixed(data, indices, indptr, shape, *, out_dtype=None):
+def prepare_spmm_csr_mixed(data, indices, indptr, shape, *, out_dtype=None, op=None):
+    """Prepare fixed mixed CSR operands, including real transpose on Ascend.
+
+    Converted values and per-entry scatter/gather indices are prepared once.
+    The original ``shape`` is retained; ``n_rows``/``n_cols`` describe op(A).
+    """
     _check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"))
+    op = _normalize_mixed_op(op, False, data.dtype)
+    if op != "non" and not _is_ascend_runtime():
+        raise NotImplementedError("prepared mixed CSR transpose requires Ascend")
     n_rows, n_cols = int(shape[0]), int(shape[1])
     if data.numel() != indices.numel() or indptr.numel() != n_rows + 1:
         raise ValueError("invalid CSR dimensions")
@@ -2291,7 +2316,7 @@ def prepare_spmm_csr_mixed(data, indices, indptr, shape, *, out_dtype=None):
         data.dtype, data.dtype, None, out_dtype, False
     )
     return PreparedCsrSpmmMixed(
-        data, indices, indptr, shape, result_dtype, acc_dtype
+        data, indices, indptr, shape, result_dtype, acc_dtype, op=op
     )
 
 
