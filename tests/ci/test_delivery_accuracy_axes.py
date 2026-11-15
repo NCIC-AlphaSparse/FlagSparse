@@ -226,6 +226,82 @@ def test_any_other_skip_still_makes_the_run_skipped():
     assert runner.summarize_accuracy_cases(dict(cases))["status"] == "Skipped"
 
 
+def test_sddmm_other_backend_skips_preserve_passed_cases_and_counts(tmp_path):
+    # Mirror the real MUSA artifact: 4 FP32 passes, 2 BI-V skips and 48
+    # Ascend-only output_dtype cases. Keep every skip visible in both views.
+    cases = {
+        f"tests/pytest/test_spgemm_sddmm_accuracy.py::test_sddmm_csr_matches_dense[{i}]": {
+            "result": "passed",
+            "params": {"dtype": "torch.float32"},
+        }
+        for i in range(4)
+    }
+    for module, reason, count in [
+        (
+            "test_sddmm_iluvatar_layout_accuracy",
+            "Skipped: BI-V layout specialization",
+            2,
+        ),
+        ("test_ascend_sddmm_accumulation", "Skipped: requires an Ascend NPU", 48),
+    ]:
+        for i in range(count):
+            cases[f"tests/pytest/{module}.py::test_backend_specialization[{i}]"] = {
+                "result": "skipped",
+                "reason": reason,
+                "params": {"output_dtype": "torch.float32"},
+            }
+    for summary in (
+        runner.summarize_accuracy_cases(cases),
+        _project(tmp_path, cases.items()),
+    ):
+        assert summary["status"] == "Passed"
+        assert (
+            summary["passed"],
+            summary["skipped"],
+            summary["failed"],
+            summary["total"],
+        ) == (4, 50, 0, 54)
+        assert {
+            reason: len(items)
+            for reason, items in summary["details"]["skipped"].items()
+        } == {
+            "Skipped: BI-V layout specialization": 2,
+            "Skipped: requires an Ascend NPU": 48,
+        }
+
+
+def test_ascend_only_skips_cannot_supply_missing_accuracy_coverage(tmp_path):
+    skipped = {
+        "tests/pytest/test_ascend_sddmm_accumulation.py::test_half_sddmm": {
+            "result": "skipped",
+            "reason": "Skipped: requires an Ascend NPU",
+            "params": {"output_dtype": "torch.float32"},
+        }
+    }
+    for summary in (
+        runner.summarize_accuracy_cases(skipped),
+        _project(tmp_path, skipped.items()),
+    ):
+        assert summary["status"] == "Skipped"
+        assert (summary["passed"], summary["skipped"], summary["total"]) == (0, 1, 1)
+
+
+def test_other_backend_skips_do_not_hide_failures_or_unknown_skips():
+    cases = dict(
+        [
+            _surface(),
+            _skipped_case("Skipped: requires an Ascend NPU", alg="ascend"),
+        ]
+    )
+    problem, item = _case("test_sddmm_coverage", "failed", "AssertionError")
+    cases[problem] = item
+    assert runner.summarize_accuracy_cases(cases)["status"] == "Failed"
+    item.update(result="skipped", reason="Skipped: needs a GPU")
+    assert runner.summarize_accuracy_cases(cases)["status"] == "Skipped"
+    item["reason"] = "Skipped: Issue #12; requires an Ascend NPU"
+    assert runner.summarize_accuracy_cases(cases)["status"] == "Failed"
+
+
 def test_the_retired_no_verified_profile_skip_is_no_longer_exempt():
     """The spmv_csr tests stopped emitting it; if it comes back it must be seen."""
     cases = [_surface(), _skipped_case(RETIRED_SKIP, alg="row_tile", op="non")]

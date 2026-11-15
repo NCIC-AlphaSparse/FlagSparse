@@ -1618,3 +1618,25 @@ amazon0601 单矩阵仍约 0.43×。ASIC muSPARSE 基线本身仍严格失败，
 - 其他后端是否也需要：否；新默认流测试运行时限定MUSA，非默认流由既有MUSA编译宏保护，其他后端原断言不变。
 
 本轮未再次执行完整105项；旧完整轮结果不改写，详见本轮RESULTS.json和REPORT.md。
+
+### 2026-11-15 SDDMM 精度汇总的 Ascend 专用跳过识别
+
+最新完整结果 `results_mthreads_105_20261115_085354_6adb1aa/` 性能105项均>0.8，精度汇总为104 Passed、1 Skipped。
+唯一跳过行 `sddmm_csr_f32_int_non_non_row` 实际4 passed、0 failed、50 skipped：2条BI-V专用、48条Ascend专用。
+后者的参数 `output_dtype=torch.float32` 被交付FP32切片选中，其 `Skipped: requires an Ascend NPU` 原因尚未被runner识别为已有的后端能力边界。
+
+#### run_flagsparse_pytest.py::EXPECTED_ACCURACY_SKIP_REASONS
+
+- 改了什么：在现有具名能力跳过原因中补入 `requires an ascend npu`；有真实通过用例且无失败/未知跳过时，不让仅适用于其他后端的跳过把整项降为Skipped。跳过计数、逐项原因及原始记录全部保留；全跳过仍为Skipped，真实失败/Issue仍为Failed，未知跳过仍为Skipped。
+- 为什么改（附报错原文）：原行 `status=Skipped, passed=4, failed=0, skipped=50`，其中48条原因为 `Skipped: requires an Ascend NPU`。MUSA的适用精度用例已通过，错误来自汇总分类，不是数值容差或kernel。
+- 怎么验证的：`artifacts/sddmm_accuracy_summary_fix_20261115_102937/` 保存原始数据重放、独立normal精度复测和回归。实际SDDMM复测27 passed、52 skipped、0 failed，11个SDDMM交付变体全部Passed；FP32目标仍如实4 passed、50 skipped。最新完整轮原始记录用旧规则重放Skipped、新规则Passed，计数和明细逐项不变。97项runner相关CI通过，含全跳过、未知跳过、真实失败和Issue防遮蔽回归。
+- 其他后端是否也需要：该具名后端限制适用于所有共用runner的非Ascend环境；Ascend实机的适用用例仍须执行并通过。生产kernel、基线、容差、测试选择和计时器均未改，未执行其他后端硬件测试。
+
+#### tests/ci/test_delivery_accuracy_axes.py::SDDMM capability skip regressions
+
+- 改了什么：新增3项回归，模拟4通过+2 BI-V跳过+48 Ascend跳过，并验证父算子/交付切片均Passed且计数明细不丢失；全跳过保持Skipped，旁边存在真实失败/未知跳过/Issue时仍按原规则报告。
+- 为什么改（附报错原文）：防止上述 `requires an Ascend NPU` 把真实通过误标Skipped，也防止将缺失覆盖或数值错误隐藏为通过。
+- 怎么验证的：与runner格式、父失败传播和split范围测试共同运行，共97/97 passed；原始最新完整结果未修改，SHA256验证通过。
+- 其他后端是否也需要：CPU运行的共用runner回归，不更改任何后端kernel。
+
+本轮仅重新执行SDDMM精度，未重新执行完整105项或性能。`historical_summary_reclassified.json` 和对应表是在独立目录对旧完整数据重新分类的副本，显示105项精度/性能Passed；不能当作新一轮完整复测。旧结果和先前压缩包保持原样。

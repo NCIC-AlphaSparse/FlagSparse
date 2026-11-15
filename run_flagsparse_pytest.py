@@ -1726,6 +1726,10 @@ EXPECTED_ACCURACY_SKIP_REASONS = (
     # f32 cases turned sddmm_csr_f32_int_non_non_row "Skipped" on CUDA (2026-11-02,
     # 2 passed + 2 of these skips).
     "bi-v layout specialization",
+    # tests/pytest/test_ascend_sddmm_accumulation.py is an Ascend-only suite;
+    # output_dtype=float32 otherwise makes its skips downgrade SDDMM FP32 on
+    # other backends even when their applicable accuracy cases passed.
+    "requires an ascend npu",
 )
 
 
