@@ -400,10 +400,16 @@ def _build_spgemm_rhs(a_data, a_indices, a_indptr, a_shape, mode):
         return a_data, a_indices, a_indptr, a_shape
     if mode != "A_AT":
         raise ValueError(f"unsupported resolved mode: {mode}")
+    device = a_data.device
+    if ast_common._is_ascend_runtime():
+        a_data, a_indices, a_indptr = a_data.cpu(), a_indices.cpu(), a_indptr.cpu()
     a_t = ast_ops._to_torch_csr(a_data, a_indices, a_indptr, a_shape)
     # CSR^T may materialize as CSC; convert through COO so downstream always receives CSR.
     b_t = a_t.transpose(0, 1).to_sparse_coo().coalesce()
-    return ast_ops._torch_sparse_to_csr(b_t)
+    data, indices, indptr, shape = ast_ops._torch_sparse_to_csr(b_t)
+    if ast_common._is_ascend_runtime():
+        data, indices, indptr = data.to(device), indices.to(device), indptr.to(device)
+    return data, indices, indptr, shape
 
 
 def _build_scipy_spgemm_reference(

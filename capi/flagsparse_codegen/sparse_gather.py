@@ -115,7 +115,8 @@ def sparse_gather_spmm_row_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
                               R: tl.constexpr, K: tl.constexpr, BN: tl.constexpr,
                               COMPLEX: tl.constexpr, CONJ: tl.constexpr,
                               INDIRECT: tl.constexpr, HAS_BETA: tl.constexpr,
-                              WIDE: tl.constexpr = False):
+                              WIDE: tl.constexpr = False,
+                              ACC64: tl.constexpr = False):
     # MUSA, real FP32, eight contiguous dense columns. Keep sparse lanes
     # independent through the loop and reduce once per output tile.
     row = (tl.program_id(0).to(tl.int64) if WIDE else tl.program_id(0)) * R + tl.arange(0, R)
@@ -127,7 +128,10 @@ def sparse_gather_spmm_row_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
         end = end.to(tl.int64)
     ns = tl.arange(0, BN)
     ks = tl.arange(0, K)
-    acc = tl.zeros((R, K, BN), tl.float32)
+    # Transposed MUSA SpMM can add a small term before cancelling large terms.
+    # Widen products as well as the running sum, then round only at the store.
+    ACC: tl.constexpr = tl.float64 if ACC64 else tl.float32
+    acc = tl.zeros((R, K, BN), ACC)
     for offset in range(0, tl.max(end-start, 0), K):
         pos = start[:, None] + offset + ks[None, :]
         valid = active[:, None] & (pos < end[:, None])
@@ -136,9 +140,9 @@ def sparse_gather_spmm_row_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
         if WIDE:
             src = src.to(tl.int64)
             col = col.to(tl.int64)
-        value = tl.load(V + src, valid, other=0.)
+        value = tl.load(V + src, valid, other=0.).to(ACC)
         dense = tl.load(B + col[:, :, None] * 8 + ns[None, None, :],
-                        valid[:, :, None] & (ns[None, None, :] < 8), other=0.)
+                        valid[:, :, None] & (ns[None, None, :] < 8), other=0.).to(ACC)
         acc += value[:, :, None] * dense
     result = ar * tl.sum(acc, 1)
     out = C + row[:, None] * 8 + ns[None, :]
@@ -283,7 +287,8 @@ def sparse_gather_spmm_stream_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
                                   R: tl.constexpr, K: tl.constexpr, BN: tl.constexpr,
                                   COMPLEX: tl.constexpr, CONJ: tl.constexpr,
                                   INDIRECT: tl.constexpr, HAS_BETA: tl.constexpr,
-                      WIDE: tl.constexpr = False):
+                      WIDE: tl.constexpr = False,
+                      ACC64: tl.constexpr = False):
     rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
     active = rows < M
     start = tl.load(P + rows, active, other=0)
@@ -292,9 +297,10 @@ def sparse_gather_spmm_stream_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
         start = start.to(tl.int64)
         end = end.to(tl.int64)
     ns = tl.program_id(1) * BN + tl.arange(0, BN)
-    re = tl.zeros((R, BN), tl.float32)
+    ACC: tl.constexpr = tl.float64 if ACC64 else tl.float32
+    re = tl.zeros((R, BN), ACC)
     if COMPLEX:
-        im = tl.zeros((R, BN), tl.float32)
+        im = tl.zeros((R, BN), ACC)
     for base in range(0, tl.max(end - start, 0)):
         pos = start + base
         valid = active & (pos < end)
@@ -309,17 +315,17 @@ def sparse_gather_spmm_stream_f32(V, P, ORDER, COLS, B, C, ar, ai, br, bi, M, N,
         mask = valid[:, None] & (ns[None, :] < N)
         bp = B + col[:, None] * SBK + ns[None, :] * SBN
         if COMPLEX:
-            vr = tl.load(V + 2 * src, valid, other=0.)
-            vi = tl.load(V + 2 * src + 1, valid, other=0.)
+            vr = tl.load(V + 2 * src, valid, other=0.).to(ACC)
+            vi = tl.load(V + 2 * src + 1, valid, other=0.).to(ACC)
             if CONJ:
                 vi = -vi
-            xr = tl.load(bp, mask, other=0.)
-            xi = tl.load(bp + 1, mask, other=0.)
+            xr = tl.load(bp, mask, other=0.).to(ACC)
+            xi = tl.load(bp + 1, mask, other=0.).to(ACC)
             re += vr[:, None] * xr - vi[:, None] * xi
             im += vr[:, None] * xi + vi[:, None] * xr
         else:
-            value = tl.load(V + src, valid, other=0.)
-            re += value[:, None] * tl.load(bp, mask, other=0.)
+            value = tl.load(V + src, valid, other=0.).to(ACC)
+            re += value[:, None] * tl.load(bp, mask, other=0.).to(ACC)
     out = C + rows[:, None] * SCM + ns[None, :] * SCN
     mask = active[:, None] & (ns[None, :] < N)
     if COMPLEX:

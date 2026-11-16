@@ -24,6 +24,29 @@ _spgemm_compare_metrics = pytest.importorskip(
 )._spgemm_compare_metrics
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.complex64])
+def test_ascend_rectangular_rhs_transpose_keeps_dtype(monkeypatch, dtype):
+    from tests import test_spgemm as benchmark
+
+    monkeypatch.setattr(benchmark.ast_common, "_is_ascend_runtime", lambda: True)
+    dense = torch.tensor([[1, 0, 2], [0, 3, 4]], dtype=dtype)
+    sparse = dense.to_sparse_csr()
+
+    values, columns, pointer, shape = benchmark._build_spgemm_rhs(
+        sparse.values(),
+        sparse.col_indices().int(),
+        sparse.crow_indices(),
+        tuple(dense.shape),
+        "A_AT",
+    )
+
+    result = torch.sparse_csr_tensor(pointer, columns.long(), values, shape).to_dense()
+    assert values.dtype == dtype
+    assert columns.dtype == torch.int32
+    assert pointer.dtype == torch.int64
+    torch.testing.assert_close(result, dense.t())
+
+
 def _csr(data, indices, indptr, shape, dtype):
     return (
         torch.tensor(data, dtype=dtype),

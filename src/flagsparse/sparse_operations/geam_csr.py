@@ -31,7 +31,7 @@ every output position is computed from ranks.
 
 Each output slot has exactly one writer per step and step 4 runs after step 3,
 so nothing is atomic. Complex values go through ``view_as_real``. Ascend takes a
-torch_npu path (concatenate, sort the keys, reduce).
+torch_npu path that merges the already sorted CSR keys by binary-search ranks.
 """
 
 from ._common import *
@@ -217,25 +217,65 @@ def _row_tile(nnz, n_rows):
 
 
 def _torch_geam(a_data, a_indices, a_ptr, b_data, b_indices, b_ptr, shape, alpha, beta, ptr_dtype):
-    """Ascend path: concatenate both matrices' entries, sort by key, reduce runs."""
-    n_rows, n_cols = int(shape[0]), int(shape[1])
+    """Ascend path: rank both sorted inputs and scatter their union without sorting."""
+    n_cols = int(shape[1])
     dev = a_data.device
+    nnz_a, nnz_b = a_data.numel(), b_data.numel()
 
-    def row_ids(ptr):
-        return torch.repeat_interleave(torch.arange(n_rows, device=dev), ptr[1:] - ptr[:-1])
+    def scaled_values(data, scalar):
+        if data.is_complex():
+            planes = torch.view_as_real(data.resolve_conj())
+            scalar = complex(scalar)
+            if scalar == 1:
+                return planes
+            return torch.stack((
+                planes[:, 0] * scalar.real - planes[:, 1] * scalar.imag,
+                planes[:, 0] * scalar.imag + planes[:, 1] * scalar.real,
+            ), dim=-1)
+        scalar = complex(scalar).real
+        return data if scalar == 1 else data * scalar
 
-    rows = torch.cat((row_ids(a_ptr), row_ids(b_ptr)))
-    cols = torch.cat((a_indices, b_indices)).to(torch.int64)
-    vals = torch.cat((a_data * alpha, b_data * beta))
-    keys, order = torch.sort(rows * n_cols + cols, stable=True)
-    unique, inverse = torch.unique_consecutive(keys, return_inverse=True)
-    c_data = torch.zeros(unique.numel(), dtype=a_data.dtype, device=dev)
-    c_data.index_add_(0, inverse, vals.index_select(0, order))
-    c_rows = unique // n_cols
-    counts = torch.bincount(c_rows, minlength=n_rows)
-    c_ptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=dev)
-    c_ptr[1:] = torch.cumsum(counts, 0)
-    return c_data, (unique % n_cols).to(torch.int32), c_ptr.to(ptr_dtype)
+    def restore_values(values):
+        return torch.view_as_complex(values) if a_data.is_complex() else values
+
+    if not nnz_a or not nnz_b:
+        data, indices, pointer, scalar = (
+            (a_data, a_indices, a_ptr, alpha) if nnz_a
+            else (b_data, b_indices, b_ptr, beta)
+        )
+        return (
+            restore_values(scaled_values(data, scalar).clone()),
+            indices.clone(), pointer.to(ptr_dtype).clone(),
+        )
+
+    offsets_a = torch.arange(nnz_a, device=dev)
+    offsets_b = torch.arange(nnz_b, device=dev)
+    rows_a = torch.searchsorted(a_ptr[1:].contiguous(), offsets_a, right=True)
+    rows_b = torch.searchsorted(b_ptr[1:].contiguous(), offsets_b, right=True)
+    keys_a = rows_a * n_cols + a_indices
+    keys_b = rows_b * n_cols + b_indices
+    rank_a = torch.searchsorted(keys_a, keys_b)
+    gather_a = rank_a.clamp(max=nnz_a - 1)
+    duplicate = (rank_a < nnz_a) & (keys_a.index_select(0, gather_a) == keys_b)
+    duplicate_prefix = torch.zeros(nnz_b + 1, dtype=torch.int64, device=dev)
+    torch.cumsum(duplicate, 0, out=duplicate_prefix[1:])
+    nnz_c = nnz_a + nnz_b - int(duplicate_prefix[-1].item())
+    c_ptr = a_ptr + b_ptr - duplicate_prefix.index_select(0, b_ptr)
+    rank_b = torch.searchsorted(keys_b, keys_a)
+    positions_a = offsets_a + rank_b - duplicate_prefix.index_select(0, rank_b)
+    positions_b = rank_a + offsets_b - duplicate_prefix[:-1]
+    values_a = scaled_values(a_data, alpha)
+    values_b = scaled_values(b_data, beta)
+    if a_data.is_complex():
+        duplicate = duplicate[:, None]
+    merged_b = torch.where(duplicate, values_a.index_select(0, gather_a), 0) + values_b
+    c_data = torch.empty((nnz_c, *values_a.shape[1:]), dtype=values_a.dtype, device=dev)
+    c_indices = torch.empty(nnz_c, dtype=torch.int32, device=dev)
+    c_data.index_put_((positions_a,), values_a)
+    c_data.index_put_((positions_b,), merged_b)
+    c_indices.index_put_((positions_a,), a_indices)
+    c_indices.index_put_((positions_b,), b_indices)
+    return restore_values(c_data), c_indices, c_ptr.to(ptr_dtype)
 
 
 def flagsparse_geam_csr(

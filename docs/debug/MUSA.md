@@ -1530,3 +1530,113 @@ pass_relaxed），另有 40 条已声明但无测试路径的原记录；这不�
 环境继续为 `OMP_WAIT_POLICY=PASSIVE`，三个线程数变量不设置，不绑核。验证期间全部已跟踪源码及
 原十矩阵未变化，见 `VALIDATION_INFO.json`；文档在验证完成后追加。本轮是 SpMV 完整集合与三项目标
 的定向复测，没有重新跑完整 105 项。重新打包的代码与新严格验证匹配，不能把旧 105 项整轮结果改写为修复后验收。
+
+### 2026-11-14 两项 SpMM CSR 转置严格精度修复
+
+针对 `spmm_csr_f32_int_trans_non_row` 和 `spmm_csr_c32_int_conj_non_row`，基于
+`402693f7db0c117bfece1a404c2e14c84f2292d6` 修复。证据目录为
+`artifacts/spmm_strict_fix_20261114/`，数值诊断见 `artifacts/spmm_failure_20261114/`。
+两项原 ASIC 输出为“小项 + 负大项 + 正大项”，FP32 求和吞掉小项低位，严格误差比为
+1.363375；仅输入量化误差比为 0.001755，不能将该缺口归因于输入量化。
+
+#### capi/flagsparse_codegen/sparse_gather.py::SpMM gather accumulator
+
+- 改了什么：仅 `sparse_gather_spmm_row_f32` 和 `sparse_gather_spmm_stream_f32` 增加默认关闭的 ACC64 参数；开启时将乘法输入和累加器改为 FP64，实数/复数最终仍写回 FP32/complex64。全部计算保持 Triton，没有原生 MUSA 计算实现或结果缓存。
+- 为什么改（附报错原文）：原 ASIC 两项 `strict ratio 1.363375`；新增严格抵消回归在旧实现报 `actual: 1.7863762614477579 vs 1`。仅更改最终输出转换无法恢复 FP32 累加中丢掉的低位。
+- 怎么验证的：原 tests/data 十矩阵、三个独立进程，两项目标各 30/30 strict pass、0 relaxed。每轮 ASIC ratio 为 0.00922928，十矩阵最大为 0.151658。原 warmup=10、iters=100、median 和同轮 muSPARSE 1.5.1 基线不变；实数三轮平均加速比 2.259593、2.311923、2.284712，复数为 2.334367、2.378786、2.359700。不绑核，三个线程数变量均不设置，OMP_WAIT_POLICY=PASSIVE。
+- 其他后端是否也需要：否；默认 ACC64=False 的两个特化经 AST 归一化后与旧实现等价，其余 9 个 kernel AST 不变。新精度仅由下述 MUSA 分支启用；未执行其他后端硬件测试。
+
+#### capi/src/core/sparse_gather.hpp::MUSA transpose specialization
+
+- 改了什么：n=8 的 SpMM gather 签名追加 ACC64，只有 backend=musa、indirect、format=CSR 同时满足时开启。包括转换为该 CSR 视图的 COO 转置；普通 CSR、CSC、SpMV 和其他宽度保留原精度。
+- 为什么改（附报错原文）：上述两条 MUSA CSR 转置路径原严格误差比 1.363375；按后端和转置视图限定修复，避免改变共享路径的其他特化。
+- 怎么验证的：`scope_audit.json` 确认头文件唯一差异为带后端条件的精度开关；三轮逐行官方 JSON 均严格通过，验证期间源码及原十矩阵哈希未变。文档在验证结束后追加。
+- 其他后端是否也需要：否；ACC64 开启条件显式要求 MUSA，其他后端维持原 FP32 特化。
+
+#### capi/ctest/accuracy/test_spmm.cpp::MusaTransposeCancellationStrict
+
+- 改了什么：新增 MUSA 专用严格抵消回归，覆盖实数/复数、非零虚部、int32/int64、trans/conj、opB 转置、两种布局及 padding、alpha/beta、空输出行和预处理后实时输入更新。直接使用原 default_tolerance，要求误差比不超过 1。
+- 为什么改（附报错原文）：旧实现新回归 `actual: 1.7863762614477579 vs 1`，避免官方复数矩阵虚部为零掩盖复数算术问题。
+- 怎么验证的：回归先失败后通过，原始日志均保留；修复后完整 SpMM 精度测试 29/29 passed。新回归仅在 MUSA 执行，其他后端原断言不变。
+- 其他后端是否也需要：否；本轮只验收 MUSA 两项目标。
+
+扩大首轮未过滤 SpMM 共 420 条：413 strict pass、1 pass_relaxed、6 failed，不能称全严格通过。
+六条失败是交付 105 项之外的 retained FP16（CSR/CSC/COO，各 ASIC_680ks/GL7d14）。隔离构建
+旧头文件和旧 codegen，使用同一官方 benchmark 重放这两个矩阵，六条失败的 status、accuracy、
+strict/relaxed ratio 和 detail 全部与修复后一致；两项目标 ASIC 也恢复旧 pass_relaxed，证明对照生效。
+静态检查发现 retained FP16 使用缩放 A 上传，但 verify 因 variant_id 为空选用未缩放 A 的外层参考；
+该参考选择问题本轮未修改。对照及逐行对比见 `before_overlay/`、`retained_failure_comparison.json`。
+另一条既有放宽是 CSC FP32 转置 ASIC，ratio=1.36338，本次未覆盖该分支。
+
+初始 `VALIDATION_INFO.json` 保持 failed，后两轮成功目标验证另记 `TARGET_VALIDATION_INFO.json`，
+最终汇总为 `RESULTS.json` 和 `REPORT.md`。性能通过指每个算子的十矩阵算术平均值；复数
+amazon0601 单矩阵仍约 0.43×。ASIC muSPARSE 基线本身仍严格失败，其计时按原框架保留。
+本轮未重跑完整 105 项，旧压缩包也不代表修复后验收。输入压缩包缺少 C API 原始 JSON，
+本机已复现并修复数值缺口，但不能完全还原其最终 Failed 的触发原因。
+
+
+### 2026-11-14 CSC FP32 转置 SpMM 放宽项的严格修复
+
+用户要求继续修复 `spmm_csc_f32_int_trans_non_row`。证据目录 `artifacts/spmm_csc_strict_fix_20261114/`，保留前轮两个 CSR 修复及所有历史失败记录。
+
+#### capi/src/core/sparse_gather.hpp::MUSA CSC transpose ACC64
+
+- 改了什么：将 n=8 的 ACC64 条件扩展到 MUSA、CSC、!indirect、!complex；该 direct CSC gather 按原列计算 A^T。复用已有 Triton FP64 乘法与累加、FP32 输出；本轮 kernel 源码逐字未改。普通 CSR、CSC 非转置、SpMV、其他宽度及其他后端维持原精度，前轮 CSR/COO 转置修复保留。
+- 为什么改（附报错原文）：原 ASIC `strict ratio 1.363375`，只能 pass_relaxed；新增 CSC 抵消回归修改前 `actual: 1.7863762614477579 vs 1`。仍是 FP32 大项抵消吞掉小项低位，未改容差、参考、矩阵、baseline、runner 或计时器。
+- 怎么验证的：原 tests/data 十矩阵、三独立进程，CSC 各轮10/10 strict pass，合计30/30，0 relaxed；ASIC strict ratio 0.00922928，十矩阵最大 0.151658。CSC 三轮平均加速比 1.217447、1.247310、1.227211。原两个 CSR 目标同轮各30/30严格通过。原 warmup=10、iters=100、median、同轮muSPARSE基线不变；OMP_WAIT_POLICY=PASSIVE、三个线程数变量不设置、不绑核。验证期间源码和矩阵哈希不变，见 VALIDATION_INFO.json。
+- 其他后端是否也需要：否；新条件显式要求 MUSA。scope_audit.json 确认本轮生产差异仅在精度分派，kernel 与前轮逐字相同；其他后端仅静态审计，未上其他后端实机。
+
+#### capi/ctest/accuracy/test_spmm.cpp::CSC cancellation coverage
+
+- 改了什么：现有严格抵消回归扩展到 CSC FP32；覆盖 int32/int64、opB转置、两种布局和padding、空输出列、预处理后数值更新。使用原 default_tolerance，误差比必须≤1。CSR原完整复数alpha/beta断言保留；CSC遵守原API只接受alpha=1、beta=0的限制。
+- 为什么改（附报错原文）：先记录修改前严格误差比1.786376失败。最初新增CSC用例的第二步沿用CSR非单位标量，触发现有NOT_SUPPORTED（状态10）；保留regression_after和regression_diagnostic，修正新测试参数以符合原接口合同，没有更改生产标量支持范围或精度断言。
+- 怎么验证的：最终完整SpMM精度29/29 passed，见regression_final.log/.xml；新增CSC抵消用例先数值失败、后严格通过。
+- 其他后端是否也需要：否；新增CSC覆盖位于原MUSA专用回归，其他后端断言不变。
+
+首轮未过滤官方SpMM共420条：414 strict pass、0 pass_relaxed、6 failed；其中340条delivery（34组测试×10矩阵，30组带显式variant）全部严格通过。
+六条failed仍为交付105项之外的retained FP16，与前轮逐条status/accuracy/strict及relaxed ratio/detail相同，见retained_failure_comparison.json。
+本轮不代表完整105项复测；ASIC厂商基线仍严格失败，保留其原计时。性能阈值指每算子十矩阵算术平均，不代表每个单矩阵达标。
+结果、累计/增量补丁和最终源码分别见本轮RESULTS.json、REPORT.md、changes_cumulative.patch、changes_incremental.patch和source_after/。
+
+
+### 2026-11-14 COO FP32 非转置 SpMM 两项低于0.8的优化
+
+证据目录 `artifacts/spmm_coo_opt_20261114/`；保留所有前轮严格修复。完整105轮两项目标行/列布局均值为0.791431/0.757819，独立修改前重放为0.794467/0.763630，差距可重复。
+
+#### capi/src/ops/spmm.cpp::run_coo MUSA FP32 n8
+
+- 改了什么：仅MUSA、COO、FP32、opA非转置、n=8复用预处理已有的CSR行偏移和max_row_nnz，通过CSR视图调用已有run_csr。最长行≤256用原Triton batched8，长行用原CSR fallback；实时读取原值和列索引，不转换数值、不新增分配或输出缓存。kernel源码逐字未改，无MUSA原生计算。
+- 为什么改（附报错原文）：无新增生产报错；原两项均值0.791431/0.757819低于0.8。旧COO rowrun每行一个程序、BLOCK_N=64但实际8列，短行任务多且56列被掩码，ASIC/roadNet-TX最差约0.49–0.61。独立重放仍低，不以计时波动代替实现分析。
+- 怎么验证的：官方原十矩阵三独立进程，行布局均值3.128947、3.131006、3.166667，列布局1.904439、1.898995、1.922277；两项各30/30严格通过、0放宽。使用修改前固定厂商时间重新计算也全部>0.8，完整逐矩阵数据保留。另5条相关SpMM目标各30/30严格通过。原baseline/参考/容差/计时器不变，OMP_WAIT_POLICY=PASSIVE、三个线程数变量不设置、不绑核。
+- 其他后端是否也需要：否；新分支显式要求MUSA。scope_audit.json删除新增分支后与起点及HEAD的spmm.cpp逐字相同；其他dtype/宽度/opA转置及共享kernel未改。仅静态审计其他后端，未上其他后端实机。
+
+#### capi/ctest/accuracy/test_spmm.cpp::MusaCooEightColumnLiveOperands / NondefaultStream
+
+- 改了什么：新增默认流、非默认流两项MUSA回归，覆盖空行/全空、重复列、35行末尾tile、最长行0/1/4/17/256/257、int32/int64、B/C两种布局及padding、opB转置、完整alpha/beta、beta=0旧输出NaN、值/RHS实时更新和两块工作区切换。使用原严格default_tolerance，并检查padding未被覆盖。
+- 为什么改（附报错原文）：无新增生产异常；防止CSR视图复用引入元数据、输入缓存或布局语义错误，验证短行路径与长行fallback边界。
+- 怎么验证的：完整SpMM精度31/31 passed，日志和XML保留；正式定向复测共210/210严格通过。验证期间源码和十矩阵哈希不变，文档随后追加。
+- 其他后端是否也需要：否；新默认流测试运行时限定MUSA，非默认流由既有MUSA编译宏保护，其他后端原断言不变。
+
+本轮未再次执行完整105项；旧完整轮结果不改写，详见本轮RESULTS.json和REPORT.md。
+
+### 2026-11-15 SDDMM 精度汇总的 Ascend 专用跳过识别
+
+最新完整结果 `results_mthreads_105_20261115_085354_6adb1aa/` 性能105项均>0.8，精度汇总为104 Passed、1 Skipped。
+唯一跳过行 `sddmm_csr_f32_int_non_non_row` 实际4 passed、0 failed、50 skipped：2条BI-V专用、48条Ascend专用。
+后者的参数 `output_dtype=torch.float32` 被交付FP32切片选中，其 `Skipped: requires an Ascend NPU` 原因尚未被runner识别为已有的后端能力边界。
+
+#### run_flagsparse_pytest.py::EXPECTED_ACCURACY_SKIP_REASONS
+
+- 改了什么：在现有具名能力跳过原因中补入 `requires an ascend npu`；有真实通过用例且无失败/未知跳过时，不让仅适用于其他后端的跳过把整项降为Skipped。跳过计数、逐项原因及原始记录全部保留；全跳过仍为Skipped，真实失败/Issue仍为Failed，未知跳过仍为Skipped。
+- 为什么改（附报错原文）：原行 `status=Skipped, passed=4, failed=0, skipped=50`，其中48条原因为 `Skipped: requires an Ascend NPU`。MUSA的适用精度用例已通过，错误来自汇总分类，不是数值容差或kernel。
+- 怎么验证的：`artifacts/sddmm_accuracy_summary_fix_20261115_102937/` 保存原始数据重放、独立normal精度复测和回归。实际SDDMM复测27 passed、52 skipped、0 failed，11个SDDMM交付变体全部Passed；FP32目标仍如实4 passed、50 skipped。最新完整轮原始记录用旧规则重放Skipped、新规则Passed，计数和明细逐项不变。97项runner相关CI通过，含全跳过、未知跳过、真实失败和Issue防遮蔽回归。
+- 其他后端是否也需要：该具名后端限制适用于所有共用runner的非Ascend环境；Ascend实机的适用用例仍须执行并通过。生产kernel、基线、容差、测试选择和计时器均未改，未执行其他后端硬件测试。
+
+#### tests/ci/test_delivery_accuracy_axes.py::SDDMM capability skip regressions
+
+- 改了什么：新增3项回归，模拟4通过+2 BI-V跳过+48 Ascend跳过，并验证父算子/交付切片均Passed且计数明细不丢失；全跳过保持Skipped，旁边存在真实失败/未知跳过/Issue时仍按原规则报告。
+- 为什么改（附报错原文）：防止上述 `requires an Ascend NPU` 把真实通过误标Skipped，也防止将缺失覆盖或数值错误隐藏为通过。
+- 怎么验证的：与runner格式、父失败传播和split范围测试共同运行，共97/97 passed；原始最新完整结果未修改，SHA256验证通过。
+- 其他后端是否也需要：CPU运行的共用runner回归，不更改任何后端kernel。
+
+本轮仅重新执行SDDMM精度，未重新执行完整105项或性能。`historical_summary_reclassified.json` 和对应表是在独立目录对旧完整数据重新分类的副本，显示105项精度/性能Passed；不能当作新一轮完整复测。旧结果和先前压缩包保持原样。

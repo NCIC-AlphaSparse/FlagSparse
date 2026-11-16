@@ -24,10 +24,15 @@
 
 #include <algorithm>
 #include <complex>
+#include <limits>
 #include <vector>
 
 #include "common.hpp"
 #include "adaptor/adaptor.hpp"
+
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+#include <musa.h>
+#endif
 
 using namespace fstest;
 
@@ -1195,6 +1200,219 @@ TEST_F(SpMMAccuracy, CsrComplex64TransposeAndConjugateTranspose) {
 }
 
 
+
+TEST_F(SpMMAccuracy, MusaTransposeCancellationStrict) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    using Z = std::complex<double>;
+    constexpr int64_t m = 3, k = 2, n = 8;
+    const std::vector<int32_t> ptr{0, 1, 2, 3}, col{0, 0, 0};
+    const std::vector<int32_t> csc_ptr{0, 3, 3}, csc_rows{0, 1, 2};
+    // A small term followed by two cancelling large terms, from ASIC_680ks.
+    // Column 1 is empty and must still apply beta. No vendor relaxation here.
+    const float values[] = {0.0746898427605629f, -37.02705764770508f, 37.02705764770508f};
+    for (bool csc : {false, true})
+    for (bool complex : {false, true})
+    for (bool imaginary : {false, true}) {
+        if (csc && complex) continue;
+        if (!complex && imaginary) continue;
+        const auto dtype = complex ? FLAGSPARSE_C_32F : FLAGSPARSE_R_32F;
+        const int components = complex ? 2 : 1;
+        for (auto index : {FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_64I})
+        for (auto order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL})
+        for (int pad : {0, 3})
+        for (auto opA : {FLAGSPARSE_OPERATION_TRANSPOSE, FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE})
+        for (auto opB : {FLAGSPARSE_OPERATION_NON_TRANSPOSE, FLAGSPARSE_OPERATION_TRANSPOSE}) {
+            if (!complex && opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE) continue;
+            SCOPED_TRACE("csc=" + std::to_string(csc) + " complex=" + std::to_string(complex) + " imaginary=" +
+                std::to_string(imaginary) + " index=" + std::to_string(index) +
+                " order=" + std::to_string(order) + " pad=" + std::to_string(pad) +
+                " opA=" + std::to_string(opA) + " opB=" + std::to_string(opB));
+            Layout layout{order, pad};
+            const bool transpose_b = opB == FLAGSPARSE_OPERATION_TRANSPOSE;
+            const int64_t b_rows = transpose_b ? n : m, b_cols = transpose_b ? m : n;
+            auto dp = upload_indices(csc ? csc_ptr : ptr, index);
+            auto di = upload_indices(csc ? csc_rows : col, index);
+            DeviceBuffer da(m * components * sizeof(float));
+            DeviceBuffer db(layout.elems(b_rows, b_cols) * components * sizeof(float));
+            DeviceBuffer dc(layout.elems(k, n) * components * sizeof(float));
+            flagsparseSpMatDescr_t a = nullptr;
+            flagsparseDnMatDescr_t b = nullptr, c = nullptr;
+            const auto create = csc ? flagsparseCreateCsc : flagsparseCreateCsr;
+            ASSERT_EQ(create(&a, m, k, m, dp.get(), di.get(), da.get(),
+                index, index, FLAGSPARSE_INDEX_BASE_ZERO, dtype), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(flagsparseCreateDnMat(&b, b_rows, b_cols, layout.ld(b_rows, b_cols),
+                db.get(), dtype, order), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(flagsparseCreateDnMat(&c, k, n, layout.ld(k, n), dc.get(), dtype, order),
+                FLAGSPARSE_STATUS_SUCCESS);
+            const float one[2] = {1.f, 0.f}, zero[2] = {0.f, 0.f};
+            size_t bytes = 0;
+            ASSERT_EQ(flagsparseSpMM_bufferSize(handle.h, opA, opB, one, a, b, zero, c,
+                dtype, FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+            DeviceBuffer scratch(bytes ? bytes : 1);
+            ASSERT_EQ(flagsparseSpMM_preprocess(handle.h, opA, opB, one, a, b, zero, c,
+                dtype, FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get()), FLAGSPARSE_STATUS_SUCCESS);
+            for (int step = 0; step < 2; ++step) {
+                SCOPED_TRACE("live operand update=" + std::to_string(step));
+                std::vector<float> av(m * components), bv(layout.elems(b_rows, b_cols) * components, -99.f);
+                std::vector<float> initial(layout.elems(k, n) * components, -99.f);
+                std::vector<Z> logical_a(m), logical_b(m*n), logical_c(k*n);
+                auto store = [components](std::vector<float>& data, size_t pos, Z value) {
+                    data[pos * components] = static_cast<float>(value.real());
+                    if (components == 2) data[pos * components + 1] = static_cast<float>(value.imag());
+                };
+                for (int r = 0; r < m; ++r) {
+                    const float value = values[r] * (step && r == 0 ? 2.f : 1.f);
+                    logical_a[r] = Z(value, imaginary ? value * .5f : 0.f);
+                    store(av, r, logical_a[r]);
+                    for (int j = 0; j < n; ++j) {
+                        const float weight = (r == 0 ? 1.5f : 2.f) * (1 + j % 3);
+                        logical_b[r*n+j] = Z(weight, imaginary ? -.25f * weight : 0.f);
+                        const auto slot = transpose_b ? layout.at(j, r, b_rows, b_cols)
+                                                       : layout.at(r, j, b_rows, b_cols);
+                        store(bv, slot, logical_b[r*n+j]);
+                    }
+                }
+                for (int r = 0; r < k; ++r) for (int j = 0; j < n; ++j) {
+                    logical_c[r*n+j] = Z(.25 * (r+j), imaginary ? -.125 * j : 0.);
+                    store(initial, layout.at(r, j, k, n), logical_c[r*n+j]);
+                }
+                ASSERT_EQ(to_device(da.get(), av.data(), av.size()*sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(to_device(db.get(), bv.data(), bv.size()*sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+                ASSERT_EQ(to_device(dc.get(), initial.data(), initial.size()*sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+                // The existing CSC API contract supports alpha=1, beta=0 only.
+                const Z alpha = step && !csc ? Z(.75, imaginary ? -.5 : 0.) : Z(1., 0.);
+                const Z beta = step && !csc ? Z(-.25, imaginary ? .125 : 0.) : Z(0., 0.);
+                const float af[2] = {float(alpha.real()), float(alpha.imag())};
+                const float bf[2] = {float(beta.real()), float(beta.imag())};
+                const auto status = flagsparseSpMM(handle.h, opA, opB, af, a, b, bf, c, dtype,
+                    FLAGSPARSE_SPMM_ALG_DEFAULT, scratch.get());
+                const char* detail = nullptr;
+                flagsparseGetLastErrorString(handle.h, &detail);
+                ASSERT_EQ(status, FLAGSPARSE_STATUS_SUCCESS) << (detail ? detail : "");
+                dev_sync();
+                const auto got = dc.download<float>(initial.size());
+                std::vector<double> actual, reference;
+                std::vector<bool> occupied(initial.size(), false);
+                for (int r = 0; r < k; ++r) for (int j = 0; j < n; ++j) {
+                    Z sum(0., 0.);
+                    if (r == 0) for (int source = 0; source < m; ++source) {
+                        const Z a_value = opA == FLAGSPARSE_OPERATION_CONJUGATE_TRANSPOSE
+                            ? std::conj(logical_a[source]) : logical_a[source];
+                        sum += a_value * logical_b[source*n+j];
+                    }
+                    const Z expected = alpha*sum + beta*logical_c[r*n+j];
+                    const size_t pos = components*layout.at(r, j, k, n);
+                    actual.push_back(got[pos]); reference.push_back(expected.real()); occupied[pos] = true;
+                    if (complex) {
+                        actual.push_back(got[pos+1]); reference.push_back(expected.imag()); occupied[pos+1] = true;
+                    }
+                }
+                ASSERT_LE(max_error_ratio(actual, reference, default_tolerance(dtype)), 1.0);
+                for (size_t i = 0; i < got.size(); ++i) if (!occupied[i]) EXPECT_EQ(got[i], initial[i]);
+            }
+            flagsparseDestroyDnMat(c); flagsparseDestroyDnMat(b); flagsparseDestroySpMat(a);
+        }
+    }
+}
+
+void check_musa_coo_eight_column_live_operands(flagsparseHandle_t handle) {
+    constexpr int m = 35, k = 13, n = 8;
+    for (int longest : {0, 1, 4, 17, 256, 257})
+    for (auto index : {FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_64I})
+    for (auto b_order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL})
+    for (auto c_order : {FLAGSPARSE_ORDER_ROW, FLAGSPARSE_ORDER_COL})
+    for (int pad : {0, 3})
+    for (auto opB : {FLAGSPARSE_OPERATION_NON_TRANSPOSE, FLAGSPARSE_OPERATION_TRANSPOSE}) {
+        SCOPED_TRACE("longest=" + std::to_string(longest) + " index=" + std::to_string(index) +
+            " B=" + std::to_string(b_order) + " C=" + std::to_string(c_order) +
+            " pad=" + std::to_string(pad) + " opB=" + std::to_string(opB));
+        std::vector<int32_t> rows, cols;
+        std::vector<float> values;
+        for (int r = 0; r < m; ++r) {
+            const int count = !longest || r % 5 == 0 ? 0 : (r == 17 ? longest : std::min(longest, r % 5));
+            for (int z = 0; z < count; ++z) {
+                rows.push_back(r); cols.push_back((3*r + z) % k);
+                values.push_back(float(z % 7 - 3) * .125f);
+            }
+        }
+        auto dr = upload_indices(rows, index), di = upload_indices(cols, index);
+        DeviceBuffer dv(std::max<size_t>(1, values.size()) * sizeof(float));
+        Layout lb{b_order, pad}, lc{c_order, pad};
+        const bool transpose = opB == FLAGSPARSE_OPERATION_TRANSPOSE;
+        const int b_rows = transpose ? n : k, b_cols = transpose ? k : n;
+        DeviceBuffer db(lb.elems(b_rows, b_cols) * sizeof(float));
+        DeviceBuffer dc(lc.elems(m, n) * sizeof(float));
+        flagsparseSpMatDescr_t a = nullptr;
+        flagsparseDnMatDescr_t b = nullptr, c = nullptr;
+        ASSERT_EQ(flagsparseCreateCoo(&a, m, k, values.size(), dr.get(), di.get(), dv.get(),
+            index, FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnMat(&b, b_rows, b_cols, lb.ld(b_rows, b_cols), db.get(),
+            FLAGSPARSE_R_32F, b_order), FLAGSPARSE_STATUS_SUCCESS);
+        ASSERT_EQ(flagsparseCreateDnMat(&c, m, n, lc.ld(m, n), dc.get(),
+            FLAGSPARSE_R_32F, c_order), FLAGSPARSE_STATUS_SUCCESS);
+        const float one = 1.f, zero = 0.f;
+        size_t bytes = 0;
+        ASSERT_EQ(flagsparseSpMM_bufferSize(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE, opB,
+            &one, a, b, &zero, c, FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, &bytes), FLAGSPARSE_STATUS_SUCCESS);
+        DeviceBuffer first(bytes ? bytes : 1), second(bytes ? bytes : 1);
+        ASSERT_EQ(flagsparseSpMM_preprocess(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE, opB,
+            &one, a, b, &zero, c, FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, first.get()), FLAGSPARSE_STATUS_SUCCESS);
+        for (int step = 0; step < 3; ++step) {
+            SCOPED_TRACE("live update / buffer switch=" + std::to_string(step));
+            std::vector<float> bv(lb.elems(b_rows, b_cols), -99.f), initial(lc.elems(m, n), -99.f);
+            std::vector<double> expected(m*n, 0.);
+            const float alpha = step ? -1.25f : 1.f, beta = step ? .5f : 0.f;
+            for (int r = 0; r < k; ++r) for (int j = 0; j < n; ++j)
+                bv[transpose ? lb.at(j, r, b_rows, b_cols) : lb.at(r, j, b_rows, b_cols)] =
+                    float((r+j)%9 - 4) * .25f + step * .125f;
+            for (int r = 0; r < m; ++r) for (int j = 0; j < n; ++j) {
+                initial[lc.at(r, j, m, n)] = step ? float(r-j)*.25f : std::numeric_limits<float>::quiet_NaN();
+                if (step) expected[r*n+j] = beta * initial[lc.at(r, j, m, n)];
+            }
+            auto av = values;
+            for (size_t z = 0; z < av.size(); ++z) {
+                av[z] += step * .125f;
+                for (int j = 0; j < n; ++j)
+                    expected[rows[z]*n+j] += double(alpha) * av[z] *
+                        bv[transpose ? lb.at(j, cols[z], b_rows, b_cols) : lb.at(cols[z], j, b_rows, b_cols)];
+            }
+            if (!av.empty()) ASSERT_EQ(to_device(dv.get(), av.data(), av.size()*sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(to_device(db.get(), bv.data(), bv.size()*sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(to_device(dc.get(), initial.data(), initial.size()*sizeof(float)), FLAGSPARSE_STATUS_SUCCESS);
+            ASSERT_EQ(flagsparseSpMM(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE, opB, &alpha, a, b, &beta, c,
+                FLAGSPARSE_R_32F, FLAGSPARSE_SPMM_ALG_DEFAULT, step == 1 ? second.get() : first.get()), FLAGSPARSE_STATUS_SUCCESS);
+            dev_sync();
+            const auto got = dc.download<float>(initial.size());
+            std::vector<double> actual(m*n);
+            std::vector<bool> occupied(initial.size(), false);
+            for (int r = 0; r < m; ++r) for (int j = 0; j < n; ++j) {
+                const auto slot = lc.at(r, j, m, n);
+                actual[r*n+j] = got[slot]; occupied[slot] = true;
+            }
+            ASSERT_LE(max_error_ratio(actual, expected, default_tolerance(FLAGSPARSE_R_32F)), 1.0);
+            for (size_t z = 0; z < got.size(); ++z) if (!occupied[z]) EXPECT_EQ(got[z], initial[z]);
+        }
+        flagsparseDestroyDnMat(c); flagsparseDestroyDnMat(b); flagsparseDestroySpMat(a);
+    }
+}
+
+TEST_F(SpMMAccuracy, MusaCooEightColumnLiveOperands) {
+    if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();
+    check_musa_coo_eight_column_live_operands(handle.h);
+}
+
+#if defined(FLAGSPARSE_MUSA_BASELINE_EXTENSIONS)
+TEST_F(SpMMAccuracy, MusaCooEightColumnNondefaultStream) {
+    struct Stream {
+        MUstream value = nullptr;
+        ~Stream() { if (value) muStreamDestroy(value); }
+    } stream;
+    ASSERT_EQ(muStreamCreate(&stream.value, MU_STREAM_NON_BLOCKING), MUSA_SUCCESS);
+    ASSERT_EQ(flagsparseSetStream(handle.h, reinterpret_cast<flagsparseStream_t>(stream.value)), FLAGSPARSE_STATUS_SUCCESS);
+    check_musa_coo_eight_column_live_operands(handle.h);
+    ASSERT_EQ(flagsparseSetStream(handle.h, nullptr), FLAGSPARSE_STATUS_SUCCESS);
+}
+#endif
 
 TEST_F(SpMMAccuracy, MusaTransposeGatherLiveOperandsAndLayouts) {
     if (std::string(flagsparse::adaptor::backend_name()) != "musa") GTEST_SKIP();

@@ -1113,6 +1113,14 @@ flagsparseStatus_t run_coo(flagsparseHandle_t handle, SpMatDescr* A, const DnMat
         if (flagsparseStatus_t s = build_coo_row_offsets(A, externalBuffer)) return s;
     }
 
+    // Row-sorted COO preprocess already provides a CSR indptr and longest row.
+    // Reuse MUSA's batched eight-column kernel without copying values/indices;
+    // run_csr keeps its existing long-row fallback and dense stride handling.
+    if (musa_backend() && A->value_type == FLAGSPARSE_R_32F && ops.n == 8) {
+        SpMatDescr T = coo_csr_view(A, externalBuffer);
+        return run_csr(handle, &T, B, C, FLAGSPARSE_R_32F, ops);
+    }
+
     const LaunchConfig cfg = resolve_coo_launch(ops.n, ctx(handle)->device_index);
     const char* it = triton_index_dtype(A->indices_type);
 

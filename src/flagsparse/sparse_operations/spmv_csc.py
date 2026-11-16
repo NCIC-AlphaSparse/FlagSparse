@@ -390,7 +390,7 @@ def _prepare_spmv_csc_matrix(data, indices, indptr, shape):
     if not all(t.device == data.device for t in (indices, indptr)):
         raise ValueError("data, indices, indptr must be on the same CUDA device")
     if data.dtype not in SUPPORTED_SPMV_CSC_VALUE_DTYPES and not (
-        _is_ascend_runtime() and data.dtype in (torch.float16, torch.bfloat16)
+        _is_ascend_runtime() and data.dtype in (torch.float16, torch.bfloat16, torch.int8)
     ):
         raise TypeError(_spmv_csc_dtype_error_message())
     if indices.dtype not in SUPPORTED_INDEX_DTYPES:
@@ -429,7 +429,11 @@ def prepare_spmv_csc(
     index_fallback_policy="auto",
     x=None,
 ):
-    """Prepare CSC metadata and, on Ascend, optional reusable RHS conversion."""
+    """Prepare CSC metadata and, on Ascend, reusable RHS conversion.
+
+    Ascend int8 inputs accumulate in int32 by default, or float32 when the run
+    requests that output. Converted operands refresh after in-place writes.
+    """
     index_fallback_policy = _normalize_spmv_csc_index_fallback_policy(
         index_fallback_policy
     )
@@ -638,6 +642,8 @@ def _ascend_spmv_csc_indices(indices, indptr, n_cols):
 
 
 def _ascend_spmv_csc_operand(tensor):
+    if tensor.dtype == torch.int8:
+        return tensor.to(torch.int32).contiguous()
     if tensor.dtype not in (torch.float16, torch.bfloat16):
         return tensor
     return tensor.to(torch.float32).contiguous()
@@ -689,11 +695,13 @@ def _ascend_spmv_csc_torch(prepared, x, op_code, out_dtype=None):
     local to Ascend; all other backends continue to use the kernels above.
     """
     n_rows, n_cols = prepared.n_rows, prepared.n_cols
-    result_dtype = out_dtype or prepared.data.dtype
+    result_dtype = out_dtype or (
+        torch.int32 if prepared.data.dtype == torch.int8 else prepared.data.dtype
+    )
     compute_dtype = (
         torch.float32
         if prepared.data.dtype in (torch.float16, torch.bfloat16)
-        else prepared.data.dtype
+        else result_dtype if prepared.data.dtype == torch.int8 else prepared.data.dtype
     )
     nnz = int(prepared.nnz)
     if nnz == 0:
@@ -708,6 +716,8 @@ def _ascend_spmv_csc_torch(prepared, x, op_code, out_dtype=None):
         rhs = (x, _ascend_spmv_csc_operand(x), version)
         state["rhs"] = rhs
     x = rhs[1]
+    if prepared.data.dtype == torch.int8 and compute_dtype == torch.float32:
+        values, x = values.float(), x.float()
     if op_code == SPMV_CSC_OP_CONJ_TRANS:
         values = values.conj()
     transposed = _spmv_csc_op_transposes(op_code)
@@ -1184,7 +1194,7 @@ def flagsparse_spmv_csc(
             op_code = prepared.op
     x = _validate_spmv_csc_x(x, prepared, op_code)
     ascend_out_dtype = None
-    if _is_ascend_runtime() and prepared.data.dtype in (torch.float16, torch.bfloat16):
+    if _is_ascend_runtime() and prepared.data.dtype in (torch.float16, torch.bfloat16, torch.int8):
         ascend_out_dtype, _ = _mixed_spmx._resolve_types(
             prepared.data.dtype, x.dtype, out, out_dtype, False
         )

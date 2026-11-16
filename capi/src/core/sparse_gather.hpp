@@ -158,6 +158,14 @@ inline flagsparseStatus_t launch_sparse_gather(flagsparseHandle_t handle, SpMatD
     sig += indirect ? "True," : "False,";
     sig += (br != 0. || bi != 0.) ? "True," : "False,";
     sig += gather_i32(A) ? "False" : "True";
+    if (stream) {
+        // MUSA transpose views need wide products/sums for cancellation.
+        // A direct CSC gather computes A^T; ordinary CSR and SpMV stay FP32.
+        const bool acc64 = std::strcmp(adaptor::backend_name(), "musa") == 0 &&
+            ((indirect && A->format == FLAGSPARSE_FORMAT_CSR) ||
+             (!indirect && !complex && A->format == FLAGSPARSE_FORMAT_CSC));
+        sig += acc64 ? ",True" : ",False";
+    }
     std::vector<jit::Arg> args;
     for (void* p : {A->values, offsets, order, rows, B, C})
         args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(p)));

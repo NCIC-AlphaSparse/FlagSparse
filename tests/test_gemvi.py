@@ -22,8 +22,10 @@ as cusparse<t>gemvi requires. Each row carries:
   cusparse_ms  native cusparseSgemvi / cusparseCgemvi (CUDA only; empty
                elsewhere, with the reason in cusparse_reason)
   pytorch_ms   A.index_select + matrix-vector product in PyTorch
+  cann_ms      prepared CANN SparseTensorDenseMatMul (Ascend only)
 
-and the speedup columns the unified runner reads (vendor first, then PyTorch).
+and the speedup columns the unified runner reads. Ascend requires the CANN
+measurement; it cannot fall back to PyTorch or a scaled H800 estimate.
 The timed FlagSparse call passes ``validate=False`` (no index range check, a host
 sync neither baseline performs); the accuracy check runs once with it on, against
 a CPU float64 / complex128 golden. ``status`` is PASS or FAIL per row, ERROR when
@@ -46,8 +48,9 @@ import torch  # noqa: E402
 from benchmark_utils import accelerator_device  # noqa: E402
 
 import cusparse_generic_baseline as cusparse_baseline  # noqa: E402
+import ascend_gemvi_geam_baseline as cann_baseline  # noqa: E402
 import flagsparse as fs  # noqa: E402
-from flagsparse.sparse_operations._common import _benchmark_cuda_op  # noqa: E402
+from flagsparse.sparse_operations._common import _benchmark_cuda_op, _is_ascend_runtime  # noqa: E402
 
 DEFAULT_CASES = "8192:4096:256,16384:8192:2048,65536:4096:1024,4096:65536:4096"
 # (value dtype, op): the delivered variants gemvi_f32_int_non / _trans, gemvi_c32_int_non.
@@ -77,6 +80,7 @@ FIELDS = [
     "pytorch_reason",
     "status",
     "error",
+    *cann_baseline.PERF_FIELDS,
 ]
 
 
@@ -106,6 +110,8 @@ def _run_case(dtype, op, m, n, nnz, warmup, iters, gen):
         "n": n,
         "nnz": nnz,
     }
+    if _is_ascend_runtime():
+        cann_baseline.mark_row(row, "gemvi")
     A_cpu = torch.randn((m, n), dtype=dtype, generator=gen)
     idx_cpu = torch.randperm(n_in, generator=gen)[:nnz].to(torch.int32)
     x_cpu = torch.randn((nnz,), dtype=dtype, generator=gen)
@@ -152,6 +158,12 @@ def _run_case(dtype, op, m, n, nnz, warmup, iters, gen):
     row["cusparse_reason"] = reason
     row["triton_speedup_vs_cusparse"] = _ratio(row.get("cusparse_ms"), row["triton_ms"])
     row["triton_speedup_vs_pytorch"] = _ratio(row.get("pytorch_ms"), row["triton_ms"])
+    if _is_ascend_runtime():
+        cann_baseline.measure(
+            row, lambda: cann_baseline.prepare_gemvi(A, x, idx, y, op),
+            lambda output: _error(output.reshape(-1), ref), dtype,
+            row["triton_ms"], warmup, iters,
+        )
     row["status"] = "PASS" if row["triton_max_error"] <= _TOL.get(dtype, 1e-10) else "FAIL"
     return row
 
