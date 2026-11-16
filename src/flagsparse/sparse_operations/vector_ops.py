@@ -387,6 +387,11 @@ def flagsparse_axpby(
     (and the elapsed milliseconds when ``return_time``). ``validate=False`` skips the
     index range check, a host sync that cuSPARSE does not perform either.
     """
+    if (prepared is None and not validate and not return_time
+            and _backend_name() == "cuda"):
+        from ._vector_cuda import try_axpby
+        if try_axpby(values, indices, y, alpha, beta):
+            return y
     if prepared is not None:
         if not _is_ascend_runtime():
             raise ValueError("prepared Axpby is currently supported on Ascend only")
@@ -422,6 +427,16 @@ def flagsparse_axpby(
         _ACCEL.synchronize()
         t0 = time.perf_counter()
     if (
+        _backend_name() == "cuda" and y.device.type == "cuda"
+        and y.dtype in (torch.float16, torch.float32, torch.complex64)
+        and y.numel() <= 4 * 1024 * 1024
+        # Preserve the existing update order for overlapping x/y storage.
+        and (values.data_ptr() + values.numel() * values.element_size() <= y.data_ptr()
+             or y.data_ptr() + y.numel() * y.element_size() <= values.data_ptr())
+    ):
+        from ._vector_cuda import axpby
+        axpby(values, kernel_idx, y, a_re, a_im, b_re, b_im)
+    elif (
         _is_maca_runtime() and y.dtype == torch.complex64
         and y.numel() <= 4 * 1024 * 1024
     ):
@@ -573,6 +588,13 @@ def flagsparse_spvv(
     prepared plan carries the one it was prepared with.
     ``validate=False`` skips the index range check (a host sync).
     """
+    if (prepared is None and not validate and not return_time
+            and _backend_name() == "cuda"):
+        from ._vector_cuda import try_spvv
+
+        result = try_spvv(values, indices, y, op, out_dtype)
+        if result is not None:
+            return result
     if prepared is not None:
         if not _is_ascend_runtime():
             raise ValueError("prepared SpVV is currently supported on Ascend only")
@@ -605,8 +627,13 @@ def flagsparse_spvv(
     if return_time:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
+    # CUDA reads live operands and reduces deterministically into a fresh scalar.
+    if _backend_name() == "cuda" and values.device.type == "cuda":
+        from ._vector_cuda import spvv
+
+        result = spvv(values, kernel_idx, y, op == "conj", compute)
     # MUSA half dots use one/two deterministic Triton reductions with FP32 output.
-    if _is_mthreads_runtime() and values.dtype == torch.float16:
+    elif _is_mthreads_runtime() and values.dtype == torch.float16:
         from ._vector_musa import spvv_half
 
         result = spvv_half(values, kernel_idx, y)

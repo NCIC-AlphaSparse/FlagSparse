@@ -36,16 +36,46 @@ Triton's JIT dispatch costs more host time than a short gemvi runs.
 from ._common import *
 
 import time
+from types import SimpleNamespace
 
 import triton
 import triton.language as tl
 
-from ._musa_spmv_launch import launch as _launch_direct
+from ._musa_spmv_launch import fast_path_allowed, launch as _launch_direct
 from .mixed_spmx import _CUDA_DIRECT_LAUNCH
 
 GEMVI_VALUE_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 _BLOCK_OUT = 64
 _BLOCK_K = 32
+_CUDA_GEMVI_HOT = None
+
+
+def _cuda_gemvi_signature(sources):
+    return tuple((t.data_ptr(), t.dtype, t.device, t.shape, t.stride(),
+                  t.is_conj(), t.is_neg()) for t in sources)
+
+
+def _try_cuda_gemvi(A, values, indices, y, op, alpha, beta):
+    hot = _CUDA_GEMVI_HOT
+    sources = (A, values, indices, y)
+    if (hot is None or not all(a is b for a, b in zip(sources, hot.sources))
+            or not isinstance(alpha, (int, float, complex))
+            or not isinstance(beta, (int, float, complex))):
+        return False
+    if ((op, complex(alpha), complex(beta)) != hot.options
+            or _cuda_gemvi_signature(sources) != hot.signature
+            or not fast_path_allowed(hot.bound.kernel)
+            or (hot.reduce is not None and not fast_path_allowed(hot.reduce[0].kernel))
+            or torch._C._cuda_getDevice() != A.device.index
+            or (hot.reduce is not None
+                and (torch.cuda.is_current_stream_capturing()
+                     or _ACCEL.current_stream(A.device).cuda_stream != hot.stream))):
+        return False
+    hot.bound(hot.tensors, hot.scalars, hot.constants, hot.addresses, checked=True)
+    if hot.reduce is not None:
+        bound, tensors, scalars, constants, addresses = hot.reduce
+        bound(tensors, scalars, constants, addresses, checked=True)
+    return True
 
 
 def _normalize_gemvi_op(op):
@@ -225,7 +255,7 @@ def _split_count(n_out, nnz, element_size, device):
 
 def _launch(kernel, grid, tensors, scalars, constants):
     if _CUDA_DIRECT_LAUNCH:
-        _launch_direct(kernel, grid, tensors, scalars, constants, num_warps=4, cuda=True)
+        return _launch_direct(kernel, grid, tensors, scalars, constants, num_warps=4, cuda=True)
     else:
         kernel[grid](*tensors, *scalars, *constants, num_warps=4)
 
@@ -330,7 +360,11 @@ def flagsparse_gemvi(
     place and returned when given; it is required when ``beta != 0``.
     ``validate=False`` skips the index range check (a host sync).
     """
+    global _CUDA_GEMVI_HOT
     op = _normalize_gemvi_op(op)
+    if (_CUDA_DIRECT_LAUNCH and not validate and not return_time
+            and _try_cuda_gemvi(A, values, indices, y, op, alpha, beta)):
+        return y
     n_out = _validate_gemvi(A, values, indices, y, op, beta, validate)
     t0 = None
     if return_time:
@@ -394,14 +428,44 @@ def flagsparse_gemvi(
                 # op='non' or row-major A with op='trans'.
                 constants += (stride_out == 1,)
             grid = (_cdiv(n_out, _BLOCK_OUT), n_split)
-            _launch(kernel, grid, tensors, scalars, constants)
+            bound = _launch(kernel, grid, tensors, scalars, constants)
+            if (_CUDA_DIRECT_LAUNCH and n_split == 1 and target is y
+                    and A.dtype == torch.float32 and indices.dtype == torch.int32
+                    and values.is_contiguous() and not values.is_neg() and not A.is_neg()
+                    and not y.is_neg() and bound is not None
+                    and not torch.cuda.is_current_stream_capturing()):
+                sources = (A, values, indices, y)
+                _CUDA_GEMVI_HOT = SimpleNamespace(
+                    sources=sources, signature=_cuda_gemvi_signature(sources),
+                    options=(op, complex(alpha), complex(beta)), bound=bound,
+                    tensors=tensors, scalars=scalars, constants=constants,
+                    addresses=tuple(t.data_ptr() for t in tensors),
+                    reduce=None, stream=None,
+                )
             if n_split > 1:
                 y_view = torch.view_as_real(target) if complex_ else target
-                _launch(
-                    _gemvi_reduce_kernel, (_cdiv(n_out, 256),), (y_view, part),
-                    (n_out, n_split, a_c.real, a_c.imag, b_c.real, b_c.imag),
-                    (has_beta, complex_, acc, 256),
+                reduce_tensors = (y_view, part)
+                reduce_scalars = (n_out, n_split, a_c.real, a_c.imag, b_c.real, b_c.imag)
+                reduce_constants = (has_beta, complex_, acc, 256)
+                reduce_bound = _launch(
+                    _gemvi_reduce_kernel, (_cdiv(n_out, 256),), reduce_tensors,
+                    reduce_scalars, reduce_constants,
                 )
+                if (_CUDA_DIRECT_LAUNCH and target is y and A.dtype == torch.float32
+                        and indices.dtype == torch.int32 and values.is_contiguous()
+                        and not any(t.is_neg() for t in (A, values, y))
+                        and bound is not None and reduce_bound is not None
+                        and not torch.cuda.is_current_stream_capturing()):
+                    sources = (A, values, indices, y)
+                    _CUDA_GEMVI_HOT = SimpleNamespace(
+                        sources=sources, signature=_cuda_gemvi_signature(sources),
+                        options=(op, complex(alpha), complex(beta)), bound=bound,
+                        tensors=tensors, scalars=scalars, constants=constants,
+                        addresses=tuple(t.data_ptr() for t in tensors),
+                        reduce=(reduce_bound, reduce_tensors, reduce_scalars, reduce_constants,
+                                tuple(t.data_ptr() for t in reduce_tensors)),
+                        stream=_ACCEL.current_stream(A.device).cuda_stream,
+                    )
         if y is not None and target is not y:
             y.copy_(target)
             target = y

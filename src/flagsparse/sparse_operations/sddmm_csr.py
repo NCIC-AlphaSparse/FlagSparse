@@ -1012,6 +1012,18 @@ def _run_sddmm_prepared(
             "out_dtype": str(target_out_dtype).replace("torch.", ""),
         }
 
+    if (_backend_name() == "cuda" and x.device.type == "cuda"
+            and x.dtype == torch.complex64 and variant == "baseline"
+            and not allow_fallback
+            and x.shape[1] <= 64):
+        from ._cuda_sparse import sddmm
+
+        sddmm(prepared, x, y, data, alpha, beta, out)
+        return out, {"block_p": 1, "block_k": triton.next_power_of_2(x.shape[1]),
+                     "num_warps": 1, "fallback_used": False, "variant": variant,
+                     "implementation": "cuda_row_reuse", "rows_per_program": 4,
+                     "acc_dtype": "float32", "out_dtype": str(out.dtype).replace("torch.", "")}
+
     # XPU's Triton lowering rejects the reduction accumulator in the generic
     # kernel (the accumulator and reduction result receive incompatible
     # encodings).  Advanced indexing and reduction are supported by the XPU

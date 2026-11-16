@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from ._common import (
+    _backend_name,
     _gather_values,
     _is_iluvatar_runtime,
     _is_maca_runtime,
@@ -266,7 +267,15 @@ def gather(values, x, plan, n_rows, conjugate=False, out=None):
         if result is not None:
             return result
     if complex_values:
-        if cache.get("component_source") is not values:
+        refresh_view = cache.get("component_source") is not values
+        if not refresh_view and _backend_name() == "cuda":
+            view = cache["component_view"]
+            refresh_view = (
+                view.data_ptr() != values.data_ptr()
+                or view.shape[:-1] != values.shape
+                or view.stride()[:-1] != tuple(2 * s for s in values.stride())
+            )
+        if refresh_view:
             cache.update(component_source=values, component_view=torch.view_as_real(values))
         v, vector, target = cache["component_view"], torch.view_as_real(x), torch.view_as_real(y)
     else:

@@ -110,6 +110,15 @@ class _Launch:
         # MUSA's compiled entry and module metadata are immutable. Resolving
         # these lazy properties on every short call adds host launch overhead.
         self.musa_entry = None
+        self.cuda_entry = None
+        if self.direct and cuda:
+            entry = compiled.run
+            if (hasattr(entry, "launch")
+                    and getattr(entry, "global_scratch_size", None) == 0
+                    and getattr(entry, "profile_scratch_size", None) == 0
+                    and getattr(entry, "launch_cooperative_grid", None) is False
+                    and getattr(entry, "launch_pdl", None) is False):
+                self.cuda_entry = (entry.launch, compiled.function, compiled.packed_metadata)
         if self.direct and not cuda:
             entry = compiled.run
             # Use the compiled Triton launcher directly only when its Python
@@ -141,6 +150,15 @@ class _Launch:
             stream = _RAW_STREAM(self.device.index)
         if addresses is None:
             addresses = tuple(t.data_ptr() for t in tensors)
+        if self.cuda_entry is not None:
+            entry, function, metadata = self.cuda_entry
+            try:
+                entry(*self.grid, stream, function, False, False, None, None,
+                      metadata, None, None, None, *addresses, *scalars, *constants)
+                return
+            except TypeError:
+                # ABI rejection occurs before launch; use Triton's wrapper.
+                self.cuda_entry = None
         # This is Triton's normal compiled launcher, including scratch handling.
         # Only pointer validation and empty profiling metadata are redundant.
         try:

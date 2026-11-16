@@ -49,6 +49,11 @@ _SPMM_CSC_RESERVED_OP_MESSAGE = "spmm_csc_base supports op='non', 'trans', and '
 _ROCM_CSC_PREPARED_CACHE = TensorPlanCache()
 _MUSA_CSC_HALF_CACHE = TensorPlanCache()
 _ILUVATAR_CSC_CSR_CACHE = TensorPlanCache(maxsize=16)
+# CUDA call routes otherwise repeat reductions and row-id construction on
+# unchanged CSC operands. These caches validate tensor identity and mutation
+# counters; neither RHS tensors nor computed outputs are cached.
+_CUDA_CSC_PREPARED_CACHE = TensorPlanCache(maxsize=2)
+_CUDA_CSC_HALF_VALUES_CACHE = TensorPlanCache(maxsize=2)
 
 
 class SpmmCscAlgorithmUnavailable(RuntimeError):
@@ -316,6 +321,7 @@ class PreparedCscSpmm:
         index_fallback_applied=False,
         index_fallback_reason=None,
         musa_trans_gather=False,
+        cuda_non_gather=False,
     ):
         self.data = data
         self.kernel_indices = kernel_indices
@@ -346,7 +352,7 @@ class PreparedCscSpmm:
         if _is_ascend_runtime() and data.is_complex():
             planes = torch.view_as_real((data.conj() if self.op == "conj" else data).resolve_conj())
             self.ascend_value_planes = (planes[:, 0].contiguous(), planes[:, 1].contiguous())
-        if ((_is_rocm_runtime() or _is_iluvatar_runtime()) and not _is_ascend_runtime()
+        if ((_is_rocm_runtime() or _is_iluvatar_runtime() or cuda_non_gather) and not _is_ascend_runtime()
                 and data.dtype == torch.complex64 and self.op == "non"):
             from . import _spmv_csr_transpose
             cols, ptr, order, rows, _, _, _ = _spmv_csr_transpose.prepare(
@@ -692,6 +698,11 @@ def prepare_spmm_csc_route(
     )
     op_code = _normalize_spmm_csc_op(op)
     _ensure_spmm_csc_supported_op(op_code)
+    cuda_non_gather = (
+        _backend_name() == "cuda" and torch.is_tensor(data)
+        and data.device.type == "cuda" and block_n is None
+        and block_nnz is None and max_segments is None
+    )
     data, indices, indptr, n_rows, n_cols, col_lengths, max_col_nnz = (
         _prepare_spmm_csc_matrix(data, indices, indptr, shape)
     )
@@ -758,6 +769,7 @@ def prepare_spmm_csc_route(
         op=_spmm_csc_op_to_name(op_code),
         alg=resolved_alg,
         index_fallback_policy=index_fallback_policy,
+        cuda_non_gather=cuda_non_gather,
         musa_trans_gather=(
             (_is_mthreads_runtime() or (_is_iluvatar_runtime() and data.dtype == torch.float32))
             and _spmm_csc_op_transposes(op_code)
@@ -1353,13 +1365,20 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
             except RuntimeError:
                 version = None
             if version is not None:
-                if cache.get("source") is not values or cache.get("version") != version:
+                stream = (_ACCEL.current_stream(values.device).cuda_stream
+                          if _backend_name() == "cuda" else None)
+                if (cache.get("source") is not values or cache.get("version") != version
+                        or cache.get("cuda_stream") != stream):
                     cache.update(source=values, version=version,
-                                 values=_gather_values(values, order).contiguous())
+                                 values=_gather_values(values, order).contiguous(),
+                                 cuda_stream=stream)
                 values = cache["values"]
             B_ri = torch.view_as_real(B)
             tile_n = prepared.block_n if prepared.block_n_override else 32
             rows_per, lanes = (8, 4) if _is_iluvatar_runtime() else (4, 8)
+            if _backend_name() == "cuda":
+                tile_n = min(32, triton.next_power_of_2(n_dense_cols))
+                rows_per, lanes = 8, 4
             _spmm_csc_rocm_complex_gather_kernel[(triton.cdiv(out_rows, rows_per), triton.cdiv(n_dense_cols, tile_n))](
                 torch.view_as_real(values), cols, ptr, rows, order, B_ri, torch.view_as_real(C),
                 out_rows, n_dense_cols, B_ri.stride(0), B_ri.stride(1),
@@ -1690,6 +1709,8 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
         block_n = min(32, triton.next_power_of_2(int(B.shape[1])))
     elif gather_route:
         block_n = prepared.block_n if prepared.block_n_override else 32
+        if _backend_name() == "cuda":
+            block_n = min(32, triton.next_power_of_2(int(B.shape[1])))
     else:
         block_n = (prepared.block_n if prepared.block_n_override else
                    _select_block_n(int(B.shape[1]), prepared.data.dtype, prepared.data.device))
@@ -1709,7 +1730,8 @@ def _run_spmm_csc_base_route(prepared, B, *, timing=False, diagnostics=False):
         "process_gpu_ms": 0.0 if timing else None,
         "compute_ms": compute_ms,
         "block_n": int(block_n),
-        "block_nnz": 4 if musa_gather else 8 if gather_route else int(prepared.block_nnz),
+        "block_nnz": (4 if musa_gather or (gather_route and _backend_name() == "cuda")
+                      else 8 if gather_route else int(prepared.block_nnz)),
         "launch_backend": backend_info["backend"],
         "device_warp_size": int(backend_info["device_warp_size"]),
     }
@@ -2062,8 +2084,16 @@ def flagsparse_spmm_csc(
     # end" shape COO already uses) and cast back once at this public boundary.
     if prepared is None and data is not None and data.dtype == torch.float16:
         result_dtype = out_dtype or torch.float16
+        float_data = None
+        if (_backend_name() == "cuda" and data.device.type == "cuda"
+                and not timing and not return_meta):
+            options = (_ACCEL.current_stream(data.device).cuda_stream,)
+            float_data = _CUDA_CSC_HALF_VALUES_CACHE.get((data,), options)
+            if float_data is None:
+                float_data = data.to(torch.float32)
+                _CUDA_CSC_HALF_VALUES_CACHE.put((data,), options, float_data)
         result = flagsparse_spmm_csc(
-            data.to(torch.float32),
+            float_data if float_data is not None else data.to(torch.float32),
             indices,
             indptr,
             B.to(torch.float32) if B is not None else B,
@@ -2104,7 +2134,13 @@ def flagsparse_spmm_csc(
             raise ValueError(
                 "data, indices, indptr, and shape are required when prepared is not provided"
             )
-        cacheable = ((_is_rocm_runtime() and not _is_ascend_runtime()
+        cuda_cacheable = (
+            _backend_name() == "cuda" and data.device.type == "cuda"
+            and data.dtype in (torch.float32, torch.complex64)
+            and not timing and not return_meta
+        )
+        cacheable = (cuda_cacheable or
+                     (_is_rocm_runtime() and not _is_ascend_runtime()
                      and data.dtype == torch.complex64
                      and op_code == SPMM_CSC_OP_NON)
                      or (_is_iluvatar_runtime() and data.dtype == torch.float32
@@ -2114,7 +2150,10 @@ def flagsparse_spmm_csc(
             sources = (data, indices, indptr)
             options = (tuple(shape), block_n, block_nnz, max_segments,
                        op_code, alg, index_fallback_policy)
-            prepared = _ROCM_CSC_PREPARED_CACHE.get(sources, options)
+            if cuda_cacheable:
+                options += (_ACCEL.current_stream(data.device).cuda_stream,)
+            cache = _CUDA_CSC_PREPARED_CACHE if cuda_cacheable else _ROCM_CSC_PREPARED_CACHE
+            prepared = cache.get(sources, options)
         if prepared is None:
             prepared = prepare_spmm_csc_route(
                 data,
@@ -2129,7 +2168,7 @@ def flagsparse_spmm_csc(
                 index_fallback_policy=index_fallback_policy,
             )
             if cacheable:
-                _ROCM_CSC_PREPARED_CACHE.put(sources, options, prepared)
+                cache.put(sources, options, prepared)
     else:
         if op_explicit and _spmm_csc_op_to_name(op_code) != prepared.op:
             raise ValueError(f"op={_spmm_csc_op_to_name(op_code)} does not match prepared.op={prepared.op}")

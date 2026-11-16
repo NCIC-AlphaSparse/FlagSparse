@@ -499,6 +499,21 @@ def _triton_scatter_impl(
     index_fallback_policy = str(index_fallback_policy).lower()
     if index_fallback_policy not in ("auto", "strict"):
         raise ValueError("index_fallback_policy must be 'auto' or 'strict'")
+    if (_backend_name() == "cuda" and sparse_values.device.type == "cuda"
+            and sparse_values.dtype in (torch.complex64, torch.complex128) and block_size is None
+            and (out is None or reset_output) and dense_size <= 4 * 1024 * 1024
+            and (out is None or (out.is_contiguous() and not out.is_conj() and not out.is_neg()
+                                 and not torch._C._overlaps(out, sparse_values)))):
+        from ._vector_cuda import scatter_reset
+
+        dense = out if out is not None else torch.empty(
+            dense_size, dtype=sparse_values.dtype, device=sparse_values.device
+        )
+        result = scatter_reset(sparse_values, kernel_indices, dense)
+        if return_metadata:
+            return result, {"index_fallback_applied": False, "index_fallback_reason": None,
+                            "kernel_index_dtype": str(kernel_indices.dtype).replace("torch.", "")}
+        return result
     musa = _is_mthreads_runtime()
     block_size = _resolve_scatter_block_size(
         block_size, sparse_values.dtype, kernel_indices.numel()
