@@ -208,7 +208,8 @@ def _finish_segments(partials, output_rows, output_values,
 
 
 def prepare_structure(a_columns, a_pointer, b_pointer):
-    device = a_columns.device
+    from ._spgemm_ascend_padded import prefix_sum
+
     if max(int(a_pointer[-1].item()), int(b_pointer[-1].item())) >= 2**30:
         return None
     right_degrees = (b_pointer[1:] - b_pointer[:-1]).to(torch.int32)
@@ -216,8 +217,8 @@ def prepare_structure(a_columns, a_pointer, b_pointer):
     total = int(torch.sum(lengths, dtype=torch.int64).item())
     if total > MAX_PRODUCTS:
         return None
-    prefix = torch.zeros(a_columns.numel() + 1, dtype=torch.int32, device=device)
-    prefix[1:] = torch.cumsum(lengths, 0, dtype=torch.int32)
+    scratch = []
+    prefix = prefix_sum(lengths, scratch)
     row_pointer = prefix.index_select(0, a_pointer)
     work = row_pointer[1:] - row_pointer[:-1]
     maximum = int(work.max().item()) if work.numel() else 0
