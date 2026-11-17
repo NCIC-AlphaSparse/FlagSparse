@@ -1503,7 +1503,13 @@ def flagsparse_spgemm_csr(
         if return_meta:
             _ACCEL.synchronize()
             t_prepare0 = time.perf_counter()
-        prepared = prepare_spgemm_csr(
+        prepare = prepare_spgemm_csr
+        if (_backend_name() == "cuda" and torch.is_tensor(a_data)
+                and a_data.device.type == "cuda" and a_data.dtype == torch.float32
+                and torch.is_tensor(b_data) and b_data.device == a_data.device):
+            from ._spgemm_cuda import prepare
+
+        prepared = prepare(
             a_data,
             a_indices,
             a_indptr,

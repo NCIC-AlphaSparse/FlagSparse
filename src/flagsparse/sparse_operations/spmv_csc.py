@@ -736,6 +736,15 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if (_SPMV_CSC_CUDA and prepared.data.device.type == "cuda" and trans
+            and dtype in (torch.float32, torch.complex64)):
+        from ._cuda_sparse import csr_spmv, remember_csc
+
+        result = csr_spmv(prepared.data, prepared.kernel_indices,
+                          prepared.kernel_indptr, x, out_len,
+                          conjugate=op_code == SPMV_CSC_OP_CONJ_TRANS)
+        remember_csc(prepared, x, op_code)
+        return result
     if trans and prepared.iluvatar_nnz_plan is not None:
         from ._spmv_csr_nnz import _complex_nnz_kernel, _nnz_kernel
 
@@ -961,6 +970,36 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
     if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
         raise ValueError("invalid CSC dimensions")
     timed = bool(return_time or return_meta)
+    if (_SPMV_CSC_CUDA and data.device.type == "cuda" and data.dtype == torch.int8):
+        from ._cuda_sparse import csr_spmv, transpose_topology
+
+        _mixed_spmx._check_1d((data, "data"), (indices, "indices"),
+                              (indptr, "indptr"), (x, "x"))
+        trans = _spmv_csc_op_transposes(op_code)
+        length, input_length = (n_cols, n_rows) if trans else (n_rows, n_cols)
+        if x.numel() != input_length:
+            raise ValueError("x shape does not match CSC operation")
+        if any(t.device != data.device for t in (indices, indptr, x)):
+            raise ValueError("CSC inputs must be on the same device")
+        if indices.dtype not in SUPPORTED_INDEX_DTYPES or indptr.dtype not in SUPPORTED_INDEX_DTYPES:
+            raise TypeError("indices and indptr must be int32 or int64")
+        result_dtype, _ = _mixed_spmx._resolve_types(data.dtype, x.dtype, out, out_dtype, False)
+        if out is not None and (out.shape != (length,) or out.device != data.device):
+            raise ValueError("out shape/device must match the CSC SpMV result")
+        t0 = _mixed_spmx._start(timed)
+        cols, ptr, order = indices, indptr, None
+        if not trans:
+            cols, ptr, order = transpose_topology(indices, indptr, (n_cols, n_rows))
+        y = csr_spmv(data, cols, ptr, x, length, out=out,
+                     out_dtype=result_dtype, order=order)
+        result = _mixed_spmx._finish(y, out, t0, timed)
+        if not timed:
+            return result
+        y, elapsed = result
+        if return_meta:
+            meta = {"route": "cuda_csc_int_gather", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
+        return y, elapsed
     if ((_is_maca_runtime() or _is_iluvatar_runtime()) and data.dtype == torch.int8
             and _mixed_spmx._requested_out_dtype(out, out_dtype) in (None, torch.int32)):
         from . import _spmv_csr_transpose
@@ -1138,6 +1177,17 @@ def flagsparse_spmv_csc(
     kernels, whose op='non' path atomically adds in the value dtype -- fp16 atomics
     are not available on every backend. See ``_spmv_csc_via_mixed``.
     """
+    if (isinstance(prepared, PreparedCscSpmv) and _SPMV_CSC_CUDA
+            and prepared.data.device.type == "cuda"
+            and prepared.data.dtype in (torch.float32, torch.complex64)
+            and prepared.op in (SPMV_CSC_OP_TRANS, SPMV_CSC_OP_CONJ_TRANS)
+            and all(arg is None for arg in (data, indices, indptr, shape, out, op, transpose))
+            and not (return_time or return_meta)):
+        from ._cuda_sparse import try_csc
+
+        result = try_csc(prepared, x, prepared.op)
+        if result is not None:
+            return result
     op_explicit = op is not None
     op_code = _normalize_spmv_csc_op(
         op,
@@ -1192,6 +1242,15 @@ def flagsparse_spmv_csc(
             )
         if not op_explicit:
             op_code = prepared.op
+    if (_SPMV_CSC_CUDA and prepared.data.device.type == "cuda"
+            and prepared.data.dtype in (torch.float32, torch.complex64)
+            and _spmv_csc_op_transposes(op_code)
+            and out is None and not (return_time or return_meta)):
+        from ._cuda_sparse import try_csc
+
+        result = try_csc(prepared, x, op_code)
+        if result is not None:
+            return result
     x = _validate_spmv_csc_x(x, prepared, op_code)
     ascend_out_dtype = None
     if _is_ascend_runtime() and prepared.data.dtype in (torch.float16, torch.bfloat16, torch.int8):

@@ -34,6 +34,8 @@ from functools import lru_cache
 import triton
 import triton.language as tl
 
+_CUDA_SPARSE = None
+
 SUPPORTED_SPMV_COO_VALUE_DTYPES = (
     torch.float32,
     torch.float64,
@@ -1424,8 +1426,44 @@ def flagsparse_spmv_coo(
     float16 / bfloat16 / int8 matrices and widened outputs (``out_dtype`` or
     ``out.dtype``: half -> float32, int8 -> int32 / float32) run in ``mixed_spmx``.
     """
+    global _CUDA_SPARSE
     if prepared is not None and torch.is_tensor(x):
         mixed_data = prepared.data_non
+        if ((_CUDA_SPARSE is not None or _backend_name() == "cuda")
+                and mixed_data.device.type == "cuda"
+                and prepared.op == SPMV_COO_OP_NON and op in (None, "non", 0)
+                and transpose in (None, False)
+                and block_size is None and num_warps is None and block_inner == 128
+                and not return_time
+                and (mixed_data.dtype in (torch.float16, torch.bfloat16, torch.int8, torch.complex64)
+                     or (mixed_data.dtype == torch.float32 and x.dtype == torch.complex64))):
+            if _CUDA_SPARSE is None:
+                from . import _cuda_sparse as _CUDA_SPARSE
+
+            if shape is not None and tuple(shape) != prepared.shape:
+                raise ValueError("shape does not match prepared.shape")
+            if out is None:
+                result = _CUDA_SPARSE.try_coo(prepared, x, out_dtype)
+                if result is not None:
+                    return result
+            _mixed_spmx._check_1d((x, "x"))
+            if x.device != mixed_data.device or x.numel() != prepared.n_cols:
+                raise ValueError("x shape/device does not match COO operation")
+            result_dtype, _ = _mixed_spmx._resolve_types(
+                mixed_data.dtype, x.dtype, out, out_dtype, True
+            )
+            if out is not None and (out.shape != (prepared.n_rows,) or out.device != x.device):
+                raise ValueError("out shape/device must match the COO SpMV result")
+            cols, ptr, order = _CUDA_SPARSE.coo_topology(
+                prepared.row_non, prepared.col_non, prepared.n_rows
+            )
+            result = _CUDA_SPARSE.csr_spmv(
+                mixed_data, cols, ptr, x, prepared.n_rows,
+                out=out, out_dtype=result_dtype, order=order,
+            )
+            if out is None:
+                _CUDA_SPARSE.remember_coo(prepared, x, result_dtype)
+            return result
         if _mixed_spmx.spmv_needs_mixed(
             mixed_data.dtype, x.dtype, out, out_dtype, coo=True
         ):

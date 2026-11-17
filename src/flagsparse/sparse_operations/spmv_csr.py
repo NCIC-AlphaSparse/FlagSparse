@@ -2194,6 +2194,19 @@ def flagsparse_spmv_csr_run(
         _spmv_check_output(out, prepared, x)
         x = checked_x
         if not (return_time or return_meta or timing):
+            if (prepared.alg_requested == "auto" and prepared.backend_caps is not None
+                    and prepared.backend_caps.backend == "cuda"
+                    and getattr(prepared.data.device, "type", None) == "cuda"
+                    and prepared.kernel_indices.dtype == torch.int32
+                    and prepared.kernel_indptr.dtype == torch.int32
+                    and prepared.config_source != "explicit"
+                    and not os.environ.get("FLAGSPARSE_SPMV_CSR_KERNEL")
+                    and not prepared.transpose):
+                from ._cuda_sparse import csr_spmv
+
+                return csr_spmv(prepared.data, prepared.kernel_indices,
+                                prepared.kernel_indptr, x, prepared.n_rows, out=out,
+                                checked_out=True)
             if (prepared.non_gather_plan is not None
                     and prepared.alg_requested == "auto"
                     and _is_mthreads_runtime()
@@ -2326,6 +2339,26 @@ def flagsparse_spmv_csr(
     bfloat16 -> float32, int8 -> int32 or float32. A real matrix times a complex
     ``x`` writes the complex type. Those combinations run in ``mixed_spmx``.
     """
+    if (isinstance(prepared, PreparedCsrSpmv)
+            and prepared.alg_requested == "auto" and prepared.backend_caps is not None
+            and prepared.backend_caps.backend == "cuda"
+            and getattr(prepared.data.device, "type", None) == "cuda"
+            and prepared.kernel_indices.dtype == torch.int32
+            and prepared.kernel_indptr.dtype == torch.int32
+            and not prepared.transpose
+            and prepared.config_source != "explicit"
+            and not os.environ.get("FLAGSPARSE_SPMV_CSR_KERNEL")
+            and all(value is None for value in (
+                data, indices, indptr, shape, alg, config, use_opt, op, transpose,
+            )) and out_dtype is None
+            and not (return_time or return_meta)):
+        from ._cuda_sparse import csr_spmv
+
+        checked_x = _validate_spmv_x(x, prepared)
+        _spmv_check_output(out, prepared, x)
+        return csr_spmv(prepared.data, prepared.kernel_indices,
+                        prepared.kernel_indptr, checked_x, prepared.n_rows, out=out,
+                        checked_out=True)
     if (isinstance(prepared, PreparedCsrSpmv)
             and prepared.alg_requested == "auto" and prepared.non_gather_plan is not None
             and prepared.data.dtype in (torch.float16, torch.bfloat16)

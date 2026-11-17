@@ -736,6 +736,24 @@ def flagsparse_spmv_sell(
     if return_time and not cached_musa:
         _ACCEL.synchronize()
         t0 = time.perf_counter()
+    if (_CUDA_DIRECT_LAUNCH and values.device.type == "cuda" and slice_size == 32
+            and values.dtype in (torch.float16, torch.int8)):
+        y = out if out is not None and out.is_contiguous() else torch.empty(
+            n_rows, dtype=out_dtype, device=x.device
+        )
+        if n_slices:
+            _launch_musa_spmv(
+                _spmv_sell_wide_kernel, (n_slices,), (y, values, cols, offsets, x),
+                (), (n_rows, slice_size, 32, 4, False, _TL[acc_dtype]),
+                num_warps=4, num_stages=1, cuda=True,
+            )
+        if out is not None and y is not out:
+            out.copy_(y)
+            y = out
+        if return_time:
+            _ACCEL.synchronize()
+            return y, (time.perf_counter() - t0) * 1000.0
+        return y
     if (_is_iluvatar_runtime() and slice_size == 32 and n_slices <= 32768
             and values.dtype in (torch.float16, torch.float32, torch.int8, torch.complex64)):
         plan = _iluvatar_sell_plan(values, cols, offsets, shape, slice_size, out_dtype)

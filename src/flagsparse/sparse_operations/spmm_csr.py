@@ -3090,6 +3090,19 @@ def flagsparse_spmm_csr_run(
     if B.dtype != prepared.data.dtype:
         raise TypeError("B dtype must match sparse matrix dtype")
 
+    if (_backend_name() == "cuda" and prepared.data.device.type == "cuda"
+            and prepared.data.dtype == torch.complex64 and op_name == "non"
+            and alg_name == "auto" and dense_layout in ("auto", "row")
+            and not (return_time or return_meta or timing or diagnostics)):
+        from ._cuda_sparse import csr_spmm
+
+        if B.shape[0] != prepared.n_cols:
+            raise ValueError("B shape does not match CSR operation")
+        if out is not None:
+            _validate_spmm_out(prepared, B, out, dense_layout)
+        return csr_spmm(prepared.data, prepared.kernel_indices,
+                        prepared.kernel_indptr, B, prepared.n_rows, out=out)
+
     if (
         _is_iluvatar_runtime()
         and prepared.data.dtype in (torch.float16, torch.complex64, torch.complex128)

@@ -1468,6 +1468,13 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
     cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
     if op == "trans":
+        if _CUDA_DIRECT_LAUNCH and data.device.type == "cuda":
+            from ._cuda_sparse import csr_spmv, transpose_topology
+
+            tcols, tptr, order = transpose_topology(cols, ptr, (n_rows, n_cols))
+            y = csr_spmv(data, tcols, tptr, x, n_cols, out=out,
+                         out_dtype=result_dtype, order=order)
+            return _finish(y, out, t0, return_time)
         if _is_ascend_runtime():
             rows = _csr_row_ids(ptr, n_rows, data.numel())
             y = _torch_spmv_rows(
@@ -1850,6 +1857,14 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     sources = (data, row, col)
     data, x = data.contiguous(), x.contiguous()
     t0 = _start(return_time)
+    if _CUDA_DIRECT_LAUNCH and data.device.type == "cuda":
+        from ._cuda_sparse import coo_topology, csr_spmv
+
+        target_rows, source_cols = (row, col) if op == "non" else (col, row)
+        cols, ptr, order = coo_topology(target_rows, source_cols, n_out)
+        y = csr_spmv(data, cols, ptr, x, n_out, out=out,
+                     out_dtype=result_dtype, order=order, conjugate=op == "conj")
+        return _finish(y, out, t0, return_time)
     if _is_ascend_runtime():
         rows = _index32(row.contiguous()).to(torch.int64).contiguous()
         cols = _index32(col.contiguous()).to(torch.int64).contiguous()
@@ -2157,6 +2172,15 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
     data = data.contiguous()
     cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
+    if _CUDA_DIRECT_LAUNCH and data.device.type == "cuda":
+        from ._cuda_sparse import csr_spmm, transpose_topology
+
+        order = None
+        if op != "non":
+            cols, ptr, order = transpose_topology(cols, ptr, (n_rows, n_cols))
+        C = csr_spmm(data, cols, ptr, B, n_out, out=out, out_dtype=result_dtype,
+                     order=order, conjugate=op == "conj")
+        return _finish(C, out, t0, return_time)
     if op == "trans":
         C = _csr_spmm_trans(data, cols, ptr, B, n_rows, n_cols, acc_dtype)
         C = C if C.dtype == result_dtype else C.to(result_dtype)
@@ -2638,6 +2662,14 @@ def spmm_coo_mixed(data, row, col, B, shape, *, op=None, transpose=None,
     n_dense = int(B.shape[1])
     if out is not None and (tuple(out.shape) != (n_rows, n_dense) or out.device != B.device):
         raise ValueError("out shape/device must match the COO SpMM result")
+    if _CUDA_DIRECT_LAUNCH and data.device.type == "cuda":
+        from ._cuda_sparse import coo_topology, csr_spmm
+
+        t0 = _start(return_time)
+        cols, ptr, order = coo_topology(row, col, n_rows)
+        C = csr_spmm(data, cols, ptr, B, n_rows, out=out,
+                     out_dtype=result_dtype, order=order)
+        return _finish(C, out, t0, return_time)
     if _is_mthreads_runtime():
         values, cols, ptr = _musa_coo_csr(data, row, col, shape)
         return spmm_csr_mixed(

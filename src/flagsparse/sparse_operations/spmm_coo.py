@@ -2666,6 +2666,18 @@ def flagsparse_spmm_coo_run(
     if not isinstance(prepared, PreparedCooSpmmRoute):
         raise TypeError("prepared must be a PreparedCooSpmmRoute instance")
     alg_name = prepared.alg if alg is None else _normalize_spmm_coo_alg(alg)
+    if (_backend_name() == "cuda" and prepared.data.device.type == "cuda"
+            and prepared.output_dtype in (torch.float16, torch.float32, torch.complex64)
+            and alg_name == "auto" and dense_layout in ("auto", "row")
+            and not (return_time or return_meta or timing or diagnostics)):
+        from ._cuda_sparse import coo_topology, csr_spmm
+
+        B = _validate_spmm_coo_route_runtime_inputs(prepared, B, dense_layout, wide=False)
+        if out is not None:
+            _validate_spmm_out(prepared, B, out, dense_layout)
+        cols, ptr, order = coo_topology(prepared.row, prepared.col, prepared.n_rows)
+        return csr_spmm(prepared.data, cols, ptr, B, prepared.n_rows, out=out,
+                        out_dtype=prepared.output_dtype, order=order)
     if alg_name == "auto":
         # Resolved here rather than in resolve_spmm_coo_algorithm(), which only sees
         # (alg, op, dtype) and cannot look at the matrix.  Falls back to the registry's
