@@ -397,7 +397,7 @@ def remember_coo(prepared, x, dtype):
         return
     hot = _SPMV_HOT
     sources = (prepared.data_non, prepared.row_non, prepared.col_non, x)
-    signature = TensorPlanCache._signature(sources)
+    signature = _coo_signature(sources)
     if (
         hot is not None
         and signature is not None
@@ -414,6 +414,7 @@ def remember_coo(prepared, x, dtype):
             hot[4],
             hot[5],
             _stream(x.device),
+            hot[6],
         )
 
 
@@ -423,8 +424,10 @@ def try_coo(prepared, x, out_dtype):
         return None
     sources = (prepared.data_non, prepared.row_non, prepared.col_non, x)
     if (
-        not all(a is b for a, b in zip(sources, hot[1]))
-        or TensorPlanCache._signature(sources) != hot[2]
+        sources[0] is not hot[1][0]
+        or sources[1] is not hot[1][1]
+        or sources[2] is not hot[1][2]
+        or _coo_signature(sources) != hot[2]
         or prepared.n_rows != hot[6][0]
         or x.numel() != prepared.n_cols
         or (out_dtype is not None and out_dtype != hot[3])
@@ -432,15 +435,29 @@ def try_coo(prepared, x, out_dtype):
             out_dtype is None
             and hot[3] != (torch.int32 if x.dtype == torch.int8 else x.dtype)
         )
-        or _stream(x.device) != hot[-1]
+        or _stream(x.device) != hot[7]
         or not fast_path_allowed(hot[4].kernel)
-        or any(t.is_conj() or t.is_neg() for t in sources)
+        or x.device.index != torch._C._cuda_getDevice()
     ):
         return None
     result = torch.empty(prepared.n_rows, dtype=hot[3], device=x.device)
-    target = torch.view_as_real(result) if result.is_complex() else result
-    hot[4]((*hot[5], target), (), hot[6], checked=True)
+    _launch_hot(hot[4], hot[5], hot[6], hot[8], result)
     return result
+
+
+def _coo_signature(sources):
+    # Numerical operands stay live; topology mutation must invalidate the plan.
+    # Spell out the four operands to avoid generator/tuple conversions per call.
+    a, b, c, d = sources
+    try:
+        return (
+            (a.data_ptr(), a.dtype, a.device, a.shape, a.stride(), a.is_conj(), a.is_neg()),
+            (b._version, b.data_ptr(), b.dtype, b.device, b.shape, b.stride()),
+            (c._version, c.data_ptr(), c.dtype, c.device, c.shape, c.stride()),
+            (d.data_ptr(), d.dtype, d.device, d.shape, d.stride(), d.is_conj(), d.is_neg()),
+        )
+    except RuntimeError:
+        return None
 
 
 def remember_csc(prepared, x, op):

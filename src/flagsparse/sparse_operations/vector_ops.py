@@ -51,6 +51,8 @@ SPVV_VALUE_DTYPES = AXPBY_VALUE_DTYPES + (torch.int8,)
 _VECTOR_BLOCK = 1024
 _MUSA_AXPBY_INDEX_CACHE = TensorPlanCache()
 _ILUVATAR_AXPBY_INDEX_CACHE = TensorPlanCache()
+# Bound only after the CUDA route has validated and launched real operands.
+_CUDA_AXPBY_TRY = None
 
 
 class PreparedAxpby:
@@ -387,10 +389,10 @@ def flagsparse_axpby(
     (and the elapsed milliseconds when ``return_time``). ``validate=False`` skips the
     index range check, a host sync that cuSPARSE does not perform either.
     """
-    if (prepared is None and not validate and not return_time
-            and _backend_name() == "cuda"):
-        from ._vector_cuda import try_axpby
-        if try_axpby(values, indices, y, alpha, beta):
+    global _CUDA_AXPBY_TRY
+    if (_CUDA_AXPBY_TRY is not None and prepared is None
+            and not validate and not return_time):
+        if _CUDA_AXPBY_TRY(values, indices, y, alpha, beta):
             return y
     if prepared is not None:
         if not _is_ascend_runtime():
@@ -434,8 +436,9 @@ def flagsparse_axpby(
         and (values.data_ptr() + values.numel() * values.element_size() <= y.data_ptr()
              or y.data_ptr() + y.numel() * y.element_size() <= values.data_ptr())
     ):
-        from ._vector_cuda import axpby
+        from ._vector_cuda import axpby, try_axpby
         axpby(values, kernel_idx, y, a_re, a_im, b_re, b_im)
+        _CUDA_AXPBY_TRY = try_axpby
     elif (
         _is_maca_runtime() and y.dtype == torch.complex64
         and y.numel() <= 4 * 1024 * 1024
