@@ -361,6 +361,52 @@ def test_cuda_sddmm_row_reuse_reads_current_operands_and_beta(k, strided):
         torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("indptr_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("op_a", ["non", "trans"])
+@pytest.mark.parametrize("op_b", ["non", "trans"])
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_cuda_sddmm_complex_irregular_rows_and_layouts(indptr_dtype, op_a, op_b, layout):
+    # Exercise row/column tile tails, empty rows and a long row in the same tile.
+    torch.manual_seed(93)
+    lengths = torch.tensor([0, 1, 7, 8, 9, 17, 0, 65, 2, 31, 3, 16, 0])
+    m, n, k = lengths.numel(), 80, 32
+    ptr = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+    rows = torch.repeat_interleave(torch.arange(m), lengths)
+    cols = torch.randint(n, (rows.numel(),), dtype=torch.int32, device="cuda")
+    plan = fs.prepare_sddmm_csr(cols, ptr.to(device="cuda", dtype=indptr_dtype), (m, n))
+    a = torch.randn((m, k) if op_a == "non" else (k, m), device="cuda", dtype=torch.complex64)
+    b = torch.randn((k, n) if op_b == "non" else (n, k), device="cuda", dtype=torch.complex64)
+    if layout == "col":
+        a, b = a.t().contiguous().t(), b.t().contiguous().t()
+    data = torch.randn(rows.numel(), device="cuda", dtype=torch.complex64)
+    target = torch.empty_like(data)
+    for step in range(3):
+        if step:
+            a.add_(0.25 + 0.5j)
+            b.mul_(0.5)
+            data.add_(1)
+            cols[0] = (cols[0] + 1) % n
+        aa = a.cpu().to(torch.complex128)
+        bb = b.cpu().to(torch.complex128)
+        aa = aa if op_a == "non" else aa.t()
+        bb = bb if op_b == "non" else bb.t()
+        sampled = (aa[rows] * bb.t()[cols.cpu().long()]).sum(1)
+        # Also cover input/output aliasing and the data-free allocation path.
+        source = data if step < 2 else None
+        output = target if step == 0 else data if step == 1 else None
+        alpha, beta = 1.25, -0.5 if source is not None else 0.0
+        expected = alpha * sampled
+        if source is not None:
+            expected += beta * source.cpu().to(torch.complex128)
+        actual = fs.flagsparse_sddmm_csr(
+            prepared=plan, x=a, y=b, data=source, alpha=alpha, beta=beta,
+            out=output, op_a=op_a, op_b=op_b, dense_layout=layout,
+        )
+        if output is not None:
+            assert actual is output
+        torch.testing.assert_close(actual.cpu(), expected.to(actual.dtype), rtol=1e-5, atol=1e-5)
+
+
 def test_cuda_csr_spmv_hot_launch_rechecks_output_alignment():
     v = torch.tensor([1, 2, 3, 4], dtype=torch.float32, device="cuda")
     ci = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")

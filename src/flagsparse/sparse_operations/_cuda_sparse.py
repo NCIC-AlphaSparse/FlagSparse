@@ -769,7 +769,22 @@ def _sddmm(
         )
 
 
-def sddmm(prepared, x, y, data, alpha, beta, out):
+def sddmm_launch_config(x, y):
+    # Row-major A @ B maps B to an N x K view with strided K loads.
+    # Issue several sampled columns together instead of serialising every
+    # nonzero. The wider tile improved all ten K=32 delivery matrices on CUDA.
+    if (
+        x.shape[1] == 32
+        and x.stride(1) == 1
+        and y.stride(0) == 1
+        and y.stride(1) > 1
+    ):
+        return 8, 8, 4
+    return 4, 1, 1
+
+
+def sddmm(prepared, x, y, data, alpha, beta, out, *, config=None):
+    rows, columns, warps = sddmm_launch_config(x, y) if config is None else config
     x, y = x.resolve_conj().resolve_neg(), y.resolve_conj().resolve_neg()
     if data is not None:
         data = data.resolve_conj().resolve_neg()
@@ -783,16 +798,16 @@ def sddmm(prepared, x, y, data, alpha, beta, out):
     )
     constants = (prepared.n_rows, x.shape[1], *x.stride(), *y.stride())
     # The two runtime scalars precede the remaining constexpr parameters.
-    _sddmm[((prepared.n_rows + 3) // 4,)](
+    _sddmm[(triton.cdiv(prepared.n_rows, rows),)](
         *inputs,
         *constants,
         float(alpha),
         float(beta),
         data is not None,
-        4,
-        1,
+        rows,
+        columns,
         triton.next_power_of_2(x.shape[1]),
-        num_warps=1,
+        num_warps=warps,
         num_stages=1,
     )
     return out
