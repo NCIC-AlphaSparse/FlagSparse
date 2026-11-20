@@ -1848,9 +1848,10 @@ def write_phase_result(
     return path
 
 
-def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
+def _base_env(project_root: Path, gpu_id: int | None) -> dict[str, str]:
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     # Batch schedulers can leave these variables pointing at a cleaned-up job
     # scratch directory. Triton's ROCm compiler delegates assembly to clang,
     # which then fails before a kernel is built. Keep valid user directories,
@@ -1863,7 +1864,7 @@ def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     # ("undefined symbol: ixcclReduce", BI-V 10-27) then fails every kernel compile.
     # FlagSparse uses no distributed TLE, so keep FlagCX off unless asked for.
     env.setdefault("USE_FLAGCX", "0")
-    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
+    if gpu_id is not None and env.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
         # torch_npu ignores CUDA_VISIBLE_DEVICES: without this every child landed
         # on physical NPU 0 whatever --gpus said (measured on 910B, 2026-09-17).
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(gpu_id)
@@ -1875,7 +1876,7 @@ def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     return env
 
 
-def _subprocess_device_id(gpu_id: int) -> int:
+def _subprocess_device_id(gpu_id: int | None) -> int:
     """The device ordinal to pass a child whose visible devices _base_env masked.
 
     Backends whose runtime honours that mask renumber the one visible device to
@@ -1883,6 +1884,8 @@ def _subprocess_device_id(gpu_id: int) -> int:
     ASCEND_RT_VISIBLE_DEVICES, and XPU's torch_xmlir shim reads
     CUDA_VISIBLE_DEVICES. Every other backend keeps the id it was given.
     """
+    if gpu_id is None:
+        return 0  # The caller (e.g. optest) already selected the visible device.
     backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
     return 0 if backend in ("ascend", "xpu") else gpu_id
 
@@ -1916,7 +1919,9 @@ def run_subprocess(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        start_new_session=True,
+        # Optest already owns the pytest process group and its delivery timeout.
+        # Keep its benchmark descendants in that group so a timeout kills them too.
+        start_new_session=not env.get("FLAGSPARSE_OPTEST_DELIVERY_DIR") or timeout > 0,
     )
     timed_out = False
     try:
@@ -3256,7 +3261,7 @@ def run_performance(
     *,
     project_root: Path,
     op: str,
-    gpu_id: int,
+    gpu_id: int | None,
     template: tuple[str, ...] | None,
     op_dir: Path,
     benchmark_input: Path | None,
@@ -4294,11 +4299,15 @@ def _delivery_performance_phase(
     return result
 
 
-def _delivery_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
+def _delivery_results(
+    results: list[dict[str, object]],
+    *,
+    variants: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     """Project group-level runner results onto the fixed delivery registry."""
     by_operator = {str(result.get("operator")): result for result in results}
     projected: list[dict[str, object]] = []
-    for variant in load_delivery_variants():
+    for variant in load_delivery_variants() if variants is None else variants:
         parent = by_operator.get(variant["operator"])
         result: dict[str, object] = {
             "operator": variant["id"],

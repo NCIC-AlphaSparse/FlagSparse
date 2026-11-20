@@ -3,6 +3,18 @@
 `FLAGSPARSE_BACKEND=rocm`（通常能自动识别）。环境搭建、交付复现见 [`../DCU.md`](../DCU.md)。背景见
 本目录 [`README.md`](README.md)。
 
+## optest 验证
+
+海光 BW1000 的 optest 真机验证待完成。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `hygon`，PyTorch 能看到 HIP 设备。需要核对 hipSPARSE 基线时，再确认当前环境可导入 `hip`。先用单卡定向验证 CSR SpMV。
+
+```bash
+FLAGSPARSE_BACKEND=rocm python -m tools.run_optest --delivery --gpus 0 --quick \
+  --ops spmv_csr_f32_int_non --benchmark-input tests/data/wave.mtx \
+  --dump-output --output-dir pytest_results_optest_hygon
+```
+
+核对设备编号和 `summary.json` 的厂商信息，确认有精度通过用例和有效的 FlagSparse 时延。性能日志里分别核对 hipSPARSE 或 PyTorch 基线。此命令由 optest 按 `--gpus` 为海光子进程设置 `HIP_VISIBLE_DEVICES`，卡号按探测结果填写。
+
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（

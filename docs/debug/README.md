@@ -1,5 +1,48 @@
 # 调试手册：交付变体注册表（现为 105 个），上机要做什么
 
+## FlagOS optest 验证
+
+已在 NVIDIA RTX 5090 上用 `wave.mtx` 验证全部 105 个交付变体，精度和性能各 105 项通过，共记录 397 组性能测量。当前仓库的 [optest 工作流](../../.github/workflows/optest.yml)配置为在 NVIDIA runner 上使用 10 个交付矩阵。远端工作流和其他厂商的 optest 真机验证待完成。
+
+### 测试环境和设备
+
+先按各后端主文档准备厂商 Torch、Triton 或 FlagTree，以及测试需要的基线库。在厂商 Python 环境中，从仓库根目录安装 optest 和公共测试依赖。NVIDIA CUDA 12 使用 `.[test,nvidia]`，其余厂商先使用 `.[test]`。 [NVIDIA 安装说明](../../README_cn.md#flagos-optest-快速验证)
+
+```bash
+uv pip install --reinstall-package pytest -e '.[test]' -r tools/ci/requirements-optest.txt
+flagos-gpu-check --format json
+```
+
+核对 `vendor`、`device` 和 `runtime`，从 `available_gpus` 取一个设备编号传给 `--gpus`。各示例用指定卡号说明跑法，执行时以本机探测结果为准。`FLAGOS_GPU_VENDOR` 与 `FLAGSPARSE_BACKEND` 的对应关系见 [optest 启动入口](../../tools/run_optest.py)。
+
+### 跑法和结果检查
+
+- 首轮用 `--benchmark-input tests/data/wave.mtx` 和 `--ops` 指定一个或两个交付变体。定向通过后，省略这两个选项即可运行 105 个变体和清单中的 10 个矩阵。
+- 在 `summary.json` 核对 `env.flagsparse.vendor`、`env.flagsparse.device` 和 `result` 下的变体 ID。通过时两个阶段的 `status` 均为 `Passed`，`accuracy.passed` 大于 0，`performance.data` 有有效的 FlagSparse 时延。全量结果应包含清单中的 105 个 ID。 [交付清单](../../conf/operators.yaml)
+- `parent_summary.json` 及父算子目录保留原始测试报告。传 `--dump-output` 可保存 stdout/stderr。优先用这些日志区分设备探测、精度参考、编译和性能基线问题。
+- optest 入口验证 Python 精度和性能链路。各厂商原有交付命令里的 C API 基线、H800 折算及专用参数仍按后文各自的跑法验证。
+
+```bash
+python -m tools.run_optest --delivery --gpus 0 --quick \
+  --benchmark-input tests/data/wave.mtx --dump-output \
+  --output-dir pytest_results_optest_delivery_wave
+flagos-psum-html pytest_results_optest_delivery_wave \
+  -o pytest_results_optest_delivery_wave/result.html
+```
+
+### 各后端验证入口
+
+| 厂商 | optest 验证 |
+|---|---|
+| NVIDIA | 上面的单矩阵命令已在 RTX 5090 上通过 |
+| 海光 DCU | [DCU](DCU.md#optest-验证) |
+| 沐曦 MACA | [MACA](MACA.md#optest-验证) |
+| 摩尔线程 MUSA | [MUSA](MUSA.md#optest-验证) |
+| 天数智芯 Iluvatar | [Iluvatar](ILUVATAR.md#optest-验证) |
+| 昇腾 Ascend | [Ascend](ASCEND.md#optest-验证) |
+| 昆仑芯 XPU | 待验证。按 [XPU 环境自检](../XPU.md) 确认插件及设备可用，核对 `kunlunxin → xpu`，先用上述命令加 `--ops gather_f32_int` |
+| 燧原 GCU | 待验证。核对 `enflame → gcu` 和 `torch_gcu` 设备可用性，先用上述命令加 `--ops gather_f32_int`，记录精度结果及性能能力探测状态 |
+
 ## 统一命令（2026-11-03 起，所有后端同一行）
 
 ```bash

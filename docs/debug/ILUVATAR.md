@@ -6,6 +6,20 @@
 > SELL / COO 的优化任务（瓶颈探针 `tools/biv_spmv_probe.py`、`prepare_spmv_sell` 的 A/B 命令和交给 Codex 的 prompt）
 > 见 [`ILUVATAR_SELL_COO_PLAN.md`](ILUVATAR_SELL_COO_PLAN.md) 第 9 节。
 
+## optest 验证
+
+BI-V150 的 optest 真机验证待完成。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `iluvatar`，CoreX 的 PyTorch、FlagTree 和 CuPy 均可用。首轮选择 FP32、int32、无转置的 CSR 用例，便于核对 CoreX 基线。
+
+```bash
+FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python -m tools.run_optest --delivery --gpus 0 --quick \
+  --ops spmv_csr_f32_int_non,spmm_csr_f32_int_non_non_row \
+  --benchmark-input tests/data/wave.mtx --dump-output \
+  --output-dir pytest_results_optest_iluvatar
+```
+
+核对设备为 BI-V150、两个变体均出现在报告中，并在性能报告里检查基线来源和校验状态。扩大到全量时单独记录 FP64、复数及混合精度的失败、跳过或缺测项。下文旧交付入口的 FP64 筛选和 H800 折算参数适用于该入口。
+
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（

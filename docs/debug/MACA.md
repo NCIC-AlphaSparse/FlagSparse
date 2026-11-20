@@ -3,6 +3,20 @@
 `FLAGSPARSE_BACKEND=metax`。环境搭建、交付复现见 [`../MACA.md`](../MACA.md)。背景见本目录
 [`README.md`](README.md)。
 
+## optest 验证
+
+C550 的 optest 真机验证待完成。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `metax`，设备为 C550。先用单矩阵验证 CSR SpMV 和 SDDMM，使用本机 PyTorch 对照。
+
+```bash
+FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch \
+  python -m tools.run_optest --delivery --gpus 0 --quick \
+  --ops spmv_csr_f32_int_non,sddmm_csr_f32_int_non_non_row \
+  --benchmark-input tests/data/wave.mtx --dump-output \
+  --output-dir pytest_results_optest_metax
+```
+
+确认两个变体分别出现在 `summary.json` 中。核对 SDDMM 的基线来源及校验结果。若 `sampled_addmm` 对照异常，查看父算子报告里的备用 PyTorch 计算路径和基线失败原因。
+
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。2026-11-03 起所有后端用同一行命令（

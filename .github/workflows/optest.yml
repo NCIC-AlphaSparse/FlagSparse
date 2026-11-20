@@ -1,0 +1,75 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: FlagSparse optest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nvidia-delivery:
+    runs-on: test-flagsparse
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install optest in the GPU runner environment
+        shell: bash
+        run: |
+          venv="${RUNNER_TEMP}/flagsparse-optest-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3.12 -m venv --system-site-packages "$venv"
+          "$venv/bin/python" -m pip install 'uv>=0.11.30'
+          "$venv/bin/python" -m uv pip install --python "$venv/bin/python" \
+            --reinstall-package pytest -e '.[test,nvidia]' -r tools/ci/requirements-optest.txt
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run the optest delivery suite
+        shell: bash
+        run: |
+          flagos-gpu-check --vendor nvidia --format json --output gpu-status.json
+          gpu=$(python -c 'import json; print(json.load(open("gpu-status.json"))["available_gpus"].split(",")[0])')
+          python -m tools.run_optest --gpus "$gpu" --delivery --quick \
+            --dump-output --output-dir pytest_results_optest_delivery
+
+      - name: Check all delivery variants are reported
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from tools.delivery_variants import load_delivery_variants
+
+          report = json.loads(Path('pytest_results_optest_delivery/summary.json').read_text())
+          expected = {variant['id'] for variant in load_delivery_variants()}
+          actual = set(report['result'])
+          if actual != expected:
+              raise SystemExit(f'Missing {sorted(expected - actual)}. Unexpected {sorted(actual - expected)}.')
+          PY
+
+      - name: Generate the HTML report
+        if: ${{ !cancelled() && hashFiles('pytest_results_optest_delivery/summary.json') != '' }}
+        run: |
+          flagos-psum-html pytest_results_optest_delivery -o pytest_results_optest_delivery/result.html
+
+      - name: Upload optest results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: optest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            gpu-status.json
+            pytest_results_optest_delivery/

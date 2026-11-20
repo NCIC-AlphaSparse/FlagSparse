@@ -35,6 +35,19 @@ ASIC 跨精度下溢模式已单独调查，验证与复测见
 今天已经做了一部分代码级别的工作，但还有明确分三档、工作量差异很大的剩余任务，不是跑一条命令就能
 验完的。`../ASCEND.md`"现在是 65 个变体"一节有同样内容的简版，这里是给要上机干活的人看的任务清单。
 
+## optest 验证
+
+910B 的 optest 真机验证待完成。先加载 [CANN 环境](../ASCEND.md)，确认 `torch_npu` 可用，再按 [公共步骤](README.md#flagos-optest-验证)安装。核对 `flagos-gpu-check` 的厂商为 `ascend`，从可用设备里选一张卡。下面以 6 号卡为例。
+
+```bash
+FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch \
+  python -m tools.run_optest --delivery --gpus 6 --quick \
+  --ops gather_f32_int,spmv_csr_f32_int_non --benchmark-input tests/data/wave.mtx \
+  --dump-output --output-dir pytest_results_optest_ascend
+```
+
+核对报告中的设备类型为 `npu`，并检查精度用例、FlagSparse 时延和 PyTorch-NPU 基线。若报告出现缺测或失败，先从父算子日志定位是 NPU 参考、Triton 编译还是性能入口问题。对应的昇腾专用探针和完整交付命令见下文。
+
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。按约定，`ASCEND_Q4_VARIANTS` 要等 NPU 真机

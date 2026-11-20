@@ -53,16 +53,13 @@ def test_summary_for_plot_entrypoint_exists():
 
 
 def test_benchmark_pytest_json_record_plugin_exists():
-    text = BENCHMARK_CONFTEST.read_text(encoding="utf-8")
-    for snippet in [
-        '"--record"',
-        '"--output"',
-        "def update_result",
-        "RECORD_JSON",
-        "pytest_terminal_summary",
-        "benchmark_result.json",
-    ]:
-        assert snippet in text
+    shared = (PROJECT_ROOT / "conftest.py").read_text(encoding="utf-8")
+    benchmark = BENCHMARK_CONFTEST.read_text(encoding="utf-8")
+    assert '"--record"' in shared
+    assert '"--output"' in shared
+    assert "def record_benchmark" in benchmark
+    assert "pytest_terminal_summary" in benchmark
+    assert "benchmark_result.json" in benchmark
 
 
 def test_spgemm_csv_is_written_incrementally():
