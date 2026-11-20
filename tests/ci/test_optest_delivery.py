@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from tools.delivery_variants import load_delivery_matrices, load_delivery_variants
+from tools import delivery_variants
 from tools.optest_delivery import _write_delivery_summary, run_delivery
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_optest_delivery_schedules_once_per_parent():
     catalog = yaml.safe_load((ROOT / "conf/operators.yaml").read_text())["ops"]
-    variants = load_delivery_variants()
+    variants = delivery_variants.load_delivery_variants()
     seen = []
     optest = SimpleNamespace(ROOT=ROOT, CFG=SimpleNamespace())
     optest.get_ops_from_inventory = lambda: catalog
@@ -32,7 +32,9 @@ def test_optest_delivery_schedules_once_per_parent():
     def main():
         seen.extend(optest.get_ops_to_test())
         inputs = Path(os.environ["FLAGSPARSE_OPTEST_BENCHMARK_INPUT"])
-        assert {p.stem for p in inputs.glob("*.mtx")} == set(load_delivery_matrices())
+        assert {p.stem for p in inputs.glob("*.mtx")} == set(
+            delivery_variants.load_delivery_matrices()
+        )
         return 3
 
     optest.get_ops_to_test = select
@@ -46,7 +48,8 @@ def test_optest_delivery_schedules_once_per_parent():
 def test_optest_delivery_keeps_classic_and_tagged_variants_distinct(tmp_path, missing):
     op = "spmv_csr"
     classic, transposed = "spmv_csr_f32_int_non", "spmv_csr_f32_int_trans"
-    variants = [v for v in load_delivery_variants() if v["id"] in {classic, transposed}]
+    ids = {classic, transposed}
+    variants = [v for v in delivery_variants.load_delivery_variants() if v["id"] in ids]
     accuracy_path = tmp_path / "accuracy_result.json"
     accuracy_path.write_text(
         json.dumps(
