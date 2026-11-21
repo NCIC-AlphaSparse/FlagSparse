@@ -8,7 +8,9 @@
 
 ## optest 验证
 
-BI-V150 的 optest 真机验证待完成。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `iluvatar`，CoreX 的 PyTorch、FlagTree 和 CuPy 均可用。首轮选择 FP32、int32、无转置的 CSR 用例，便于核对 CoreX 基线。
+2026-11-20 已在 BI-V150 / CoreX 4.4.0 上跑通下列两个 FP32 CSR 变体的 optest 精度与性能，`wave.mtx` 定向运行退出码为 0。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `iluvatar`，CoreX 的 PyTorch、FlagTree 和 CuPy 均可用。首轮选择 FP32、int32、无转置的 CSR 用例，便于核对 CoreX 基线。
+
+建议用 `python3 -m venv --system-site-packages` 建独立环境，继承厂商 Torch/FlagTree/CuPy，再安装公共测试依赖。本机 CoreX 的 `PYTHONPATH` 优先加载 pytest 9.0.2；独立环境安装 pytest 9.2.0 时，其入口会调用旧模块没有的 `_console_main`，须把独立环境中的 pytest 同样固定为 9.0.2。环境中的 NumPy/SciPy 固定为原有 1.26.4/1.17.0，避免升级影响厂商 CuPy。
 
 ```bash
 FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
@@ -18,7 +20,35 @@ FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
   --output-dir pytest_results_optest_iluvatar
 ```
 
-核对设备为 BI-V150、两个变体均出现在报告中，并在性能报告里检查基线来源和校验状态。扩大到全量时单独记录 FP64、复数及混合精度的失败、跳过或缺测项。下文旧交付入口的 FP64 筛选和 H800 折算参数适用于该入口。
+核对设备为 BI-V150、两个变体均出现在报告中，并在性能报告里检查基线来源和校验状态。扩大到全量时单独记录 FP64、复数及混合精度的失败、跳过或缺测项。optest 现支持 `--h800-reference`，可在基准子进程生成报告前补齐折算基线。
+
+optest 按父算子调度，`--ops` 只选择最终交付变体，并不把共享精度和基准测试收窄为该变体的 dtype。最初即使只选 FP32 CSR，也会执行 FP64 atomic 用例而触发 LLVM 错误，SpMM 的 FP64/complex128 还会返回全零。当前 optest delivery 的精度收集与基准参数复用 `run_flagsparse_delivery.py` 的 Iluvatar 类型限制，保留 q4 混合精度用例；H800 折算通过参数显式启用。FP64/complex128 的缺测不能记为通过。
+
+定向通过后，去掉 `--ops` 和 `--benchmark-input`，运行全部 105 个注册变体与 10 个矩阵：
+
+```bash
+FLAGSPARSE_BACKEND=iluvatar FLAGSPARSE_ILUVATAR_VENDOR=cupy_cusparse \
+  python -m tools.run_optest --delivery --gpus 0 --quick --dump-output \
+  --h800-reference --vendor-card iluvatar-biv150 \
+  --output-dir pytest_results_optest_iluvatar_105
+```
+
+折算沿用 runner 的实现：H800 已验证 cuSPARSE 时延（缺失时使用已验证 PyTorch 时延）乘以 `3050/1150`，再除以本机 FlagSparse 实测时延。已有有效本机基线不变；未匹配参考或失败记录仍保留缺测/失败。`summary.json` 的 `scaled_baseline` 记录配置，性能 dtype 分组的 `baseline` 标注来源。报告的 `Passed` 表示测试状态，不代表平均比值已经达到 0.8。
+
+2026-11-20 原始全量未启用折算；复用原始时延的离线核对补齐 65 项后，共 96 项有比值、95 项平均比值达到 0.8，`spmv_csc_f32_int_trans` 为 0.749219。该离线报告位于 `results_optest_iluvatar_20261120_2248/h800_supplement/`，不替代下述原始运行状态。
+
+H800 接入后的 BI-V150 定向验证保存在 `results_optest_iluvatar_20261120_2248/`。`smoke_h800/` 中 SELL f16 和 CSR f32 的精度与性能均通过，退出码为 0。SELL 的 wave 行标注 `h800_scaled`。CSR 的本机厂商基线校验失败，保留原始 `vendor_status=FAIL` 并回退至 H800。`smoke_h800_local/` 中 gather f32 的有效本机基线保持原值，退出码为 0。
+
+2026-11-21 在 BI-V150 上用 `--h800-reference --vendor-card iluvatar-biv150` 完成全量运行，105 个交付 ID 均出现在 `results_optest_105_h800/full/summary.json`。精度和性能各有 96 项 `Passed`，其余 9 项（7 项 FP64、2 项 complex128）均为 `NotFound`，严格模式退出码为 1。该报告生成于性能汇总的 dtype 过滤修正之前，核对性能比值时按各交付变体指定的 dtype 取值。
+
+2026-11-20 的环境、启动日志和原始报告保存在 `results_optest_iluvatar_20261120_2248/`，其中 `smoke_profile/` 是通过的定向验证，`full/` 是未启用折算的全量测试。该次报告包含 105 个 ID，精度 96 项 `Passed`、9 项 `NotFound`，实际精度样例 289 项通过、678 项跳过。源码与输入哈希校验通过，runner 退出码为 1。该次全量报告存在以下缺口。
+
+- 仅 31 个变体在汇总中有有效 FlagSparse 时延；65 个非 FP64 变体缺时延，另外 9 个是平台限制导致的缺测。
+- COO SpMM、SELL SpMV、CSC SpMM、SpGEMM、geam 五个父算子的性能包装断言报 `recorded no measurements`。无本机基线时，CSV 中实际存在的 `ms`/`triton_ms` 未被映射到 `latency`，不是这些行都没有执行。原始记录已保存到 `raw_phases/`。
+- `summary.json` 的交付投影仍显示 performance 96 Passed、9 NotFound，必须同时核对有效时延与 `parent_summary.json`；入口最终检查将 74 个缺测或缺时延项报为 incomplete。
+- 原始性能记录仍有 COO/CSR SpMM 的 `ASIC_680ks + float16` 两条 FAIL/NaN，不能用汇总 Passed 掩盖。
+
+以上是未启用折算的原始全量结果；当时只接入已有 Iluvatar 类型限制。新增 H800 参数复用原有折算逻辑，未修改算子实现、精度容差或性能计时方法。
 
 ## 2026-11-02 复测计划：105 变体
 

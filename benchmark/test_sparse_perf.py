@@ -16,6 +16,7 @@
 
 import json
 import os
+import shlex
 from pathlib import Path
 
 import pytest
@@ -63,12 +64,18 @@ def _benchmark_cases():
 
 @pytest.mark.parametrize("op", _benchmark_cases())
 def test_core_performance(op, tmp_path, record_benchmark, monkeypatch):
+    import run_flagsparse_pytest as runner
     from flagsparse.sparse_operations import _common as runtime
 
     if not runtime._accel_module().is_available():
         pytest.skip("An accelerator is required for FlagSparse performance tests")
     backend = runtime._backend_name()
     monkeypatch.setenv("FLAGSPARSE_BACKEND", backend)
+    monkeypatch.setattr(
+        runner,
+        "_SCALED_BASELINE",
+        json.loads(os.environ.get("FLAGSPARSE_OPTEST_SCALED_BASELINE", "null")),
+    )
     if DELIVERY_DIR:
         benchmark_input = Path(os.environ["FLAGSPARSE_OPTEST_BENCHMARK_INPUT"])
         extra_args = (
@@ -76,6 +83,13 @@ def test_core_performance(op, tmp_path, record_benchmark, monkeypatch):
             if _uses_generic_benchmark_script(op)
             else []
         )
+        if backend == "iluvatar":
+            from run_flagsparse_delivery import PROFILES
+
+            for setting in PROFILES[backend].op_benchmark_args:
+                operator, _, arguments = setting.partition("=")
+                if operator == op:
+                    extra_args.extend(shlex.split(arguments))
         timeout = 0  # Optest enforces the deadline for the whole benchmark phase.
     else:
         benchmark_input = None if op == "gather" else CORE_MATRIX

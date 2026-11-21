@@ -2,7 +2,9 @@
 
 ## FlagOS optest 验证
 
-已在 NVIDIA RTX 5090 上用 `wave.mtx` 验证全部 105 个交付变体，精度和性能各 105 项通过，共记录 397 组性能测量。当前仓库的 [optest 工作流](../../.github/workflows/optest.yml)配置为在 NVIDIA runner 上使用 10 个交付矩阵。远端工作流和其他厂商的 optest 真机验证待完成。
+已在 NVIDIA RTX 5090 上用 `wave.mtx` 验证全部 105 个交付变体，精度和性能各 105 项通过，共记录 397 组性能测量。当前仓库的 [optest 工作流](../../.github/workflows/optest.yml)配置为在 NVIDIA runner 上使用 10 个交付矩阵。
+
+2026-11-21 在 Iluvatar BI-V150 上启用 `--h800-reference` 运行全部 105 项。精度和性能各有 96 项通过、9 项缺测，严格模式退出码为 1。 [Iluvatar 实测记录](ILUVATAR.md#optest-验证)
 
 ### 测试环境和设备
 
@@ -20,7 +22,7 @@ flagos-gpu-check --format json
 - 首轮用 `--benchmark-input tests/data/wave.mtx` 和 `--ops` 指定一个或两个交付变体。定向通过后，省略这两个选项即可运行 105 个变体和清单中的 10 个矩阵。
 - 在 `summary.json` 核对 `env.flagsparse.vendor`、`env.flagsparse.device` 和 `result` 下的变体 ID。通过时两个阶段的 `status` 均为 `Passed`，`accuracy.passed` 大于 0，`performance.data` 有有效的 FlagSparse 时延。全量结果应包含清单中的 105 个 ID。 [交付清单](../../conf/operators.yaml)
 - `parent_summary.json` 及父算子目录保留原始测试报告。传 `--dump-output` 可保存 stdout/stderr。优先用这些日志区分设备探测、精度参考、编译和性能基线问题。
-- optest 入口验证 Python 精度和性能链路。各厂商原有交付命令里的 C API 基线、H800 折算及专用参数仍按后文各自的跑法验证。
+- optest 入口验证 Python 精度和性能链路。可加 `--h800-reference` 补充缺失基线，默认使用仓库的 `conf/h800_reference.json`；`--vendor-card` 指定目标卡，`--reference-peaks` 指定参考卡峰值表。折算只补缺失项，保留有效本机基线，交付汇总标注 `h800_scaled` 或 `h800_pytorch_scaled`。C API 基线及其他厂商专用参数仍按后文各自的跑法验证。
 
 ```bash
 python -m tools.run_optest --delivery --gpus 0 --quick \

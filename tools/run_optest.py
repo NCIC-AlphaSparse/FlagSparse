@@ -15,8 +15,13 @@
 """Run the pinned FlagOS scheduler with FlagSparse runtime metadata."""
 
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
+from unittest.mock import patch
+
+from tools import baseline_bound
 
 _VENDOR_BACKENDS = {
     "nvidia": "cuda",
@@ -38,6 +43,24 @@ def main():
     )
     parser.add_argument(
         "--benchmark-input", help="Delivery MatrixMarket file or directory."
+    )
+    parser.add_argument(
+        "--h800-reference",
+        nargs="?",
+        const=str(baseline_bound._h800_reference.DEFAULT_PATH),
+        metavar="FILE_OR_DIR",
+        help="Fill missing baselines with scaled H800 times; defaults to the bundled reference.",
+    )
+    parser.add_argument(
+        "--vendor-card",
+        choices=sorted(baseline_bound.VENDOR_BANDWIDTH_GBS),
+        help="Target card for H800 scaling; defaults to the detected backend/card.",
+    )
+    parser.add_argument(
+        "--reference-peaks",
+        default="h800-sxm",
+        choices=sorted(baseline_bound.REFERENCE_PEAKS),
+        help="Reference card peak table for H800 scaling.",
     )
     flags, args = parser.parse_known_args()
     if flags.benchmark_input and not flags.delivery:
@@ -86,13 +109,22 @@ def main():
     flagsparse.vendor_name = vendor
     flagsparse.device = runtime._accel_device_type()
     run_tests._KNOWN_LIBS[:] = [("flagsparse", "FlagSparse")]
-    if flags.delivery:
-        from tools.optest_delivery import run_delivery
+    import run_flagsparse_pytest as runner
 
-        if not any(arg.split("=", 1)[0] == "--stages" for arg in args):
-            sys.argv.extend(("--stages", "all"))
-        return run_delivery(run_tests, flags.benchmark_input)
-    return run_tests.main()
+    if flags.h800_reference:
+        flags.h800_reference = str(Path(flags.h800_reference).resolve())
+    runner._configure_scaled_baseline(parser, flags, {})
+    with patch.dict(
+        os.environ,
+        {"FLAGSPARSE_OPTEST_SCALED_BASELINE": json.dumps(runner._SCALED_BASELINE)},
+    ):
+        if flags.delivery:
+            from tools.optest_delivery import run_delivery
+
+            if not any(arg.split("=", 1)[0] == "--stages" for arg in args):
+                sys.argv.extend(("--stages", "all"))
+            return run_delivery(run_tests, flags.benchmark_input)
+        return run_tests.main()
 
 
 if __name__ == "__main__":

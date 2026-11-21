@@ -14,6 +14,8 @@
 
 """Accuracy collection and result reports for the FlagSparse pytest suites."""
 
+import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -42,6 +44,17 @@ def pytest_configure(config):
     global QUICK_MODE
     QUICK_MODE = config.getoption("--quick") or config.getoption("--mode") == "quick"
     config._flagsparse_accuracy_results = {}
+    if (
+        os.environ.get("FLAGSPARSE_OPTEST_DELIVERY_DIR")
+        and os.environ.get("FLAGSPARSE_BACKEND") == "iluvatar"
+    ):
+        from run_flagsparse_delivery import PROFILES
+
+        selection = shlex.split(PROFILES["iluvatar"].pytest_args)[1]
+        previous = config.option.keyword
+        config.option.keyword = (
+            f"({previous}) and ({selection})" if previous else selection
+        )
 
 
 def pytest_ignore_collect(collection_path, config):

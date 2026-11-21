@@ -59,15 +59,22 @@ def _write_delivery_summary(optest, variants, delivery_dir):
                 entry[phase]["exit_code"] = parent_phase["exit_code"]
             if reason := variant[phase].get("reason"):
                 entry[phase]["reason"] = reason
-        if records := variant["performance"].get("records"):
+        performance = variant["performance"]
+        if records := performance.get("records"):
             # Keep missing baselines null and give each delivered case its shape.
+            selected_dtypes = performance.get("data", {})
             entry["performance"]["data"] = {
                 _flag_gems_dtype(dtype): data
                 for dtype, data in _flaggems_perf_data(records).items()
+                if _flag_gems_dtype(dtype) in selected_dtypes
             }
         results[variant["operator"]] = entry
 
     summary = dict(parent_summary, result=results, total_ops=len(results))
+    if scaled_baseline := json.loads(
+        os.environ.get("FLAGSPARSE_OPTEST_SCALED_BASELINE", "null")
+    ):
+        summary["scaled_baseline"] = scaled_baseline
     for phase in ("accuracy", "performance"):
         summary[f"{phase}_counts"] = optest.count_op_statuses(results, phase)
     pending = summary_path.with_suffix(".tmp")

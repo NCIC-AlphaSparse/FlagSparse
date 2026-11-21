@@ -5,10 +5,11 @@
 
 ## optest 验证
 
-C550 的 optest 真机验证待完成。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `metax`，设备为 C550。先用单矩阵验证 CSR SpMV 和 SDDMM，使用本机 PyTorch 对照。
+C550 的 optest 真机验证记录见本文末尾 2026-11-20 一节。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `metax`，设备为 C550。先用单矩阵验证 CSR SpMV 和 SDDMM，使用本机 PyTorch 对照。
 
 ```bash
 FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=torch \
+  PYTORCH_CONFIG_STREAM_POOLS=32,2,2 \
   python -m tools.run_optest --delivery --gpus 0 --quick \
   --ops spmv_csr_f32_int_non,sddmm_csr_f32_int_non_non_row \
   --benchmark-input tests/data/wave.mtx --dump-output \
@@ -927,3 +928,47 @@ env -u FLAGSPARSE_ACCURACY_REFERENCE \
 校验文件。包含相对上游 17448bd 的 5 个修改文件及可应用补丁、上述最新完整
 105 项原始结果、优化后三轮定向结果及日志、探索/回归证据、文件清单和 SHA256。
 包内说明逐组标明代码阶段，不将优化前完整结果与优化后定向结果混为全量验证。
+
+## 2026-11-20：optest 安装、105 项首轮与 17 项流池修复复测
+
+本轮验证使用源码 `1bdf67d`，本机 C550，驱动 3.8.1、SDK 3.8.2.6、Python 3.12.14、
+Torch `2.10.0+metax3.8.1.0`、Triton `3.6.0+metax3.8.1.0`。
+optest 按固定提交 `2c5027b56c0fa5cdb3e61e7321d08a4b57425e6c` 安装。
+使用本机 PyTorch baseline，`FLAGSPARSE_MACA_VENDOR=torch`。
+
+首轮 `pytest_results_optest_metax_delivery_20261120/`：105 个预期 ID 均出现，
+精度 99 Passed / 6 Error，性能 94 Passed / 11 NotFound，88 项双阶段通过。
+Gather、Scatter 性能及 SpVV 多流精度停滞后被人工终止；原结果保留，没有改写为通过。
+
+### 2026-11-20 `docs/MACA.md`::每次开工的环境、本文 optest 命令
+
+- 改了什么：为本机 metax PyTorch 增加启动前的环境配置
+  `PYTORCH_CONFIG_STREAM_POOLS=32,2,2`，记录原因和复测结果。未改算子、精度用例、
+  baseline、容差或 graph 计时实现。
+- 为什么改（附报错原文）：独立复现的堆栈停在
+  `torch/cuda/streams.py:41::__new__` → `_common.py::_benchmark_cuda_graph_op`
+  的 `capture_stream = _ACCEL.Stream()`。诊断包装器记录首次建流按 0、-1、-2
+  轮流创建默认的各 32 条流；第 12 次调用（第 4 条 -2 流）开始等待。
+  加诊断限时后输出 `[mxkwCreateQueueBlock]ioctl create queue block timeout -1`。
+  单独创建 40 条普通优先级原生流正常，说明不足的是高优先级队列。
+  改为 32、2、2 后保留标准普通流池，并将另外两个优先级各限制为 2 条。
+  该变量在 PyTorch 库加载时读取，必须在启动 Python 前设置。
+- 怎么验证的：先验证两个不同 stream、0/-1/-2 优先级计算及 graph batch=100 的
+  capture/replay，再用原 optest `--delivery --quick` 定向重跑上述 17 个 ID。
+  结果目录 `pytest_results_optest_metax_stream_fix_20261120/`：退出码 0，
+  精度 **17/17 Passed**，性能 **17/17 Passed**，missing=0；optest 耗时 2:38，
+  含初始化的外层耗时约 174 秒。Gather 14、Scatter 28、SpVV 190 个精度用例通过；
+  SpVV 的 float32/complex64 两个多流用例均实际 Passed。另有 208 个 MUSA 专用用例
+  按原有 `MUSA required` 条件跳过。原始性能 68 行全 PASS（20/24/24），每个目标
+  变体恰好 4 个 int32 合成规模，有正数且有限的 Triton/PyTorch 时间。
+  Gather/Scatter/SpVV 使用的是脚本原有合成输入，不是 10 个稀疏矩阵。
+- 其他后端是否也需要：否；这是本机 metax PyTorch / MACA 的启动配置，其他软件栈未验证。
+
+结果目录包含 `REPORT.md`、`summary.json`、`parent_summary.json`、`result.html`、
+`variant_status.csv`、`validation.json`、原始性能 CSV、精度产物和流创建诊断日志。
+本轮仅补测 17 项，不能称为修复后单轮 105 项全量通过。
+
+当时的 `summary.json` 中有 11 个 Gather/Scatter 交付变体混入了其他 dtype 的性能数据。
+核对这次历史报告时，各变体的测量覆盖及加速比以 `variant_status.csv` 为准，该文件从原始
+CSV 按 dtype 分别计算。提交 `a27c46a` 修正了交付汇总逻辑，新生成的 `summary.json` 按
+交付变体的 dtype 筛选性能数据。原始 68 行性能结果和精度结果仍以该次真机记录为准。
