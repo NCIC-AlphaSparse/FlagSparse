@@ -218,7 +218,8 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
         return 0.0
     diff = torch.abs(actual - reference).to(torch.float64)
     tol = (atol + rtol * torch.abs(reference)).to(torch.float64)
-    return float(torch.max(diff / tol).item())
+    ratio = float(torch.max(diff / tol).item())
+    return ratio if math.isfinite(ratio) else float("inf")
 
 
 def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
@@ -244,12 +245,6 @@ def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
     )
     cols = indices[start:end].to(torch.int64)
     vals = data[start:end]
-    # Sparse products may retain structural entries whose value is exactly
-    # zero (explicit input zeros or cancellation). SciPy drops some of them.
-    # Compare the mathematical sparse result, keeping every nonzero entry and
-    # the existing numerical tolerances. Do this per block to bound memory.
-    nonzero = vals != 0
-    rows, cols, vals = rows[nonzero], cols[nonzero], vals[nonzero]
     keys = rows * max(1, int(n_cols)) + cols
     order = torch.argsort(keys)
     return keys[order], vals[order]
@@ -304,15 +299,21 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
                     continue
                 raise
 
-        if c_keys.numel() != r_keys.numel() or not torch.equal(c_keys, r_keys):
-            return {
-                "pattern_ok": False,
-                "pass": False,
-                "err_ratio": float("inf"),
-                "max_abs_error": float("inf"),
-                "max_relative_error": float("inf"),
-                "reason": f"sparsity pattern mismatch in rows [{row}, {row + chunk_rows})",
-            }
+        if not torch.equal(c_keys, r_keys):
+            # Some libraries omit explicit zeros. Drop only zeros absent from the
+            # other structure: a shared zero and subnormal are a numerical pair.
+            c_keep = (c_vals != 0) | torch.isin(c_keys, r_keys)
+            r_keep = (r_vals != 0) | torch.isin(r_keys, c_keys)
+            if not torch.equal(c_keys[c_keep], r_keys[r_keep]):
+                return {
+                    "pattern_ok": False,
+                    "pass": False,
+                    "err_ratio": float("inf"),
+                    "max_abs_error": float("inf"),
+                    "max_relative_error": float("inf"),
+                    "reason": f"sparsity pattern mismatch in rows [{row}, {row + chunk_rows})",
+                }
+            c_vals, r_vals = c_vals[c_keep], r_vals[r_keep]
         if c_vals.numel() > 0:
             err_ratio = max(
                 err_ratio, _allclose_error_ratio(c_vals, r_vals, atol, rtol)
@@ -323,7 +324,7 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
         row += chunk_rows
 
     max_rel = 0.0 if ref_max == 0.0 else max_abs / ref_max
-    ok = (not torch.isnan(torch.tensor(err_ratio)).item()) and err_ratio <= 1.0
+    ok = err_ratio <= 1.0
     return {
         "pattern_ok": True,
         "pass": bool(ok),

@@ -314,6 +314,42 @@ tests/test_spmv_csr.py tests/data --alg compare --warmup 5 --iters 20
 5. docs/debug/DCU.md "实机改动记录"一节的内容。
 ````
 
+## 2026-11-22 K100 实机复测
+
+海光 K100（Triton target `hip gfx926 64`），FlagTree `0.5.1+hcu3.1`、Triton `3.1.0`、PyTorch `2.10.0`，
+驱动 `6.2.30`，DTK `26.04-DCC2602-0317`。通过 `python -m tools.run_optest --delivery --quick`
+在 8 张卡上按父算子并行调度。耗时 0:20:00，结果保存在 `pytest_results_optest_hcu31_acceptance`。
+
+- 6 个原失败变体的精度和性能阶段全部通过。CSC SpMM 父算子覆盖 290 条性能用例，
+  其中 `amazon0601.mtx` 的 FP32、int64、共轭转置用例与 FP32 参考值一致。
+- 原失败变体中的 `spgemm_csr_f32_int_non_non` 通过了正确性检查，平均加速比为 `0.093×`。
+- 20 个调优变体全部通过精度和性能检查。加速比沿用 optest 的本机基线，按每个变体的全部性能用例取算术平均。
+  每个变体的平均值均严格大于 `0.8×`，其中仍有 36 个单独用例低于 `0.8×`。
+- complex64 CSR SpGEMM 的 10 张矩阵均通过校验，性能基线为本机 PyTorch。
+
+| 变体 | 有效性能用例 | 调优前 | 复测 | 单项低于 0.8× |
+| --- | ---: | ---: | ---: | ---: |
+| `gather_f16_int` | 4 | 0.646× | 1.553× | 0 |
+| `gather_f32_int` | 4 | 0.731× | 1.643× | 0 |
+| `gather_c32_int` | 4 | 0.671× | 1.662× | 0 |
+| `gather_c64_int` | 4 | 0.647× | 1.722× | 0 |
+| `spvv_f16f32_int_non` | 4 | 0.596× | 1.444× | 0 |
+| `spvv_c32_int_conj` | 4 | 0.796× | 1.399× | 0 |
+| `spvv_i8i32_int_non` | 4 | 0.638× | 1.712× | 0 |
+| `spmv_coo_c32_int_non` | 10 | 0.675× | 1.018× | 4 |
+| `axpby_f32_int` | 4 | 0.749× | 1.743× | 0 |
+| `axpby_c32_int` | 4 | 0.512× | 1.839× | 0 |
+| `spvv_f32_int_non` | 4 | 0.559× | 1.200× | 0 |
+| `spmv_csc_f32_int_trans` | 10 | 0.184× | 1.012× | 6 |
+| `spvv_c32_int_non` | 4 | 0.622× | 1.000× | 0 |
+| `spmv_csc_c32_int_conj` | 10 | 0.248× | 1.013× | 5 |
+| `spmv_csc_i8i32_int_non` | 10 | 0.033× | 1.214× | 4 |
+| `spvv_i8f32_int_non` | 4 | 0.558× | 1.476× | 0 |
+| `spmv_csr_f16f32_int_trans` | 10 | 0.418× | 1.092× | 5 |
+| `spmv_coo_f32c32_int_non` | 10 | 0.200× | 1.097× | 5 |
+| `spmv_csr_f32c32_int_trans` | 10 | 0.317× | 1.003× | 6 |
+| `spgemm_csr_c32_int_non_non` | 10 | 0.071× | 0.963× | 1 |
+
 ## 实机改动记录
 
 在这台机器上为了跑通而改过的每一个文件都记在这里，跟着 commit 一起推上来。没改就写"无"，不要留空。
@@ -348,3 +384,52 @@ tests/test_spmv_csr.py tests/data --alg compare --warmup 5 --iters 20
   - 新增测试 `test_spmv_sell_writes_caller_out`。
 - 其他后端是否也需要：SELL 的修复对所有后端都生效；其余改动只在 ROCm 上生效。
 - 待办：HIP graph 回放只在 FlagSparse 一侧，所以 spmv_csr / SELL 的加速比口径和 hipSPARSE 不对等，报数时要注明。
+
+### 2026-11-21 src/flagsparse/sparse_operations/{spmm_csc,_spmm_row_gather}.py
+
+- 海光 K100、FlagTree `0.5.1+hcu3.1` 上，`amazon0601.mtx` 的 FP32、int64、共轭转置用例报 `correctness check failed`，归一化误差为 1.39246。CSC 转置路径按平均列长度选择内核，长列的乘积通过 FP32 原子加归约，同一输入重复执行时误差波动。
+- `_triton_spmm_csc_base_kernel` 在 ROCm FP32 的短列分支检查最长列。超过该分支的非零元分块大小时，由一个程序负责一个输出行中的一组元素。`_spmm_row_gather.compute` 增加累加类型参数，供此路径使用 FP64 乘加并写回 FP32。
+- 同一张矩阵上用 9 个随机种子各运行 3 次，27 次均与转换为 FP32 的参考结果一致。其他后端沿用原来的累加类型。
+
+### 2026-11-21 tests/pytest/test_spmm_csc_accuracy.py
+
+- `test_rocm_spmm_csc_long_column_cancellation` 构造只有一列很长的 CSC 矩阵，用可精确计算的小整数和大数抵消复现归约误差。ROCm 的普通转置和共轭转置均验证输出为 512，其余列为零。
+
+### 2026-11-21 tests/test_spgemm.py 和 tests/ci/test_spgemm_compare.py
+
+- `ASIC_680ks.mtx` 的 PyTorch 比对报 `sparsity pattern mismatch in rows [0, 2048)`。实际 15,941,134 个存储位置全部一致，逐侧删除显式零会把同一位置的零和极小非零值判成结构差异。
+- `_spgemm_compare_metrics` 先对齐存储位置，仅忽略另一侧缺失的显式零，对共有位置使用原有数值容差。CPU 回归测试覆盖双向比较、单侧额外显式零，以及零与 NaN 或无穷大的比较。此修复适用于所有后端的 SpGEMM 基准校验。
+
+### 2026-11-21 src/flagsparse/sparse_operations/spgemm_csr.py 和 tests/pytest/test_spgemm_sddmm_accuracy.py
+
+- K100 的 hipSPARSE 参考结果也报 `sparsity pattern mismatch in rows [0, 2048)`。用 2×2 矩阵复现后，发现设置输出指针后重复调用 `hipsparseSpGEMM_compute` 导致 CSR 行指针全为零。
+- hipSPARSE 路径按 DTK 的 SpGEMM 调用顺序，在设置输出指针后直接调用 `hipsparseSpGEMM_copy`。基准每轮计时包含完整乘法。`test_hipsparse_spgemm_writes_csr_result` 检查结果的行指针和矩阵值。此项只涉及 ROCm 的厂商参考实现。
+
+### 2026-11-21 src/flagsparse/sparse_operations/gather_scatter.py
+
+- ROCm Gather 复用按输出元素分块的索引拷贝内核。复数路径按实部和虚部分量并行读写，保留输入、输出和索引的步长。实机复测覆盖 FP16、FP32、complex64、complex128。
+
+### 2026-11-21 src/flagsparse/sparse_operations/{vector_ops,_vector_rocm,_rocm_launch}.py
+
+- ROCm Axpby 用索引反查表合并稠密缩放和稀疏更新。SpVV 在单次启动中归约，重复调用同一组操作数时可复用编译后的启动函数。保留每次 SpVV 调用独立的输出，Axpby 按索引张量的版本和流判断反查表是否可复用。实机复测覆盖 2 个 Axpby 和 6 个 SpVV 变体。
+
+### 2026-11-21 src/flagsparse/sparse_operations/{spmv_coo,spmv_csc,mixed_spmx,_spmv_rocm}.py
+
+- ROCm SpMV 按非零数排列输出行，每 64 行一组，把同组内相同位置的元素连续存放以合并读请求。对矩阵张量的版本及当前流校验后复用预处理数据。填充开销过大时走原有路径。实机复测覆盖 7 个 COO、CSC、CSR 变体。
+
+### 2026-11-21 src/flagsparse/sparse_operations/{spgemm_csr,_spgemm_rocm}.py
+
+- K100 上的 FlagTree 3.1 缺少 TLE 共享内存接口。complex64 SpGEMM 通过 Triton extern library 在工作组共享内存中累加每行的乘积，再生成 CSR 行指针并压紧结果。每次乘法重新计算输出结构。行长分布不均时采用标准 Triton 的排序归约，哈希表溢出时采用分块展开归约。
+
+### 2026-11-21 tests/pytest/test_spgemm_sddmm_accuracy.py
+
+- `test_k100_spgemm_hash_collision_and_overflow` 覆盖哈希冲突、容量溢出、原地修改输入、输出独立分配，以及重新验证修改后的索引。
+
+### 2026-11-22 src/flagsparse/sparse_operations/{spgemm_csr,_spgemm_rocm}.py
+
+- 将 K100 上的行内共享内存哈希扩展到 FP32，每个槽位仅使用一个 FP32 累加器。行长分布不均时沿用 Triton 行内排序和长行哈希，哈希表溢出时使用分块展开归约。内核按输入张量所在的设备启动。
+- `pytest_results_optest_hcu31_fp32_final` 使用原有 optest 计时方式和本机 hipSPARSE 基线。FP32 CSR SpGEMM 的平均加速比从 `0.093×` 提升到 `1.250×`，10 张矩阵均通过 PyTorch 和 hipSPARSE 校验。9 张矩阵超过 `0.8×`，`ASIC_680ks.mtx` 从 59.56 ms 降到 23.47 ms，加速比为 `0.411×`。同轮 complex64 CSR SpGEMM 也通过复测，平均为 `0.985×`。
+
+### 2026-11-22 tests/pytest/test_spgemm_sddmm_accuracy.py
+
+- 为行内哈希的冲突和溢出回归补充 FP32 参数。相同测试同时覆盖 complex64。另在两张 K100 上验证了当前设备与输入设备不同时的哈希和排序路径。

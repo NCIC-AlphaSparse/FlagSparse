@@ -63,7 +63,7 @@ def _kernel(V, I, P, B, C, M, N, BK, BN, CM, CN,
         tl.store(C + out, real, store_mask)
 
 
-def compute(values, cols, ptr, b, out):
+def compute(values, cols, ptr, b, out, *, acc_dtype=tl.float32):
     m, n = out.shape
     if not m or not n:
         return out
@@ -94,11 +94,12 @@ def compute(values, cols, ptr, b, out):
         batch, lanes = (8, 4) if values.dtype == torch.int8 else (4, 4)
         if values.dtype == torch.complex64:
             batch, lanes = 4, 1
-    acc = tl.int32 if (musa or iluvatar) and values.dtype == torch.int8 and out.dtype == torch.int32 else tl.float32
+    if (musa or iluvatar) and values.dtype == torch.int8 and out.dtype == torch.int32:
+        acc_dtype = tl.int32
     tile_n = min(32, triton.next_power_of_2(n))
     _kernel[(triton.cdiv(m, batch), triton.cdiv(n, tile_n))](
         v, cols, ptr, dense, target, m, n, b.stride(0), b.stride(1),
         out.stride(0), out.stride(1), is_complex, batch, lanes, tile_n,
-        ACC=acc, num_warps=1 if iluvatar else 4, num_stages=1,
+        ACC=acc_dtype, num_warps=1 if iluvatar else 4, num_stages=1,
     )
     return out

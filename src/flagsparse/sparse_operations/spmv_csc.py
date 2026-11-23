@@ -736,6 +736,16 @@ def _triton_spmv_csc_kernel(prepared, x, op_code):
     dtype = prepared.data.dtype
     trans = _spmv_csc_op_transposes(op_code)
     out_len = prepared.n_cols if trans else prepared.n_rows
+    if _is_rocm_runtime() and trans and dtype in (torch.float32, torch.complex64):
+        from . import _spmv_rocm
+
+        result = _spmv_rocm.multiply(
+            prepared.data, prepared.kernel_indices, prepared.kernel_indptr, x,
+            (out_len, prepared.n_rows), "csr", dtype,
+            conjugate=op_code == SPMV_CSC_OP_CONJ_TRANS,
+        )
+        if result is not None:
+            return result
     if (_SPMV_CSC_CUDA and prepared.data.device.type == "cuda" and trans
             and dtype in (torch.float32, torch.complex64)):
         from ._cuda_sparse import csr_spmv, remember_csc
@@ -970,6 +980,27 @@ def _spmv_csc_via_mixed(data, indices, indptr, x, shape, op_code, out, out_dtype
     if indptr.numel() != n_cols + 1 or data.numel() != indices.numel():
         raise ValueError("invalid CSC dimensions")
     timed = bool(return_time or return_meta)
+    if (_is_rocm_runtime() and data.dtype == x.dtype == torch.int8
+            and op_code == SPMV_CSC_OP_NON
+            and _mixed_spmx._requested_out_dtype(out, out_dtype) in (None, torch.int32)):
+        from . import _spmv_rocm
+
+        _mixed_spmx._check_1d((data, "data"), (indices, "indices"), (indptr, "indptr"), (x, "x"))
+        if indices.dtype not in SUPPORTED_INDEX_DTYPES or indptr.dtype not in SUPPORTED_INDEX_DTYPES:
+            raise TypeError("indices and indptr must be int32 or int64")
+        if any(t.device != data.device for t in (indices, indptr, x)) or x.numel() != n_cols:
+            raise ValueError("x and CSC indices must match matrix shape and device")
+        if out is not None and (out.shape != (n_rows,) or out.device != x.device):
+            raise ValueError("out shape/device must match the CSC SpMV result")
+        t0 = _mixed_spmx._start(timed)
+        y = _spmv_rocm.multiply(data, indices, indptr, x, (n_cols, n_rows), "transpose", torch.int32)
+        if y is not None:
+            result = _mixed_spmx._finish(y, out, t0, timed)
+            if not return_meta:
+                return result
+            y, elapsed = result
+            meta = {"route": "rocm_csc_gather", "compute_ms": elapsed, "op_total_ms": elapsed}
+            return (y, elapsed, meta) if return_time else (y, meta)
     if (_SPMV_CSC_CUDA and data.device.type == "cuda" and data.dtype == torch.int8):
         from ._cuda_sparse import csr_spmv, transpose_topology
 

@@ -108,3 +108,28 @@ def test_spgemm_comparison_still_checks_values(dtype):
     assert metrics["pattern_ok"]
     assert not metrics["pass"]
     assert metrics["reason"] == "value mismatch"
+
+
+@pytest.mark.parametrize("extra_zero", [False, True])
+def test_spgemm_comparison_checks_shared_zero_against_subnormal(extra_zero):
+    dtype = torch.float32
+    values = [0.0, 0.0] if extra_zero else [0.0]
+    candidate = _csr(values, list(range(len(values))), [0, len(values)], (1, 2), dtype)
+    reference = _csr([1e-42], [0], [0, 1], (1, 2), dtype)
+
+    for left, right in [(candidate, reference), (reference, candidate)]:
+        metrics = _spgemm_compare_metrics(left, right, dtype)
+        assert metrics["pass"]
+        assert metrics["max_abs_error"] == reference[0][0].item()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_spgemm_comparison_rejects_shared_zero_against_nonfinite(value):
+    dtype = torch.float32
+    zero = _csr([0.0], [0], [0, 1], (1, 1), dtype)
+    other = _csr([value], [0], [0, 1], (1, 1), dtype)
+
+    for left, right in [(zero, other), (other, zero)]:
+        metrics = _spgemm_compare_metrics(left, right, dtype)
+        assert not metrics["pass"]
+        assert metrics["reason"] == "value mismatch"

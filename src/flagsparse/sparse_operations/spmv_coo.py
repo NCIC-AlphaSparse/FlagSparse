@@ -1077,6 +1077,14 @@ def _validate_x_coo(x, prepared):
 
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
+    if (_is_rocm_runtime() and prepared.op == SPMV_COO_OP_NON
+            and prepared.data.dtype == torch.complex64 and prepared.csr_plan is not None):
+        from . import _spmv_rocm
+
+        cols, ptr = prepared.csr_plan[:2]
+        result = _spmv_rocm.multiply(prepared.data, cols, ptr, x, prepared.shape, "csr", x.dtype)
+        if result is not None:
+            return result
     if prepared.csr_plan is not None:
         if isinstance(prepared.csr_plan, _CooTorchScatterPlan):
             plan = prepared.csr_plan

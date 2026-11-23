@@ -1465,6 +1465,21 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
     if out is not None and (out.shape != (n_out,) or out.device != x.device):
         raise ValueError("out shape/device must match the CSR SpMV result")
     data, x = data.contiguous(), x.contiguous()
+    if op == "trans" and _is_rocm_runtime() and (data.dtype, x.dtype, result_dtype) in (
+        (torch.float16, torch.float16, torch.float32),
+        (torch.float32, torch.complex64, torch.complex64),
+    ):
+        from . import _spmv_rocm
+
+        if indices.dtype not in (torch.int32, torch.int64) or indptr.dtype not in (torch.int32, torch.int64):
+            raise TypeError("indices and indptr must be int32 or int64")
+        if any(t.device != data.device for t in (indices, indptr, x)):
+            raise ValueError("CSR inputs must share a device")
+        t0 = _start(return_time)
+        y = _spmv_rocm.multiply(data, indices, indptr, x, (n_rows, n_cols),
+                                "transpose", result_dtype, out=out)
+        if y is not None:
+            return _finish(y, out, t0, return_time)
     cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
     t0 = _start(return_time)
     if op == "trans":
@@ -1857,6 +1872,13 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     sources = (data, row, col)
     data, x = data.contiguous(), x.contiguous()
     t0 = _start(return_time)
+    if (_is_rocm_runtime() and op == "non" and data.dtype == torch.float32
+            and x.dtype == result_dtype == torch.complex64):
+        from . import _spmv_rocm
+
+        y = _spmv_rocm.multiply(data, row, col, x, (n_rows, n_cols), "coo", result_dtype)
+        if y is not None:
+            return _finish(y, out, t0, return_time)
     if _CUDA_DIRECT_LAUNCH and data.device.type == "cuda":
         from ._cuda_sparse import coo_topology, csr_spmv
 
