@@ -133,3 +133,35 @@ def test_spgemm_comparison_rejects_shared_zero_against_nonfinite(value):
         metrics = _spgemm_compare_metrics(left, right, dtype)
         assert not metrics["pass"]
         assert metrics["reason"] == "value mismatch"
+
+
+@pytest.mark.parametrize("last_value", [2.0, 3.0])
+def test_spgemm_comparison_retries_alignment_oom(monkeypatch, last_value):
+    dtype = torch.float32
+    candidate = _csr([1, 0, last_value, 0], [0, 1, 0, 1], [0, 2, 4], (2, 2), dtype)
+    reference = _csr([1, 2], [0, 0], [0, 1, 2], (2, 2), dtype)
+    expected = _spgemm_compare_metrics(candidate, reference, dtype)
+    isin = torch.isin
+    retries = []
+
+    def limited_isin(keys, other):
+        if keys.numel() + other.numel() > 3:
+            retries.append(keys.numel())
+            raise RuntimeError("out of memory")
+        return isin(keys, other)
+
+    monkeypatch.setattr(torch, "isin", limited_isin)
+    assert _spgemm_compare_metrics(candidate, reference, dtype) == expected
+    assert retries == [4]
+
+
+def test_spgemm_comparison_raises_single_row_oom(monkeypatch):
+    candidate = _csr([1, 0], [0, 1], [0, 2], (1, 2), torch.float32)
+    reference = _csr([1], [0], [0, 1], (1, 2), torch.float32)
+
+    def fail_isin(keys, other):
+        raise RuntimeError("out of memory")
+
+    monkeypatch.setattr(torch, "isin", fail_isin)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _spgemm_compare_metrics(candidate, reference, torch.float32)

@@ -222,7 +222,8 @@ def _allclose_error_ratio(actual, reference, atol, rtol):
     return ratio if math.isfinite(ratio) else float("inf")
 
 
-def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
+def _csr_sorted_pairs_block(matrix, row_start, row_end):
+    data, indices, indptr, (_, n_cols) = matrix
     row_start = int(row_start)
     row_end = int(row_end)
     if row_end <= row_start:
@@ -250,9 +251,31 @@ def _csr_sorted_pairs_block(data, indices, indptr, n_cols, row_start, row_end):
     return keys[order], vals[order]
 
 
+def _spgemm_block_errors(candidate, reference, row, end, atol, rtol):
+    """Return block error maxima, or None if the stored nonzero patterns differ."""
+    c_keys, c_vals = _csr_sorted_pairs_block(candidate, row, end)
+    r_keys, r_vals = _csr_sorted_pairs_block(reference, row, end)
+
+    if not torch.equal(c_keys, r_keys):
+        # Some libraries omit explicit zeros. Keep shared zeros for numerical comparison.
+        c_keep = (c_vals != 0) | torch.isin(c_keys, r_keys)
+        r_keep = (r_vals != 0) | torch.isin(r_keys, c_keys)
+        if not torch.equal(c_keys[c_keep], r_keys[r_keep]):
+            return None
+        c_vals, r_vals = c_vals[c_keep], r_vals[r_keep]
+
+    if not c_vals.numel():
+        return 0.0, 0.0, 0.0
+    return (
+        _allclose_error_ratio(c_vals, r_vals, atol, rtol),
+        float(torch.abs(c_vals - r_vals).max().item()),
+        float(torch.abs(r_vals).max().item()),
+    )
+
+
 def _spgemm_compare_metrics(candidate, reference, value_dtype):
-    c_data, c_indices, c_indptr, c_shape = candidate
-    r_data, r_indices, r_indptr, r_shape = reference
+    c_indptr, c_shape = candidate[2:]
+    r_indptr, r_shape = reference[2:]
     if c_shape != r_shape:
         return {
             "pattern_ok": False,
@@ -284,43 +307,27 @@ def _spgemm_compare_metrics(candidate, reference, value_dtype):
     row = 0
     while row < n_rows:
         chunk_rows = min(compare_rows, n_rows - row)
-        while True:
-            try:
-                c_keys, c_vals = _csr_sorted_pairs_block(
-                    c_data, c_indices, c_indptr, c_shape[1], row, row + chunk_rows
-                )
-                r_keys, r_vals = _csr_sorted_pairs_block(
-                    r_data, r_indices, r_indptr, r_shape[1], row, row + chunk_rows
-                )
-                break
-            except Exception as exc:
-                if _is_resource_error(exc) and chunk_rows > 1:
-                    chunk_rows = max(1, chunk_rows // 2)
-                    continue
+        try:
+            errors = _spgemm_block_errors(candidate, reference, row, row + chunk_rows, atol, rtol)
+        except Exception as exc:
+            if chunk_rows == 1 or not (isinstance(exc, MemoryError) or _is_resource_error(exc)):
                 raise
+            compare_rows = chunk_rows // 2
+            continue
 
-        if not torch.equal(c_keys, r_keys):
-            # Some libraries omit explicit zeros. Drop only zeros absent from the
-            # other structure: a shared zero and subnormal are a numerical pair.
-            c_keep = (c_vals != 0) | torch.isin(c_keys, r_keys)
-            r_keep = (r_vals != 0) | torch.isin(r_keys, c_keys)
-            if not torch.equal(c_keys[c_keep], r_keys[r_keep]):
-                return {
-                    "pattern_ok": False,
-                    "pass": False,
-                    "err_ratio": float("inf"),
-                    "max_abs_error": float("inf"),
-                    "max_relative_error": float("inf"),
-                    "reason": f"sparsity pattern mismatch in rows [{row}, {row + chunk_rows})",
-                }
-            c_vals, r_vals = c_vals[c_keep], r_vals[r_keep]
-        if c_vals.numel() > 0:
-            err_ratio = max(
-                err_ratio, _allclose_error_ratio(c_vals, r_vals, atol, rtol)
-            )
-            abs_diff = torch.abs(c_vals - r_vals)
-            max_abs = max(max_abs, float(torch.max(abs_diff).item()))
-            ref_max = max(ref_max, float(torch.max(torch.abs(r_vals)).item()))
+        if errors is None:
+            return {
+                "pattern_ok": False,
+                "pass": False,
+                "err_ratio": float("inf"),
+                "max_abs_error": float("inf"),
+                "max_relative_error": float("inf"),
+                "reason": f"sparsity pattern mismatch in rows [{row}, {row + chunk_rows})",
+            }
+        block_ratio, block_abs, block_ref = errors
+        err_ratio = max(err_ratio, block_ratio)
+        max_abs = max(max_abs, block_abs)
+        ref_max = max(ref_max, block_ref)
         row += chunk_rows
 
     max_rel = 0.0 if ref_max == 0.0 else max_abs / ref_max
