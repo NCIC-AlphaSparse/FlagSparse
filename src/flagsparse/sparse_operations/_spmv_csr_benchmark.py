@@ -10,10 +10,6 @@ from .spmv_csr import flagsparse_spmv_csr_run, _spmv_device_context
 
 def _prepared_row_tile_op(prepared, x, out):
     """Bind a prepared real row-tile launch outside the event window."""
-    if common._is_rocm_runtime() and prepared.rocm_nnz_plan is not None:
-        from . import _spmv_csr_nnz
-
-        return _spmv_csr_nnz.bind(prepared, x, out)
     from . import _spmv_csr_kernels as kernels
 
     config = prepared.config["row_tile"]
@@ -28,6 +24,10 @@ def _prepared_row_tile_op(prepared, x, out):
         or kernels.uses_native_rocm_fp32_accumulation(prepared)
         else tl.float64
     )
+    if common._is_rocm_runtime():
+        run = kernels.bind_rocm_row_tile(prepared, x, out, acc)
+        if run is not None:
+            return run
     avg_nnz = prepared.data.numel() / prepared.n_rows
     fixed_steps = 0
     # Match the production row-tile loop policy in kernels.compute: short
@@ -81,10 +81,7 @@ def _prepared_row_tile_op(prepared, x, out):
                 V=config["lanes_per_row"],
                 STAGES=config["loop_num_stages"],
                 ACC=acc,
-                POSITION_64=not (
-                    prepared.data.dtype == torch.float32
-                    and prepared.kernel_indptr.dtype == torch.int32
-                ),
+                POSITION_64=kernels.row_tile_needs_wide_positions(prepared),
                 FIXED_STEPS=fixed_steps,
                 num_warps=config["num_warps"],
                 enable_fp_fusion=(acc == tl.float32),
@@ -200,8 +197,8 @@ def measure_route(prepared, x, warmup=10, iters=50, timing=False):
             )
         )
         if direct_row_tile:
-            timed_op = _prepared_row_tile_op(prepared, x, out)
-            timed_op = _rocm_graph_replay(timed_op, out)
+            launch = _prepared_row_tile_op(prepared, x, out)
+            timed_op = _rocm_graph_replay(launch, out)
         else:
             def timed_op():
                 return flagsparse_spmv_csr_run(prepared, x, out=out)

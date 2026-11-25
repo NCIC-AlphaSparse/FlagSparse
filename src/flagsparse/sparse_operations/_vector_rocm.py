@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._rocm_launch import launch as _launch
+from ._rocm_launch import can_launch, launch as _launch
 from ._rocm_sparse_cache import TensorPlanCache
 from ._vector_cuda import _axpby_real, _dot, _dot_workspace, _stream
 from ._vector_maca import _axpby_complex, _inverse
@@ -48,17 +48,19 @@ def try_bound(kind, values, indices, y, options):
             or torch.cuda.is_current_stream_capturing()):
         return None
     if kind == "axpby":
-        if version != indices._version or _axpby_complex.pre_run_hooks or _axpby_real.pre_run_hooks:
+        kernel = _axpby_complex if y.is_complex() else _axpby_real
+        if version != indices._version or not can_launch(kernel):
             return None
         runner(*inputs, *extra, stream=stream)
         return y
-    if _dot.pre_run_hooks:
+    if not can_launch(_dot):
         return None
     dtype, parts, n = extra
     result = torch.empty((), dtype=dtype, device=y.device)
-    target = torch.view_as_real(result) if result.is_complex() else result
-    work, counter = partial if parts > 1 else (target, target)
-    runner(*inputs, work, counter, target, n, stream=stream)
+    # The compiled launcher reads addresses. A complex scalar already owns
+    # the same two adjacent floats as its real view.
+    work, counter = partial if parts > 1 else (result, result)
+    runner(*inputs, work, counter, result, n, stream=stream)
     return result
 
 
@@ -87,15 +89,21 @@ def axpby(values, indices, y, ar, ai, br, bi):
     n = y.numel()
     if not n:
         return
+    if torch.cuda.current_device() != y.device.index:
+        with torch.cuda.device(y.device):
+            return axpby(values, indices, y, ar, ai, br, bi)
+    capturing = torch.cuda.is_current_stream_capturing()
     stream = _stream(y.device)
-    owner = _OWNERS.get((indices,), (n, stream))
+    # Capture the inverse itself so each replay reads the graph's current indices.
+    owner = None if capturing else _OWNERS.get((indices,), (n, stream))
     if owner is None:
         owner = torch.full((n,), -1, dtype=torch.int32, device=y.device)
         if indices.numel():
             _inverse[(triton.cdiv(indices.numel(), 256),)](
                 owner, indices.contiguous(), indices.numel(), n, 256, num_warps=4
             )
-        _OWNERS.put((indices,), (n, stream), owner)
+        if not capturing:
+            _OWNERS.put((indices,), (n, stream), owner)
     if y.is_complex():
         kernel = _axpby_complex
         tensors = (torch.view_as_real(y), torch.view_as_real(values), owner)
@@ -103,7 +111,8 @@ def axpby(values, indices, y, ar, ai, br, bi):
     else:
         kernel = _axpby_real
         tensors = (y, values, owner)
-        scalars, constants = (n, ar, br), (1024,)
-    runner = _launch(kernel, triton.cdiv(n, constants[-1]), tensors, scalars, constants)
+        scalars, constants = (n, ar, br), (1024, y.dtype == torch.float16)
+    block = constants[-1] if y.is_complex() else constants[0]
+    runner = _launch(kernel, triton.cdiv(n, block), tensors, scalars, constants)
     _remember("axpby", runner, (values, indices, y), (complex(ar, ai), complex(br, bi)),
               tensors, scalars)

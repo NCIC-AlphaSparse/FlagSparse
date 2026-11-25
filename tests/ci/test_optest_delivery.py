@@ -4,17 +4,207 @@
 
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
 
-from tools import delivery_variants
+from tools import delivery_variants, optest_delivery
 from tools.optest_delivery import _write_delivery_summary, run_delivery
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    "op,flavor,as_directory,uses_matrix_timeout",
+    [
+        ("spmm_csr", "performance", True, True),
+        ("sddmm_csr", "performance", True, True),
+        ("spmm_csr", "accuracy", True, False),
+        ("spmm_csr", "performance", False, False),
+        ("spgemm_csr", "performance", True, False),
+    ],
+)
+def test_optest_ascend_benchmark_timeout(
+    tmp_path, monkeypatch, op, flavor, as_directory, uses_matrix_timeout
+):
+    for name in ("first.mtx", "second.mtx", "ignore.txt"):
+        (tmp_path / name).touch()
+    input_path = tmp_path if as_directory else tmp_path / "first.mtx"
+    monkeypatch.setenv("FLAGSPARSE_OPTEST_BENCHMARK_INPUT", str(input_path))
+
+    def run_cmd(operator, command, **kwargs):
+        assert operator == op
+        assert command == "benchmark command"
+        return kwargs
+
+    optest = SimpleNamespace(run_cmd=run_cmd)
+    env = {"ASCEND_RT_VISIBLE_DEVICES": "7"}
+    with optest_delivery._ascend_benchmark_timeout_adapter(optest):
+        result = optest.run_cmd(
+            op, "benchmark command", flavor=flavor, env=env, timeout=3600
+        )
+    assert optest.run_cmd is run_cmd
+    assert env == {"ASCEND_RT_VISIBLE_DEVICES": "7"}
+    if uses_matrix_timeout:
+        assert result["env"]["FLAGSPARSE_OPTEST_MATRIX_TIMEOUT"] == "3600"
+        assert result["timeout"] > 2 * 3600
+    else:
+        assert result["env"] == env
+        assert result["timeout"] == 3600
+
+
+def test_optest_delivery_reports_parent_timeout(tmp_path):
+    variant = next(
+        variant
+        for variant in delivery_variants.load_delivery_variants()
+        if variant["operator"] == "spmm_csr"
+    )
+    path = tmp_path / "summary.json"
+    path.write_text(
+        json.dumps(
+            {
+                "result": {
+                    "spmm_csr": {
+                        "accuracy": {},
+                        "performance": {"status": "Timeout", "exit_code": -100},
+                    }
+                }
+            }
+        )
+    )
+    optest = SimpleNamespace(
+        CFG=SimpleNamespace(output_dir=tmp_path), count_op_statuses=lambda *_: {}
+    )
+    assert _write_delivery_summary(optest, [variant], tmp_path) == 1
+    performance = json.loads(path.read_text())["result"][variant["id"]]["performance"]
+    assert performance["status"] == "Timeout"
+    assert performance["data"] == {}
+
+
+@pytest.mark.parametrize(
+    "phase_status,returncode,expected_status,expected_code",
+    [
+        ("Passed", 0, "Passed", 0),
+        ("TIMEOUT", -9, "Timeout", -100),
+        ("Passed", -100, "Timeout", -100),
+        ("FAIL", 1, "Error", 1),
+    ],
+)
+def test_optest_ascend_accuracy_adapter(
+    tmp_path, monkeypatch, phase_status, returncode, expected_status, expected_code
+):
+    def native_accuracy(**kwargs):
+        assert kwargs["gpu_id"] == 6
+        assert kwargs["op"] == kwargs["marker"] == "spmv_csr"
+        assert kwargs["timeout"] == 3600
+        if phase_status == "Passed":
+            (kwargs["op_dir"] / "accuracy_result.json").write_text("{}")
+        return {"status": phase_status, "returncode": returncode, "duration": 2.0}
+
+    def parse_accuracy(path):
+        assert path.is_file()
+        return {"status": "Passed", "passed": 1}
+
+    def generic_accuracy(gpu_id, op):
+        return gpu_id, op
+
+    optest = SimpleNamespace(
+        ROOT=ROOT,
+        CFG=SimpleNamespace(output_dir=tmp_path, quick=True, timeout=3600),
+        TIMEOUT=-100,
+        op_marker=lambda op: op,
+        parse_accuracy_data=parse_accuracy,
+        run_accuracy_q=generic_accuracy,
+    )
+    monkeypatch.setattr(optest_delivery, "run_accuracy", native_accuracy)
+    with optest_delivery._ascend_accuracy_adapter(optest):
+        assert optest.run_accuracy_q(6, "axpby") == (6, "axpby")
+        result = optest.run_accuracy_q(6, "spmv_csr")
+    assert optest.run_accuracy_q is generic_accuracy
+    assert result["status"] == expected_status
+    assert result["exit_code"] == expected_code
+    assert result["duration"] == 2.0
+    assert result["data_file"] == (
+        "spmv_csr/accuracy_result.json" if expected_status == "Passed" else None
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux process groups")
+def test_optest_outer_timeout_stops_matrix(tmp_path):
+    import fcntl
+
+    lock_path = tmp_path / "matrix.lock"
+    started = tmp_path / "matrix.pid"
+    matrix = """
+import fcntl
+import os
+import signal
+import sys
+from pathlib import Path
+
+with open(sys.argv[1], "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    pid = Path(sys.argv[2])
+    pid.with_suffix(".tmp").write_text(str(os.getpid()))
+    pid.with_suffix(".tmp").replace(pid)
+    signal.pause()
+"""
+    wrapper = """
+import os
+import sys
+from pathlib import Path
+
+from run_flagsparse_pytest import run_subprocess
+
+run_subprocess([sys.executable, "-c", *sys.argv[1:]], project_root=Path.cwd(),
+               env=os.environ, timeout=30)
+"""
+    env = dict(
+        os.environ,
+        FLAGSPARSE_OPTEST_DELIVERY_DIR=str(tmp_path),
+        FLAGSPARSE_OPTEST_MATRIX_TIMEOUT="30",
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", wrapper, matrix, str(lock_path), str(started)],
+        cwd=ROOT,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while (
+            not started.exists() and proc.poll() is None and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert started.exists(), "matrix subprocess did not start"
+        os.killpg(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=5) == -signal.SIGTERM
+        with lock_path.open("r+") as lock:
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        pytest.fail("matrix subprocess survived the outer termination")
+                    time.sleep(0.02)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+        if started.exists():
+            matrix_pid = int(started.read_text())
+            try:
+                os.killpg(matrix_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.fixture

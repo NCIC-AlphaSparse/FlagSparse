@@ -4,7 +4,7 @@
 import torch
 import triton
 import triton.language as tl
-from ._common import _is_iluvatar_runtime, _is_mthreads_runtime
+from ._common import _is_iluvatar_runtime, _is_mthreads_runtime, _is_rocm_runtime
 
 
 @triton.jit
@@ -72,7 +72,8 @@ def compute(values, cols, ptr, b, out, *, acc_dtype=tl.float32):
     if iluvatar and is_complex:
         b = b.resolve_conj()
     if (((_is_mthreads_runtime() and values.dtype in (torch.float16, torch.int8))
-         or (iluvatar and values.dtype in (torch.float16, torch.int8, torch.complex64)))
+         or (iluvatar and values.dtype in (torch.float16, torch.int8, torch.complex64))
+         or (_is_rocm_runtime() and values.dtype == b.dtype == torch.float16))
             and b.stride(0) == 1 and b.stride(1) != 1):
         # Read the current RHS every call. Packing is included in call timing;
         # it replaces repeated uncoalesced loads inside the sparse row loop.

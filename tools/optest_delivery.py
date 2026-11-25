@@ -4,15 +4,20 @@
 
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from run_flagsparse_pytest import (
+    ASCEND_ACCURACY_OPS,
+    ASCEND_PER_MATRIX_PERFORMANCE_OPS,
+    TIMEOUT_RETURN_CODE,
     _delivery_results,
     _flag_gems_dtype,
     _flaggems_perf_data,
     _operator_summary,
+    run_accuracy,
 )
 from tools.delivery_variants import (
     load_delivery_matrices,
@@ -60,6 +65,7 @@ def _write_delivery_summary(optest, variants, delivery_dir):
             if reason := variant[phase].get("reason"):
                 entry[phase]["reason"] = reason
         performance = variant["performance"]
+        entry["performance"].setdefault("data", {})
         if records := performance.get("records"):
             # Keep missing baselines null and give each delivered case its shape.
             selected_dtypes = performance.get("data", {})
@@ -108,6 +114,76 @@ def _write_delivery_summary(optest, variants, delivery_dir):
             flush=True,
         )
     return int(bool(failed))
+
+
+def _ascend_accuracy_adapter(optest):
+    """Run native Ascend probes with Optest's scheduling and reporting."""
+    default_accuracy = optest.run_accuracy_q
+
+    def accuracy(gpu_id, op):
+        if op not in ASCEND_ACCURACY_OPS:
+            return default_accuracy(gpu_id, op)
+
+        op_dir = optest.CFG.output_dir / op
+        op_dir.mkdir(parents=True, exist_ok=True)
+        phase = run_accuracy(
+            project_root=optest.ROOT,
+            op=op,
+            gpu_id=gpu_id,
+            marker=optest.op_marker(op),
+            mode="quick" if optest.CFG.quick else "normal",
+            op_dir=op_dir,
+            extra_pytest_args=[],
+            timeout=optest.CFG.timeout,
+            delivery_only=True,
+        )
+        result_file = op_dir / "accuracy_result.json"
+        timed_out = (
+            phase["returncode"] == TIMEOUT_RETURN_CODE or phase["status"] == "TIMEOUT"
+        )
+        if timed_out or not result_file.is_file():
+            result = {
+                "status": "Timeout" if timed_out else "Error",
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "errors": int(not timed_out),
+            }
+            data_file = None
+        else:
+            result = optest.parse_accuracy_data(result_file)
+            data_file = str(result_file.relative_to(optest.CFG.output_dir))
+        return dict(
+            result,
+            exit_code=optest.TIMEOUT if timed_out else phase["returncode"],
+            duration=phase["duration"],
+            data_file=data_file,
+        )
+
+    return patch.object(optest, "run_accuracy_q", accuracy)
+
+
+def _ascend_benchmark_timeout_adapter(optest):
+    """Apply Optest's timeout per matrix for Ascend's matrix-isolated benchmarks."""
+    run_cmd = optest.run_cmd
+
+    def run_with_matrix_timeout(op, cmd, **kwargs):
+        if (
+            kwargs.get("flavor") == "performance"
+            and op in ASCEND_PER_MATRIX_PERFORMANCE_OPS
+        ):
+            matrix_dir = Path(os.environ["FLAGSPARSE_OPTEST_BENCHMARK_INPUT"])
+            matrix_count = sum(1 for _ in matrix_dir.glob("*.mtx"))
+            timeout = kwargs["timeout"]
+            if matrix_count and timeout > 0:
+                kwargs["env"] = dict(
+                    kwargs["env"], FLAGSPARSE_OPTEST_MATRIX_TIMEOUT=str(timeout)
+                )
+                kwargs["timeout"] = matrix_count * (timeout + 30) + 120
+        return run_cmd(op, cmd, **kwargs)
+
+    return patch.object(optest, "run_cmd", run_with_matrix_timeout)
 
 
 def run_delivery(optest, benchmark_input):
@@ -165,11 +241,23 @@ def run_delivery(optest, benchmark_input):
                 FLAGSPARSE_OPTEST_DELIVERY_DIR=str(delivery_dir),
                 FLAGSPARSE_OPTEST_BENCHMARK_INPUT=str(input_path),
             )
+            if (
+                ascend
+                and input_path.is_dir()
+                and set(parents) & ASCEND_PER_MATRIX_PERFORMANCE_OPS
+            ):
+                print(
+                    f"Ascend matrix-isolated benchmarks: {optest.CFG.timeout}s per matrix",
+                    flush=True,
+                )
             return parents
 
+        ascend = os.environ.get("FLAGSPARSE_BACKEND") == "ascend"
         with (
             patch.dict(os.environ),
             patch.object(optest, "get_ops_to_test", select_parent_ops),
+            _ascend_accuracy_adapter(optest) if ascend else nullcontext(),
+            _ascend_benchmark_timeout_adapter(optest) if ascend else nullcontext(),
         ):
             status = optest.main()
         if status:

@@ -165,6 +165,8 @@ DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
         "float32,float64",
     ),
     "spmm_coo": ("--index-dtypes", "int32", "--dtypes", "float32,float64"),
+    # SpGEMM's FP32 child also appends the registered complex64 variant.
+    "spgemm_csr": ("--dtypes", "float32"),
 }
 # SpSV is not a delivery parent any more (the delivery list dropped it on
 # 2026-09-21), so `--delivery-only` no longer selects spsv_csr/spsv_coo and this
@@ -1912,19 +1914,46 @@ def run_subprocess(
     timeout: int,
 ) -> tuple[int, str, str, float, bool]:
     start = time.monotonic()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(project_root),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        # Optest already owns the pytest process group and its delivery timeout.
-        # Keep its benchmark descendants in that group so a timeout kills them too.
-        start_new_session=not env.get("FLAGSPARSE_OPTEST_DELIVERY_DIR") or timeout > 0,
-    )
+    delivery = bool(env.get("FLAGSPARSE_OPTEST_DELIVERY_DIR"))
+    proc = None
+    pending_termination = False
+    previous_sigterm = None
+
+    def terminate_matrix(signum, _frame):
+        nonlocal pending_termination
+        if proc is None:
+            pending_termination = True
+            return
+        # Optest only signals pytest's group. The matrix has its own group so
+        # its individual deadline can stop it without killing pytest.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        signal.signal(signum, previous_sigterm)
+        signal.raise_signal(signum)
+
+    if (
+        delivery
+        and timeout > 0
+        and env.get("FLAGSPARSE_OPTEST_MATRIX_TIMEOUT")
+        and threading.current_thread() is threading.main_thread()
+    ):
+        previous_sigterm = signal.signal(signal.SIGTERM, terminate_matrix)
     timed_out = False
     try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(project_root),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # A positive inner timeout needs its own group for per-case cleanup.
+            start_new_session=not delivery or timeout > 0,
+        )
+        if pending_termination:
+            terminate_matrix(signal.SIGTERM, None)
         stdout, stderr = proc.communicate(timeout=timeout if timeout > 0 else None)
         returncode = proc.returncode
     except subprocess.TimeoutExpired:
@@ -1932,6 +1961,9 @@ def run_subprocess(
         _terminate_process_group(proc)
         stdout, stderr = proc.communicate()
         returncode = TIMEOUT_RETURN_CODE
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     duration = time.monotonic() - start
     return returncode, stdout or "", stderr or "", duration, timed_out
 

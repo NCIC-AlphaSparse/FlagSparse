@@ -48,6 +48,10 @@ FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch \
 
 核对报告中的设备类型为 `npu`，并检查精度用例、FlagSparse 时延和 PyTorch-NPU 基线。若报告出现缺测或失败，先从父算子日志定位是 NPU 参考、Triton 编译还是性能入口问题。对应的昇腾专用探针和完整交付命令见下文。
 
+Optest 的 Ascend 交付模式对 `gather`、`scatter`、`spmv_csr`、`spmm_csr` 和 `sddmm_csr` 复用昇腾专用精度探针，避免通用 pytest 用例触发非交付内核的 CANN 编译错误。全量运行时省略 `--ops` 和 `--benchmark-input`，覆盖 105 个交付变体和 10 个矩阵；可使用 `--gpus 6,7 --timeout 3600 --h800-reference`。
+
+目录输入下，`spmm_csr` 和 `sddmm_csr` 性能测试的 `--timeout` 按矩阵计算；其他算子的 Optest 超时仍按阶段计算。
+
 ## 2026-11-02 复测计划：105 变体
 
 注册表扩到 105 个，改了什么见 [`README.md`](README.md) 的 2026-11-02 一节。按约定，`ASCEND_Q4_VARIANTS` 要等 NPU 真机

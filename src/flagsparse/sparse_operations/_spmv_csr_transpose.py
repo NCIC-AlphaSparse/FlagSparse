@@ -14,6 +14,7 @@ from ._common import (
     _is_iluvatar_runtime,
     _is_maca_runtime,
     _is_mthreads_runtime,
+    _is_rocm_runtime,
 )
 
 
@@ -498,6 +499,16 @@ def _scatter(V, I, P, X, Y, M: tl.constexpr, COMPLEX: tl.constexpr,
 
 def compute(prepared, x, out=None):
     if prepared.transpose_plan is not None:
+        if _is_rocm_runtime() and prepared.data.dtype in (torch.float32, torch.complex64):
+            from . import _spmv_rocm
+
+            result = _spmv_rocm.multiply(
+                prepared.data, prepared.kernel_indices, prepared.kernel_indptr, x,
+                prepared.shape, "transpose", prepared.data.dtype,
+                conjugate=prepared.op == 2, out=out,
+            )
+            if result is not None:
+                return result
         return gather(prepared.data, x, prepared.transpose_plan, prepared.n_cols,
                       prepared.op == 2, out)
     y = out if out is not None else torch.empty(

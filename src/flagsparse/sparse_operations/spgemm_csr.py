@@ -15,6 +15,7 @@
 """CSR SpGEMM (A@B) with two-phase structure/value build."""
 
 import ctypes
+from copy import copy
 
 from . import _common as _common_mod
 from ._common import *
@@ -1375,6 +1376,20 @@ def _spgemm_hash_hybrid_compute(prepared):
 
 def _spgemm_compute(prepared):
     """Dispatch: hybrid hash when worthwhile, otherwise memory-safe ESC."""
+    if _is_rocm_runtime() and torch.is_tensor(prepared.a_data) and prepared.a_data.is_cuda:
+        from . import _spgemm_rocm
+
+        try:
+            result = _spgemm_rocm.compute_symbolic(prepared)
+        except (_accel_oom_error(), triton.runtime.errors.OutOfResources):
+            result = None
+        if result is not None:
+            return result
+        a_data, b_data = prepared.a_data, prepared.b_data
+        if a_data.is_conj() or b_data.is_conj() or a_data.is_neg() or b_data.is_neg():
+            prepared = copy(prepared)
+            prepared.a_data = a_data.resolve_conj().resolve_neg()
+            prepared.b_data = b_data.resolve_conj().resolve_neg()
     config = getattr(prepared, "rocm_hash_config", None)
     if config is not None:
         from . import _spgemm_rocm
@@ -1567,7 +1582,7 @@ def flagsparse_spgemm_csr(
             b_indptr,
             b_shape,
         )
-        if (_is_iluvatar_runtime()
+        if ((_is_iluvatar_runtime() or _is_rocm_runtime())
                 and prepared.a_data.dtype in (torch.float32, torch.complex64)):
             prepared.symbolic_sources = (a_indices, a_indptr, b_indices, b_indptr)
         if return_meta:

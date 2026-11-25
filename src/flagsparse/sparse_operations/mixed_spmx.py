@@ -1465,9 +1465,12 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
     if out is not None and (out.shape != (n_out,) or out.device != x.device):
         raise ValueError("out shape/device must match the CSR SpMV result")
     data, x = data.contiguous(), x.contiguous()
-    if op == "trans" and _is_rocm_runtime() and (data.dtype, x.dtype, result_dtype) in (
-        (torch.float16, torch.float16, torch.float32),
-        (torch.float32, torch.complex64, torch.complex64),
+    if _is_rocm_runtime() and (
+        (data.dtype, x.dtype, result_dtype) in (
+            (torch.float16, torch.float16, torch.float32),
+            (torch.int8, torch.int8, torch.float32),
+            (torch.float32, torch.complex64, torch.complex64),
+        ) or (op == "trans" and data.dtype == x.dtype == torch.int8 and result_dtype == torch.int32)
     ):
         from . import _spmv_rocm
 
@@ -1476,8 +1479,9 @@ def spmv_csr_mixed(data, indices, indptr, x, shape, *, op=None, transpose=None,
         if any(t.device != data.device for t in (indices, indptr, x)):
             raise ValueError("CSR inputs must share a device")
         t0 = _start(return_time)
+        fmt = "csr" if op == "non" else "transpose"
         y = _spmv_rocm.multiply(data, indices, indptr, x, (n_rows, n_cols),
-                                "transpose", result_dtype, out=out)
+                                fmt, result_dtype, out=out)
         if y is not None:
             return _finish(y, out, t0, return_time)
     cols, ptr = _index32(indices.contiguous()), _index32(indptr.contiguous())
@@ -1872,11 +1876,15 @@ def spmv_coo_mixed(data, row, col, x, shape, *, op=None, transpose=None,
     sources = (data, row, col)
     data, x = data.contiguous(), x.contiguous()
     t0 = _start(return_time)
-    if (_is_rocm_runtime() and op == "non" and data.dtype == torch.float32
-            and x.dtype == result_dtype == torch.complex64):
+    if (_is_rocm_runtime() and row.dtype in (torch.int32, torch.int64)
+            and col.dtype in (torch.int32, torch.int64)
+            and ((data.dtype == torch.float32 and x.dtype == result_dtype == torch.complex64)
+                 or (data.dtype == x.dtype and data.dtype in (torch.float16, torch.int8)))):
         from . import _spmv_rocm
 
-        y = _spmv_rocm.multiply(data, row, col, x, (n_rows, n_cols), "coo", result_dtype)
+        target_rows, source_cols = (row, col) if op == "non" else (col, row)
+        y = _spmv_rocm.multiply(data, target_rows, source_cols, x, (n_out, n_in),
+                                "coo", result_dtype, out=out)
         if y is not None:
             return _finish(y, out, t0, return_time)
     if _CUDA_DIRECT_LAUNCH and data.device.type == "cuda":
@@ -2312,13 +2320,12 @@ def spmm_csr_mixed(data, indices, indptr, B, shape, *, op=None, transpose=None,
         return _finish(C.to(result_dtype), out, t0, return_time)
     C = out if out is not None else torch.empty(n_rows, n_dense, dtype=result_dtype, device=B.device)
     if n_rows and n_dense:
-        if _is_mthreads_runtime():
+        if (_is_mthreads_runtime()
+                or (_is_rocm_runtime() and data.dtype == B.dtype == torch.float16
+                    and B.stride(0) == 1 and B.stride(1) != 1)):
             from . import _spmm_row_gather
             _spmm_row_gather.compute(data, cols, ptr, B, C)
-            if return_time:
-                _ACCEL.synchronize()
-                return C, (time.perf_counter() - t0) * 1000.0
-            return C
+            return _finish(C, out, t0, return_time)
         block_n = min(128, max(16, triton.next_power_of_2(n_dense)))
         if _is_iluvatar_runtime():
             if data.dtype == torch.float16:

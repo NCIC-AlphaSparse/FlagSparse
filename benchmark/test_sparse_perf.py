@@ -90,7 +90,7 @@ def test_core_performance(op, tmp_path, record_benchmark, monkeypatch):
                 operator, _, arguments = setting.partition("=")
                 if operator == op:
                     extra_args.extend(shlex.split(arguments))
-        timeout = 0  # Optest enforces the deadline for the whole benchmark phase.
+        timeout = int(os.environ.get("FLAGSPARSE_OPTEST_MATRIX_TIMEOUT", "0"))
     else:
         benchmark_input = None if op == "gather" else CORE_MATRIX
         extra_args = CORE_ARGS[op] if backend in GENERIC_BENCHMARK_BACKENDS else []

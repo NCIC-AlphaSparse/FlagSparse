@@ -101,14 +101,20 @@ def try_axpby(values, indices, y, alpha, beta):
 
 
 @triton.jit
-def _axpby_real(Y, V, OWNER, N, ALPHA, BETA, BLOCK: tl.constexpr):
+def _axpby_real(Y, V, OWNER, N, ALPHA, BETA, BLOCK: tl.constexpr,
+                ROUND_INTERMEDIATES: tl.constexpr = False):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = row < N
     source = tl.load(OWNER + row, valid, -1)
     value = tl.load(V + source, valid & (source >= 0), 0.0).to(tl.float32)
     previous = tl.load(Y + row, valid, 0.0).to(tl.float32)
     update = tl.where(source >= 0, ALPHA * value, 0.0)
-    tl.store(Y + row, BETA * previous + update, valid)
+    scaled = BETA * previous
+    if ROUND_INTERMEDIATES:
+        # Match the two FP16 PyTorch updates used by the ROCm path.
+        scaled = scaled.to(tl.float16).to(tl.float32)
+        update = update.to(tl.float16).to(tl.float32)
+    tl.store(Y + row, scaled + update, valid)
 
 
 def axpby(values, indices, y, ar, ai, br, bi):
@@ -133,7 +139,7 @@ def axpby(values, indices, y, ar, ai, br, bi):
         scalars, constants = (n, ar, ai, br, bi), (ai != 0.0, bi != 0.0, 512)
     else:
         kernel, grid = _axpby_real, (triton.cdiv(n, 1024),)
-        tensors, scalars, constants = (y, values, owner), (n, ar, br), (1024,)
+        tensors, scalars, constants = (y, values, owner), (n, ar, br), (1024, False)
     if not hasattr(triton, "knobs"):
         kernel[grid](*tensors, *scalars, *constants, num_warps=4)
         return

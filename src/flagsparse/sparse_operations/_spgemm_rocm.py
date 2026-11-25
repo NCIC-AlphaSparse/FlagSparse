@@ -20,6 +20,61 @@ from triton.runtime.cache import get_cache_manager
 from ._rocm_sparse_cache import TensorPlanCache
 
 _OPERANDS = TensorPlanCache(maxsize=4)
+_SYMBOLIC_CACHE = TensorPlanCache(maxsize=1)
+_SYMBOLIC_SEEN = TensorPlanCache(maxsize=8)
+# A recipe keeps two int32 source indices per product plus the CSR structure.
+_MAX_SYMBOLIC_PRODUCTS = 128_000_000
+
+
+@lru_cache(maxsize=16)
+def symbolic_available(device):
+    with torch.cuda.device(device):
+        target = triton.runtime.driver.active.get_current_target()
+        return target.backend == "hip" and target.arch == "gfx936"
+
+
+def compute_symbolic(prepared):
+    """Reuse the product map for repeated gfx936 CSR products."""
+    from ._spgemm_symbolic import build_symbolic, evaluate_symbolic
+
+    device = prepared.a_data.device
+    if (
+        prepared.a_data.dtype not in (torch.float32, torch.complex64)
+        or not symbolic_available(device)
+        or prepared.n_rows * prepared.n_cols >= 2**63
+        or max(prepared.a_data.numel(), prepared.b_data.numel()) >= 2**31
+        or not (prepared.a_data.numel() and prepared.b_data.numel())
+    ):
+        return None
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        sources = prepared.symbolic_sources
+        if sources is None:
+            sources = (
+                prepared.a_indices, prepared.a_indptr,
+                prepared.b_indices, prepared.b_indptr,
+            )
+        stream = torch.cuda.current_stream(device).cuda_stream
+        options = (prepared.a_shape, prepared.b_shape, stream)
+        symbolic = _SYMBOLIC_CACHE.get(sources, options)
+        if symbolic is None:
+            seen = _SYMBOLIC_SEEN.get(sources, options)
+            if seen is None:
+                # A one-off product uses the ordinary hash path.
+                _SYMBOLIC_SEEN.put(sources, options, True)
+                return None
+            if not seen:
+                return None
+            try:
+                symbolic = build_symbolic(prepared, _MAX_SYMBOLIC_PRODUCTS)
+            except torch.cuda.OutOfMemoryError:
+                symbolic = ()
+            if not symbolic:
+                _SYMBOLIC_SEEN.put(sources, options, False)
+                return None
+            _SYMBOLIC_CACHE.put(sources, options, symbolic)
+        return evaluate_symbolic(prepared, symbolic)
 
 
 @lru_cache(maxsize=16)

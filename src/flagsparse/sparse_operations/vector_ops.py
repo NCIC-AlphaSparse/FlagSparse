@@ -446,7 +446,7 @@ def flagsparse_axpby(
         from ._vector_cuda import axpby, try_axpby
         axpby(values, kernel_idx, y, a_re, a_im, b_re, b_im)
         _CUDA_AXPBY_TRY = try_axpby
-    elif (_is_rocm_runtime() and y.dtype in (torch.float32, torch.complex64)
+    elif (_is_rocm_runtime() and y.dtype in (torch.float16, torch.float32, torch.complex64)
           and y.numel() <= 4 * 1024 * 1024
           and not (y.is_conj() or y.is_neg() or values.is_conj() or values.is_neg())
           and not torch._C._overlaps(values, y)):
