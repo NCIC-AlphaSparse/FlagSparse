@@ -27,7 +27,11 @@ from ._ascend_fp64_spmm import prepare_fp64_spmm as _prepare_ascend_fp64_spmm
 from ._ascend_fp64_spmm import run_fp64_spmm as _run_ascend_fp64_spmm
 from ._ascend_fp64_spmm import run_fp64_spmm_once as _run_ascend_fp64_spmm_once
 from ._alpha_spmm_alg1_common import _select_alpha_spmm_alg1_warp_and_factor
+from ._rocm_sparse_cache import TensorPlanCache
 from dataclasses import dataclass
+
+_ROCM_TRANSPOSE_ROUTES = TensorPlanCache(maxsize=4)
+_ROCM_RAW_C32_ROUTES = TensorPlanCache(maxsize=4)
 
 
 def _ascend_csr_row_ids(indptr, n_rows, *, cache=True):
@@ -1018,6 +1022,23 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
     if cached is not None and prepared.materialized_op == op_name:
         return cached, 0.0 if timing else None
 
+    sources = None
+    if (
+        not timing
+        and _is_rocm_runtime()
+        and prepared.data.is_cuda
+        and prepared.data.dtype == torch.complex64
+        and torch._C._cuda_getDevice() == prepared.data.device.index
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # Reuse the transposed data on the stream that produced them.
+        sources = (prepared.data, prepared.kernel_indices, prepared.kernel_indptr)
+        stream = torch._C._cuda_getCurrentRawStream(prepared.data.device.index)
+        options = (prepared.shape, op_name, prepared.alg, stream)
+        cached = _ROCM_TRANSPOSE_ROUTES.get(sources, options)
+        if cached is not None:
+            return cached, 0.0 if timing else None
+
     start = _ACCEL.Event(enable_timing=True) if timing else None
     end = _ACCEL.Event(enable_timing=True) if timing else None
     if start is not None:
@@ -1037,11 +1058,34 @@ def _materialize_spmm_csr_route_op(prepared, op_name, *, timing=False):
         shape,
         op_name,
     )
+    if sources is not None:
+        _ROCM_TRANSPOSE_ROUTES.put(sources, options, runtime_prepared)
     if end is not None:
         end.record()
         _ACCEL.synchronize()
         return runtime_prepared, start.elapsed_time(end)
     return runtime_prepared, None
+
+
+def _rocm_c32_transpose_gather_enabled(data, B, out):
+    return (
+        _is_rocm_runtime()
+        and torch.is_tensor(data)
+        and data.is_cuda
+        and data.dtype == torch.complex64
+        and torch.is_tensor(B)
+        and not B.is_neg()
+        and (
+            out is None
+            or (
+                torch.is_tensor(out)
+                and out.is_contiguous()
+                and not out.is_conj()
+                and not out.is_neg()
+                and not torch._C._overlaps(out, B)
+            )
+        )
+    )
 
 
 def _run_spmm_csr_base_route(
@@ -3124,14 +3168,25 @@ def flagsparse_spmm_csr_run(
         )
 
     if (
-        _is_iluvatar_runtime()
-        and (prepared.data.dtype == torch.float32
-             or (prepared.data.dtype == torch.complex64
-                 and prepared.data.numel() <= 32 * max(1, prepared.n_cols)))
-        and op_name in ("trans", "conj")
+        op_name in ("trans", "conj")
         and dense_layout in ("auto", "row")
         and not return_meta
         and not timing
+        and (
+            (
+                _is_iluvatar_runtime()
+                and (
+                    prepared.data.dtype == torch.float32
+                    or (prepared.data.dtype == torch.complex64
+                        and prepared.nnz <= 32 * max(1, prepared.n_cols))
+                )
+            )
+            or (
+                alg_name == "auto"
+                and not (return_time or diagnostics)
+                and _rocm_c32_transpose_gather_enabled(prepared.data, B, out)
+            )
+        )
     ):
         from . import mixed_spmx
 
@@ -4866,6 +4921,26 @@ def flagsparse_spmm_csr(
         raise ValueError("block_nnz must be positive when provided")
     if max_segments is not None and max_segments <= 0:
         raise ValueError("max_segments must be positive when provided")
+
+    if (
+        _spmm_op_transposes(op_code)
+        and not (return_time or return_meta)
+        and block_n is None and block_nnz is None and max_segments is None
+        and _rocm_c32_transpose_gather_enabled(data, B, out)
+        and all(torch.is_tensor(t) and t.device == data.device for t in (indices, indptr))
+        and shape is not None and len(shape) == 2
+        and torch._C._cuda_getDevice() == data.device.index
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        sources = (data, indices, indptr)
+        stream = torch._C._cuda_getCurrentRawStream(data.device.index)
+        op_name = _spmm_op_to_name(op_code)
+        options = ((int(shape[0]), int(shape[1])), op_name, stream)
+        prepared = _ROCM_RAW_C32_ROUTES.get(sources, options)
+        if prepared is None:
+            prepared = prepare_spmm_csr_route(*sources, shape, op=op_name)
+            _ROCM_RAW_C32_ROUTES.put(sources, options, prepared)
+        return flagsparse_spmm_csr_run(prepared, B, out=out)
 
     # Default fast path: for the plain A @ B case in float32/float64 with no base
     # tuning overrides, route to the optimized (alg1) kernel. Transpose/conj,

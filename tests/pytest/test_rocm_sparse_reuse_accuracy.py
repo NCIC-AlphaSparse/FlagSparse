@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize(
     "dtype,out_dtype",
     [
+        (torch.float32, torch.float32),
         (torch.float16, torch.float16),
         (torch.float16, torch.float32),
         (torch.int8, torch.int32),
@@ -40,7 +41,7 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_mixed_coo_reuse_tracks_all_inputs(dtype, out_dtype, index_dtype):
+def test_coo_reuse_tracks_all_inputs(dtype, out_dtype, index_dtype):
     device = accelerator_device()
     values = torch.tensor([1, 2, -3, 4], dtype=dtype, device=device)
     rows = torch.tensor([2, 0, 2, 1], dtype=index_dtype, device=device)
@@ -139,6 +140,35 @@ def test_complex_csc_gather_reuse_and_prepared_value_updates(dense_cols):
         values.mul_(2)
 
 
+@pytest.mark.spmm_csr
+@pytest.mark.skipif(not _is_rocm_runtime(), reason="ROCm transpose reuse")
+def test_complex_csr_transpose_reuse_tracks_values_and_indices():
+    device = accelerator_device()
+    values = torch.tensor([1 + 2j, -2 + 3j, 4 - 1j], device=device)
+    indices = torch.tensor([0, 2, 1], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 2, 3], dtype=torch.int64, device=device)
+    B = torch.tensor([[1 + 2j, 3], [-1j, 2 + 1j]], device=device).t().conj()
+    prepared = fs.prepare_spmm_csr_route(values, indices, indptr, (2, 3), op="conj")
+    out = torch.empty((3, 2), dtype=values.dtype, device=device)
+
+    def check():
+        dense = torch.zeros((2, 3), dtype=values.dtype)
+        dense[torch.tensor([0, 0, 1]), indices.cpu().long()] = values.cpu()
+        actual = fs.flagsparse_spmm_csr_run(prepared, B, out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), dense.mH @ B.cpu())
+        actual = fs.flagsparse_spmm_csr(values, indices, indptr, B, (2, 3), op="conj", out=out)
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), dense.mH @ B.cpu())
+
+    check()
+    check()
+    values.mul_(1 + 1j)
+    check()
+    indices.copy_(torch.tensor([1, 0, 2], dtype=indices.dtype, device=device))
+    check()
+
+
 @pytest.mark.spmv_coo
 def test_inference_coo_recomputes_after_mutation_and_handles_empty_rows():
     device = accelerator_device()
@@ -194,3 +224,73 @@ def test_spgemm_repeated_calls_track_topology_and_value_mutation():
             ai.copy_(torch.tensor([1, 1, 0], dtype=torch.int32, device=device))
         elif stage == 2:
             bi.copy_(torch.tensor([1, 0, 0], dtype=torch.int32, device=device))
+
+
+@pytest.mark.spgemm_csr
+@pytest.mark.skipif(not _is_rocm_runtime(), reason="ROCm symbolic SpGEMM")
+def test_spgemm_symbolic_reuse_preserves_output_ownership(monkeypatch):
+    from flagsparse.sparse_operations import _spgemm_rocm, _spgemm_symbolic
+
+    device = accelerator_device()
+    if not _spgemm_rocm.symbolic_available(device):
+        pytest.skip("Requires gfx936")
+    values = torch.tensor([1 + 2j, 3 - 1j, -2 + 3j], device=device)
+    cols = torch.tensor([0, 1, 0], device=device, dtype=torch.int32)
+    ptr = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
+    builds = []
+    build_symbolic = _spgemm_symbolic.build_symbolic
+
+    def record_build(*args):
+        builds.append(None)
+        return build_symbolic(*args)
+
+    monkeypatch.setattr(_spgemm_symbolic, "build_symbolic", record_build)
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for step, expected_builds in enumerate((0, 1, 1, 1, 2, 2)):
+            if step == 2:
+                values.mul_(2 - 1j)
+            if step == 3:
+                ptr[1] = 1
+            data, out_cols, out_ptr, shape = fs.flagsparse_spgemm_csr(
+                values.conj(), cols, ptr, (2, 2), values, cols, ptr, (2, 2)
+            )
+            sparse = torch.sparse_csr_tensor(ptr.cpu(), cols.cpu(), values.cpu(), (2, 2))
+            dense = sparse.to_dense()
+            actual = torch.sparse_csr_tensor(out_ptr.cpu(), out_cols.cpu(), data.cpu(), shape)
+            torch.testing.assert_close(actual.to_dense(), dense.conj() @ dense)
+            assert len(builds) == expected_builds
+            out_cols.zero_()
+            out_ptr.zero_()
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_rocm_fp16_axpby_replay_reads_current_indices(warm_cache):
+    from flagsparse.sparse_operations import _vector_rocm
+
+    if not (_is_rocm_runtime() or _backend_name() == "cuda"):
+        pytest.skip("ROCm Axpby graph regression uses the HIP/CUDA graph API")
+    device = accelerator_device()
+    values = torch.ones(1, dtype=torch.float16, device=device)
+    indices = torch.tensor([1], dtype=torch.int32, device=device)
+    output = torch.zeros(4, dtype=torch.float16, device=device)
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+
+    def update(index):
+        _vector_rocm.axpby(values, index, output, 1.0, 0.0, 0.0, 0.0)
+
+    with torch.cuda.stream(stream):
+        update(indices if warm_cache else indices.clone())
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        update(indices)
+    with torch.cuda.stream(stream):
+        if not warm_cache:
+            key = (output.numel(), stream.cuda_stream)
+            assert _vector_rocm._OWNERS.get((indices,), key) is None
+        indices.fill_(2)
+        graph.replay()
+        torch.testing.assert_close(output.cpu(), torch.tensor([0, 0, 1, 0], dtype=output.dtype))

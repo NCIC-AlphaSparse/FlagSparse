@@ -389,6 +389,13 @@ def flagsparse_axpby(
     (and the elapsed milliseconds when ``return_time``). ``validate=False`` skips the
     index range check, a host sync that cuSPARSE does not perform either.
     """
+    if (_is_rocm_runtime() and prepared is None and not validate and not return_time
+            and isinstance(alpha, (float, int, complex)) and isinstance(beta, (float, int, complex))):
+        from ._vector_rocm import try_bound
+
+        result = try_bound("axpby", values, indices, y, (alpha, beta))
+        if result is not None:
+            return result
     global _CUDA_AXPBY_TRY
     if (_CUDA_AXPBY_TRY is not None and prepared is None
             and not validate and not return_time):
@@ -439,6 +446,13 @@ def flagsparse_axpby(
         from ._vector_cuda import axpby, try_axpby
         axpby(values, kernel_idx, y, a_re, a_im, b_re, b_im)
         _CUDA_AXPBY_TRY = try_axpby
+    elif (_is_rocm_runtime() and y.dtype in (torch.float16, torch.float32, torch.complex64)
+          and y.numel() <= 4 * 1024 * 1024
+          and not (y.is_conj() or y.is_neg() or values.is_conj() or values.is_neg())
+          and not torch._C._overlaps(values, y)):
+        from ._vector_rocm import axpby
+
+        axpby(values, kernel_idx, y, a_re, a_im, b_re, b_im)
     elif (
         _is_maca_runtime() and y.dtype == torch.complex64
         and y.numel() <= 4 * 1024 * 1024
@@ -591,6 +605,12 @@ def flagsparse_spvv(
     prepared plan carries the one it was prepared with.
     ``validate=False`` skips the index range check (a host sync).
     """
+    if _is_rocm_runtime() and prepared is None and not validate and not return_time:
+        from ._vector_rocm import try_bound
+
+        result = try_bound("spvv", values, indices, y, (op, out_dtype))
+        if result is not None:
+            return result
     if (prepared is None and not validate and not return_time
             and _backend_name() == "cuda"):
         from ._vector_cuda import try_spvv
@@ -652,6 +672,11 @@ def flagsparse_spvv(
         from ._vector_maca import spvv
 
         result = spvv(values, kernel_idx, y, op == "conj")
+    elif (_is_rocm_runtime() and values.numel() <= 65536
+          and values.dtype in (torch.float16, torch.int8, torch.float32, torch.complex64)):
+        from ._vector_rocm import spvv
+
+        result = spvv(values, kernel_idx, y, op == "conj", compute, out_dtype)
     elif _is_rocm_runtime() and values.dtype in (torch.float16, torch.complex64, torch.int8):
         # Match the native ROCm baseline for launch-bound reductions; complex
         # real-plane fallbacks would need two additional reduction launches.

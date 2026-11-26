@@ -12,17 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Make this directory importable the way running a script here already does.
+"""Accuracy collection and result reports for the FlagSparse pytest suites."""
 
-The benchmark scripts are named test_*.py, so `pytest tests/` imports them even
-though their work is behind a CLI. Run as scripts they get this directory on
-sys.path for free and `import benchmark_utils` resolves; imported by pytest they
-do not, and collection would fail on that import alone.
-"""
-
+import os
+import shlex
 import sys
 from pathlib import Path
 
+import pytest
+
+from tools.pytest_reporting import operator_marks, report_reason, write_json_report
+
+# Benchmark scripts in tests/ also use script-local imports during collection.
 _TESTS_ROOT = str(Path(__file__).resolve().parent)
 if _TESTS_ROOT not in sys.path:
     sys.path.insert(0, _TESTS_ROOT)
+
+QUICK_MODE = False
+_ACCURACY_DIR = Path(_TESTS_ROOT) / "pytest"
+
+
+def pytest_addoption(parser):
+    parser.addoption("--mode", choices=("normal", "quick"), default="normal")
+    parser.addoption(
+        "--quick", action="store_true", help="Run the quick accuracy grid."
+    )
+    parser.addoption("--ref", choices=("cpu",), help="Use the CPU accuracy suite.")
+
+
+def pytest_configure(config):
+    global QUICK_MODE
+    QUICK_MODE = config.getoption("--quick") or config.getoption("--mode") == "quick"
+    config._flagsparse_accuracy_results = {}
+    if (
+        os.environ.get("FLAGSPARSE_OPTEST_DELIVERY_DIR")
+        and os.environ.get("FLAGSPARSE_BACKEND") == "iluvatar"
+    ):
+        from run_flagsparse_delivery import PROFILES
+
+        selection = shlex.split(PROFILES["iluvatar"].pytest_args)[1]
+        previous = config.option.keyword
+        config.option.keyword = (
+            f"({previous}) and ({selection})" if previous else selection
+        )
+
+
+def pytest_ignore_collect(collection_path, config):
+    if not config.getoption("--ref") and config.getoption("--collect-marks") is None:
+        return None
+    if not collection_path.is_relative_to(_ACCURACY_DIR):
+        return True
+    return None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if item.config.getoption("--record") != "json":
+        return
+    callspec = getattr(item, "callspec", None)
+    result = item.config._flagsparse_accuracy_results.setdefault(
+        item.nodeid,
+        {
+            "params": dict(callspec.params) if callspec else {},
+            "result": None,
+            "opname": operator_marks(item),
+        },
+    )
+    if report.when == "call" or report.failed or report.skipped:
+        result["result"] = report.outcome
+        result["reason"] = None if report.passed else report_reason(report)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if config.getoption("--record") == "json":
+        path = config.getoption("--output") or "accuracy_result.json"
+        write_json_report(path, config._flagsparse_accuracy_results)

@@ -237,6 +237,24 @@ def test_spmm_csc_prepared_op_mismatch_rejected():
 
 @pytest.mark.spmm_csc
 @pytest.mark.parametrize("op", ["trans", "conj"], ids=["trans", "conj"])
+def test_rocm_spmm_csc_long_column_cancellation(op):
+    if not spmm_csc_mod._is_rocm_runtime():
+        pytest.skip("ROCm FP32 transpose reduction")
+    device = accelerator_device()
+    values = torch.tensor([2**24, 1.0, -(2**24)], dtype=torch.float32, device=device).repeat(512)
+    rows = torch.arange(values.numel(), device=device, dtype=torch.int64)
+    n_cols = 256
+    ptr = torch.full((n_cols + 1,), values.numel(), device=device, dtype=torch.int64)
+    ptr[0] = 0
+    rhs = torch.ones((values.numel(), 3), device=device, dtype=values.dtype)
+    out = flagsparse_spmm_csc(values, rows, ptr, rhs, shape=(values.numel(), n_cols), op=op)
+    expected = torch.zeros_like(out)
+    expected[0] = 512.0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.spmm_csc
+@pytest.mark.parametrize("op", ["trans", "conj"], ids=["trans", "conj"])
 def test_spmm_csc_transpose_family_high_level(op):
     device = accelerator_device()
     data, indices, indptr, dense = _random_csc_mk(

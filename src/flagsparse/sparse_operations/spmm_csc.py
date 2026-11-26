@@ -1463,6 +1463,15 @@ def _triton_spmm_csc_base_kernel(prepared, B, op_code=None):
         and (int(prepared.nnz) / prepared.n_cols) < _gate[0]
     ):
         bnz = _gate[1]
+        if dtype == torch.float32 and _is_rocm_runtime() and prepared.max_col_nnz > bnz:
+            # A short mean can hide long columns. FP32 atomics into one output
+            # lose accuracy under cancellation. Each CSC column is a row of A.T.
+            from . import _spmm_row_gather
+
+            return _spmm_row_gather.compute(
+                prepared.data, prepared.kernel_indices, prepared.kernel_indptr,
+                B, C, acc_dtype=tl.float64,
+            )
         grid_nnz = (
             triton.cdiv(int(prepared.nnz), bnz),
             triton.cdiv(n_dense_cols, block_n),

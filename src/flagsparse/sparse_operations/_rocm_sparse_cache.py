@@ -3,12 +3,14 @@
 """Bounded, mutation-aware reuse of ROCm sparse preprocessing."""
 
 from collections import OrderedDict
+from threading import Lock
 
 
 class TensorPlanCache:
     def __init__(self, maxsize=8):
         self.maxsize = maxsize
         self._entries = OrderedDict()
+        self._lock = Lock()
 
     @staticmethod
     def _signature(tensors):
@@ -30,17 +32,18 @@ class TensorPlanCache:
 
     def get(self, tensors, options=()):
         key = (tuple(id(t) for t in tensors), options)
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        sources, signature, plan = entry
-        if not all(
-            a is b for a, b in zip(sources, tensors)
-        ) or signature != self._signature(tensors):
-            del self._entries[key]
-            return None
-        self._entries.move_to_end(key)
-        return plan
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            sources, signature, plan = entry
+            if not all(
+                a is b for a, b in zip(sources, tensors)
+            ) or signature != self._signature(tensors):
+                del self._entries[key]
+                return None
+            self._entries.move_to_end(key)
+            return plan
 
     def put(self, tensors, options, plan):
         signature = self._signature(tensors)
@@ -48,7 +51,8 @@ class TensorPlanCache:
             return
         key = (tuple(id(t) for t in tensors), options)
         # Retaining the sources prevents Python id/storage reuse until eviction.
-        self._entries[key] = (tuple(tensors), signature, plan)
-        self._entries.move_to_end(key)
-        while len(self._entries) > self.maxsize:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[key] = (tuple(tensors), signature, plan)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.maxsize:
+                self._entries.popitem(last=False)

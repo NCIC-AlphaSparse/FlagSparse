@@ -22,6 +22,24 @@ def uses_native_rocm_fp32_accumulation(prepared):
     )
 
 
+def row_tile_needs_wide_positions(prepared):
+    return (
+        prepared.kernel_indptr.dtype != torch.int32
+        or prepared.kernel_indices.dtype != torch.int32
+        or max(prepared.n_rows, prepared.data.numel()) > 2**31 - 65536
+    )
+
+
+def bind_rocm_row_tile(prepared, x, out, acc):
+    if prepared.rocm_nnz_plan is not None:
+        from . import _spmv_csr_nnz
+
+        return _spmv_csr_nnz.bind(prepared, x, out)
+    from . import _spmv_rocm
+
+    return _spmv_rocm.bind_real_csr(prepared, x, out, acc=acc)
+
+
 @triton.jit
 def _product(A, X, pos, col, mask, COMPLEX: tl.constexpr, ACC: tl.constexpr):
     if COMPLEX:
@@ -124,7 +142,7 @@ def row_tile_real_kernel(
     for step in tl.range(0, steps, num_stages=STAGES):
         pos = start[:, None] + step * V + lane[None, :]
         mask = valid[:, None] & (pos < end[:, None])
-        col = tl.load(CI + pos, mask, 0).to(tl.int64)
+        col = tl.load(CI + pos, mask, 0)
         value = tl.load(A + pos, mask, 0).to(ACC)
         vector = tl.load(X + col, mask, 0).to(ACC)
         acc += value * vector
@@ -432,10 +450,6 @@ def compute(prepared, x, y, alg, config, plan=None):
     m = prepared.n_rows
     if not m:
         return y
-    if _common._is_rocm_runtime() and alg == "row_tile" and prepared.rocm_nnz_plan is not None:
-        from . import _spmv_csr_nnz
-
-        return _spmv_csr_nnz.bind(prepared, x, y)()
     complex_input = prepared.data.is_complex()
     # gfx936's FP64 accumulation doubles value traffic and register pressure,
     # but a row spanning more than two 16-wide chunks can exceed the public
@@ -451,6 +465,10 @@ def compute(prepared, x, y, alg, config, plan=None):
         )
     )
     acc = tl.float64 if acc_dtype == torch.float64 else tl.float32
+    if _common._is_rocm_runtime() and alg == "row_tile":
+        run = bind_rocm_row_tile(prepared, x, y, acc)
+        if run is not None:
+            return run()
     view = lambda t: (
         torch.view_as_real(t.resolve_conj()).reshape(-1) if complex_input else t
     )
@@ -524,10 +542,7 @@ def compute(prepared, x, y, alg, config, plan=None):
                     V=c["lanes_per_row"],
                     STAGES=c["loop_num_stages"],
                     ACC=acc,
-                    POSITION_64=not (
-                        prepared.data.dtype == torch.float32
-                        and prepared.kernel_indptr.dtype == torch.int32
-                    ),
+                    POSITION_64=row_tile_needs_wide_positions(prepared),
                     FIXED_STEPS=fixed_steps,
                     num_warps=c["num_warps"],
                     enable_fp_fusion=(prepared.data.dtype == torch.float32),

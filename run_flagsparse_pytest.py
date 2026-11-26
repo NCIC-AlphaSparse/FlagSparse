@@ -165,6 +165,8 @@ DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
         "float32,float64",
     ),
     "spmm_coo": ("--index-dtypes", "int32", "--dtypes", "float32,float64"),
+    # SpGEMM's FP32 child also appends the registered complex64 variant.
+    "spgemm_csr": ("--dtypes", "float32"),
 }
 # SpSV is not a delivery parent any more (the delivery list dropped it on
 # 2026-09-21), so `--delivery-only` no longer selects spsv_csr/spsv_coo and this
@@ -1848,9 +1850,10 @@ def write_phase_result(
     return path
 
 
-def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
+def _base_env(project_root: Path, gpu_id: int | None) -> dict[str, str]:
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     # Batch schedulers can leave these variables pointing at a cleaned-up job
     # scratch directory. Triton's ROCm compiler delegates assembly to clang,
     # which then fails before a kernel is built. Keep valid user directories,
@@ -1863,7 +1866,7 @@ def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     # ("undefined symbol: ixcclReduce", BI-V 10-27) then fails every kernel compile.
     # FlagSparse uses no distributed TLE, so keep FlagCX off unless asked for.
     env.setdefault("USE_FLAGCX", "0")
-    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
+    if gpu_id is not None and env.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
         # torch_npu ignores CUDA_VISIBLE_DEVICES: without this every child landed
         # on physical NPU 0 whatever --gpus said (measured on 910B, 2026-09-17).
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(gpu_id)
@@ -1875,7 +1878,7 @@ def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     return env
 
 
-def _subprocess_device_id(gpu_id: int) -> int:
+def _subprocess_device_id(gpu_id: int | None) -> int:
     """The device ordinal to pass a child whose visible devices _base_env masked.
 
     Backends whose runtime honours that mask renumber the one visible device to
@@ -1883,6 +1886,8 @@ def _subprocess_device_id(gpu_id: int) -> int:
     ASCEND_RT_VISIBLE_DEVICES, and XPU's torch_xmlir shim reads
     CUDA_VISIBLE_DEVICES. Every other backend keeps the id it was given.
     """
+    if gpu_id is None:
+        return 0  # The caller (e.g. optest) already selected the visible device.
     backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
     return 0 if backend in ("ascend", "xpu") else gpu_id
 
@@ -1909,17 +1914,46 @@ def run_subprocess(
     timeout: int,
 ) -> tuple[int, str, str, float, bool]:
     start = time.monotonic()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(project_root),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    delivery = bool(env.get("FLAGSPARSE_OPTEST_DELIVERY_DIR"))
+    proc = None
+    pending_termination = False
+    previous_sigterm = None
+
+    def terminate_matrix(signum, _frame):
+        nonlocal pending_termination
+        if proc is None:
+            pending_termination = True
+            return
+        # Optest only signals pytest's group. The matrix has its own group so
+        # its individual deadline can stop it without killing pytest.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        signal.signal(signum, previous_sigterm)
+        signal.raise_signal(signum)
+
+    if (
+        delivery
+        and timeout > 0
+        and env.get("FLAGSPARSE_OPTEST_MATRIX_TIMEOUT")
+        and threading.current_thread() is threading.main_thread()
+    ):
+        previous_sigterm = signal.signal(signal.SIGTERM, terminate_matrix)
     timed_out = False
     try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(project_root),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # A positive inner timeout needs its own group for per-case cleanup.
+            start_new_session=not delivery or timeout > 0,
+        )
+        if pending_termination:
+            terminate_matrix(signal.SIGTERM, None)
         stdout, stderr = proc.communicate(timeout=timeout if timeout > 0 else None)
         returncode = proc.returncode
     except subprocess.TimeoutExpired:
@@ -1927,6 +1961,9 @@ def run_subprocess(
         _terminate_process_group(proc)
         stdout, stderr = proc.communicate()
         returncode = TIMEOUT_RETURN_CODE
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     duration = time.monotonic() - start
     return returncode, stdout or "", stderr or "", duration, timed_out
 
@@ -3256,7 +3293,7 @@ def run_performance(
     *,
     project_root: Path,
     op: str,
-    gpu_id: int,
+    gpu_id: int | None,
     template: tuple[str, ...] | None,
     op_dir: Path,
     benchmark_input: Path | None,
@@ -4294,11 +4331,15 @@ def _delivery_performance_phase(
     return result
 
 
-def _delivery_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
+def _delivery_results(
+    results: list[dict[str, object]],
+    *,
+    variants: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     """Project group-level runner results onto the fixed delivery registry."""
     by_operator = {str(result.get("operator")): result for result in results}
     projected: list[dict[str, object]] = []
-    for variant in load_delivery_variants():
+    for variant in load_delivery_variants() if variants is None else variants:
         parent = by_operator.get(variant["operator"])
         result: dict[str, object] = {
             "operator": variant["id"],

@@ -286,6 +286,33 @@ BSR 脚本会保留已完成的 `PASS`/`FAIL` case、重试此前的 `ERROR` cas
 
 ## 测试用法
 
+### FlagOS optest 快速验证
+
+在已有 CUDA 12 版 PyTorch 和 Triton/FlagTree 的 NVIDIA 机器上，从仓库根目录执行以下命令。`uv` 需为 0.11.30 或以上版本。
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install 'uv>=0.11.30'
+uv pip install --reinstall-package pytest -e '.[test,nvidia]' -r tools/ci/requirements-optest.txt
+flagos-gpu-check --format json
+python -m tools.run_optest --gpus 0 --quick \
+  --ops gather,spmv_csr,spmm_csr --dump-output \
+  --output-dir pytest_results_optest_smoke
+```
+
+`--gpus` 使用 `flagos-gpu-check` 返回的设备编号。上面的命令用于三个父算子的冒烟测试。
+
+**105 项交付测试**直接读取 `conf/operators.yaml` 的 `delivery_variants`。每个父算子执行一次精度和性能测试，`summary.json` 按完整变体 ID 出结果，`parent_summary.json` 和父算子目录保留原始结果及日志。
+
+```bash
+python -m tools.run_optest --delivery --gpus 0 --quick --dump-output \
+  --output-dir pytest_results_optest_delivery
+flagos-psum-html pytest_results_optest_delivery -o pytest_results_optest_delivery/result.html
+```
+
+默认性能输入是 `tests/data` 中清单指定的 10 个矩阵。可传 `--benchmark-input tests/data/wave.mtx` 做单矩阵验证，或用 `--ops spmv_csr_f32_int_non,spmv_csr_f32_int_trans` 选择具体交付变体。任何所选变体的精度失败、性能失败或测量缺失都会让命令返回非零状态。[GitHub Actions optest 工作流](.github/workflows/optest.yml)可手动触发全部交付测试，并上传 JSON、日志和 HTML 报告。
+
 在项目根目录执行，或先 `cd tests` 再运行脚本（.mtx 目录可用 `../matrix` 等相对路径）。
 
 **算子测试 runner** - 按 YAML 算子清单逐算子运行精度/性能测试：

@@ -15,6 +15,7 @@
 """CSR SpGEMM (A@B) with two-phase structure/value build."""
 
 import ctypes
+from copy import copy
 
 from . import _common as _common_mod
 from ._common import *
@@ -55,6 +56,7 @@ class SpGEMMPrepared:
         "row_work_ready",
         "symbolic_sources",
         "ascend_plan",
+        "rocm_hash_config",
     )
 
     def __init__(
@@ -89,6 +91,7 @@ class SpGEMMPrepared:
         self.row_work_ready = bool(row_work_ready)
         self.symbolic_sources = None
         self.ascend_plan = None
+        self.rocm_hash_config = None
 
 
 def _validate_csr(data, indices, indptr, shape, tag):
@@ -107,6 +110,8 @@ def _validate_csr(data, indices, indptr, shape, tag):
         raise ValueError(f"{tag}_data and {tag}_indices must have the same length")
     if not _is_accel_tensor(data) or not _is_accel_tensor(indices) or not _is_accel_tensor(indptr):
         raise ValueError(f"{tag} tensors must be CUDA tensors")
+    if data.device != indices.device or data.device != indptr.device:
+        raise ValueError(f"{tag} data, indices and indptr must share a device")
     if data.dtype not in SUPPORTED_SPGEMM_VALUE_DTYPES:
         raise TypeError(
             f"{tag}_data dtype must be torch.float32, torch.float64 or torch.complex64"
@@ -231,6 +236,35 @@ def prepare_spgemm_csr(
 ):
     if block_nnz <= 0:
         raise ValueError("block_nnz must be positive")
+    if (_is_rocm_runtime() and not _TLE_AVAILABLE
+            and torch.is_tensor(a_data) and torch.is_tensor(b_data)
+            and a_data.device.type == "cuda" and a_data.device == b_data.device
+            and a_data.dtype == b_data.dtype
+            and a_data.dtype in (torch.float32, torch.complex64)):
+        from . import _spgemm_rocm
+
+        if _spgemm_rocm.available(a_data.device):
+            ai, ap, ash, max_a = _spgemm_rocm.operand(a_data, a_indices, a_indptr, a_shape, "a")
+            bi, bp, bsh, max_b = _spgemm_rocm.operand(b_data, b_indices, b_indptr, b_shape, "b")
+            if ash[1] != bsh[0]:
+                raise ValueError(f"shape mismatch for A@B: {ash} and {bsh}")
+            config = _spgemm_rocm.config(ash, bsh, ai.numel(), bi.numel(), max_a, max_b)
+            if config is None:
+                # The sort kernels need row product counts and per-entry offsets.
+                from ._spgemm_maca import build_metadata
+
+                with torch.cuda.device(a_data.device):
+                    work, prefix = build_metadata(ai, ap, bp)
+            else:
+                work = prefix = ai.new_empty(0)
+            prepared = SpGEMMPrepared(
+                a_data.resolve_neg().contiguous(), ai, ap, ash,
+                b_data.resolve_neg().contiguous(), bi, bp, bsh,
+                work, prefix, row_work_ready=config is None,
+            )
+            # An empty tuple selects sorting for an irregular K100 product.
+            prepared.rocm_hash_config = config or ()
+            return prepared
     (
         a_data,
         a_indices,
@@ -1342,6 +1376,35 @@ def _spgemm_hash_hybrid_compute(prepared):
 
 def _spgemm_compute(prepared):
     """Dispatch: hybrid hash when worthwhile, otherwise memory-safe ESC."""
+    if _is_rocm_runtime() and torch.is_tensor(prepared.a_data) and prepared.a_data.is_cuda:
+        from . import _spgemm_rocm
+
+        try:
+            result = _spgemm_rocm.compute_symbolic(prepared)
+        except (_accel_oom_error(), triton.runtime.errors.OutOfResources):
+            result = None
+        if result is not None:
+            return result
+        a_data, b_data = prepared.a_data, prepared.b_data
+        if a_data.is_conj() or b_data.is_conj() or a_data.is_neg() or b_data.is_neg():
+            prepared = copy(prepared)
+            prepared.a_data = a_data.resolve_conj().resolve_neg()
+            prepared.b_data = b_data.resolve_conj().resolve_neg()
+    config = getattr(prepared, "rocm_hash_config", None)
+    if config is not None:
+        from . import _spgemm_rocm
+
+        with torch.cuda.device(prepared.a_data.device):
+            try:
+                if not config:
+                    return _maca_triton_spgemm_compute(prepared)
+                result = _spgemm_rocm.compute(prepared)
+                if result is not None:
+                    return result
+            except (_accel_oom_error(), triton.runtime.errors.OutOfResources):
+                pass
+            # An overflowing table or exhausted device memory uses chunked expansion.
+            return _spgemm_esc_compute_safe(prepared)
     if (isinstance(prepared, SpGEMMPrepared) and _is_iluvatar_runtime()
             and prepared.a_data.dtype in (torch.float32, torch.complex64)):
         from . import _spgemm_iluvatar
@@ -1519,7 +1582,7 @@ def flagsparse_spgemm_csr(
             b_indptr,
             b_shape,
         )
-        if (_is_iluvatar_runtime()
+        if ((_is_iluvatar_runtime() or _is_rocm_runtime())
                 and prepared.a_data.dtype in (torch.float32, torch.complex64)):
             prepared.symbolic_sources = (a_indices, a_indptr, b_indices, b_indptr)
         if return_meta:
@@ -2064,7 +2127,6 @@ def _prepare_spgemm_csr_ref_hipsparse(
             "backend": "hipsparse",
             "buffer1_size": buffer1_size,
             "buffer2_size": buffer2_size,
-            "compute_size_out": ctypes.c_size_t(buffer2_size),
             "handle": handle,
             "mat_a": mat_a,
             "mat_b": mat_b,
@@ -2112,25 +2174,9 @@ def _prepare_spgemm_csr_ref_hipsparse(
                 pass
 
 
-def _run_spgemm_csr_ref_hipsparse_prepared(state):
-    _hip_check_result(
-        hipsparse.hipsparseSpGEMM_compute(
-            state["handle"],
-            state["op_enum"],
-            state["op_enum"],
-            state["alpha"],
-            state["mat_a"],
-            state["mat_b"],
-            state["beta"],
-            state["mat_c"],
-            state["value_type"],
-            state["alg"],
-            state["descr"],
-            state["compute_size_out"],
-            state["buffer2"],
-        ),
-        "hipsparseSpGEMM_compute",
-    )
+def _copy_spgemm_csr_ref_hipsparse(state):
+    # The product is already in the temporary buffers. After CsrSetPointers,
+    # hipSPARSE requires copy before the descriptor can be used again.
     _hip_check_result(
         hipsparse.hipsparseSpGEMM_copy(
             state["handle"],
@@ -2217,7 +2263,7 @@ def _spgemm_csr_ref_hipsparse(
         b_shape,
     )
     try:
-        result = _run_spgemm_csr_ref_hipsparse_prepared(state)
+        result = _copy_spgemm_csr_ref_hipsparse(state)
         metadata = {
             "backend": "hipsparse",
             "buffer1_size": int(state.get("buffer1_size", 0)),
@@ -2289,8 +2335,8 @@ def _benchmark_spgemm_csr_sparse_ref(
         return result
 
     if backend == "hipsparse":
-        values, ms = _benchmark_prepared_cuda_op(
-            lambda: _prepare_spgemm_csr_ref_hipsparse(
+        values, ms = _benchmark_cuda_op(
+            lambda: _spgemm_csr_ref_hipsparse(
                 a_data,
                 a_indices,
                 a_indptr,
@@ -2300,8 +2346,6 @@ def _benchmark_spgemm_csr_sparse_ref(
                 b_indptr,
                 b_shape,
             ),
-            _run_spgemm_csr_ref_hipsparse_prepared,
-            _destroy_spgemm_csr_ref_hipsparse_prepared,
             warmup=warmup,
             iters=iters,
         )
@@ -2413,8 +2457,8 @@ def benchmark_spgemm_case(
     if run_cusparse and sparse_ref_backend == "hipsparse":
         # DCU/ROCm: hipSPARSE SpGEMM stands in for the cuSPARSE baseline.
         try:
-            c_ref, cusparse_ms = _benchmark_prepared_cuda_op(
-                lambda: _prepare_spgemm_csr_ref_hipsparse(
+            c_ref, cusparse_ms = _benchmark_cuda_op(
+                lambda: _spgemm_csr_ref_hipsparse(
                     a_data,
                     a_indices,
                     a_indptr,
@@ -2424,8 +2468,6 @@ def benchmark_spgemm_case(
                     b_indptr,
                     (n_inner, n_cols),
                 ),
-                _run_spgemm_csr_ref_hipsparse_prepared,
-                _destroy_spgemm_csr_ref_hipsparse_prepared,
                 warmup=warmup,
                 iters=iters,
             )

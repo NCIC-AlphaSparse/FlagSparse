@@ -18,7 +18,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ACCURACY_UTILS = PROJECT_ROOT / "tests" / "pytest" / "accuracy_utils.py"
-ACCURACY_CONFTEST = PROJECT_ROOT / "tests" / "pytest" / "conftest.py"
+ACCURACY_CONFTEST = PROJECT_ROOT / "tests" / "conftest.py"
 
 
 def test_accuracy_policy_helpers_are_defined():
@@ -42,12 +42,9 @@ def test_accuracy_policy_documents_goldens():
 
 
 def test_accuracy_pytest_json_record_plugin_exists():
-    text = ACCURACY_CONFTEST.read_text(encoding="utf-8")
-    for snippet in [
-        '"--record"',
-        '"--output"',
-        "RECORD_JSON",
-        "pytest_terminal_summary",
-        "accuracy_result.json",
-    ]:
-        assert snippet in text
+    shared = (PROJECT_ROOT / "conftest.py").read_text(encoding="utf-8")
+    accuracy = ACCURACY_CONFTEST.read_text(encoding="utf-8")
+    assert '"--record"' in shared
+    assert '"--output"' in shared
+    assert "pytest_terminal_summary" in accuracy
+    assert "accuracy_result.json" in accuracy

@@ -265,7 +265,7 @@ def _scatter_complex_kernel(
 
 
 @triton.jit
-def _musa_indexed_copy_kernel(
+def _indexed_copy_kernel(
     DST, SRC, IDX, N,
     DST_STRIDE: tl.constexpr, SRC_STRIDE: tl.constexpr, INDEX_STRIDE: tl.constexpr,
     COMPONENTS: tl.constexpr, GATHER: tl.constexpr, BLOCK: tl.constexpr,
@@ -390,7 +390,7 @@ def _musa_indexed_copy(dst, src, indices, gather, block_size):
         _MUSA_COPY_RUNNERS.move_to_end(key)
         return
     runner = _musa_launch(
-        _musa_indexed_copy_kernel, grid, (dst_view, src_view, indices),
+        _indexed_copy_kernel, grid, (dst_view, src_view, indices),
         scalars, constants,
     )
     if runner is not None:
@@ -427,7 +427,7 @@ def _triton_gather_impl(
             raise TypeError("out dtype must match gather output dtype")
         return out
 
-    if _is_mthreads_runtime():
+    if _is_mthreads_runtime() or _is_rocm_runtime():
         if out is not None:
             if out.shape != (nnz,):
                 raise ValueError("out shape must match gather output shape")
@@ -435,7 +435,18 @@ def _triton_gather_impl(
                 raise TypeError("out dtype must match gather output dtype")
         else:
             out = torch.empty(nnz, dtype=dense_vector.dtype, device=dense_vector.device)
-        _musa_indexed_copy(out, dense_vector, kernel_indices, True, block_size)
+        if _is_rocm_runtime():
+            packed = dense_vector.is_complex()
+            source = torch.view_as_real(dense_vector.resolve_conj()) if packed else dense_vector
+            target = torch.view_as_real(out) if packed else out
+            components = 2 if packed else 1
+            grid = (triton.cdiv(nnz * components, block_size),)
+            _indexed_copy_kernel[grid](
+                target, source, kernel_indices, nnz, target.stride(0), source.stride(0),
+                kernel_indices.stride(0), components, True, block_size, num_warps=4,
+            )
+        else:
+            _musa_indexed_copy(out, dense_vector, kernel_indices, True, block_size)
         return out
 
     max_programs = _gather_max_programs(dense_vector.device, DEFAULT_GATHER_NUM_WARPS)

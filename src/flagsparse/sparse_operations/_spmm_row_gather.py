@@ -4,7 +4,7 @@
 import torch
 import triton
 import triton.language as tl
-from ._common import _is_iluvatar_runtime, _is_mthreads_runtime
+from ._common import _is_iluvatar_runtime, _is_mthreads_runtime, _is_rocm_runtime
 
 
 @triton.jit
@@ -63,7 +63,7 @@ def _kernel(V, I, P, B, C, M, N, BK, BN, CM, CN,
         tl.store(C + out, real, store_mask)
 
 
-def compute(values, cols, ptr, b, out):
+def compute(values, cols, ptr, b, out, *, acc_dtype=tl.float32):
     m, n = out.shape
     if not m or not n:
         return out
@@ -72,7 +72,8 @@ def compute(values, cols, ptr, b, out):
     if iluvatar and is_complex:
         b = b.resolve_conj()
     if (((_is_mthreads_runtime() and values.dtype in (torch.float16, torch.int8))
-         or (iluvatar and values.dtype in (torch.float16, torch.int8, torch.complex64)))
+         or (iluvatar and values.dtype in (torch.float16, torch.int8, torch.complex64))
+         or (_is_rocm_runtime() and values.dtype == b.dtype == torch.float16))
             and b.stride(0) == 1 and b.stride(1) != 1):
         # Read the current RHS every call. Packing is included in call timing;
         # it replaces repeated uncoalesced loads inside the sparse row loop.
@@ -94,11 +95,12 @@ def compute(values, cols, ptr, b, out):
         batch, lanes = (8, 4) if values.dtype == torch.int8 else (4, 4)
         if values.dtype == torch.complex64:
             batch, lanes = 4, 1
-    acc = tl.int32 if (musa or iluvatar) and values.dtype == torch.int8 and out.dtype == torch.int32 else tl.float32
+    if (musa or iluvatar) and values.dtype == torch.int8 and out.dtype == torch.int32:
+        acc_dtype = tl.int32
     tile_n = min(32, triton.next_power_of_2(n))
     _kernel[(triton.cdiv(m, batch), triton.cdiv(n, tile_n))](
         v, cols, ptr, dense, target, m, n, b.stride(0), b.stride(1),
         out.stride(0), out.stride(1), is_complex, batch, lanes, tile_n,
-        ACC=acc, num_warps=1 if iluvatar else 4, num_stages=1,
+        ACC=acc_dtype, num_warps=1 if iluvatar else 4, num_stages=1,
     )
     return out

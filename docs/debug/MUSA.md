@@ -5,6 +5,18 @@
 
 **MUSA 实现约束（用户于 2026-10-18 明确）**：算子计算内核必须使用 Triton，允许使用当前后端支持且经实测验证的 TLE 特性。禁止以手写 MUSA C++/`.mu` 内核、mcc 编译的计算库或 PyTorch 原生索引替代被测算子的计算内核。C API 主机封装、设备内存/流管理和厂商对照基线不属于计算内核；其他后端保持原实现。本文后半部保留的原生实验为撤回历史，不能用于全 Triton 验收。
 
+## optest 验证
+
+S5000 的 optest 真机验证待完成。按 [公共步骤](README.md#flagos-optest-验证)安装后，确认 `flagos-gpu-check` 返回 `mthreads`，`torch_musa` 可用，FlagSparse 识别出的设备类型为 `musa`。
+
+```bash
+FLAGSPARSE_BACKEND=mthreads python -m tools.run_optest --delivery --gpus 0 --quick \
+  --ops gather_f32_int,spmv_csr_f32_int_non --benchmark-input tests/data/wave.mtx \
+  --dump-output --output-dir pytest_results_optest_mthreads
+```
+
+确认两个变体都有精度结果和有效的本机时延。缺少 Python 侧可用的稀疏基线时，记录报告里的基线状态。muSPARSE 对照仍按下文 C API 交付命令验证。
+
 ## 2026-11-04：H800 参照扩到 105 变体，重跑补 17 个 NoBaseline；3 条 Python 慢路径待上卡排查
 
 **为什么 11-03 整轮还剩 17 个 NoBaseline。** 那轮已经带了 `--h800-reference`，但仓库自带的

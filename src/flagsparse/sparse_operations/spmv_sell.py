@@ -195,7 +195,8 @@ def _musa_sell_csr_plan(values, cols, offsets, n_rows, slice_size):
 def _rocm_sell_csr_plan(values, cols, offsets, n_rows, slice_size):
     """Materialize a row-major view once for the ROCm real fast path."""
     sources = (values, cols, offsets)
-    options = (int(n_rows), int(slice_size))
+    stream = torch._C._cuda_getCurrentRawStream(values.device.index)
+    options = (int(n_rows), int(slice_size), stream)
     cached = _ROCM_SELL_CSR_CACHE.get(sources, options)
     if cached is not None:
         return cached
@@ -918,6 +919,20 @@ def flagsparse_spmv_sell(
         y = out if out is not None and out.is_contiguous() else torch.empty(
             n_rows, dtype=out_dtype, device=x.device
         )
+        if (_is_rocm_runtime() and values.dtype == torch.complex64
+                and not torch.cuda.is_current_stream_capturing()):
+            from . import _spmv_rocm
+
+            data, indices, indptr, _ = _rocm_sell_csr_plan(
+                values, cols, offsets, n_rows, slice_size
+            )
+            result = _spmv_rocm.multiply(
+                data, indices, indptr, x, (n_rows, _n_cols), "csr", out_dtype, out=y
+            )
+            if result is not None:
+                from .mixed_spmx import _finish
+
+                return _finish(result, out, t0, return_time)
         if (
             _is_iluvatar_runtime()
             and values.dtype == torch.complex64

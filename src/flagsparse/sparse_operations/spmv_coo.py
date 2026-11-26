@@ -35,6 +35,7 @@ import triton
 import triton.language as tl
 
 _CUDA_SPARSE = None
+_ROCM_COO_LAUNCH_CACHE = TensorPlanCache()
 
 SUPPORTED_SPMV_COO_VALUE_DTYPES = (
     torch.float32,
@@ -973,7 +974,7 @@ def _prepare_spmv_coo_launch_from_raw(
     op=None,
     index_fallback_policy="auto",
 ):
-    """Build one runtime launch view from raw COO inputs for benchmark-only timing."""
+    """Build a runtime launch view for one operation on raw COO inputs."""
     index_fallback_policy = _normalize_spmv_coo_index_fallback_policy(
         index_fallback_policy
     )
@@ -981,6 +982,17 @@ def _prepare_spmv_coo_launch_from_raw(
     if op is not None and bool(transpose) and op_code == SPMV_COO_OP_NON:
         raise ValueError("transpose=True conflicts with op=non")
     shape = (int(shape[0]), int(shape[1]))
+    if (_is_rocm_runtime() and sort_by_row and op_code == SPMV_COO_OP_NON
+            and torch.is_tensor(data) and data.dtype == torch.float32
+            and torch.is_tensor(row) and torch.is_tensor(col)
+            and data.device.type == "cuda" and data.device == row.device == col.device):
+        sources = (data, row, col)
+        options = (shape, index_fallback_policy, torch._C._cuda_getCurrentRawStream(data.device.index))
+        cached = _ROCM_COO_LAUNCH_CACHE.get(sources, options)
+        if cached is not None:
+            return cached
+    else:
+        sources = None
     launch_shape = shape
     launch_data = data
     launch_row = row
@@ -1000,7 +1012,7 @@ def _prepare_spmv_coo_launch_from_raw(
         launch_shape,
         sort_by_row,
     )
-    return _PreparedCooLaunch(
+    launch = _PreparedCooLaunch(
         data=launch_data,
         row=launch_row,
         col=launch_col,
@@ -1009,6 +1021,9 @@ def _prepare_spmv_coo_launch_from_raw(
         op=op_code,
         index_fallback_policy=index_fallback_policy,
     )
+    if sources is not None:
+        _ROCM_COO_LAUNCH_CACHE.put(sources, options, launch)
+    return launch
 
 
 def _resolve_spmv_coo_launch(prepared, op):
@@ -1077,6 +1092,27 @@ def _validate_x_coo(x, prepared):
 
 
 def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
+    if (_is_rocm_runtime() and prepared.data.dtype == torch.float32 and prepared.use_seg_kernel
+            and block_inner == 128
+            and prepared.data.device == prepared.row.device == prepared.col.device):
+        from . import _spmv_rocm
+
+        result = _spmv_rocm.multiply(
+            prepared.data, prepared.row, prepared.col, x, prepared.shape, "coo", x.dtype
+        )
+        if result is not None:
+            return result
+    if (_is_rocm_runtime() and prepared.data.dtype == torch.complex64
+            and isinstance(prepared.csr_plan, tuple) and prepared.csr_plan[2] is None):
+        from . import _spmv_rocm
+
+        cols, ptr = prepared.csr_plan[:2]
+        result = _spmv_rocm.multiply(
+            prepared.data, cols, ptr, x, prepared.shape, "csr", x.dtype,
+            conjugate=prepared.op == SPMV_COO_OP_CONJ_TRANS,
+        )
+        if result is not None:
+            return result
     if prepared.csr_plan is not None:
         if isinstance(prepared.csr_plan, _CooTorchScatterPlan):
             plan = prepared.csr_plan
@@ -1232,16 +1268,23 @@ def _triton_spmv_coo_kernel(prepared, x, block_size, num_warps, block_inner):
         return y
     ker = _spmv_coo_atomic_f64 if dtype == torch.float64 else _spmv_coo_atomic_f32
     grid = (triton.cdiv(nnz, block_size),)
+    if (_is_rocm_runtime() and dtype in (torch.float32, torch.float64)
+            and prepared.row.device == prepared.col.device == prepared.data.device):
+        from ._rocm_launch import launch
+
+        launch(
+            ker,
+            grid[0],
+            (prepared.data, prepared.row, prepared.col, x, y),
+            (nnz,),
+            (block_size,),
+            num_warps=num_warps,
+        )
+        return y
     if _is_rocm_runtime():
         _spmv_coo_atomic_runs_real[grid](
-            prepared.data,
-            prepared.row,
-            prepared.col,
-            x,
-            y,
-            nnz,
-            BLOCK=block_size,
-            ACC=tl.float64 if dtype == torch.float64 else tl.float32,
+            prepared.data, prepared.row, prepared.col, x, y, nnz,
+            BLOCK=block_size, ACC=tl.float64 if dtype == torch.float64 else tl.float32,
             num_warps=num_warps,
         )
         return y
@@ -1371,14 +1414,12 @@ def _cached_rocm_coo_launch(device, dtype, nnz, block_size, num_warps):
 
 
 def _resolve_spmv_coo_kernel_launch(prepared, block_size, num_warps):
-    # gfx936's atomic COO kernel is memory/atomic bound. A 256-element tile
-    # with two waves outperformed the former 512-element tile on the delivery
-    # matrices. Preserve explicit callers'
-    # launch choices; this policy is only the public default.
+    # A 256-element tile lets FP32 use a full group of four wave64 wavefronts.
+    # Keep the launch geometry supplied explicitly by callers.
     if block_size is None:
-        block_size = 256 if _is_rocm_runtime() else 256
+        block_size = 256
     if num_warps is None:
-        num_warps = 2 if _is_rocm_runtime() else 4
+        num_warps = 4
     if _is_rocm_runtime():
         return _cached_rocm_coo_launch(
             prepared.data.device,
@@ -1558,9 +1599,15 @@ def flagsparse_spmv_coo(
         and bool(transpose) != _spmv_coo_op_transposes(op_code)
     ):
         raise ValueError("transpose conflicts with op")
-    if prepared is None:
-        if any(a is None for a in (data, row, col, x, shape)):
-            raise ValueError("data, row, col, x, shape required when prepared is None")
+    if prepared is None and any(a is None for a in (data, row, col, x, shape)):
+        raise ValueError("data, row, col, x, shape required when prepared is None")
+    if (prepared is None and _is_rocm_runtime() and sort_by_row
+            and op_code == SPMV_COO_OP_NON and torch.is_tensor(data)
+            and data.is_cuda and data.dtype == torch.float32):
+        launch = _prepare_spmv_coo_launch_from_raw(
+            data, row, col, shape, index_fallback_policy=index_fallback_policy
+        )
+    elif prepared is None:
         prepared = prepare_spmv_coo(
             data,
             row,
@@ -1571,6 +1618,7 @@ def flagsparse_spmv_coo(
             op=op,
             index_fallback_policy=index_fallback_policy,
         )
+        launch = _resolve_spmv_coo_launch(prepared, op_code)
     else:
         if x is None:
             raise TypeError("x is required when prepared is set")
@@ -1585,7 +1633,7 @@ def flagsparse_spmv_coo(
             op_code = prepared.op
         elif not op_explicit and transpose is not None:
             op_code = _normalize_spmv_coo_op(None, transpose=transpose_flag)
-    launch = _resolve_spmv_coo_launch(prepared, op_code)
+        launch = _resolve_spmv_coo_launch(prepared, op_code)
     x = _validate_x_coo(x, launch)
     if num_warps is not None and num_warps not in (1, 2, 4, 8, 16, 32):
         raise ValueError("num_warps must be a power of 2 in [1, 32]")

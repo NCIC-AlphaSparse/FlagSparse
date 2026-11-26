@@ -17,6 +17,10 @@ import torch
 
 from flagsparse import flagsparse_sddmm_csr, flagsparse_spgemm_csr
 from flagsparse.sparse_operations import _common as common
+from flagsparse.sparse_operations.spgemm_csr import (
+    _hipsparse_spgemm_csr_skip_reason,
+    _spgemm_csr_ref_hipsparse,
+)
 from tests import reference_utils
 
 from tests.pytest.accuracy_utils import (
@@ -116,6 +120,67 @@ def test_spgemm_csr_matches_torch(M, N, K, dtype, indptr_dtype):
     got = _csr_to_dense(c_data, c_indices, c_indptr, c_shape)
     rtol, atol = _tol(dtype)
     assert torch.allclose(got.to(ref.device), ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.spgemm_csr
+@pytest.mark.parametrize("width", [3, 33])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+def test_k100_spgemm_hash_collision_and_overflow(width, dtype):
+    if not torch.version.hip:
+        pytest.skip("requires the K100 hash kernel")
+    from flagsparse.sparse_operations import _spgemm_rocm
+    from flagsparse.sparse_operations.spgemm_csr import prepare_spgemm_csr
+
+    device = accelerator_device()
+    if not _spgemm_rocm.available(device):
+        pytest.skip("requires the K100 hash kernel")
+    # All columns initially map to bucket zero. The second width overflows
+    # the 32-slot table and exercises the fallback with deferred row metadata.
+    value = 2 + 1j if dtype.is_complex else 2.0
+    scale = 1j if dtype.is_complex else -2.0
+    a = (torch.tensor([value], dtype=dtype, device=device),
+         torch.tensor([0], device=device, dtype=torch.int32),
+         torch.tensor([0, 1], device=device), (1, 1))
+    cols = torch.arange(width, device=device, dtype=torch.int32) * 32
+    b = (torch.ones(width, dtype=dtype, device=device), cols,
+         torch.tensor([0, width], device=device), (1, width * 32))
+    prepared = prepare_spgemm_csr(*a, *b)
+    prepared.rocm_hash_config = (16, 32, 4)
+    assert (_spgemm_rocm.compute(prepared) is None) == (width > 32)
+    first = flagsparse_spgemm_csr(prepared=prepared)
+    b[0].mul_(scale)
+    cols.add_(1)
+    second = flagsparse_spgemm_csr(*a, *b)
+    for result, offset, expected in ((first, 0, value), (second, 1, value * scale)):
+        values, indices, ptr, shape = result
+        assert shape == b[3]
+        assert ptr.tolist() == [0, width]
+        assert indices.sort().values.tolist() == [i * 32 + offset for i in range(width)]
+        torch.testing.assert_close(values, torch.full_like(values, expected))
+    cols[0] = b[3][1]
+    with pytest.raises(IndexError, match="b_indices out of range"):
+        flagsparse_spgemm_csr(*a, *b)
+
+
+@pytest.mark.spgemm_csr
+def test_hipsparse_spgemm_writes_csr_result():
+    dtype = torch.float32
+    reason = _hipsparse_spgemm_csr_skip_reason(
+        dtype, torch.int32, torch.int64, torch.int32, torch.int64
+    )
+    if reason is not None:
+        pytest.skip(reason)
+    device = accelerator_device()
+    a = (
+        torch.tensor([1, 2, 3], dtype=dtype, device=device),
+        torch.tensor([0, 1, 0], dtype=torch.int32, device=device),
+        torch.tensor([0, 2, 3], dtype=torch.int64, device=device),
+        (2, 2),
+    )
+    data, indices, ptr, shape = _spgemm_csr_ref_hipsparse(*a, *a)
+    assert ptr.tolist() == [0, 2, 4]
+    expected = torch.tensor([[7, 2], [3, 6]], dtype=dtype)
+    torch.testing.assert_close(_csr_to_dense(data, indices, ptr, shape).cpu(), expected)
 
 
 @pytest.mark.spgemm_csr

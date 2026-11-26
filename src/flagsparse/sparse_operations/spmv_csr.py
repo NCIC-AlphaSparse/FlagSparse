@@ -1838,24 +1838,32 @@ def _configure_spmv_route(prepared, alg, config=None):
                 source += ":irregular-short-fp64-32x4"
             elif avg_nnz_per_row <= 7.0 and maximum <= 16:
                 actual["row_tile"].update(
-                    rows_per_program=32, lanes_per_row=4, loop_num_stages=3
+                    rows_per_program=128, lanes_per_row=8, num_warps=4
                 )
-                source += ":compact-fp64-32x4s3"
+                source += ":regular-fp64-128x8"
             elif avg_nnz_per_row < 9.0 and maximum <= 16:
-                actual["row_tile"]["loop_num_stages"] = 3
-                source += ":regular-short-fp64-64x8s3"
+                actual["row_tile"].update(
+                    rows_per_program=64, lanes_per_row=16, num_warps=4
+                )
+                source += ":regular-fp64-64x16"
+            elif maximum <= 32 and avg_nnz_per_row < 12.0:
+                actual["row_tile"].update(
+                    rows_per_program=64, lanes_per_row=16, num_warps=4, loop_num_stages=3
+                )
+                source += ":medium-fp64-64x16s3"
             elif avg_nnz_per_row >= 20.0:
                 actual["row_tile"].update(
-                    rows_per_program=16,
-                    lanes_per_row=8 if maximum <= 32 else 16,
+                    rows_per_program=32,
+                    lanes_per_row=16,
+                    num_warps=4 if maximum <= 32 else 2,
                     loop_num_stages=3,
                 )
                 source += ":dense-fp64-small-tile"
             elif avg_nnz_per_row < 15.0 and maximum <= 40:
                 actual["row_tile"].update(
-                    rows_per_program=16, lanes_per_row=8, loop_num_stages=3
+                    rows_per_program=64, lanes_per_row=16, num_warps=4, loop_num_stages=3
                 )
-                source += ":regular-medium-fp64-16x8s3"
+                source += ":regular-medium-fp64-64x16s3"
             elif avg_nnz_per_row >= 12.0:
                 actual["row_tile"].update(
                     rows_per_program=32, lanes_per_row=8, loop_num_stages=3
@@ -2186,14 +2194,22 @@ def flagsparse_spmv_csr_run(
             prepared = _configure_spmv_route(copy(prepared), "auto")
         if op is not None and _normalize_spmv_op(op) != prepared.op:
             raise ValueError("op does not match prepared.op")
-        _csr_config.assert_route_match(
-            prepared.alg, prepared.config, alg, config, prepared.backend_caps
-        )
+        if alg is not None or config is not None:
+            _csr_config.assert_route_match(
+                prepared.alg, prepared.config, alg, config, prepared.backend_caps
+            )
         # Check overlap before contiguous materialization can hide an aliased x view.
         checked_x = _validate_spmv_x(x, prepared)
         _spmv_check_output(out, prepared, x)
         x = checked_x
         if not (return_time or return_meta or timing):
+            if (_is_rocm_runtime() and prepared.data.dtype in (torch.float32, torch.complex64)
+                    and prepared.kernel_indices.dtype == torch.int32
+                    and prepared.kernel_indptr.dtype == torch.int32
+                    and _spmv_transpose_scatter_enabled(prepared)):
+                from . import _spmv_csr_transpose
+
+                return _spmv_csr_transpose.compute(prepared, x, out)
             if (prepared.alg_requested == "auto" and prepared.backend_caps is not None
                     and prepared.backend_caps.backend == "cuda"
                     and getattr(prepared.data.device, "type", None) == "cuda"
@@ -2368,6 +2384,17 @@ def flagsparse_spmv_csr(
             )) and out_dtype is None):
         # The fixed prepared route validates x/out in run(). No route options
         # were supplied, so resolving the default algorithm again is redundant.
+        return flagsparse_spmv_csr_run(
+            prepared, x, out=out, timing=timing,
+            return_time=return_time, return_meta=return_meta,
+        )
+    if (isinstance(prepared, PreparedCsrSpmv) and _is_rocm_runtime()
+            and prepared.data.device.type == "cuda"
+            and prepared.alg_requested == "auto" and prepared.transpose
+            and prepared.data.dtype in (torch.float32, torch.complex64)
+            and all(value is None for value in (
+                data, indices, indptr, shape, alg, config, use_opt, op, transpose,
+            )) and out_dtype is None):
         return flagsparse_spmv_csr_run(
             prepared, x, out=out, timing=timing,
             return_time=return_time, return_meta=return_meta,

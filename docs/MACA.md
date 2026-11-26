@@ -159,8 +159,18 @@ export PYTHONPATH=$PWD/src               # 独立脚本需要；pytest 由 pytes
 export FLAGSPARSE_BACKEND=metax
 export FLAGSPARSE_MACA_MODEL=c550
 export FLAGSPARSE_MACA_VENDOR=torch      # 本机没有 CuPy，用 PyTorch 作基线；不要设 none，否则 spmv_csr 的基线列是 N/A
+# 本机 metax PyTorch 2.10.0 / MACA 3.8：必须在启动 Python 前配置流池
+export PYTORCH_CONFIG_STREAM_POOLS=32,2,2
 unset FLAGSPARSE_ACCURACY_REFERENCE      # 用默认的 auto（CPU 上的 SciPy），防止上次调试残留的设置
 ```
+
+本机 PyTorch 默认在首次 `torch.cuda.Stream()` 时为优先级 0、-1、-2 各创建
+32 条流。实测创建第 4 条 -2 流时，高优先级硬件队列不足，默认无限等待；表现为
+Gather/Scatter 的 graph 性能测试和 SpVV 的多流精度测试停滞。
+`PYTORCH_CONFIG_STREAM_POOLS=32,2,2` 保留 32 条普通流，将另外两个优先级各设为
+2 条。实测独立双流、三个优先级计算和 graph capture/replay 均可执行。这个变量由
+metax PyTorch 在库加载时读取，必须在启动 Python 前设置；仅在已导入 torch 的进程中
+修改 `os.environ` 不能修复流池。该配置仅在上述 C550 软件栈验证，不要套用到其他后端。
 
 C550 上本来也能自动探测（2.2 节），这里显式指定，是为了不依赖 `torch.version.maca` 和设备名的识别。
 代价是探测被跳过，所以检查里要打印**真实设备名**：只有它是 `MetaX C550`，写死 `c550` 才对；
